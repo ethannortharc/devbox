@@ -10,12 +10,56 @@ pub struct DoctorArgs {}
 pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
     println!("devbox doctor\n");
 
-    // Check runtimes
+    let os = std::env::consts::OS;
+    let mut has_any_runtime = false;
+
+    // Platform-appropriate runtime checks
     println!("Runtime availability:");
-    check_binary("  Incus", "incus");
-    check_binary("  Lima", "limactl");
-    check_binary("  Multipass", "multipass");
-    check_binary("  Docker", "docker");
+
+    if os == "linux" {
+        let found = check_binary_with_install("  Incus", "incus", "sudo apt install incus  # or: snap install incus");
+        has_any_runtime |= found;
+    }
+
+    if os == "macos" || os == "linux" {
+        let found = check_binary_with_install(
+            "  Lima",
+            "limactl",
+            if os == "macos" { "brew install lima" } else { "brew install lima  # or: https://lima-vm.io/docs/installation/" },
+        );
+        if found {
+            has_any_runtime = true;
+        } else if !has_any_runtime {
+            let found = check_binary_with_install(
+                "  Multipass",
+                "multipass",
+                if os == "macos" { "brew install multipass" } else { "sudo snap install multipass" },
+            );
+            has_any_runtime |= found;
+        }
+    }
+
+    if !has_any_runtime {
+        let found = check_binary_with_install(
+            "  Docker",
+            "docker",
+            if os == "macos" {
+                "brew install --cask docker  # or: https://docker.com/get-started"
+            } else {
+                "sudo apt install docker.io  # or: https://docker.com/get-started"
+            },
+        );
+        has_any_runtime |= found;
+    }
+
+    if !has_any_runtime {
+        println!("\n  \x1b[31mNo runtime found!\x1b[0m Install at least one:");
+        if os == "macos" {
+            println!("    brew install lima          # Recommended for macOS");
+        } else {
+            println!("    sudo apt install incus     # Recommended for Linux");
+        }
+    }
 
     // Auto-detected runtime
     print!("\nAuto-detected runtime: ");
@@ -55,17 +99,30 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
 
     // Supporting tools
     println!("\nSupporting tools:");
-    check_binary("  Zellij", "zellij");
-    check_binary("  Nix", "nix");
+    check_binary_with_install(
+        "  Zellij",
+        "zellij",
+        if os == "macos" { "brew install zellij" } else { "cargo install zellij  # or: https://zellij.dev/documentation/installation" },
+    );
+    check_binary_with_install(
+        "  Nix",
+        "nix",
+        "curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh",
+    );
 
     println!("\nAll checks complete.");
     Ok(())
 }
 
-fn check_binary(label: &str, name: &str) {
+/// Check if a binary is available. If missing, print install instructions.
+/// Returns true if found.
+fn check_binary_with_install(label: &str, name: &str, install_hint: &str) -> bool {
     if which::which(name).is_ok() {
         println!("{label}: \x1b[32minstalled\x1b[0m");
+        true
     } else {
         println!("{label}: \x1b[31mnot found\x1b[0m");
+        println!("    Install: {install_hint}");
+        false
     }
 }

@@ -180,10 +180,17 @@ impl SandboxManager {
         }
 
         // Exec interactive shell
+        // Lima maps the host user into the VM automatically, so no sudo needed.
+        // Try zsh first (NixOS/configured VMs), fall back to bash (vanilla Ubuntu).
         println!("Attaching to sandbox '{name}'...");
-        runtime
-            .exec_cmd(name, &["sudo", "-u", "dev", "zsh"], true)
-            .await?;
+        let result = runtime
+            .exec_cmd(name, &["zsh", "-l"], true)
+            .await;
+        if result.is_err() {
+            runtime
+                .exec_cmd(name, &["bash", "-l"], true)
+                .await?;
+        }
         Ok(())
     }
 
@@ -260,6 +267,17 @@ impl SandboxManager {
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let result = runtime.exec_cmd(name, &cmd_refs, interactive).await?;
+
+        // For non-interactive commands, print captured output
+        if !interactive {
+            if !result.stdout.is_empty() {
+                print!("{}", result.stdout);
+            }
+            if !result.stderr.is_empty() {
+                eprint!("{}", result.stderr);
+            }
+        }
+
         Ok(result.exit_code)
     }
 
