@@ -18,6 +18,7 @@ pub mod commit;
 pub mod diff;
 pub mod discard;
 pub mod help;
+pub mod reprovision;
 pub mod self_update;
 
 use anyhow::Result;
@@ -122,6 +123,9 @@ pub enum Command {
     #[command(name = "guide")]
     Guide(help::HelpArgs),
 
+    /// Re-provision a sandbox (push latest configs + rebuild)
+    Reprovision(reprovision::ReprovisionArgs),
+
     /// Update devbox to the latest version
     SelfUpdate(self_update::SelfUpdateArgs),
 }
@@ -149,6 +153,7 @@ impl Command {
             Command::Diff(args) => diff::run(args, manager).await,
             Command::Discard(args) => discard::run(args, manager).await,
             Command::Guide(args) => help::run(args, manager).await,
+            Command::Reprovision(args) => reprovision::run(args, manager).await,
             Command::SelfUpdate(args) => self_update::run(args, manager).await,
         }
     }

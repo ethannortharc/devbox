@@ -20,6 +20,7 @@
   devbox init                      Generate devbox.toml
   devbox config show               Show global defaults
   devbox upgrade --tools rust      Add tools to sandbox
+  devbox reprovision               Re-push configs after update
 
 ## Troubleshooting
   devbox doctor         Diagnose issues

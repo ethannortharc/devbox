@@ -141,6 +141,7 @@ cp host-configs/ghostty/config ~/.config/ghostty/config
 | `devbox guide` | Show tool quick reference |
 | `devbox guide <tool>` | Cheat sheet for a specific tool |
 | `devbox doctor` | Diagnose issues |
+| `devbox reprovision` | Re-push configs + rebuild (after update) |
 | `devbox self-update` | Update devbox |
 | `devbox init` | Generate devbox.toml |
 | `devbox config` | Get/set configuration |
