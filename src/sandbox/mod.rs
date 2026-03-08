@@ -1,6 +1,7 @@
 pub mod config;
 pub mod global_config;
 pub mod overlay;
+pub mod provision;
 pub mod state;
 
 use std::collections::HashMap;
@@ -121,6 +122,13 @@ impl SandboxManager {
 
         // Create via runtime
         let info = runtime.create(&opts).await?;
+
+        // Provision tools in the VM based on selected sets
+        let active_sets = config.active_sets();
+        let active_langs = config.active_languages();
+        if let Err(e) = provision::provision_vm(runtime, name, &active_sets, &active_langs).await {
+            eprintln!("Warning: provisioning incomplete: {e}");
+        }
 
         // Save state
         let state = SandboxState {

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -97,7 +96,7 @@ fn lookup_embedded(name: &str) -> Option<&'static str> {
 
 /// Embedded cheat sheets — compiled into the binary so they work
 /// both on the host CLI and inside the VM.
-static CHEAT_SHEETS: &[(&str, &str)] = &[
+pub static CHEAT_SHEETS: &[(&str, &str)] = &[
     ("index", include_str!("../../help/index.md")),
     ("devbox", include_str!("../../help/devbox.md")),
     ("zellij", include_str!("../../help/zellij.md")),

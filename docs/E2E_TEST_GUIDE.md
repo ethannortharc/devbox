@@ -76,15 +76,17 @@ devbox create --name e2e-test --bare
 ```
 
 **Expected:**
-- "Creating Lima VM 'devbox-e2e-test'..." (downloads Ubuntu image on first run, ~1-2 min)
-- "Starting Lima VM 'devbox-e2e-test'..."
+- "Creating NixOS VM 'devbox-e2e-test'..."
+- "Starting NixOS VM 'devbox-e2e-test'..."
+- "Setting up NixOS configuration..."
+- "Installing packages via nixos-rebuild (this may take a few minutes)..."
+- "NixOS rebuild complete."
 - "Sandbox 'e2e-test' created successfully (runtime: lima)"
-- Auto-attaches to shell inside VM (type `exit` to return)
 
 **Notes:**
-- First run downloads Ubuntu 24.04 cloud image (~600MB), subsequent creates are faster
+- First run downloads NixOS Lima image (~800MB), subsequent creates are faster
 - The `--bare` flag skips auto-detection for a minimal VM
-- You may see `cd: No such file or directory` messages from Lima trying to match the host CWD -- this is normal
+- NixOS rebuild downloads and installs packages from nixpkgs (may take 5-10 min on first run)
 
 ## 4. List and status
 
@@ -126,9 +128,8 @@ devbox exec --name e2e-test -- cat /etc/os-release
 - `echo`: prints `hello from VM`
 - `uname -a`: prints Linux kernel info (e.g., `Linux lima-devbox-e2e-test ... aarch64 GNU/Linux`)
 - `whoami`: prints your host username (Lima maps it)
-- `cat /etc/os-release`: shows Ubuntu 24.04 info
+- `cat /etc/os-release`: shows NixOS info
 - All commands exit with code 0
-- `cd` warnings in stderr are normal (Lima CWD matching)
 
 ## 6. Shell attach
 
@@ -137,16 +138,30 @@ devbox shell e2e-test
 ```
 
 **Expected:**
-- Drops into an interactive shell inside the VM
-- On vanilla Ubuntu: bash shell (zsh not installed)
-- On NixOS image: zsh shell with starship prompt
+- Drops into an interactive zsh shell inside the VM
+- After NixOS provisioning: zsh with starship prompt is default
 - Type `exit` to return to host
 
 **Inside the VM, verify:**
 ```bash
-uname -a       # Should show Linux
-hostname       # Should show lima-devbox-e2e-test
-ls /            # Standard Linux filesystem
+uname -a       # Should show Linux (NixOS)
+cat /etc/os-release  # Should show NixOS
+hostname       # Should show lima-devbox-e2e-test or devbox
+
+# Verify tools are installed (from system/shell/tools sets):
+zellij --version    # Terminal multiplexer
+rg --version        # ripgrep
+fd --version        # fd-find
+bat --version       # bat (cat replacement)
+lazygit --version   # Git TUI
+nvim --version      # Neovim
+starship --version  # Shell prompt
+eza --version       # ls replacement
+
+# Verify devbox is available inside VM:
+devbox guide        # Should show help index
+devbox guide zellij # Should show zellij keybindings
+
 exit
 ```
 
@@ -268,10 +283,10 @@ rm -rf /tmp/devbox-e2e
 
 ## Known Behaviors
 
-1. **Lima CWD warnings**: Lima tries to `cd` to the host's current directory inside the VM. If that path doesn't exist in the VM, you'll see `cd: No such file or directory` in stderr. This is harmless.
+1. **First-run image download**: The first `devbox create` downloads a NixOS Lima image (~800MB). Subsequent creates reuse the cached image.
 
-2. **First-run image download**: The first `devbox create` downloads an Ubuntu 24.04 cloud image (~600MB). Subsequent creates reuse the cached image.
+2. **NixOS rebuild time**: The first `nixos-rebuild switch` downloads and builds packages from nixpkgs, which may take 5-10 minutes depending on network speed and selected sets/languages. Subsequent rebuilds are faster due to Nix's caching.
 
-3. **Shell fallback**: On vanilla Ubuntu VMs, zsh isn't installed, so the shell falls back to bash. With the NixOS image, zsh with starship prompt is the default.
+3. **Shell**: After provisioning, zsh is the default shell with starship prompt. If provisioning is incomplete, the shell falls back to bash.
 
 4. **Self-update**: `devbox self-update --check` will fail until GitHub Releases are published for the repository.
