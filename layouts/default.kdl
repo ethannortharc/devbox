@@ -1,5 +1,8 @@
 // Devbox — Default layout: Home Base
-// Editor + terminal + file browser, with git and shell tabs
+// Tab 1: Editor + terminal + file browser
+// Tab 2: Editor + terminal + help/guide + management
+// Tab 3: Plain shell
+// Tab 4: Git (lazygit)
 layout {
     default_tab_template {
         pane size=1 borderless=true {
@@ -8,27 +11,46 @@ layout {
         children
     }
 
-    tab name="workspace" focus=true {
+    tab name="Workspace" focus=true {
         pane split_direction="vertical" {
-            pane name="editor" size="60%" {
-                command "nvim"
-                args "."
-            }
-            pane split_direction="horizontal" {
-                pane name="terminal" size="60%" focus=true
-                pane name="files" size="40%" {
-                    command "yazi"
-                    args "/workspace"
+            pane split_direction="horizontal" size="50%" {
+                pane name="editor" size="60%" {
+                    command "nvim"
+                    args "."
                 }
+                pane name="terminal" size="40%" focus=true
+            }
+            pane name="files" size="50%" {
+                command "yazi"
+                args "/workspace"
             }
         }
     }
 
-    tab name="shell" {
+    tab name="DevBox" {
+        pane split_direction="vertical" {
+            pane split_direction="horizontal" size="50%" {
+                pane name="editor" size="60%" {
+                    command "nvim"
+                    args "."
+                }
+                pane name="terminal" size="40%"
+            }
+            pane split_direction="horizontal" size="50%" {
+                pane name="help" size="50%" {
+                    command "bash"
+                    args "-c" "devbox guide 2>/dev/null; echo ''; echo 'Type: devbox guide <tool> for detailed help'; exec bash"
+                }
+                pane name="management" size="50%"
+            }
+        }
+    }
+
+    tab name="Shell" {
         pane name="main"
     }
 
-    tab name="git" {
+    tab name="Git" {
         pane {
             command "lazygit"
         }

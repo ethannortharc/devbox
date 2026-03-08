@@ -13,17 +13,26 @@ pub struct LayoutDef {
 pub static LAYOUTS: &[LayoutDef] = &[
     LayoutDef {
         name: "default",
-        description: "Clean workspace: editor + terminal + files",
+        description: "Editor + terminal + files, with DevBox management tab",
         preview: r#"
+Tab 1 [Workspace]:
 +------------------+------------------+
-|                  |                  |
-|  nvim .          |  terminal        |
-|  (editor - 60%) |  (60%)           |
-|                  +------------------+
-|                  |  yazi            |
-|                  |  (files - 40%)   |
+|  nvim .    60%   |                  |
+|  (editor)        |  yazi            |
++------------------+  (files)   50%  |
+|  terminal  40%   |                  |
 +------------------+------------------+
-Tabs: [workspace] [shell] [git]
+       50%                50%
+
+Tab 2 [DevBox]:
++------------------+------------------+
+|  nvim .    60%   |  help/guide 50% |
+|  (editor)        +------------------+
++------------------+  management     |
+|  terminal  40%   |           50%   |
++------------------+------------------+
+
+Tabs: [Workspace] [DevBox] [Shell] [Git]
 "#,
     },
     LayoutDef {
@@ -129,6 +138,28 @@ Tabs: [debug] [shell]
 /// Find a layout by name.
 pub fn find_layout(name: &str) -> Option<&'static LayoutDef> {
     LAYOUTS.iter().find(|l| l.name == name)
+}
+
+/// Embedded layout KDL files — compiled into the binary so they can
+/// be pushed into the VM at attach time.
+pub static LAYOUT_FILES: &[(&str, &str)] = &[
+    ("default", include_str!("../../layouts/default.kdl")),
+    ("ai-pair", include_str!("../../layouts/ai-pair.kdl")),
+    ("fullstack", include_str!("../../layouts/fullstack.kdl")),
+    ("tdd", include_str!("../../layouts/tdd.kdl")),
+    ("debug", include_str!("../../layouts/debug.kdl")),
+    ("monitor", include_str!("../../layouts/monitor.kdl")),
+    ("git-review", include_str!("../../layouts/git-review.kdl")),
+    ("presentation", include_str!("../../layouts/presentation.kdl")),
+];
+
+/// Look up a layout KDL file by name. Falls back to default.
+pub fn lookup_layout_kdl(name: &str) -> &'static str {
+    LAYOUT_FILES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(LAYOUT_FILES[0].1)
 }
 
 #[cfg(test)]

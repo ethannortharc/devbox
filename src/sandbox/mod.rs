@@ -150,8 +150,8 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Attach to a sandbox (start if stopped, then exec shell).
-    pub async fn attach(&self, name: &str) -> Result<()> {
+    /// Attach to a sandbox (start if stopped, then launch Zellij or shell).
+    pub async fn attach(&self, name: &str, layout_override: Option<&str>) -> Result<()> {
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
 
@@ -186,25 +186,68 @@ impl SandboxManager {
                 .as_secs()
         );
         if let Err(e) = runtime.snapshot_create(name, &snap_name).await {
-            // Some runtimes (Lima/Docker) don't support snapshots yet — that's fine
             let _ = e;
         }
 
-        // Exec interactive shell
-        // Lima maps the host user into the VM automatically, so no sudo needed.
-        // Probe for zsh silently, then launch the right shell interactively.
-        println!("Attaching to sandbox '{name}'...");
-        let probe = runtime
-            .exec_cmd(name, &["which", "zsh"], false)
-            .await;
-        let shell = if probe.is_ok() && probe.unwrap().exit_code == 0 {
-            "zsh"
-        } else {
-            "bash"
-        };
+        // Determine layout: CLI flag > saved state > "default"
+        let layout = layout_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| state.layout.clone());
+
+        // "plain" layout = raw shell, no Zellij
+        if layout == "plain" {
+            println!("Attaching to sandbox '{name}'...");
+            let shell = Self::probe_shell(runtime.as_ref(), name).await;
+            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
+            return Ok(());
+        }
+
+        // Check if Zellij is available in the VM
+        let zellij_check = runtime.exec_cmd(name, &["which", "zellij"], false).await;
+        let has_zellij = zellij_check.is_ok() && zellij_check.unwrap().exit_code == 0;
+
+        if !has_zellij {
+            // No Zellij — fall back to raw shell
+            println!("Attaching to sandbox '{name}'...");
+            let shell = Self::probe_shell(runtime.as_ref(), name).await;
+            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
+            return Ok(());
+        }
+
+        // Push layout KDL into the VM and launch Zellij
+        let layout_content = crate::tui::lookup_layout_kdl(&layout);
+        Self::push_layout_to_vm(runtime.as_ref(), name, &layout, layout_content).await?;
+
+        let layout_path = format!("/tmp/devbox-layout-{layout}.kdl");
+        println!("Attaching to sandbox '{name}' (layout: {layout})...");
         runtime
-            .exec_cmd(name, &[shell, "-l"], true)
+            .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
             .await?;
+        Ok(())
+    }
+
+    /// Probe for zsh in the VM, fall back to bash.
+    async fn probe_shell(runtime: &dyn crate::runtime::Runtime, name: &str) -> String {
+        let probe = runtime.exec_cmd(name, &["which", "zsh"], false).await;
+        if probe.is_ok() && probe.unwrap().exit_code == 0 {
+            "zsh".to_string()
+        } else {
+            "bash".to_string()
+        }
+    }
+
+    /// Push a Zellij layout KDL file into the VM at /tmp/.
+    async fn push_layout_to_vm(
+        runtime: &dyn crate::runtime::Runtime,
+        name: &str,
+        layout_name: &str,
+        content: &str,
+    ) -> Result<()> {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+        let path = format!("/tmp/devbox-layout-{layout_name}.kdl");
+        let cmd = format!("echo '{encoded}' | base64 -d > {path}");
+        runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
         Ok(())
     }
 
@@ -215,7 +258,7 @@ impl SandboxManager {
         let name = self.name_from_dir(&cwd);
 
         if self.sandbox_exists(&name) {
-            self.attach(&name).await
+            self.attach(&name, None).await
         } else {
             let runtime = self.resolve_runtime(None)?;
             let mut config = self.generate_config(&cwd);
@@ -232,7 +275,7 @@ impl SandboxManager {
                 false,
             )
             .await?;
-            self.attach(&name).await
+            self.attach(&name, None).await
         }
     }
 

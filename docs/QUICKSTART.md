@@ -251,6 +251,56 @@ devbox shell
 devbox destroy --force
 ```
 
+## File Safety: The Overlay System
+
+By default, devbox mounts your host project directory **read-only** inside the VM and places a copy-on-write (CoW) overlay on top. Any file you edit inside the VM is written to the overlay layer, not to your host disk. This means a runaway `rm -rf` or a bad code-generation tool cannot damage your real files.
+
+```
+┌─────────────────────────────────────────────┐
+│           VM sees merged view               │
+│                                             │
+│  ┌───────────────────────────────────────┐  │
+│  │  Overlay (upper)  ← writes land here  │  │
+│  ├───────────────────────────────────────┤  │
+│  │  Host mount (lower) ← read-only       │  │
+│  └───────────────────────────────────────┘  │
+│                                             │
+│  Reads: overlay first, then host            │
+│  Writes: always go to overlay               │
+└─────────────────────────────────────────────┘
+```
+
+### Reviewing and applying changes
+
+```bash
+# See what changed in the overlay vs your host files
+devbox diff
+
+# Happy with the changes? Copy them back to the host
+devbox commit
+
+# Made a mess? Throw away all overlay changes
+devbox discard
+```
+
+`devbox diff` shows a unified diff of every file the VM modified. `devbox commit` copies those changes back to your host directory atomically. `devbox discard` wipes the overlay layer and resets the VM view to match your host files exactly.
+
+### Opting out of overlay mode
+
+If you want the VM to write directly to your host filesystem (the traditional shared-folder behavior), you have two options:
+
+```bash
+# Per-session: pass the flag when creating or entering
+devbox create --name my-vm --writable
+devbox shell --writable
+
+# Per-project: set it in devbox.toml
+# [sandbox]
+# mount_mode = "writable"
+```
+
+**Warning:** In writable mode there is no safety net. Any process inside the VM can modify or delete your host files immediately. Use this only when you need real-time two-way sync (e.g., a host-side editor saving while the VM compiles).
+
 ## What's Installed by Default
 
 When you create a sandbox, these sets are always installed:

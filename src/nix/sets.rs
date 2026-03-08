@@ -29,7 +29,7 @@ pub static NIX_SETS: &[NixSet] = &[
         name: "tools",
         packages: &[
             "ripgrep", "fd", "bat", "eza", "delta", "sd", "choose",
-            "jq", "yq-go", "fx", "htop", "procs", "du-dust", "duf",
+            "jq", "yq-go", "fx", "htop", "procs", "dust", "duf",
             "tokei", "hyperfine", "tealdeer", "httpie", "dog", "glow", "entr",
         ],
     },

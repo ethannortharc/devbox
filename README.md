@@ -199,7 +199,7 @@ devbox config show
 
 ## Tool Sets
 
-Devbox organizes 90+ tools into toggleable sets declared as NixOS packages.
+Devbox organizes 90+ tools into toggleable sets declared as NixOS packages. See the [Package Reference](docs/PACKAGES.md) for descriptions and official links for every package.
 
 ### Core sets (always installed)
 
