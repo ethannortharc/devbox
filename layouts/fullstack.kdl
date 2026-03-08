@@ -1,0 +1,39 @@
+// Devbox — Full Stack Development layout
+// Backend + frontend + containers + API testing
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        children
+    }
+
+    tab name="dev" focus=true {
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" size="50%" {
+                pane name="backend" size="50%"
+                pane name="frontend" size="50%"
+            }
+            pane split_direction="vertical" size="35%" {
+                pane name="containers" size="50%" {
+                    command "lazydocker"
+                }
+                pane name="api-test" size="50%"
+            }
+            pane name="logs" size="15%"
+        }
+    }
+
+    tab name="editor" {
+        pane {
+            command "nvim"
+            args "."
+        }
+    }
+
+    tab name="git" {
+        pane {
+            command "lazygit"
+        }
+    }
+}

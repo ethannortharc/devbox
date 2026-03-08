@@ -1,0 +1,258 @@
+use anyhow::{Result, bail};
+use async_trait::async_trait;
+
+use super::cmd::{run_ok, run_cmd, run_interactive};
+use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
+
+/// Incus runtime — primary on Linux (QEMU/KVM VM).
+pub struct IncusRuntime;
+
+impl IncusRuntime {
+    /// All Incus VMs managed by devbox are prefixed with "devbox-".
+    fn vm_name(name: &str) -> String {
+        format!("devbox-{name}")
+    }
+
+    /// Base NixOS image alias.
+    fn image_name() -> &'static str {
+        "devbox-nixos"
+    }
+}
+
+#[async_trait]
+impl Runtime for IncusRuntime {
+    fn name(&self) -> &str {
+        "incus"
+    }
+
+    fn is_available(&self) -> bool {
+        which::which("incus").is_ok()
+    }
+
+    fn priority(&self) -> u32 {
+        30
+    }
+
+    async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
+        let vm = Self::vm_name(&opts.name);
+
+        // Check if already exists
+        let result = run_cmd("incus", &["info", &vm]).await?;
+        if result.exit_code == 0 {
+            bail!(
+                "Incus VM '{}' already exists. Use `devbox destroy {}` first.",
+                vm,
+                opts.name
+            );
+        }
+
+        // Launch the VM
+        println!("Creating Incus VM '{vm}'...");
+        let mut launch_args = vec!["launch", Self::image_name(), &vm, "--vm"];
+
+        let cpu_str;
+        if opts.cpu > 0 {
+            cpu_str = format!("limits.cpu={}", opts.cpu);
+            launch_args.push("-c");
+            launch_args.push(&cpu_str);
+        }
+
+        let mem_str;
+        if !opts.memory.is_empty() {
+            mem_str = format!("limits.memory={}", opts.memory);
+            launch_args.push("-c");
+            launch_args.push(&mem_str);
+        }
+
+        run_ok("incus", &launch_args).await?;
+
+        // Add mounts
+        for (i, m) in opts.mounts.iter().enumerate() {
+            let device_name = format!("mount{i}");
+            let host = m.host_path.display().to_string();
+            let source_arg = format!("source={host}");
+            let path_arg = format!("path={}", m.container_path);
+
+            let mut mount_args = vec![
+                "config",
+                "device",
+                "add",
+                &vm,
+                &device_name,
+                "disk",
+            ];
+            mount_args.push(&source_arg);
+            mount_args.push(&path_arg);
+
+            if m.read_only {
+                mount_args.push("readonly=true");
+            }
+
+            run_ok("incus", &mount_args).await?;
+        }
+
+        Ok(SandboxInfo {
+            name: opts.name.clone(),
+            status: SandboxStatus::Running,
+            runtime: "incus".to_string(),
+            created_at: Some(chrono_now()),
+            ip_address: None,
+        })
+    }
+
+    async fn start(&self, name: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        run_ok("incus", &["start", &vm]).await?;
+        Ok(())
+    }
+
+    async fn stop(&self, name: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        run_ok("incus", &["stop", &vm]).await?;
+        Ok(())
+    }
+
+    async fn exec_cmd(
+        &self,
+        name: &str,
+        cmd: &[&str],
+        interactive: bool,
+    ) -> Result<ExecResult> {
+        let vm = Self::vm_name(name);
+
+        if interactive {
+            let mut args = vec!["exec", &vm, "--"];
+            args.extend_from_slice(cmd);
+            run_interactive("incus", &args).await
+        } else {
+            let mut args = vec!["exec", &vm, "--"];
+            args.extend_from_slice(cmd);
+            run_cmd("incus", &args).await
+        }
+    }
+
+    async fn destroy(&self, name: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        // Stop first (ignore errors if already stopped)
+        let _ = run_cmd("incus", &["stop", &vm, "--force"]).await;
+        run_ok("incus", &["delete", &vm, "--force"]).await?;
+        Ok(())
+    }
+
+    async fn status(&self, name: &str) -> Result<SandboxStatus> {
+        let vm = Self::vm_name(name);
+        let result = run_cmd("incus", &["info", &vm]).await?;
+
+        if result.exit_code != 0 {
+            return Ok(SandboxStatus::NotFound);
+        }
+
+        // Parse "Status: RUNNING" or "Status: STOPPED" from info output
+        for line in result.stdout.lines() {
+            let line = line.trim();
+            if let Some(status_val) = line.strip_prefix("Status:") {
+                return Ok(match status_val.trim().to_uppercase().as_str() {
+                    "RUNNING" => SandboxStatus::Running,
+                    "STOPPED" => SandboxStatus::Stopped,
+                    other => SandboxStatus::Unknown(other.to_string()),
+                });
+            }
+        }
+
+        Ok(SandboxStatus::Unknown("no status found".to_string()))
+    }
+
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        let result = run_cmd("incus", &["list", "--format", "json"]).await?;
+
+        if result.exit_code != 0 {
+            return Ok(vec![]);
+        }
+
+        let mut infos = vec![];
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result.stdout) {
+            for v in arr {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                if !name.starts_with("devbox-") {
+                    continue;
+                }
+                let sandbox_name = name.strip_prefix("devbox-").unwrap_or(&name).to_string();
+                let status_str = v["status"].as_str().unwrap_or("").to_uppercase();
+                let status = match status_str.as_str() {
+                    "RUNNING" => SandboxStatus::Running,
+                    "STOPPED" => SandboxStatus::Stopped,
+                    other => SandboxStatus::Unknown(other.to_string()),
+                };
+
+                infos.push(SandboxInfo {
+                    name: sandbox_name,
+                    status,
+                    runtime: "incus".to_string(),
+                    created_at: v["created_at"].as_str().map(|s| s.to_string()),
+                    ip_address: None,
+                });
+            }
+        }
+
+        Ok(infos)
+    }
+
+    async fn snapshot_create(&self, name: &str, snap: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        run_ok("incus", &["snapshot", "create", &vm, snap]).await?;
+        Ok(())
+    }
+
+    async fn snapshot_restore(&self, name: &str, snap: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        run_ok("incus", &["snapshot", "restore", &vm, snap]).await?;
+        Ok(())
+    }
+
+    async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
+        let vm = Self::vm_name(name);
+        let result = run_cmd(
+            "incus",
+            &["snapshot", "list", &vm, "--format", "json"],
+        )
+        .await?;
+
+        if result.exit_code != 0 {
+            return Ok(vec![]);
+        }
+
+        let mut snaps = vec![];
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result.stdout) {
+            for v in arr {
+                snaps.push(SnapshotInfo {
+                    name: v["name"].as_str().unwrap_or("").to_string(),
+                    created_at: v["created_at"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+
+        Ok(snaps)
+    }
+
+    async fn upgrade(&self, _name: &str, _tools: &[String]) -> Result<()> {
+        todo!("Phase 5: Incus upgrade")
+    }
+}
+
+fn chrono_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}s-since-epoch", now.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_name_prefix() {
+        assert_eq!(IncusRuntime::vm_name("myapp"), "devbox-myapp");
+    }
+}

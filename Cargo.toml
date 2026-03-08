@@ -1,0 +1,39 @@
+[package]
+name = "devbox"
+version = "0.1.0"
+edition = "2024"
+description = "NixOS-powered developer VM CLI"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization / Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# UX
+indicatif = "0.17"
+colored = "2"
+dialoguer = "0.11"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+dirs = "6"
+which = "7"
+
+[dev-dependencies]
+tempfile = "3"

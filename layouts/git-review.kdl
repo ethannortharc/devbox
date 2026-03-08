@@ -1,0 +1,22 @@
+// Devbox — Code Review layout
+// lazygit + diff viewer + PR comments
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        children
+    }
+
+    tab name="review" focus=true {
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" size="65%" {
+                pane name="lazygit" size="50%" {
+                    command "lazygit"
+                }
+                pane name="diff" size="50%"
+            }
+            pane name="pr" size="35%"
+        }
+    }
+}

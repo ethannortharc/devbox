@@ -1,0 +1,41 @@
+// Devbox — AI Pair Programming layout
+// AI assistant on left, editor center, output right
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        children
+    }
+
+    tab name="ai-pair" focus=true {
+        pane split_direction="vertical" {
+            pane name="ai" size="30%" {
+                command "claude"
+            }
+            pane name="editor" size="40%" {
+                command "nvim"
+                args "."
+            }
+            pane name="output" size="30%"
+        }
+    }
+
+    tab name="aider" {
+        pane split_direction="vertical" {
+            pane name="aider" size="50%" {
+                command "aider"
+            }
+            pane name="diff" size="50%" {
+                command "watch"
+                args "-n1" "git diff --stat"
+            }
+        }
+    }
+
+    tab name="git" {
+        pane {
+            command "lazygit"
+        }
+    }
+}

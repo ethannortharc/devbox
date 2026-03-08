@@ -1,0 +1,96 @@
+# Ghostty terminal configuration for devbox users
+# Place this file at: ~/.config/ghostty/config
+
+# ---------------------------------------------------------------------------
+# Font
+# ---------------------------------------------------------------------------
+
+# FiraCode Nerd Font — matches the font installed inside the devbox VM,
+# giving you consistent rendering for ligatures, icons, and powerline glyphs.
+font-family = FiraCode Nerd Font
+font-size = 14
+
+# Disable font ligatures if you find them distracting (uncomment below).
+# font-feature = -calt
+# font-feature = -liga
+
+# ---------------------------------------------------------------------------
+# Theme & Colors
+# ---------------------------------------------------------------------------
+
+# Catppuccin Mocha — a warm, low-contrast dark theme that is easy on the eyes
+# during long coding sessions. Ghostty ships with this theme built in.
+theme = catppuccin-mocha
+
+# ---------------------------------------------------------------------------
+# Cursor
+# ---------------------------------------------------------------------------
+
+# Block cursor with blinking — easy to spot without being intrusive.
+cursor-style = block
+cursor-style-blink = true
+
+# ---------------------------------------------------------------------------
+# Window & Padding
+# ---------------------------------------------------------------------------
+
+# Padding (in pixels) keeps content from pressing against the window edges.
+window-padding-x = 8
+window-padding-y = 6
+
+# Balance the padding so resizes stay centered visually.
+window-padding-balance = true
+
+# Start maximized for a full-screen coding workspace.
+# Change to "false" if you prefer windowed mode.
+maximize = true
+
+# ---------------------------------------------------------------------------
+# Scrollback
+# ---------------------------------------------------------------------------
+
+# 10 000 lines of scrollback — plenty for build output and log tailing.
+scrollback-limit = 10000
+
+# ---------------------------------------------------------------------------
+# Mouse
+# ---------------------------------------------------------------------------
+
+# URLs become clickable links (open in default browser).
+link-url = true
+
+# Copy text to clipboard on select (like a classic Linux terminal).
+copy-on-select = clipboard
+
+# ---------------------------------------------------------------------------
+# Shell Integration
+# ---------------------------------------------------------------------------
+
+# Let Ghostty inject its shell integration automatically (prompt marking,
+# semantic zones, etc.). Works with bash, zsh, and fish.
+shell-integration = detect
+
+# ---------------------------------------------------------------------------
+# Key Bindings & Input
+# ---------------------------------------------------------------------------
+
+# Use Option as Alt so Meta-key combos work properly in vim, tmux, etc.
+macos-option-as-alt = true
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+# Minimum contrast ratio between foreground and background (1.0 = no
+# adjustment). Bump this up if some color schemes produce hard-to-read text.
+minimum-contrast = 1.1
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+
+# Confirm before closing a window that still has a running process.
+confirm-close-surface = true
+
+# Disable the desktop notification sound — visual bell only.
+audible-bell = false
