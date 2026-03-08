@@ -21,6 +21,7 @@ These tests should be run manually after significant changes.
 | 6 | [Shell attach + tool verification](#6-shell-attach-and-tool-verification) | Verified |
 | 7 | [Guide system (inside VM)](#7-guide-system-inside-vm) | Verified |
 | 8 | [Create sandbox (with tools)](#8-create-sandbox-with-language-tools) | Manual |
+| 8b | [Create Ubuntu sandbox](#8b-create-ubuntu-sandbox) | Manual |
 | 9 | [Layout commands](#9-layout-commands) | Verified |
 | 10 | [Config management](#10-config-management) | Verified |
 | 11 | [Stop and destroy](#11-stop-and-destroy) | Verified |
@@ -287,6 +288,58 @@ rustup --version
 python3 --version
 exit
 devbox destroy e2e-explicit --force
+```
+
+## 8b. Create Ubuntu sandbox
+
+This test verifies the Ubuntu image with Nix package manager provisioning.
+
+```bash
+devbox create --name e2e-ubuntu --image ubuntu --bare
+```
+
+**What happens differently from NixOS:**
+1. Lima downloads Ubuntu 24.04 cloud image (instead of NixOS)
+2. The Nix package manager is installed via the Determinate Systems installer
+3. Packages are installed via `nix profile install nixpkgs#...` (instead of nixos-rebuild)
+4. Shell environment (zsh, starship, zoxide) is configured via dotfiles (instead of NixOS module)
+
+**Expected console output:**
+```
+Creating Ubuntu VM 'devbox-e2e-ubuntu'...
+Installing Nix package manager on Ubuntu...
+Installing N packages via Nix (this may take a few minutes)...
+Nix package installation complete.
+Copying devbox into VM...
+Sandbox 'e2e-ubuntu' created successfully (runtime: lima)
+```
+
+**Inside the VM, verify:**
+```bash
+devbox shell e2e-ubuntu
+
+# Should be Ubuntu
+cat /etc/os-release      # Should show Ubuntu 24.04
+
+# Nix should be installed
+nix --version            # Nix package manager
+
+# Same tools as NixOS image:
+rg --version             # ripgrep
+fd --version             # fd
+bat --version            # bat
+zellij --version         # zellij
+lazygit --version        # lazygit
+
+# devbox guide should work
+devbox guide
+
+exit
+```
+
+**Cleanup:**
+```bash
+devbox destroy e2e-ubuntu --force
 ```
 
 ## 9. Layout commands

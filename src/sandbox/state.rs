@@ -14,6 +14,13 @@ pub struct SandboxState {
     pub layout: String,
     pub sets: Vec<String>,
     pub languages: Vec<String>,
+    /// Base image type: "nixos" or "ubuntu"
+    #[serde(default = "default_image")]
+    pub image: String,
+}
+
+fn default_image() -> String {
+    "nixos".to_string()
 }
 
 impl SandboxState {
@@ -86,6 +93,7 @@ mod tests {
             layout: "default".to_string(),
             sets: vec!["system".into(), "shell".into(), "tools".into()],
             languages: vec!["go".into()],
+            image: "nixos".to_string(),
         }
     }
 

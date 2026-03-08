@@ -1,18 +1,16 @@
-//! Post-create provisioning for NixOS VMs.
+//! Post-create provisioning for VMs.
 //!
-//! After the VM boots with a stock NixOS Lima image, this module:
-//! 1. Pushes devbox nix configuration files into the VM
-//! 2. Generates devbox-state.toml with active sets/languages
-//! 3. Runs `nixos-rebuild switch` to install all declared packages
-//! 4. Copies the devbox binary and help files into the VM
+//! Supports two image types:
+//! - **NixOS**: push nix config files + `nixos-rebuild switch`
+//! - **Ubuntu**: install Nix package manager + `nix profile install`
+//!
+//! Both paths use the same package definitions from nix/sets/*.nix.
 
 use anyhow::Result;
 
 use crate::runtime::Runtime;
 
-// ── Embedded Nix files ──────────────────────────────────────
-// These are compiled into the binary so provisioning works without
-// needing the nix/ directory at runtime.
+// ── Embedded Nix files (for NixOS provisioning) ─────────────
 
 const NIX_DEVBOX_MODULE: &str = include_str!("../../nix/devbox-module.nix");
 const NIX_SETS_DEFAULT: &str = include_str!("../../nix/sets/default.nix");
@@ -50,8 +48,72 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
     ("lang-ruby.nix", NIX_SETS_LANG_RUBY),
 ];
 
-/// Provision a NixOS VM with tools based on active sets and languages.
+// ── Package name mapping (for Ubuntu/Nix profile install) ───
+// These map set names to nixpkgs attribute paths for `nix profile install`.
+// The names match the nix/sets/*.nix files exactly.
+
+fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
+    match set {
+        "system" => vec![
+            "coreutils", "gnugrep", "gnused", "gawk", "findutils", "diffutils",
+            "gzip", "gnutar", "xz", "bzip2", "file", "which", "tree", "less",
+            "curl", "wget", "openssh", "openssl", "cacert", "gnupg",
+            "gcc", "gnumake", "pkg-config", "man-db",
+        ],
+        "shell" => vec![
+            "zellij", "zsh", "zsh-autosuggestions", "zsh-syntax-highlighting",
+            "starship", "fzf", "zoxide", "direnv", "nix-direnv", "yazi",
+        ],
+        "tools" => vec![
+            "ripgrep", "fd", "bat", "eza", "delta", "sd", "choose",
+            "jq", "yq-go", "fx", "htop", "procs", "du-dust", "duf",
+            "tokei", "hyperfine", "tealdeer", "httpie", "dog", "glow", "entr",
+        ],
+        "editor" => vec!["neovim", "helix", "nano"],
+        "git" => vec!["git", "lazygit", "gh", "git-lfs", "git-crypt", "pre-commit"],
+        "container" => vec!["docker", "docker-compose", "lazydocker", "dive", "buildkit", "skopeo"],
+        "network" => vec!["tailscale", "mosh", "nmap", "tcpdump", "bandwhich", "trippy", "doggo"],
+        "ai" => vec![
+            "claude-code", "aider-chat", "ollama", "open-webui", "codex",
+            "python312Packages.huggingface-hub", "mcp-hub", "litellm", "continue", "opencode",
+        ],
+        "lang-go" => vec!["go", "gopls", "golangci-lint", "delve", "gotools", "gore"],
+        "lang-rust" => vec!["rustup", "rust-analyzer", "cargo-watch", "cargo-edit", "cargo-expand", "sccache"],
+        "lang-python" => vec![
+            "python312", "uv", "ruff", "pyright",
+            "python312Packages.ipython", "python312Packages.pytest",
+        ],
+        "lang-node" => vec![
+            "nodejs_22", "bun", "pnpm", "typescript",
+            "nodePackages.typescript-language-server", "biome",
+        ],
+        "lang-java" => vec!["jdk21", "gradle", "maven", "jdt-language-server"],
+        "lang-ruby" => vec!["ruby_3_3", "bundler", "solargraph", "rubocop"],
+        _ => vec![],
+    }
+}
+
+// ── Public API ──────────────────────────────────────────────
+
+/// Provision a VM with tools based on active sets and languages.
+/// Dispatches to NixOS or Ubuntu provisioning based on image type.
 pub async fn provision_vm(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    image: &str,
+) -> Result<()> {
+    match image {
+        "ubuntu" => provision_ubuntu(runtime, name, sets, languages).await,
+        _ => provision_nixos(runtime, name, sets, languages).await,
+    }
+}
+
+// ── NixOS Provisioning ─────────────────────────────────────
+
+/// Provision a NixOS VM: push nix config files + nixos-rebuild switch.
+async fn provision_nixos(
     runtime: &dyn Runtime,
     name: &str,
     sets: &[String],
@@ -59,7 +121,7 @@ pub async fn provision_vm(
 ) -> Result<()> {
     let username = whoami();
 
-    // 1. Create directory structure inside the VM
+    // 1. Create directory structure
     println!("Setting up NixOS configuration...");
     runtime
         .exec_cmd(
@@ -69,7 +131,7 @@ pub async fn provision_vm(
         )
         .await?;
 
-    // 2. Generate and push devbox-state.toml
+    // 2. Push devbox-state.toml
     let state_toml = generate_state_toml(sets, languages, &username);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
@@ -97,26 +159,208 @@ pub async fn provision_vm(
 
     if result.exit_code != 0 {
         eprintln!("Warning: nixos-rebuild failed (exit {}):", result.exit_code);
-        // Show last few lines of stderr for debugging
         let stderr_lines: Vec<&str> = result.stderr.lines().collect();
         let start = stderr_lines.len().saturating_sub(20);
         for line in &stderr_lines[start..] {
             eprintln!("  {line}");
         }
-        eprintln!("Tools may be incomplete. You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
+        eprintln!("You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
     } else {
         println!("NixOS rebuild complete.");
     }
 
-    // 7. Copy devbox binary into the VM
+    // 7. Copy devbox binary + help files
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
-
-    // 8. Write help files into the VM
     setup_help_in_vm(runtime, name).await?;
 
     Ok(())
 }
+
+// ── Ubuntu Provisioning ─────────────────────────────────────
+
+/// Provision an Ubuntu VM: install Nix package manager + nix profile install.
+async fn provision_ubuntu(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+) -> Result<()> {
+    // 1. Install the Nix package manager
+    println!("Installing Nix package manager on Ubuntu...");
+    let install_nix = r#"if ! command -v nix >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm 2>&1
+fi"#;
+    let result = runtime
+        .exec_cmd(name, &["bash", "-c", install_nix], false)
+        .await?;
+
+    if result.exit_code != 0 {
+        eprintln!("Warning: Nix installation may have issues: {}", result.stderr.trim());
+    }
+
+    // 2. Collect all package names from active sets
+    let mut packages: Vec<&str> = vec![];
+    for set in sets {
+        packages.extend(nix_packages_for_set(set));
+    }
+    for lang in languages {
+        let set_name = format!("lang-{lang}");
+        packages.extend(nix_packages_for_set(&set_name));
+    }
+    packages.sort();
+    packages.dedup();
+
+    if !packages.is_empty() {
+        // 3. Install all packages via nix profile install
+        let pkg_args: Vec<String> = packages.iter().map(|p| format!("nixpkgs#{p}")).collect();
+        let pkg_list = pkg_args.join(" ");
+
+        println!("Installing {} packages via Nix (this may take a few minutes)...", packages.len());
+
+        // Source the nix profile before running nix commands
+        let install_cmd = format!(
+            ". /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && nix profile install {pkg_list}"
+        );
+        let result = runtime
+            .exec_cmd(name, &["bash", "-c", &install_cmd], false)
+            .await?;
+
+        if result.exit_code != 0 {
+            eprintln!("Warning: some packages failed to install:");
+            let stderr_lines: Vec<&str> = result.stderr.lines().collect();
+            let start = stderr_lines.len().saturating_sub(15);
+            for line in &stderr_lines[start..] {
+                eprintln!("  {line}");
+            }
+            eprintln!("You can retry with: devbox exec --name {name} -- nix profile install <packages>");
+        } else {
+            println!("Nix package installation complete.");
+        }
+    }
+
+    // 4. Install services that need apt (Docker, Tailscale)
+    install_ubuntu_services(runtime, name, sets).await?;
+
+    // 5. Set up shell environment
+    setup_ubuntu_shell(runtime, name).await?;
+
+    // 6. Create devbox directories and copy binary + help
+    runtime
+        .exec_cmd(
+            name,
+            &["sudo", "mkdir", "-p", "/etc/devbox/help"],
+            false,
+        )
+        .await?;
+
+    println!("Copying devbox into VM...");
+    copy_devbox_to_vm(runtime, name).await?;
+    setup_help_in_vm(runtime, name).await?;
+
+    Ok(())
+}
+
+/// Install services that need OS-level integration on Ubuntu.
+/// Nix installs the binaries but systemd services need apt packages.
+async fn install_ubuntu_services(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+) -> Result<()> {
+    let needs_docker = sets.iter().any(|s| s == "container");
+    let needs_tailscale = sets.iter().any(|s| s == "network");
+
+    if needs_docker {
+        print!("  Setting up Docker service...");
+        let cmd = "export DEBIAN_FRONTEND=noninteractive && \
+            sudo apt-get update -qq && \
+            sudo apt-get install -y -qq docker.io >/dev/null 2>&1 && \
+            sudo usermod -aG docker $(whoami) && \
+            sudo systemctl enable --now docker";
+        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+        match result {
+            Ok(r) if r.exit_code == 0 => println!(" done"),
+            _ => println!(" skipped"),
+        }
+    }
+
+    if needs_tailscale {
+        print!("  Setting up Tailscale service...");
+        let cmd = "curl -fsSL https://tailscale.com/install.sh | sh && \
+            sudo systemctl enable --now tailscaled";
+        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+        match result {
+            Ok(r) if r.exit_code == 0 => println!(" done"),
+            _ => println!(" skipped"),
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up shell environment on Ubuntu (zsh + starship + PATH).
+async fn setup_ubuntu_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let username = whoami();
+
+    // Add Nix profile to shell init and set up zsh as default
+    let setup = format!(
+        r#"
+# Set zsh as default shell if installed via Nix
+NIX_ZSH="$(. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && which zsh 2>/dev/null)"
+if [ -n "$NIX_ZSH" ]; then
+  echo "$NIX_ZSH" | sudo tee -a /etc/shells >/dev/null
+  sudo chsh -s "$NIX_ZSH" {username}
+fi
+
+# Create .zshrc with Nix integration
+cat > /home/{username}/.zshrc << 'ZSHRC'
+# Nix
+if [ -e '/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' ]; then
+  . '/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh'
+fi
+
+# Nix profile binaries
+export PATH="$HOME/.nix-profile/bin:$PATH"
+
+# Starship prompt
+if command -v starship >/dev/null 2>&1; then
+  eval "$(starship init zsh)"
+fi
+
+# Zoxide
+if command -v zoxide >/dev/null 2>&1; then
+  eval "$(zoxide init zsh)"
+fi
+
+# fzf
+if command -v fzf >/dev/null 2>&1; then
+  source <(fzf --zsh) 2>/dev/null
+fi
+
+# Aliases
+alias ls='eza --icons' 2>/dev/null
+alias cat='bat --paging=never' 2>/dev/null
+alias top='htop' 2>/dev/null
+
+# Devbox identity
+export DEVBOX_NAME="${{DEVBOX_NAME:-devbox}}"
+export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
+ZSHRC
+"#
+    );
+
+    let result = runtime.exec_cmd(name, &["bash", "-c", &setup], false).await;
+    if let Ok(r) = result {
+        if r.exit_code != 0 {
+            eprintln!("Warning: shell setup incomplete");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Shared Helpers ──────────────────────────────────────────
 
 /// Generate devbox-state.toml content from active sets and languages.
 fn generate_state_toml(sets: &[String], languages: &[String], username: &str) -> String {
@@ -143,7 +387,6 @@ fn generate_state_toml(sets: &[String], languages: &[String], username: &str) ->
 }
 
 /// Write a file into the VM using base64-encoded content via exec_cmd.
-/// This avoids shell escaping issues with single quotes, newlines, etc.
 async fn write_file_to_vm(
     runtime: &dyn Runtime,
     name: &str,
@@ -163,9 +406,7 @@ async fn write_file_to_vm(
 }
 
 /// Add devbox module import to the VM's /etc/nixos/configuration.nix.
-/// Backs up the original config and creates a wrapper that imports both.
 async fn add_devbox_import(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    // Check if already imported
     let check = runtime
         .exec_cmd(
             name,
@@ -175,11 +416,9 @@ async fn add_devbox_import(runtime: &dyn Runtime, name: &str) -> Result<()> {
         .await?;
 
     if check.exit_code == 0 {
-        // Already imported, skip
         return Ok(());
     }
 
-    // Backup original configuration.nix
     runtime
         .exec_cmd(
             name,
@@ -192,14 +431,10 @@ async fn add_devbox_import(runtime: &dyn Runtime, name: &str) -> Result<()> {
         )
         .await?;
 
-    // Add import line after the first `imports = [` or create one
-    // Strategy: use sed to add our import to the imports list
     let add_import = r#"
 if grep -q 'imports' /etc/nixos/configuration.nix; then
-  # Add to existing imports list
   sudo sed -i '/imports\s*=\s*\[/a\    /etc/devbox/devbox-module.nix' /etc/nixos/configuration.nix
 else
-  # Add imports list after the opening brace of the module
   sudo sed -i '/^{/a\  imports = [ /etc/devbox/devbox-module.nix ];' /etc/nixos/configuration.nix
 fi
 "#;
@@ -210,7 +445,7 @@ fi
 
     if result.exit_code != 0 {
         eprintln!(
-            "Warning: failed to add devbox import to configuration.nix: {}",
+            "Warning: failed to add devbox import: {}",
             result.stderr.trim()
         );
     }
@@ -223,7 +458,6 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let exe_str = exe.to_string_lossy();
 
-    // Lima supports limactl copy for file transfer
     if runtime.name() == "lima" {
         let vm_name = format!("devbox-{name}");
         let result = crate::runtime::cmd::run_cmd(
@@ -267,6 +501,8 @@ fn whoami() -> String {
         .unwrap_or_else(|_| "dev".to_string())
 }
 
+// ── Tests ───────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +541,6 @@ mod tests {
         let langs = vec![];
         let toml = generate_state_toml(&sets, &langs, "dev");
 
-        // lang-rust in sets should enable rust in languages section
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
     }
@@ -319,5 +554,65 @@ mod tests {
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));
         assert!(toml.contains("name = \"user\""));
+    }
+
+    #[test]
+    fn nix_packages_system_set() {
+        let pkgs = nix_packages_for_set("system");
+        assert_eq!(pkgs.len(), 24);
+        assert!(pkgs.contains(&"coreutils"));
+        assert!(pkgs.contains(&"gcc"));
+        assert!(pkgs.contains(&"curl"));
+    }
+
+    #[test]
+    fn nix_packages_shell_set() {
+        let pkgs = nix_packages_for_set("shell");
+        assert_eq!(pkgs.len(), 10);
+        assert!(pkgs.contains(&"zellij"));
+        assert!(pkgs.contains(&"starship"));
+        assert!(pkgs.contains(&"yazi"));
+    }
+
+    #[test]
+    fn nix_packages_tools_set() {
+        let pkgs = nix_packages_for_set("tools");
+        assert_eq!(pkgs.len(), 21);
+        assert!(pkgs.contains(&"ripgrep"));
+        assert!(pkgs.contains(&"bat"));
+    }
+
+    #[test]
+    fn nix_packages_lang_go() {
+        let pkgs = nix_packages_for_set("lang-go");
+        assert_eq!(pkgs.len(), 6);
+        assert!(pkgs.contains(&"go"));
+        assert!(pkgs.contains(&"gopls"));
+    }
+
+    #[test]
+    fn nix_packages_lang_python_has_nested() {
+        let pkgs = nix_packages_for_set("lang-python");
+        assert!(pkgs.contains(&"python312Packages.ipython"));
+        assert!(pkgs.contains(&"uv"));
+    }
+
+    #[test]
+    fn nix_packages_unknown_set() {
+        let pkgs = nix_packages_for_set("nonexistent");
+        assert!(pkgs.is_empty());
+    }
+
+    #[test]
+    fn nix_packages_all_sets_have_packages() {
+        let all_sets = [
+            "system", "shell", "tools", "editor", "git", "container",
+            "network", "ai", "lang-go", "lang-rust", "lang-python",
+            "lang-node", "lang-java", "lang-ruby",
+        ];
+        for set in &all_sets {
+            let pkgs = nix_packages_for_set(set);
+            assert!(!pkgs.is_empty(), "set '{set}' should have packages");
+        }
     }
 }

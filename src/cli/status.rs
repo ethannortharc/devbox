@@ -31,6 +31,7 @@ pub async fn run(args: StatusArgs, manager: &SandboxManager) -> Result<()> {
     println!("Sandbox:     {}", name);
     println!("Status:      {}", status_str);
     println!("Runtime:     {}", state.runtime);
+    println!("Image:       {}", state.image);
     println!("Project:     {}", state.project_dir.display());
     println!("Mount mode:  {}", state.mount_mode);
     println!("Layout:      {}", state.layout);

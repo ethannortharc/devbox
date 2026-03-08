@@ -39,6 +39,9 @@ pub struct SandboxSection {
 
     #[serde(default = "default_mount_mode")]
     pub mount_mode: String,
+
+    #[serde(default = "default_image")]
+    pub image: String,
 }
 
 impl Default for SandboxSection {
@@ -47,6 +50,7 @@ impl Default for SandboxSection {
             runtime: default_runtime(),
             layout: default_layout(),
             mount_mode: default_mount_mode(),
+            image: default_image(),
         }
     }
 }
@@ -237,6 +241,9 @@ fn default_layout() -> String {
 }
 fn default_mount_mode() -> String {
     "overlay".to_string()
+}
+fn default_image() -> String {
+    "nixos".to_string()
 }
 fn yes() -> bool {
     true

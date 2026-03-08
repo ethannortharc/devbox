@@ -57,6 +57,25 @@ pub struct CreateArgs {
     /// Zellij layout to use
     #[arg(long)]
     pub layout: Option<String>,
+
+    /// Base image: nixos (default, declarative) or ubuntu (familiar + Nix packages)
+    #[arg(long, value_enum, default_value = "nixos")]
+    pub image: ImageChoice,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum ImageChoice {
+    Nixos,
+    Ubuntu,
+}
+
+impl ImageChoice {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Nixos => "nixos",
+            Self::Ubuntu => "ubuntu",
+        }
+    }
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -116,6 +135,7 @@ pub async fn run(args: CreateArgs, manager: &SandboxManager) -> Result<()> {
         }
         .to_string();
     }
+    config.sandbox.image = args.image.as_str().to_string();
 
     // Parse extra mounts
     let extra_mounts = parse_mounts(&args.mount.unwrap_or_default())?;

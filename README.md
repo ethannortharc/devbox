@@ -10,7 +10,7 @@ NixOS-powered developer VMs. One command to create a fully-loaded, safe, persist
 $ devbox
 ```
 
-That's it. Devbox auto-detects your project, creates a NixOS VM with the right tools, and drops you into a configured workspace.
+That's it. Devbox auto-detects your project, creates a VM with the right tools, and drops you into a configured workspace. Choose NixOS (default, declarative) or Ubuntu (familiar) as your base image -- both use the same 90+ tool catalog from nixpkgs.
 
 ---
 
@@ -84,8 +84,9 @@ devbox doctor
 cd my-project
 devbox
 
-# Or be explicit about tools and layout
+# Or be explicit about tools, layout, and base image
 devbox create --tools go,docker --layout ai-pair
+devbox create --image ubuntu --tools python    # Ubuntu base + Nix packages
 
 # Attach to an existing sandbox
 devbox shell
@@ -154,6 +155,7 @@ cp host-configs/ghostty/config ~/.config/ghostty/config
 ```toml
 [sandbox]
 runtime = "auto"            # auto | lima | incus | multipass | docker
+image = "nixos"             # nixos (declarative) | ubuntu (familiar)
 layout = "default"          # zellij layout name
 mount_mode = "overlay"      # overlay (safe) | writable (direct)
 
@@ -283,6 +285,24 @@ devbox discard                # Throw away all changes
 devbox snapshot restore <id>  # Roll back to a snapshot
 ```
 
+## Base Images
+
+Devbox supports two base images. Both install the same 90+ tools from [nixpkgs](https://search.nixos.org/packages).
+
+| Image | Install Method | Rollback | Best For |
+|-------|---------------|----------|----------|
+| **nixos** (default) | `nixos-rebuild switch` | Full system generations | Declarative, reproducible environments |
+| **ubuntu** | Nix package manager | `nix profile rollback` | Familiar base OS, lighter image |
+
+```bash
+devbox create --image nixos     # Default: NixOS image + nixos-rebuild
+devbox create --image ubuntu    # Ubuntu 24.04 + Nix package manager
+```
+
+On **NixOS**, packages are installed system-wide via `nixos-rebuild switch`. The entire OS is declaratively configured. Rollback is instant via NixOS generations.
+
+On **Ubuntu**, the Nix package manager is installed first, then packages are added via `nix profile install`. The base OS is familiar Ubuntu, but all developer tools come from the same nixpkgs repository. Services like Docker are installed via apt for systemd integration.
+
 ## Runtime Support
 
 | Runtime | Platform | Isolation | Snapshots | Priority |
@@ -369,7 +389,7 @@ cargo clippy -- -D warnings  # Lint with warnings as errors (CI)
 cargo test
 ```
 
-43 unit tests covering: config parsing, state management, runtime backends, Nix set generation, NixOS provisioning, layout registry, cheat sheet embedding, platform detection.
+51 unit tests covering: config parsing, state management, runtime backends, Nix set generation, NixOS/Ubuntu provisioning, package name mapping, layout registry, cheat sheet embedding, platform detection.
 
 ### Integration tests
 

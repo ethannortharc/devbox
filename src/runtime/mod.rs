@@ -51,6 +51,8 @@ pub struct CreateOpts {
     pub layout: String,
     pub bare: bool,
     pub writable: bool,
+    /// Base image type: "nixos" or "ubuntu"
+    pub image: String,
 }
 
 /// A host-to-VM mount point.

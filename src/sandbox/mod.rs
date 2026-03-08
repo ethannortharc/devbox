@@ -118,6 +118,7 @@ impl SandboxManager {
             layout: config.sandbox.layout.clone(),
             bare,
             writable: config.sandbox.mount_mode == "writable",
+            image: config.sandbox.image.clone(),
         };
 
         // Create via runtime
@@ -126,7 +127,8 @@ impl SandboxManager {
         // Provision tools in the VM based on selected sets
         let active_sets = config.active_sets();
         let active_langs = config.active_languages();
-        if let Err(e) = provision::provision_vm(runtime, name, &active_sets, &active_langs).await {
+        let image = config.sandbox.image.as_str();
+        if let Err(e) = provision::provision_vm(runtime, name, &active_sets, &active_langs, image).await {
             eprintln!("Warning: provisioning incomplete: {e}");
         }
 
@@ -140,6 +142,7 @@ impl SandboxManager {
             layout: config.sandbox.layout.clone(),
             sets: config.active_sets(),
             languages: config.active_languages(),
+            image: config.sandbox.image.clone(),
         };
         state.save(&self.state_dir)?;
 
