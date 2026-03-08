@@ -157,6 +157,7 @@ impl DevboxConfig {
     }
 
     /// Save to devbox.toml.
+    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self)
             .context("Failed to serialize config")?;

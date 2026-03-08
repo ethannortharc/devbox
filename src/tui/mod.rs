@@ -1,4 +1,3 @@
-pub mod layout_picker;
 pub mod packages;
 
 /// Layout definition with metadata for the TUI picker.

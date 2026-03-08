@@ -22,6 +22,7 @@ pub enum SandboxStatus {
 
 /// Information about a sandbox instance.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SandboxInfo {
     pub name: String,
     pub status: SandboxStatus,
@@ -39,6 +40,7 @@ pub struct SnapshotInfo {
 
 /// Options for creating a new sandbox.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CreateOpts {
     pub name: String,
     pub mounts: Vec<Mount>,
@@ -110,6 +112,7 @@ pub trait Runtime: Send + Sync {
     async fn status(&self, name: &str) -> Result<SandboxStatus>;
 
     /// List all devbox sandboxes managed by this runtime.
+    #[allow(dead_code)]
     async fn list(&self) -> Result<Vec<SandboxInfo>>;
 
     /// Create a named snapshot.
@@ -122,5 +125,6 @@ pub trait Runtime: Send + Sync {
     async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>>;
 
     /// Add tools/sets to an existing sandbox.
+    #[allow(dead_code)]
     async fn upgrade(&self, name: &str, tools: &[String]) -> Result<()>;
 }

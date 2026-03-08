@@ -104,32 +104,3 @@ pub async fn write_nix_file(
     Ok(())
 }
 
-/// Read the current NixOS generation number.
-pub async fn current_generation(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<String> {
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "nix-env", "--list-generations", "--profile", "/nix/var/nix/profiles/system"],
-            false,
-        )
-        .await?;
-
-    if result.exit_code != 0 {
-        return Ok("unknown".to_string());
-    }
-
-    // Last line contains current generation
-    let generation = result
-        .stdout
-        .lines()
-        .filter(|l| l.contains("(current)"))
-        .last()
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
-
-    Ok(generation)
-}

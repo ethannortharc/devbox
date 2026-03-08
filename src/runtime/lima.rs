@@ -101,6 +101,7 @@ containerd:
     }
 
     /// Parse `limactl list --json` output to extract sandbox info.
+    #[allow(dead_code)]
     fn parse_list_json(output: &str) -> Vec<SandboxInfo> {
         let mut infos = vec![];
         for line in output.lines() {

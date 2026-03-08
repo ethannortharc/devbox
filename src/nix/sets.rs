@@ -94,6 +94,7 @@ pub static NIX_SETS: &[NixSet] = &[
 ];
 
 /// Lookup a NixSet by name.
+#[allow(dead_code)]
 pub fn find_set(name: &str) -> Option<&'static NixSet> {
     NIX_SETS.iter().find(|s| s.name == name)
 }

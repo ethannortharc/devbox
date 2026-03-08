@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use crate::runtime::Runtime;
 
 /// OverlayFS paths inside the VM.
+#[allow(dead_code)]
 const WORKSPACE: &str = "/workspace";
 const UPPER: &str = "/workspace/upper";
 const LOWER: &str = "/workspace/lower";
@@ -270,11 +271,4 @@ impl ChangeStatus {
         }
     }
 
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Added => "added",
-            Self::Modified => "modified",
-            Self::Deleted => "deleted",
-        }
-    }
 }
