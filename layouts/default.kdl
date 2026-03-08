@@ -1,6 +1,6 @@
 // Devbox — Default layout: Home Base
 // Tab 1: Editor + terminal + file browser (yazi)
-// Tab 2: Editor + terminal + help/guide + management TUI
+// Tab 2: Editor + terminal + help/guide + management
 // Tab 3: Plain shell
 // Tab 4: Git (lazygit)
 layout {
@@ -16,7 +16,7 @@ layout {
         }
     }
 
-    tab name="  Workspace" focus=true {
+    tab name="  Workspace" focus=true cwd="/workspace" {
         pane split_direction="vertical" {
             pane split_direction="horizontal" size="50%" {
                 pane name="editor" size="60%" {
@@ -32,7 +32,7 @@ layout {
         }
     }
 
-    tab name="  DevBox" {
+    tab name="  DevBox" cwd="/workspace" {
         pane split_direction="vertical" {
             pane split_direction="horizontal" size="50%" {
                 pane name="editor" size="60%" {
@@ -44,21 +44,21 @@ layout {
             pane split_direction="horizontal" size="50%" {
                 pane name="help" size="50%" {
                     command "bash"
-                    args "-c" "echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null || echo 'devbox guide <tool>  — show cheat sheet'; fi; echo ''; echo '  Usage: devbox guide <tool>'; echo '  Example: devbox guide lazygit'; echo ''; echo '  Press any key to browse interactively...'; read -n1; exec bash -c 'while true; do echo \"\" && echo \"Available guides: devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie\" && echo \"\" && read -p \"guide> \" tool && if [ -z \"$tool\" ]; then break; fi && if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"No guide for: $tool\"; fi; done; exec bash'"
+                    args "-c" "cd /workspace; echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null || echo 'devbox guide <tool>  — show cheat sheet'; fi; echo ''; echo '  Usage: devbox guide <tool>'; echo '  Example: devbox guide lazygit'; echo ''; echo '  Press any key to browse interactively...'; read -n1; exec bash -c 'while true; do echo \"\" && echo \"Available guides: devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie\" && echo \"\" && read -p \"guide> \" tool && if [ -z \"$tool\" ]; then break; fi && if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"No guide for: $tool\"; fi; done; exec bash'"
                 }
                 pane name="management" size="50%" {
                     command "bash"
-                    args "-c" "if command -v devbox >/dev/null 2>&1; then devbox packages; else echo 'devbox not found — run: devbox packages'; fi; exec bash"
+                    args "-c" "clear; echo ''; echo '  ╔══════════════════════════════════════╗'; echo '  ║         DevBox Management            ║'; echo '  ╚══════════════════════════════════════╝'; echo ''; echo '  System:'; echo \"    OS:       $(uname -s) $(uname -m)\"; echo \"    Hostname: $(hostname)\"; echo \"    Kernel:   $(uname -r)\"; if command -v nix >/dev/null 2>&1; then echo \"    Nix:      $(nix --version 2>/dev/null)\"; fi; echo ''; echo '  Installed Sets:'; if [ -f /etc/devbox/devbox-state.toml ]; then grep '= true' /etc/devbox/devbox-state.toml | sed 's/^/    ● /' | sed 's/ = true//'; else echo '    (state file not found)'; fi; echo ''; echo '  Resources:'; echo \"    CPU:      $(nproc) cores\"; echo \"    Memory:   $(free -h 2>/dev/null | awk '/Mem:/{print $2}' || echo 'N/A')\"; echo \"    Disk:     $(df -h /workspace 2>/dev/null | awk 'NR==2{print $3\"/\"$2\" used\"}' || echo 'N/A')\"; echo ''; echo '  Commands:'; echo '    devbox packages       Toggle tool sets'; echo '    devbox upgrade --tools go   Add language'; echo '    devbox guide <tool>   Tool cheat sheet'; echo '    devbox diff           Show overlay changes'; echo '    devbox commit         Sync changes to host'; echo '    devbox snapshot save  Create checkpoint'; echo ''; exec bash"
                 }
             }
         }
     }
 
-    tab name="  Shell" {
+    tab name="  Shell" cwd="/workspace" {
         pane name="main"
     }
 
-    tab name="  Git" {
+    tab name="  Git" cwd="/workspace" {
         pane {
             command "lazygit"
         }

@@ -46,6 +46,12 @@ in {
   programs.zsh.enable = true;
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
 
+  # ── Environment ──────────────────────────────────
+  environment.variables = {
+    EDITOR = "nvim";
+    VISUAL = "nvim";
+  };
+
   # ── User configuration ────────────────────────────
   # Lima creates the user automatically; we declare it here so NixOS
   # manages the shell and group memberships properly.

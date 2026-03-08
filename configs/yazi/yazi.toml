@@ -16,16 +16,15 @@ max_height = 1000
 
 [opener]
 edit = [
-  { run = 'nvim "$@"', block = true, desc = "Edit in Neovim" },
-  { run = 'helix "$@"', block = true, desc = "Edit in Helix" },
+  { run = 'nvim "$@"', block = true, desc = "Neovim" },
 ]
-open = [
-  { run = 'xdg-open "$@"', desc = "System open" },
+edit-helix = [
+  { run = 'helix "$@"', block = true, desc = "Helix" },
 ]
-reveal = [
+view = [
   { run = 'bat --paging=always --style=full "$@"', block = true, desc = "View with bat" },
 ]
-view_markdown = [
+view-markdown = [
   { run = 'glow -p "$@"', block = true, desc = "Render markdown" },
 ]
 lazygit = [
@@ -34,21 +33,41 @@ lazygit = [
 lazydocker = [
   { run = 'lazydocker', block = true, desc = "Open lazydocker" },
 ]
+open = [
+  { run = 'xdg-open "$@"', desc = "System open" },
+]
 
 [open]
 rules = [
-  { mime = "text/markdown",    use = ["view_markdown", "edit"] },
-  { name = "*.md",             use = ["view_markdown", "edit"] },
-  { name = "*.mdx",            use = ["view_markdown", "edit"] },
+  # Markdown — render with glow first, then edit
+  { mime = "text/markdown",    use = ["view-markdown", "edit"] },
+  { name = "*.md",             use = ["view-markdown", "edit"] },
+  { name = "*.mdx",            use = ["view-markdown", "edit"] },
+
+  # Git directory — open lazygit
   { name = ".git/",            use = ["lazygit"] },
 
-  # Code and text
-  { mime = "text/*",           use = ["edit", "reveal"] },
-  { mime = "*/json",           use = ["edit", "reveal"] },
-  { mime = "*/toml",           use = ["edit", "reveal"] },
-  { mime = "*/yaml",           use = ["edit", "reveal"] },
-  { mime = "*/xml",            use = ["edit", "reveal"] },
-  { name = "*.nix",            use = ["edit", "reveal"] },
+  # Code and text — edit with nvim (first = default on Enter)
+  { mime = "text/*",           use = ["edit", "view"] },
+  { mime = "*/json",           use = ["edit", "view"] },
+  { mime = "*/toml",           use = ["edit", "view"] },
+  { mime = "*/yaml",           use = ["edit", "view"] },
+  { mime = "*/xml",            use = ["edit", "view"] },
+  { name = "*.nix",            use = ["edit", "view"] },
+  { name = "*.rs",             use = ["edit", "view"] },
+  { name = "*.go",             use = ["edit", "view"] },
+  { name = "*.py",             use = ["edit", "view"] },
+  { name = "*.js",             use = ["edit", "view"] },
+  { name = "*.ts",             use = ["edit", "view"] },
+  { name = "*.tsx",            use = ["edit", "view"] },
+  { name = "*.jsx",            use = ["edit", "view"] },
+  { name = "*.lua",            use = ["edit", "view"] },
+  { name = "*.sh",             use = ["edit", "view"] },
+  { name = "*.bash",           use = ["edit", "view"] },
+  { name = "*.zsh",            use = ["edit", "view"] },
+  { name = "Makefile",         use = ["edit", "view"] },
+  { name = "Dockerfile",       use = ["edit", "view"] },
+  { name = "*.kdl",            use = ["edit", "view"] },
 
   # Fallback
   { name = "*",                use = ["edit", "open"] },

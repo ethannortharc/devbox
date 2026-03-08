@@ -350,6 +350,10 @@ if command -v fzf >/dev/null 2>&1; then
   source <(fzf --zsh) 2>/dev/null
 fi
 
+# Editor
+export EDITOR=nvim
+export VISUAL=nvim
+
 # Aliases
 alias ls='eza --icons' 2>/dev/null
 alias cat='bat --paging=never' 2>/dev/null
