@@ -46,11 +46,13 @@ in {
   programs.zsh.enable = true;
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
 
-  # ── User shell override ────────────────────────────
-  # Lima creates the user automatically; we just set zsh as their shell.
+  # ── User configuration ────────────────────────────
+  # Lima creates the user automatically; we declare it here so NixOS
+  # manages the shell and group memberships properly.
   users.users.${username} = {
+    isNormalUser = true;
     shell = lib.mkForce pkgs.zsh;
-    extraGroups = lib.mkAfter [ "docker" ];
+    extraGroups = lib.mkAfter [ "wheel" "docker" ];
   };
 
   # ── Nix Garbage Collection ─────────────────────────

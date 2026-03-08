@@ -66,7 +66,7 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
         ],
         "tools" => vec![
             "ripgrep", "fd", "bat", "eza", "delta", "sd", "choose",
-            "jq", "yq-go", "fx", "htop", "procs", "du-dust", "duf",
+            "jq", "yq-go", "fx", "htop", "procs", "dust", "duf",
             "tokei", "hyperfine", "tealdeer", "httpie", "dog", "glow", "entr",
         ],
         "editor" => vec!["neovim", "helix", "nano"],
@@ -131,30 +131,34 @@ async fn provision_nixos(
         )
         .await?;
 
-    // 2. Push devbox-state.toml
+    // 2. Generate base NixOS config if it doesn't exist
+    //    NixOS Lima images ship with an empty /etc/nixos/ — we need to
+    //    run nixos-generate-config to create the hardware and base configs.
+    ensure_nixos_config(runtime, name).await?;
+
+    // 3. Push devbox-state.toml
     let state_toml = generate_state_toml(sets, languages, &username);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
-    // 3. Push devbox-module.nix
+    // 4. Push devbox-module.nix
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-module.nix", NIX_DEVBOX_MODULE).await?;
 
-    // 4. Push all set .nix files
+    // 5. Push all set .nix files
     for (filename, content) in NIX_SET_FILES {
         let path = format!("/etc/devbox/sets/{filename}");
         write_file_to_vm(runtime, name, &path, content).await?;
     }
 
-    // 5. Add import to the VM's /etc/nixos/configuration.nix
-    add_devbox_import(runtime, name).await?;
-
     // 6. Run nixos-rebuild switch
+    //    NixOS Lima images use flake-based NIX_PATH (nixpkgs=flake:nixpkgs)
+    //    which doesn't include nixos-config. We must set it explicitly.
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
+    let rebuild_cmd = concat!(
+        "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && ",
+        "nixos-rebuild switch --show-trace 2>&1"
+    );
     let result = runtime
-        .exec_cmd(
-            name,
-            &["sudo", "nixos-rebuild", "switch", "--show-trace"],
-            false,
-        )
+        .exec_cmd(name, &["sudo", "bash", "-c", rebuild_cmd], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -169,7 +173,7 @@ async fn provision_nixos(
         println!("NixOS rebuild complete.");
     }
 
-    // 7. Copy devbox binary + help files
+    // 8. Copy devbox binary + help files
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
@@ -405,50 +409,81 @@ async fn write_file_to_vm(
     Ok(())
 }
 
-/// Add devbox module import to the VM's /etc/nixos/configuration.nix.
-async fn add_devbox_import(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let check = runtime
+/// Ensure /etc/nixos/configuration.nix and hardware-configuration.nix exist.
+///
+/// NixOS Lima images ship with an empty /etc/nixos/ directory.
+/// We run `nixos-generate-config` to create hardware-configuration.nix,
+/// then write our own minimal configuration.nix with correct bootloader
+/// settings and the devbox module import already included.
+async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Generate hardware-configuration.nix (always safe to regenerate)
+    let hw_check = runtime
         .exec_cmd(
             name,
-            &["grep", "-q", "devbox-module", "/etc/nixos/configuration.nix"],
+            &["test", "-f", "/etc/nixos/hardware-configuration.nix"],
             false,
         )
         .await?;
 
-    if check.exit_code == 0 {
-        return Ok(());
+    if hw_check.exit_code != 0 {
+        println!("  Generating hardware configuration...");
+        let result = runtime
+            .exec_cmd(name, &["sudo", "nixos-generate-config"], false)
+            .await?;
+        if result.exit_code != 0 {
+            eprintln!(
+                "Warning: nixos-generate-config failed: {}",
+                result.stderr.trim()
+            );
+        }
     }
 
-    runtime
-        .exec_cmd(
-            name,
-            &[
-                "sudo", "cp",
-                "/etc/nixos/configuration.nix",
-                "/etc/nixos/configuration.nix.pre-devbox",
-            ],
-            false,
-        )
+    // Detect the actual bootloader: check if GRUB config exists
+    let grub_check = runtime
+        .exec_cmd(name, &["test", "-f", "/boot/grub/grub.cfg"], false)
         .await?;
+    let uses_grub = grub_check.exit_code == 0;
 
-    let add_import = r#"
-if grep -q 'imports' /etc/nixos/configuration.nix; then
-  sudo sed -i '/imports\s*=\s*\[/a\    /etc/devbox/devbox-module.nix' /etc/nixos/configuration.nix
-else
-  sudo sed -i '/^{/a\  imports = [ /etc/devbox/devbox-module.nix ];' /etc/nixos/configuration.nix
-fi
-"#;
+    // Write our own configuration.nix with correct bootloader and devbox import.
+    // We always overwrite to ensure a clean, known-good configuration.
+    let bootloader_config = if uses_grub {
+        r#"  # GRUB bootloader (matches the pre-built image)
+  boot.loader.grub.enable = true;
+  boot.loader.grub.device = "nodev";
+  boot.loader.grub.efiSupport = true;
+  boot.loader.grub.efiInstallAsRemovable = true;"#
+    } else {
+        r#"  # systemd-boot EFI bootloader
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;"#
+    };
 
-    let result = runtime
-        .exec_cmd(name, &["bash", "-c", add_import], false)
-        .await?;
+    let config_nix = format!(
+        r#"# Devbox-managed NixOS configuration
+# Do not edit — this file is overwritten by devbox provisioning.
+{{ config, lib, pkgs, ... }}:
 
-    if result.exit_code != 0 {
-        eprintln!(
-            "Warning: failed to add devbox import: {}",
-            result.stderr.trim()
-        );
-    }
+{{
+  imports = [
+    ./hardware-configuration.nix
+    /etc/devbox/devbox-module.nix
+  ];
+
+{bootloader_config}
+
+  # Networking
+  networking.networkmanager.enable = true;
+
+  # OpenSSH for Lima access
+  services.openssh.enable = true;
+
+  # NixOS state version — matches the pre-built image
+  system.stateVersion = lib.mkDefault "25.11";
+}}
+"#
+    );
+
+    write_file_to_vm(runtime, name, "/etc/nixos/configuration.nix", &config_nix).await?;
 
     Ok(())
 }
