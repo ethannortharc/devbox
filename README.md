@@ -74,8 +74,13 @@ devbox self-update --check  # Check for updates without installing
 
 ## Quick Start
 
+For a detailed walkthrough with explanations of what happens at each step, see the [Quick Start Guide](docs/QUICKSTART.md).
+
 ```bash
-# Create and enter a VM (auto-detects project)
+# Check your system is ready
+devbox doctor
+
+# Create and enter a VM (auto-detects project language)
 cd my-project
 devbox
 
@@ -89,10 +94,20 @@ devbox shell
 devbox exec -- make test
 ```
 
+### What happens when you run `devbox create`:
+
+1. **Downloads a NixOS image** (~800MB, cached after first run) and creates a VM via Lima/Incus
+2. **Pushes NixOS configuration** into the VM (tool sets, language packs, system settings)
+3. **Runs `nixos-rebuild switch`** to install all packages declaratively from the Nix binary cache
+4. **Copies devbox + help files** into the VM so `devbox guide` works inside
+5. **Saves state** to `~/.devbox/sandboxes/<name>/`
+
+First create takes 5-15 minutes (image download + package install). Subsequent creates are faster.
+
 ### First-time setup
 
 ```bash
-# Generate a project config file
+# Generate a project config file (auto-detects languages)
 devbox init
 
 # Check that your system is ready
@@ -138,27 +153,34 @@ cp host-configs/ghostty/config ~/.config/ghostty/config
 
 ```toml
 [sandbox]
-name = "myproject"
-runtime = "lima"
-layout = "default"
+runtime = "auto"            # auto | lima | incus | multipass | docker
+layout = "default"          # zellij layout name
+mount_mode = "overlay"      # overlay (safe) | writable (direct)
 
 [sets]
-core = true
-shell = true
-tools = true
-git = true
-containers = true
+system = true               # core OS tools (locked, always on)
+shell = true                # terminal tools (locked, always on)
+tools = true                # modern CLI (locked, always on)
+editor = true               # neovim, helix, nano
+git = true                  # git, lazygit, gh
+container = true            # docker, compose, lazydocker
+network = false             # tailscale, mosh, nmap
+ai = false                  # claude-code, aider, ollama
 
 [languages]
-go = true
+go = true                   # auto-detected from go.mod
+rust = false
+python = false
+node = false
 
-[mounts]
-workspace = { host = ".", container = "/workspace", readonly = true }
+[mounts.workspace]
+host = "."
+target = "/workspace"
+readonly = false
 
 [resources]
-cpus = 4
-memory = "8G"
-disk = "50G"
+cpu = 4                     # 0 = default (4 cores)
+memory = "8GiB"             # "" = default (8GiB)
 
 [env]
 EDITOR = "nvim"
@@ -175,30 +197,49 @@ devbox config show
 
 ## Tool Sets
 
-Devbox organizes 90+ tools into toggleable sets. Locked sets are always installed.
+Devbox organizes 90+ tools into toggleable sets declared as NixOS packages.
 
-| Set | Contents | Locked |
-|-----|----------|--------|
-| **core** | zsh, starship, zoxide, coreutils | Yes |
-| **shell** | tmux, zellij, neovim | Yes |
-| **tools** | eza, bat, fd, ripgrep, fzf, yazi, delta, jq, yq | Yes |
-| **git** | git, lazygit, gh, git-crypt | No |
-| **network** | curl, wget, httpie, websocat, mtr | No |
-| **containers** | docker, docker-compose, podman, buildah, dive, lazydocker | No |
-| **go** | Go toolchain, gopls, golangci-lint, delve | No |
-| **rust** | Rust toolchain, rust-analyzer, cargo tools | No |
-| **node** | Node.js, npm, pnpm, eslint, prettier | No |
-| **python** | Python, pip, ruff, mypy, ipython | No |
-| **java** | JDK, Maven, Gradle | No |
-| **cloud** | aws-cli, terraform, kubectl, helm, k9s | No |
-| **ai** | Claude Code, aider, ollama | No |
-| **data** | sqlite, postgresql, redis, jq, csvkit | No |
+### Core sets (always installed)
+
+| Set | Packages |
+|-----|----------|
+| **system** | coreutils, gcc, gnumake, curl, wget, openssh, openssl, gnupg, tree, less, file, pkg-config, and more (24 packages) |
+| **shell** | zellij, zsh, starship, fzf, zoxide, direnv, yazi (10 packages) |
+| **tools** | ripgrep, fd, bat, eza, delta, jq, yq, htop, dust, httpie, glow, hyperfine, and more (21 packages) |
+
+### Default sets (on by default, can be disabled)
+
+| Set | Packages |
+|-----|----------|
+| **editor** | neovim, helix, nano |
+| **git** | git, lazygit, gh, git-lfs, git-crypt, pre-commit |
+| **container** | docker, docker-compose, lazydocker, dive, buildkit, skopeo |
+
+### Optional sets (off by default)
+
+| Set | Packages |
+|-----|----------|
+| **network** | tailscale, mosh, nmap, tcpdump, bandwhich, trippy, doggo |
+| **ai** | claude-code, aider, ollama, open-webui, codex, huggingface-hub, and more (10 packages) |
+
+### Language sets (enabled by detection or `--tools` flag)
+
+| Set | Packages |
+|-----|----------|
+| **lang-go** | go, gopls, golangci-lint, delve, gotools, gore |
+| **lang-rust** | rustup, rust-analyzer, cargo-watch, cargo-edit, cargo-expand, sccache |
+| **lang-python** | python 3.12, uv, ruff, pyright, ipython, pytest |
+| **lang-node** | node 22, bun, pnpm, typescript, typescript-language-server, biome |
+| **lang-java** | jdk 21, gradle, maven, jdt-language-server |
+| **lang-ruby** | ruby 3.3, bundler, solargraph, rubocop |
 
 Toggle sets interactively with the TUI package manager:
 
 ```bash
 devbox packages
 ```
+
+For a detailed explanation of how sets work with NixOS, see the [Quick Start Guide](docs/QUICKSTART.md#whats-installed-by-default).
 
 ## Workspace Layouts
 
@@ -271,6 +312,7 @@ src/
     config.rs   # devbox.toml parsing
     state.rs    # ~/.devbox/sandboxes/ state persistence
     overlay.rs  # OverlayFS diff/commit/discard
+    provision.rs # NixOS provisioning (push nix files + nixos-rebuild)
   nix/          # NixOS integration
     sets.rs     # 14 Nix set definitions (93+ packages)
     rebuild.rs  # nixos-rebuild orchestration with rollback
@@ -278,16 +320,28 @@ src/
     layout_picker.rs  # Interactive layout selector
     packages.rs       # Package manager TUI
   tools/        # Project detection and tool registry
-nix/            # NixOS configuration files
-  configuration.nix   # VM system config
+nix/            # NixOS configuration files (embedded in binary)
+  devbox-module.nix   # NixOS module pushed into VMs
+  configuration.nix   # Standalone config (for custom image builds)
   home.nix            # home-manager config
   flake.nix           # Build pipeline
-  sets/               # Individual set .nix files
+  sets/               # 14 individual set .nix files
 layouts/        # 8 Zellij KDL layout files
 help/           # 14 markdown cheat sheets (embedded in binary)
 host-configs/   # Host-side configs (Ghostty)
+docs/           # Quick start, E2E test guide
 tests/          # Integration tests
 ```
+
+### How provisioning works
+
+All `.nix` files and help files are compiled into the devbox binary via `include_str!`. When you create a sandbox:
+
+1. Lima creates and boots a stock NixOS VM (from [nixos-lima](https://github.com/nixos-lima/nixos-lima) images)
+2. Devbox pushes the nix files into the VM at `/etc/devbox/` via base64-encoded shell commands
+3. The devbox NixOS module is imported into the VM's `/etc/nixos/configuration.nix`
+4. `nixos-rebuild switch` installs all declared packages
+5. The devbox binary and help files are copied into the VM
 
 ## Development
 
@@ -315,7 +369,7 @@ cargo clippy -- -D warnings  # Lint with warnings as errors (CI)
 cargo test
 ```
 
-39 unit tests covering: config parsing, state management, runtime backends, Nix set generation, layout registry, cheat sheet embedding, platform detection.
+43 unit tests covering: config parsing, state management, runtime backends, Nix set generation, NixOS provisioning, layout registry, cheat sheet embedding, platform detection.
 
 ### Integration tests
 
@@ -327,146 +381,20 @@ cargo test --test integration
 
 ### End-to-end testing
 
-E2E tests require a VM runtime installed. See the [E2E Test Guide](#e2e-test-guide) below.
+E2E tests require a VM runtime installed. See the [E2E Test Guide](docs/E2E_TEST_GUIDE.md) for detailed steps.
 
 ---
 
 ### E2E Test Guide
 
-These tests verify the full devbox lifecycle against a real runtime. Run them manually.
+The full [E2E Test Guide](docs/E2E_TEST_GUIDE.md) covers 13 test scenarios including:
 
-**Prerequisites:** At least one runtime installed (Lima recommended on macOS, Incus on Linux).
-
-#### 1. System check
-
-```bash
-devbox doctor
-```
-
-Expected: All checks pass. Runtime detected. State directory exists.
-
-#### 2. Project initialization
-
-```bash
-mkdir /tmp/devbox-e2e-test && cd /tmp/devbox-e2e-test
-git init && echo 'package main' > main.go && echo 'module test' > go.mod
-devbox init
-cat devbox.toml
-```
-
-Expected: `devbox.toml` generated with `go = true` under `[languages]`.
-
-#### 3. Create a sandbox
-
-```bash
-devbox create --name e2e-test --bare
-```
-
-Expected: Sandbox created, auto-attached to shell inside VM. Type `exit` to return.
-
-#### 4. List and status
-
-```bash
-devbox list
-devbox status --name e2e-test
-```
-
-Expected: `e2e-test` appears in the list with status `Running` (green) or `Stopped` (yellow).
-
-#### 5. Shell attach
-
-```bash
-devbox shell --name e2e-test
-# Inside VM:
-uname -a        # Should show Linux (NixOS kernel)
-which zsh        # Should exist
-which nvim       # Should exist
-exit
-```
-
-Expected: Drops into a shell inside the VM. NixOS system visible.
-
-#### 6. Exec one-off command
-
-```bash
-devbox exec --name e2e-test -- echo "hello from VM"
-echo $?
-```
-
-Expected: Prints `hello from VM`, exit code `0`.
-
-#### 7. Overlay operations (if not --writable)
-
-```bash
-# Inside the VM, create a file
-devbox exec --name e2e-test -- touch /workspace/upper/testfile.txt
-
-# From host
-devbox diff --name e2e-test
-devbox discard --name e2e-test --force
-devbox diff --name e2e-test
-```
-
-Expected: First diff shows `testfile.txt` as added. After discard, diff shows no changes.
-
-#### 8. Snapshot operations (Incus/Multipass only)
-
-```bash
-devbox snapshot save --name e2e-test
-devbox snapshot list --name e2e-test
-devbox snapshot restore --name e2e-test --snapshot <id>
-```
-
-Expected: Snapshot created, listed, and restored without errors.
-
-#### 9. Guide system
-
-```bash
-devbox guide
-devbox guide zellij
-devbox guide nvim
-devbox guide nonexistent
-```
-
-Expected: Index shows all topics. Tool-specific guides render content. Unknown tool prints "No cheat sheet" message.
-
-#### 10. Layout commands
-
-```bash
-devbox layout list
-devbox layout preview ai-pair
-devbox layout preview tdd
-```
-
-Expected: Lists all 9 layouts with descriptions. Previews show ASCII diagrams.
-
-#### 11. Config management
-
-```bash
-devbox config show
-devbox config set runtime lima
-devbox config get runtime
-devbox config set runtime auto
-```
-
-Expected: Shows current config. Set/get round-trips correctly. Reset to `auto`.
-
-#### 12. Stop and destroy
-
-```bash
-devbox stop --name e2e-test
-devbox status --name e2e-test
-devbox destroy --name e2e-test --force
-devbox list
-```
-
-Expected: Status shows `Stopped`. After destroy, sandbox no longer appears in list.
-
-#### 13. Cleanup
-
-```bash
-rm -rf /tmp/devbox-e2e-test
-```
+- System check, project init, sandbox create/destroy lifecycle
+- Tool verification inside the VM (zellij, ripgrep, lazygit, etc.)
+- Language tool installation (Go, Rust, Python, etc.)
+- Guide system, layout commands, config management
+- Overlay operations and snapshots
+- Troubleshooting nixos-rebuild failures
 
 ---
 
