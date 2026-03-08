@@ -29,6 +29,12 @@ const NIX_SETS_LANG_NODE: &str = include_str!("../../nix/sets/lang-node.nix");
 const NIX_SETS_LANG_JAVA: &str = include_str!("../../nix/sets/lang-java.nix");
 const NIX_SETS_LANG_RUBY: &str = include_str!("../../nix/sets/lang-ruby.nix");
 
+// ── Embedded config files (yazi, etc.) ───────────────────
+const YAZI_CONFIG: &str = include_str!("../../configs/yazi/yazi.toml");
+const YAZI_KEYMAP: &str = include_str!("../../configs/yazi/keymap.toml");
+const YAZI_THEME: &str = include_str!("../../configs/yazi/theme.toml");
+const YAZI_INIT: &str = include_str!("../../configs/yazi/init.lua");
+
 /// All set nix files: (filename, content)
 const NIX_SET_FILES: &[(&str, &str)] = &[
     ("default.nix", NIX_SETS_DEFAULT),
@@ -173,10 +179,11 @@ async fn provision_nixos(
         println!("NixOS rebuild complete.");
     }
 
-    // 8. Copy devbox binary + help files
+    // 8. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
+    setup_yazi_config(runtime, name).await?;
 
     Ok(())
 }
@@ -261,6 +268,7 @@ fi"#;
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
+    setup_yazi_config(runtime, name).await?;
 
     Ok(())
 }
@@ -518,6 +526,37 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Push yazi config files to all user home directories in the VM.
+async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let username = whoami();
+    let config_dir = format!("/home/{username}/.config/yazi");
+
+    // Create config directory
+    runtime
+        .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
+        .await?;
+
+    // Write all yazi config files
+    let files: &[(&str, &str)] = &[
+        ("yazi.toml", YAZI_CONFIG),
+        ("keymap.toml", YAZI_KEYMAP),
+        ("theme.toml", YAZI_THEME),
+        ("init.lua", YAZI_INIT),
+    ];
+    for (filename, content) in files {
+        let path = format!("{config_dir}/{filename}");
+        write_file_to_vm(runtime, name, &path, content).await?;
+    }
+
+    // Fix ownership
+    let chown_cmd = format!("chown -R {username}:{username} /home/{username}/.config/yazi");
+    runtime
+        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+        .await?;
+
     Ok(())
 }
 

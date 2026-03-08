@@ -1,0 +1,5 @@
+# Devbox yazi theme — use defaults, override status bar for devbox branding
+
+[status]
+separator_open  = ""
+separator_close = ""

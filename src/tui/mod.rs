@@ -14,24 +14,23 @@ pub static LAYOUTS: &[LayoutDef] = &[
         name: "default",
         description: "Editor + terminal + files, with DevBox management tab",
         preview: r#"
-Tab 1 [Workspace]:
+[Workspace] [DevBox] [Shell] [Git]     <- tab bar (top)
 +------------------+------------------+
 |  nvim .    60%   |                  |
 |  (editor)        |  yazi            |
-+------------------+  (files)   50%  |
-|  terminal  40%   |                  |
++------------------+  (files)   50%   |
+|  terminal  40%   |  bat/glow        |
 +------------------+------------------+
        50%                50%
+<Ctrl+t> new pane  <Alt+n> new tab    <- shortcuts (bottom)
 
 Tab 2 [DevBox]:
 +------------------+------------------+
-|  nvim .    60%   |  help/guide 50% |
+|  nvim .    60%   |  help/guide 50%  |
 |  (editor)        +------------------+
-+------------------+  management     |
-|  terminal  40%   |           50%   |
++------------------+  packages TUI    |
+|  terminal  40%   |           50%    |
 +------------------+------------------+
-
-Tabs: [Workspace] [DevBox] [Shell] [Git]
 "#,
     },
     LayoutDef {

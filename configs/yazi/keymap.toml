@@ -1,0 +1,26 @@
+# Devbox yazi keymap — extra shortcuts for development workflows
+
+[manager]
+prepend_keymap = [
+  # Quick tools
+  { on = ["g", "g"], run = "arrow -99999999", desc = "Go to top" },
+  { on = ["G"],      run = "arrow 99999999",  desc = "Go to bottom" },
+  { on = ["g", "i"], run = "cd /workspace",   desc = "Go to workspace" },
+  { on = ["g", "h"], run = "cd ~",            desc = "Go to home" },
+  { on = ["g", "e"], run = "cd /etc/devbox",  desc = "Go to devbox config" },
+
+  # Git integration
+  { on = ["g", "l"], run = "shell 'lazygit' --block --confirm", desc = "Open lazygit" },
+
+  # View with bat (pretty syntax highlight)
+  { on = ["B"],      run = "shell 'bat --paging=always --style=full \"$@\"' --block --confirm", desc = "View with bat" },
+
+  # Render markdown with glow
+  { on = ["M"],      run = "shell 'glow -p \"$@\"' --block --confirm", desc = "Render markdown" },
+
+  # Docker
+  { on = ["g", "d"], run = "shell 'lazydocker' --block --confirm", desc = "Open lazydocker" },
+
+  # Search with fzf
+  { on = ["F"],      run = "shell 'fd --type f | fzf --preview \"bat --color=always --style=numbers {}\" --bind \"enter:become(nvim {})\"' --block --confirm", desc = "Fuzzy find + edit" },
+]
