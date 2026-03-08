@@ -171,7 +171,9 @@ impl Runtime for LimaRuntime {
         interactive: bool,
     ) -> Result<ExecResult> {
         let vm = Self::vm_name(name);
-        let mut args = vec!["shell", &vm, "--"];
+        // Use --workdir to avoid "cd: No such file or directory" warnings
+        // from Lima trying to match the host CWD inside the VM.
+        let mut args = vec!["shell", "--workdir", "/", &vm, "--"];
         args.extend_from_slice(cmd);
 
         if interactive {
