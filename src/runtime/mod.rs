@@ -127,4 +127,8 @@ pub trait Runtime: Send + Sync {
     /// Add tools/sets to an existing sandbox.
     #[allow(dead_code)]
     async fn upgrade(&self, name: &str, tools: &[String]) -> Result<()>;
+
+    /// Update mount points for an existing sandbox.
+    /// Stops the VM, updates mounts in the config, and restarts.
+    async fn update_mounts(&self, name: &str, mounts: &[Mount]) -> Result<()>;
 }

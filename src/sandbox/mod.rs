@@ -88,6 +88,7 @@ impl SandboxManager {
         }
 
         // Build mounts from config + extra
+        let is_overlay = config.sandbox.mount_mode == "overlay";
         let mut mounts: Vec<Mount> = config
             .mounts
             .values()
@@ -97,10 +98,18 @@ impl SandboxManager {
                 } else {
                     PathBuf::from(&m.host)
                 };
+                // In overlay mode, redirect the workspace mount to /mnt/host
+                // and force it read-only. The OverlayFS mount will provide
+                // /workspace as a writable overlay on top.
+                let (container_path, read_only) = if is_overlay && m.target == "/workspace" {
+                    ("/mnt/host".to_string(), true)
+                } else {
+                    (m.target.clone(), m.readonly)
+                };
                 Mount {
                     host_path: host,
-                    container_path: m.target.clone(),
-                    read_only: m.readonly,
+                    container_path,
+                    read_only,
                 }
             })
             .collect();
@@ -214,15 +223,40 @@ impl SandboxManager {
             return Ok(());
         }
 
-        // Push layout KDL into the VM and launch Zellij
-        let layout_content = crate::tui::lookup_layout_kdl(&layout);
-        Self::push_layout_to_vm(runtime.as_ref(), name, &layout, layout_content).await?;
+        // Check for saved layout in VM (user customized via `devbox layout save`)
+        // Priority: CLI --layout flag > saved layout in VM > state default > built-in default
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "dev".to_string());
+        let saved_layout_path = format!("/home/{username}/.config/devbox/saved-layout.kdl");
 
-        let layout_path = format!("/tmp/devbox-layout-{layout}.kdl");
-        println!("Attaching to sandbox '{name}' (layout: {layout})...");
-        runtime
-            .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
-            .await?;
+        let use_saved = if layout_override.is_some() {
+            // Explicit --layout flag always wins
+            false
+        } else {
+            // Check if saved layout exists in VM
+            let check = runtime
+                .exec_cmd(name, &["test", "-f", &saved_layout_path], false)
+                .await;
+            check.is_ok() && check.unwrap().exit_code == 0
+        };
+
+        if use_saved {
+            println!("Attaching to sandbox '{name}' (saved layout)...");
+            runtime
+                .exec_cmd(name, &["zellij", "--layout", &saved_layout_path], true)
+                .await?;
+        } else {
+            // Push built-in layout KDL into the VM and launch Zellij
+            let layout_content = crate::tui::lookup_layout_kdl(&layout);
+            Self::push_layout_to_vm(runtime.as_ref(), name, &layout, layout_content).await?;
+
+            let layout_path = format!("/tmp/devbox-layout-{layout}.kdl");
+            println!("Attaching to sandbox '{name}' (layout: {layout})...");
+            runtime
+                .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
+                .await?;
+        }
         Ok(())
     }
 

@@ -223,6 +223,10 @@ impl Runtime for DockerRuntime {
     async fn upgrade(&self, _name: &str, _tools: &[String]) -> Result<()> {
         todo!("Phase 5: Docker upgrade")
     }
+
+    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<()> {
+        bail!("Updating mounts is not supported for the Docker runtime")
+    }
 }
 
 fn chrono_now() -> String {

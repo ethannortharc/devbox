@@ -133,7 +133,8 @@ fn sets_map(config: &DevboxConfig) -> HashMap<String, bool> {
     m.insert("git".to_string(), config.sets.git);
     m.insert("container".to_string(), config.sets.container);
     m.insert("network".to_string(), config.sets.network);
-    m.insert("ai".to_string(), config.sets.ai);
+    m.insert("ai_code".to_string(), config.sets.ai_code);
+    m.insert("ai_infra".to_string(), config.sets.ai_infra);
     m
 }
 

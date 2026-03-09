@@ -22,14 +22,14 @@ pub static NIX_SETS: &[NixSet] = &[
         name: "shell",
         packages: &[
             "zellij", "zsh", "zsh-autosuggestions", "zsh-syntax-highlighting",
-            "starship", "fzf", "zoxide", "direnv", "nix-direnv", "yazi",
+            "starship", "fzf", "zoxide", "direnv", "nix-direnv", "yazi", "micro",
         ],
     },
     NixSet {
         name: "tools",
         packages: &[
             "ripgrep", "fd", "bat", "eza", "delta", "sd", "choose",
-            "jq", "yq-go", "fx", "htop", "procs", "dust", "duf",
+            "jq", "yq-go", "fx", "htop", "bottom", "procs", "dust", "duf",
             "tokei", "hyperfine", "tealdeer", "httpie", "dog", "glow", "entr",
         ],
     },
@@ -54,11 +54,16 @@ pub static NIX_SETS: &[NixSet] = &[
         ],
     },
     NixSet {
-        name: "ai",
+        name: "ai-code",
         packages: &[
-            "claude-code", "aider-chat", "ollama", "open-webui",
-            "codex", "python312Packages.huggingface-hub",
-            "mcp-hub", "litellm", "continue", "opencode",
+            "claude-code", "codex", "opencode", "aider-chat", "aichat", "continue",
+        ],
+    },
+    NixSet {
+        name: "ai-infra",
+        packages: &[
+            "ollama", "open-webui", "litellm", "mcp-hub",
+            "python312Packages.huggingface-hub",
         ],
     },
     NixSet {
@@ -132,7 +137,7 @@ pub fn generate_state_toml(
     custom_packages: &HashMap<String, String>,
 ) -> String {
     let mut toml = String::from("[sets]\n");
-    let set_names = ["system", "shell", "tools", "editor", "git", "container", "network", "ai"];
+    let set_names = ["system", "shell", "tools", "editor", "git", "container", "network", "ai_code", "ai_infra"];
     for name in &set_names {
         let enabled = sets.get(*name).copied().unwrap_or(false);
         toml.push_str(&format!("{name} = {enabled}\n"));
@@ -161,7 +166,7 @@ mod tests {
 
     #[test]
     fn all_sets_present() {
-        assert_eq!(NIX_SETS.len(), 14);
+        assert_eq!(NIX_SETS.len(), 15);
         assert!(find_set("system").is_some());
         assert!(find_set("lang-go").is_some());
         assert!(find_set("nonexistent").is_none());
@@ -187,12 +192,12 @@ mod tests {
     fn generate_state_toml_output() {
         let mut sets = HashMap::new();
         sets.insert("system".to_string(), true);
-        sets.insert("ai".to_string(), true);
+        sets.insert("ai_code".to_string(), true);
         let mut langs = HashMap::new();
         langs.insert("go".to_string(), true);
         let toml = generate_state_toml(&sets, &langs, &HashMap::new());
         assert!(toml.contains("system = true"));
-        assert!(toml.contains("ai = true"));
+        assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("go = true"));
         assert!(toml.contains("network = false"));
     }

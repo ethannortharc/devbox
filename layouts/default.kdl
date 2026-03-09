@@ -1,16 +1,14 @@
-// Devbox — Default layout: Home Base
-// Tab 1: Editor + terminal + file browser (yazi)
-// Tab 2: Editor + terminal + help/guide + management
-// Tab 3: Plain shell
-// Tab 4: Git (lazygit)
+// Devbox — Default layout
+// Tab 1 [Workspace]: AI coding + AI brainstorm + file browser
+// Tab 2 [DevBox]:    Monitor + help + terminal + management TUI
+// Tab 3 [Shell]:     Plain terminal
+// Tab 4 [Git]:       lazygit
 layout {
     default_tab_template {
-        // Tab bar at TOP — so users see all tabs immediately
         pane size=1 borderless=true {
             plugin location="zellij:tab-bar"
         }
         children
-        // Shortcut bar at BOTTOM
         pane size=2 borderless=true {
             plugin location="zellij:status-bar"
         }
@@ -18,14 +16,17 @@ layout {
 
     tab name="  Workspace" focus=true cwd="/workspace" {
         pane split_direction="vertical" {
-            pane split_direction="horizontal" size="50%" {
-                pane name="editor" size="60%" {
-                    command "nvim"
-                    args "."
+            pane split_direction="horizontal" size="60%" {
+                pane name="ai-code" size="60%" focus=true {
+                    command "bash"
+                    args "-c" "[ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; HAS_CLAUDE=false; if command -v claude >/dev/null 2>&1; then if [ -f ~/.claude/.credentials.json ] || [ -n \"$ANTHROPIC_API_KEY\" ]; then HAS_CLAUDE=true; fi; fi; HAS_OPENCODE=false; if command -v opencode >/dev/null 2>&1; then if [ -f ~/.config/opencode/config.json ] || [ -n \"$OPENAI_API_KEY\" ]; then HAS_OPENCODE=true; fi; fi; HAS_CODEX=false; if command -v codex >/dev/null 2>&1; then if [ -f ~/.codex/auth.json ] || [ -f ~/.codex/config.json ] || [ -n \"$OPENAI_API_KEY\" ]; then HAS_CODEX=true; fi; fi; if $HAS_CLAUDE; then echo '  Starting claude-code...'; exec claude --dangerously-skip-permissions; elif $HAS_OPENCODE; then echo '  Starting opencode...'; exec opencode; elif $HAS_CODEX; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool with valid auth found.'; echo ''; echo '  To configure, set one of:'; echo '    export ANTHROPIC_API_KEY=sk-ant-...  (for claude-code)'; echo '    export OPENAI_API_KEY=sk-...         (for opencode/codex)'; echo '  Or configure on host and run: devbox reprovision'; echo ''; exec bash; fi"
                 }
-                pane name="terminal" size="40%" focus=true
+                pane name="ideas" size="40%" {
+                    command "bash"
+                    args "-c" "[ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if ! command -v aichat >/dev/null 2>&1; then echo '  aichat not available.'; echo '  Install with: devbox upgrade --tools ai-code'; exec bash; fi; if [ -f ~/.config/aichat/config.yaml ]; then exec aichat -r architect; else echo '  AI Brainstorming — First-time Setup'; echo ''; echo '  No aichat config found. Choose a provider:'; echo ''; echo '  1) Claude (Anthropic) — uses ANTHROPIC_API_KEY'; echo '  2) OpenAI (GPT)       — uses OPENAI_API_KEY'; echo '  3) Ollama (local)     — no key needed'; echo '  4) Custom             — run: aichat --list-models'; echo ''; read -p '  Choice [1-4]: ' choice; mkdir -p ~/.config/aichat; case $choice in 1) read -p '  ANTHROPIC_API_KEY: ' key; printf 'model: claude:claude-sonnet-4-20250514\\nclients:\\n- type: claude\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 2) read -p '  OPENAI_API_KEY: ' key; printf 'model: openai:gpt-4o\\nclients:\\n- type: openai\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 3) printf 'model: ollama:llama3.2\\n' > ~/.config/aichat/config.yaml ;; *) echo '  Run: aichat --list-models to see options'; exec bash ;; esac; echo '  Config saved. Starting aichat...'; exec aichat -r architect; fi"
+                }
             }
-            pane name="files" size="50%" {
+            pane name="files" size="40%" {
                 command "yazi"
                 args "/workspace"
             }
@@ -33,22 +34,22 @@ layout {
     }
 
     tab name="  DevBox" cwd="/workspace" {
-        pane split_direction="vertical" {
-            pane split_direction="horizontal" size="50%" {
-                pane name="editor" size="60%" {
-                    command "nvim"
-                    args "."
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" size="55%" {
+                pane name="monitor" size="50%" {
+                    command "bash"
+                    args "-c" "if command -v btm >/dev/null 2>&1; then exec btm --basic; elif command -v htop >/dev/null 2>&1; then exec htop; else exec top; fi"
                 }
-                pane name="terminal" size="40%"
-            }
-            pane split_direction="horizontal" size="50%" {
                 pane name="help" size="50%" {
                     command "bash"
-                    args "-c" "cd /workspace; echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null || echo 'devbox guide <tool>  — show cheat sheet'; fi; echo ''; echo '  Usage: devbox guide <tool>'; echo '  Example: devbox guide lazygit'; echo ''; echo '  Press any key to browse interactively...'; read -n1; exec bash -c 'while true; do echo \"\" && echo \"Available guides: devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie\" && echo \"\" && read -p \"guide> \" tool && if [ -z \"$tool\" ]; then break; fi && if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"No guide for: $tool\"; fi; done; exec bash'"
+                    args "-c" "echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null; fi; echo ''; echo '  Type a tool name to view its guide:'; echo ''; while true; do echo '  devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie'; echo ''; read -p '  guide> ' tool; if [ -z \"$tool\" ]; then continue; fi; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"  No guide for: $tool\"; fi; done"
                 }
+            }
+            pane split_direction="vertical" size="45%" {
+                pane name="terminal" size="50%"
                 pane name="management" size="50%" {
                     command "bash"
-                    args "-c" "clear; echo ''; echo '  ╔══════════════════════════════════════╗'; echo '  ║         DevBox Management            ║'; echo '  ╚══════════════════════════════════════╝'; echo ''; echo '  System:'; echo \"    OS:       $(uname -s) $(uname -m)\"; echo \"    Hostname: $(hostname)\"; echo \"    Kernel:   $(uname -r)\"; if command -v nix >/dev/null 2>&1; then echo \"    Nix:      $(nix --version 2>/dev/null)\"; fi; echo ''; echo '  Installed Sets:'; if [ -f /etc/devbox/devbox-state.toml ]; then grep '= true' /etc/devbox/devbox-state.toml | sed 's/^/    ● /' | sed 's/ = true//'; else echo '    (state file not found)'; fi; echo ''; echo '  Resources:'; echo \"    CPU:      $(nproc) cores\"; echo \"    Memory:   $(free -h 2>/dev/null | awk '/Mem:/{print $2}' || echo 'N/A')\"; echo \"    Disk:     $(df -h /workspace 2>/dev/null | awk 'NR==2{print $3\"/\"$2\" used\"}' || echo 'N/A')\"; echo ''; echo '  Commands:'; echo '    devbox packages       Toggle tool sets'; echo '    devbox upgrade --tools go   Add language'; echo '    devbox guide <tool>   Tool cheat sheet'; echo '    devbox diff           Show overlay changes'; echo '    devbox commit         Sync changes to host'; echo '    devbox snapshot save  Create checkpoint'; echo ''; exec bash"
+                    args "-c" "exec bash /etc/devbox/management.sh"
                 }
             }
         }

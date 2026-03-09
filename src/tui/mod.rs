@@ -12,24 +12,22 @@ pub struct LayoutDef {
 pub static LAYOUTS: &[LayoutDef] = &[
     LayoutDef {
         name: "default",
-        description: "Editor + terminal + files, with DevBox management tab",
+        description: "AI coding + AI brainstorm + files, DevBox dashboard",
         preview: r#"
 [Workspace] [DevBox] [Shell] [Git]     <- tab bar (top)
-+------------------+------------------+
-|  nvim .    60%   |                  |
-|  (editor)        |  yazi            |
-+------------------+  (files)   50%   |
-|  terminal  40%   |  bat/glow        |
-+------------------+------------------+
-       50%                50%
-<Ctrl+t> new pane  <Alt+n> new tab    <- shortcuts (bottom)
++----------------------+-------------+
+|  claude-code   60%   |             |
+|  (AI coding)         |  yazi       |
++----------------------+  (files)    |
+|  aichat        40%   |       40%   |
+|  (brainstorm)        |             |
++----------------------+-------------+
 
 Tab 2 [DevBox]:
 +------------------+------------------+
-|  nvim .    60%   |  help/guide 50%  |
-|  (editor)        +------------------+
-+------------------+  packages TUI    |
-|  terminal  40%   |           50%    |
+|  monitor (btm)   |  help/guide     |
++------------------+------------------+
+|  terminal        |  management TUI |
 +------------------+------------------+
 "#,
     },

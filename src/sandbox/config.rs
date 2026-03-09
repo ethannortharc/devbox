@@ -71,8 +71,10 @@ pub struct SetsSection {
     pub container: bool,
     #[serde(default)]
     pub network: bool,
+    #[serde(default = "yes")]
+    pub ai_code: bool,
     #[serde(default)]
-    pub ai: bool,
+    pub ai_infra: bool,
 }
 
 impl Default for SetsSection {
@@ -85,7 +87,8 @@ impl Default for SetsSection {
             git: true,
             container: true,
             network: false,
-            ai: false,
+            ai_code: true,
+            ai_infra: false,
         }
     }
 }
@@ -178,8 +181,9 @@ impl DevboxConfig {
 
     /// Apply --tools flags: adds to auto-detected languages and enables sets.
     /// Tools like "go", "rust", "python" enable language sets.
-    /// Tools like "claude-code", "aider" enable the "ai" set.
-    /// Tools like "network", "ai" enable the corresponding set directly.
+    /// Tools like "claude-code", "aider" enable the "ai-code" set.
+    /// Tools like "ollama", "mcp-hub" enable the "ai-infra" set.
+    /// "ai" enables both ai-code and ai-infra.
     pub fn apply_tools(&mut self, tools: &[String]) {
         for tool in tools {
             match tool.as_str() {
@@ -190,8 +194,15 @@ impl DevboxConfig {
                 "java" => self.languages.java = true,
                 "ruby" => self.languages.ruby = true,
                 "network" | "tailscale" | "mosh" => self.sets.network = true,
-                "ai" | "claude-code" | "claude" | "aider" | "codex" | "ollama" | "opencode" => {
-                    self.sets.ai = true;
+                "ai" => {
+                    self.sets.ai_code = true;
+                    self.sets.ai_infra = true;
+                }
+                "ai-code" | "coding" | "claude-code" | "claude" | "aider" | "codex" | "opencode" => {
+                    self.sets.ai_code = true;
+                }
+                "ai-infra" | "ollama" | "mcp-hub" | "litellm" | "open-webui" => {
+                    self.sets.ai_infra = true;
                 }
                 _ => {}
             }
@@ -210,7 +221,8 @@ impl DevboxConfig {
         if self.sets.git { sets.push("git".to_string()); }
         if self.sets.container { sets.push("container".to_string()); }
         if self.sets.network { sets.push("network".to_string()); }
-        if self.sets.ai { sets.push("ai".to_string()); }
+        if self.sets.ai_code { sets.push("ai-code".to_string()); }
+        if self.sets.ai_infra { sets.push("ai-infra".to_string()); }
         // Language sets
         if self.languages.go { sets.push("lang-go".to_string()); }
         if self.languages.rust { sets.push("lang-rust".to_string()); }
@@ -273,7 +285,8 @@ mod tests {
         assert!(config.sets.git);
         assert!(config.sets.container);
         assert!(!config.sets.network);
-        assert!(!config.sets.ai);
+        assert!(config.sets.ai_code);
+        assert!(!config.sets.ai_infra);
     }
 
     #[test]
@@ -288,9 +301,12 @@ mod tests {
     #[test]
     fn apply_tools_enables_ai_set() {
         let mut config = DevboxConfig::default();
-        assert!(!config.sets.ai);
+        assert!(!config.sets.ai_infra);
         config.apply_tools(&["claude-code".to_string()]);
-        assert!(config.sets.ai);
+        assert!(config.sets.ai_code);
+        // "ai" enables both
+        config.apply_tools(&["ai".to_string()]);
+        assert!(config.sets.ai_infra);
     }
 
     #[test]
@@ -312,12 +328,12 @@ mod tests {
 
         let mut config = DevboxConfig::default();
         config.languages.go = true;
-        config.sets.ai = true;
+        config.sets.ai_code = true;
         config.save(&path).unwrap();
 
         let loaded = DevboxConfig::load(&path).unwrap();
         assert!(loaded.languages.go);
-        assert!(loaded.sets.ai);
+        assert!(loaded.sets.ai_code);
         assert_eq!(loaded.sandbox.runtime, "auto");
     }
 }

@@ -283,6 +283,83 @@ impl Runtime for LimaRuntime {
         // Upgrade is handled by the Nix layer (nixos-rebuild), not the runtime
         Ok(())
     }
+
+    async fn update_mounts(&self, name: &str, mounts: &[super::Mount]) -> Result<()> {
+        let vm = Self::vm_name(name);
+
+        // 1. Stop the VM
+        println!("Stopping VM '{vm}'...");
+        let _ = run_cmd("limactl", &["stop", &vm]).await;
+
+        // 2. Read existing Lima YAML
+        let home = dirs::home_dir().unwrap_or_default();
+        let yaml_path = home.join(format!(".lima/{vm}/lima.yaml"));
+        let yaml_content = std::fs::read_to_string(&yaml_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read Lima config at {}: {}", yaml_path.display(), e))?;
+
+        // 3. Replace the mounts section in the YAML
+        let mut new_mounts_yaml = String::from("mounts:\n");
+        for m in mounts {
+            let host = m.host_path.display();
+            let target = &m.container_path;
+            let writable = if m.read_only { "false" } else { "true" };
+            new_mounts_yaml.push_str(&format!(
+                "  - location: \"{host}\"\n    mountPoint: \"{target}\"\n    writable: {writable}\n    9p:\n      cache: \"mmap\"\n"
+            ));
+        }
+        if mounts.is_empty() {
+            new_mounts_yaml.push_str("  - location: \"~\"\n    writable: false\n    9p:\n      cache: \"mmap\"\n  - location: \"/tmp/lima\"\n    writable: true\n    9p:\n      cache: \"mmap\"\n");
+        }
+
+        // Find and replace the mounts section
+        let updated = if let Some(mounts_start) = yaml_content.find("\nmounts:\n") {
+            let mounts_start = mounts_start + 1; // skip the leading newline
+            // Find the next top-level key (line starting with non-space, non-dash)
+            let rest = &yaml_content[mounts_start..];
+            let mounts_end = rest
+                .lines()
+                .skip(1) // skip "mounts:" line itself
+                .position(|line| {
+                    !line.is_empty() && !line.starts_with(' ') && !line.starts_with('-')
+                })
+                .map(|pos| {
+                    // Calculate byte offset
+                    let mut offset = 0;
+                    for (i, line) in rest.lines().enumerate() {
+                        if i == 0 {
+                            offset += line.len() + 1;
+                            continue;
+                        }
+                        if i - 1 == pos {
+                            break;
+                        }
+                        offset += line.len() + 1;
+                    }
+                    mounts_start + offset
+                })
+                .unwrap_or(yaml_content.len());
+
+            format!(
+                "{}{}{}",
+                &yaml_content[..mounts_start],
+                new_mounts_yaml,
+                &yaml_content[mounts_end..],
+            )
+        } else {
+            // No mounts section found, append it
+            format!("{}\n{}", yaml_content.trim_end(), new_mounts_yaml)
+        };
+
+        // 4. Write back
+        std::fs::write(&yaml_path, &updated)
+            .map_err(|e| anyhow::anyhow!("Failed to write Lima config: {}", e))?;
+
+        // 5. Start the VM
+        println!("Starting VM '{vm}'...");
+        run_ok("limactl", &["start", &vm]).await?;
+
+        Ok(())
+    }
 }
 
 fn chrono_now() -> String {

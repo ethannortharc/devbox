@@ -9,7 +9,8 @@
   git         = import ./git.nix { inherit pkgs; };
   container   = import ./container.nix { inherit pkgs; };
   network     = import ./network.nix { inherit pkgs; };
-  ai          = import ./ai.nix { inherit pkgs; };
+  ai_code     = import ./ai-code.nix { inherit pkgs; };
+  ai_infra    = import ./ai-infra.nix { inherit pkgs; };
   lang_go     = import ./lang-go.nix { inherit pkgs; };
   lang_rust   = import ./lang-rust.nix { inherit pkgs; };
   lang_python = import ./lang-python.nix { inherit pkgs; };

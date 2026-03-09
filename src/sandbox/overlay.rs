@@ -5,8 +5,11 @@ use crate::runtime::Runtime;
 /// OverlayFS paths inside the VM.
 #[allow(dead_code)]
 const WORKSPACE: &str = "/workspace";
-const UPPER: &str = "/workspace/upper";
-const LOWER: &str = "/workspace/lower";
+const UPPER: &str = "/var/devbox/overlay/upper";
+const LOWER: &str = "/mnt/host";
+#[allow(dead_code)]
+const WORK: &str = "/var/devbox/overlay/work";
+const STASH_DIR: &str = "/var/devbox/overlay/stash";
 
 /// List files changed in the overlay upper layer.
 /// Returns a list of (status, path) tuples.
@@ -70,6 +73,49 @@ pub async fn diff(
 
     // Filter out directories that only exist as containers for changed files
     // Keep only file entries and empty new directories
+    Ok(changes)
+}
+
+/// Show overlay status summary (like `git status`).
+/// Returns the list of changes for further processing.
+pub async fn status(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+) -> Result<Vec<OverlayChange>> {
+    let changes = diff(runtime, sandbox_name).await?;
+    let stashed = has_stash(runtime, sandbox_name).await?;
+
+    if changes.is_empty() && !stashed {
+        println!("Overlay is clean — no changes.");
+        return Ok(changes);
+    }
+
+    let files: Vec<&OverlayChange> = changes.iter().filter(|c| !c.is_dir).collect();
+    let added = files.iter().filter(|c| c.status == ChangeStatus::Added).count();
+    let modified = files.iter().filter(|c| c.status == ChangeStatus::Modified).count();
+    let deleted = files.iter().filter(|c| c.status == ChangeStatus::Deleted).count();
+
+    if !files.is_empty() {
+        println!("Overlay changes:");
+        for c in &files {
+            println!("  {} {}", c.status.symbol(), c.path);
+        }
+        println!();
+        println!(
+            "{} file(s): {} added, {} modified, {} deleted",
+            files.len(),
+            added,
+            modified,
+            deleted,
+        );
+    } else {
+        println!("No file changes in overlay.");
+    }
+
+    if stashed {
+        println!("\nStash: 1 stash saved (use `devbox layer stash-pop` to restore)");
+    }
+
     Ok(changes)
 }
 
@@ -246,6 +292,108 @@ pub async fn discard(
     }
 }
 
+/// Stash the current overlay upper layer (save and clear).
+/// Only one stash is supported at a time.
+pub async fn stash(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+) -> Result<()> {
+    if has_stash(runtime, sandbox_name).await? {
+        bail!("A stash already exists. Pop or discard it first (`devbox layer stash-pop`).");
+    }
+
+    // Move upper to stash
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "mv", UPPER, STASH_DIR],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to stash overlay: {}", result.stderr.trim());
+    }
+
+    // Recreate empty upper directory
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "mkdir", "-p", UPPER],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to recreate upper directory: {}", result.stderr.trim());
+    }
+
+    println!("Overlay changes stashed.");
+    Ok(())
+}
+
+/// Restore a previously stashed overlay upper layer.
+pub async fn stash_pop(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+) -> Result<()> {
+    if !has_stash(runtime, sandbox_name).await? {
+        bail!("No stash found. Nothing to pop.");
+    }
+
+    // Merge stash back into upper (copy hidden and regular files)
+    let merge_cmd = format!(
+        "cp -a {STASH_DIR}/* {UPPER}/ 2>/dev/null; cp -a {STASH_DIR}/.[!.]* {UPPER}/ 2>/dev/null; true"
+    );
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "bash", "-c", &merge_cmd],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to restore stash: {}", result.stderr.trim());
+    }
+
+    // Remove the stash directory
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "rm", "-rf", STASH_DIR],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to clean up stash: {}", result.stderr.trim());
+    }
+
+    println!("Stash restored to overlay.");
+    Ok(())
+}
+
+/// Check if a stash exists and is non-empty.
+pub async fn has_stash(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+) -> Result<bool> {
+    // Check if stash directory exists and has contents
+    let check_cmd = format!(
+        "test -d {STASH_DIR} && [ \"$(ls -A {STASH_DIR} 2>/dev/null)\" ]"
+    );
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["bash", "-c", &check_cmd],
+            false,
+        )
+        .await?;
+
+    Ok(result.exit_code == 0)
+}
+
 /// A change detected in the overlay upper layer.
 #[derive(Debug, Clone)]
 pub struct OverlayChange {
@@ -270,5 +418,4 @@ impl ChangeStatus {
             Self::Deleted => "\x1b[31m-\x1b[0m",
         }
     }
-
 }

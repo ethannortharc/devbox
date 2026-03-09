@@ -237,6 +237,10 @@ impl Runtime for IncusRuntime {
     async fn upgrade(&self, _name: &str, _tools: &[String]) -> Result<()> {
         todo!("Phase 5: Incus upgrade")
     }
+
+    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<()> {
+        bail!("Updating mounts is not supported for the Incus runtime")
+    }
 }
 
 fn chrono_now() -> String {

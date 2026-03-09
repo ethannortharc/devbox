@@ -85,7 +85,8 @@ fn generate_commented_toml(
     s.push_str(&format!("git = {}\n", config.sets.git));
     s.push_str(&format!("container = {}\n", config.sets.container));
     s.push_str(&format!("network = {}\n", config.sets.network));
-    s.push_str(&format!("ai = {}\n", config.sets.ai));
+    s.push_str(&format!("ai_code = {}\n", config.sets.ai_code));
+    s.push_str(&format!("ai_infra = {}\n", config.sets.ai_infra));
     s.push('\n');
 
     // [languages]

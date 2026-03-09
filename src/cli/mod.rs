@@ -18,6 +18,8 @@ pub mod commit;
 pub mod diff;
 pub mod discard;
 pub mod help;
+pub mod layer;
+pub mod use_cmd;
 pub mod reprovision;
 pub mod self_update;
 
@@ -128,6 +130,13 @@ pub enum Command {
 
     /// Update devbox to the latest version
     SelfUpdate(self_update::SelfUpdateArgs),
+
+    /// Manage overlay layer (status, diff, commit, stash, ...)
+    Layer(layer::LayerArgs),
+
+    /// Switch sandbox to use current directory
+    #[command(name = "use")]
+    Use(use_cmd::UseArgs),
 }
 
 impl Command {
@@ -155,6 +164,8 @@ impl Command {
             Command::Guide(args) => help::run(args, manager).await,
             Command::Reprovision(args) => reprovision::run(args, manager).await,
             Command::SelfUpdate(args) => self_update::run(args, manager).await,
+            Command::Layer(args) => layer::run(args, manager).await,
+            Command::Use(args) => use_cmd::run(args, manager).await,
         }
     }
 }

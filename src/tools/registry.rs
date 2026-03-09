@@ -18,14 +18,14 @@ pub static TOOL_SETS: &[ToolSet] = &[
     },
     ToolSet {
         name: "shell",
-        description: "Terminal & Shell (zellij, zsh, starship, fzf, yazi...)",
-        package_count: 10,
+        description: "Terminal & Shell (zellij, zsh, starship, fzf, yazi, micro...)",
+        package_count: 11,
         locked: true,
     },
     ToolSet {
         name: "tools",
-        description: "Modern CLI (ripgrep, fd, bat, eza, delta, jq, htop...)",
-        package_count: 21,
+        description: "Modern CLI (ripgrep, fd, bat, eza, delta, jq, htop, btm...)",
+        package_count: 22,
         locked: true,
     },
     ToolSet {
@@ -53,9 +53,15 @@ pub static TOOL_SETS: &[ToolSet] = &[
         locked: false,
     },
     ToolSet {
-        name: "ai",
-        description: "AI Engines & MCP (claude-code, aider, ollama, codex...)",
-        package_count: 10,
+        name: "ai-code",
+        description: "AI Coding (claude-code, aichat, codex, opencode, aider...)",
+        package_count: 6,
+        locked: false,
+    },
+    ToolSet {
+        name: "ai-infra",
+        description: "AI Infra (ollama, open-webui, litellm, mcp-hub...)",
+        package_count: 5,
         locked: false,
     },
     ToolSet {
