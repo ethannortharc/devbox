@@ -12,6 +12,12 @@ devbox
 
 That's it. Devbox detects your project type, provisions a NixOS VM with the right tools, and drops you into a ready-to-code workspace -- isolated from your host, safe by default.
 
+### Default Workspace Layout
+
+![Default Workspace](docs/screenshot-workspace.png)
+
+Four tabs, ready to go: **Workspace** (AI coding + brainstorm + file browser), **DevBox** (monitor + help + management), **Shell** (plain terminal), and **Git** (lazygit).
+
 ## Why Devbox
 
 | Problem | Devbox Solution |
