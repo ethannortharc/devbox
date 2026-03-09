@@ -456,6 +456,21 @@ export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
         runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
     }
 
+    // Also create .profile for bash login shells (used by layout panes with bash -lc)
+    let profile_path = format!("/home/{username}/.profile");
+    let profile_check = runtime
+        .exec_cmd(name, &["test", "-f", &profile_path], false)
+        .await?;
+    if profile_check.exit_code != 0 {
+        let profile = r#"# Devbox bash profile
+# Latest tools first (official installers take precedence over nixpkgs)
+export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+"#;
+        write_file_to_vm(runtime, name, &profile_path, profile).await?;
+        let chown_cmd = format!("chown {username}:{username} {profile_path}");
+        runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
+    }
+
     Ok(())
 }
 
@@ -969,16 +984,26 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
         }
     }
 
-    // Ensure ~/.local/bin is at front of PATH in .zshrc so latest claude
-    // takes precedence over the nixpkgs system version
+    // Ensure ~/.local/bin is at front of PATH in both .zshrc and .profile
+    // so latest claude takes precedence over the nixpkgs system version.
+    // .profile is needed because layout panes use `bash -lc` (not zsh).
     let path_line = r#"export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
-    let add_path_cmd = format!(
-        "grep -qF '.local/bin' /home/{username}/.zshrc 2>/dev/null || \
-         sed -i '1i\\{path_line}' /home/{username}/.zshrc 2>/dev/null || \
-         echo '{path_line}' >> /home/{username}/.zshrc"
+    for rc_file in &[".zshrc", ".profile"] {
+        let rc_path = format!("/home/{username}/{rc_file}");
+        let add_path_cmd = format!(
+            "grep -qF '.local/bin' {rc_path} 2>/dev/null || \
+             echo '{path_line}' >> {rc_path}"
+        );
+        let _ = runtime
+            .exec_cmd(name, &["bash", "-c", &add_path_cmd], false)
+            .await;
+    }
+    // Fix ownership
+    let chown_cmd = format!(
+        "chown {username}:{username} /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
     );
     let _ = runtime
-        .exec_cmd(name, &["bash", "-c", &add_path_cmd], false)
+        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
         .await;
 }
 
