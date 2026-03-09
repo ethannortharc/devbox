@@ -963,20 +963,24 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
 
     // Install via npm with a writable global prefix.
     // On NixOS, npm may not be in PATH (claude-code nix pkg bundles its own node
-    // but doesn't expose npm). Install nodejs to user profile first if needed.
+    // but doesn't expose npm). Use nix-env (stable, no experimental features needed)
+    // to install nodejs to user profile first if needed.
     let install_cmd = concat!(
-        "set -e; ",
         "export PATH=\"$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; ",
         "export NPM_CONFIG_PREFIX=\"$HOME/.npm-global\"; ",
         "mkdir -p \"$HOME/.npm-global\"; ",
         "if ! command -v npm >/dev/null 2>&1; then ",
-        "echo 'npm not found, installing nodejs...'; ",
-        "nix profile install nixpkgs#nodejs_22 2>&1 | tail -3; ",
+        "echo 'npm not found, installing nodejs via nix-env...'; ",
+        "nix-env -iA nixos.nodejs_22 2>&1; ",
         "export PATH=\"$HOME/.nix-profile/bin:$PATH\"; ",
         "fi; ",
-        "echo \"Using npm: $(which npm)\"; ",
+        "echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; ",
+        "if command -v npm >/dev/null 2>&1; then ",
         "npm install -g @anthropic-ai/claude-code@latest 2>&1; ",
-        "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\""
+        "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; ",
+        "else ",
+        "echo 'ERROR: npm still not available after nix-env install'; ",
+        "fi"
     );
     let result = runtime
         .exec_cmd(name, &["bash", "-lc", install_cmd], true)
