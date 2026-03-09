@@ -236,7 +236,7 @@ Devbox organizes 90+ tools into toggleable sets declared as NixOS packages. See 
 
 | Set | Packages |
 |-----|----------|
-| **ai-code** (on by default) | claude-code, codex, opencode, aider-chat, aichat, continue |
+| **ai-code** (on by default) | claude-code, codex, opencode, aider-chat, aichat |
 | **ai-infra** (off by default) | ollama, open-webui, litellm, mcp-hub, huggingface-hub |
 
 ### Optional sets (off by default)

@@ -56,7 +56,7 @@ pub static NIX_SETS: &[NixSet] = &[
     NixSet {
         name: "ai-code",
         packages: &[
-            "claude-code", "codex", "opencode", "aider-chat", "aichat", "continue",
+            "claude-code", "codex", "opencode", "aider-chat", "aichat",
         ],
     },
     NixSet {

@@ -7,5 +7,4 @@ with pkgs;
   opencode
   aider-chat
   aichat
-  continue
 ]

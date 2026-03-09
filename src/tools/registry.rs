@@ -55,7 +55,7 @@ pub static TOOL_SETS: &[ToolSet] = &[
     ToolSet {
         name: "ai-code",
         description: "AI Coding (claude-code, aichat, codex, opencode, aider...)",
-        package_count: 6,
+        package_count: 5,
         locked: false,
     },
     ToolSet {
