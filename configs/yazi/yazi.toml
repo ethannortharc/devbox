@@ -45,9 +45,9 @@ open = [
 ]
 
 [open]
-rules = [
+prepend_rules = [
   # Markdown — render with glow on Enter, then edit option
-  # Name rules first (MIME detection may classify .md as text/plain)
+  # prepend_rules ensures these match before any built-in or text/* rules
   { name = "*.md",             use = ["view-markdown", "edit"] },
   { name = "*.mdx",            use = ["view-markdown", "edit"] },
   { name = "README",           use = ["view-markdown", "edit"] },
@@ -55,7 +55,9 @@ rules = [
 
   # Git directory — open lazygit
   { name = ".git/",            use = ["lazygit"] },
+]
 
+rules = [
   # Code and text — edit with nvim (first = default on Enter)
   { mime = "text/*",           use = ["edit", "view"] },
   { mime = "*/json",           use = ["edit", "view"] },
