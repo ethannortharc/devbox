@@ -127,27 +127,23 @@ layout {{
             let state = manager.get_sandbox(&sb_name)?;
             let runtime = manager.runtime_for_sandbox(&state)?;
 
-            // Use $HOME inside the VM to get the correct path
-            let save_cmd = concat!(
-                "d=\"$HOME/.config/devbox\"; ",
-                "mkdir -p \"$d\" && ",
-                "zellij action dump-layout > \"$d/saved-layout.kdl\" 2>/dev/null && ",
-                "echo OK || echo FAIL"
+            // Save the current layout name as a preference (not raw dump-layout output,
+            // which doesn't preserve command directives)
+            let layout_name = &state.layout;
+            let save_cmd = format!(
+                "d=\"$HOME/.config/devbox\"; mkdir -p \"$d\" && echo '{}' > \"$d/layout-preference\" && echo OK",
+                layout_name
             );
             let result = runtime
-                .exec_cmd(&sb_name, &["bash", "-c", save_cmd], false)
+                .exec_cmd(&sb_name, &["bash", "-c", &save_cmd], false)
                 .await?;
 
             if !result.stdout.trim().contains("OK") {
-                anyhow::bail!(
-                    "Failed to save layout. Is Zellij running in '{}'?\n\
-                     Tip: Run this from inside the devbox, or attach first with `devbox shell`.",
-                    sb_name
-                );
+                anyhow::bail!("Failed to save layout preference for '{}'.", sb_name);
             }
 
-            println!("Layout saved for sandbox '{sb_name}'.");
-            println!("Next login will use the saved layout automatically.");
+            println!("Layout preference saved for sandbox '{sb_name}': {layout_name}");
+            println!("Next login will use this layout automatically.");
             println!("To reset: devbox layout reset --name {sb_name}");
             Ok(())
         }
@@ -156,28 +152,16 @@ layout {{
             let state = manager.get_sandbox(&sb_name)?;
             let runtime = manager.runtime_for_sandbox(&state)?;
 
-            // Use $HOME inside the VM
-            let check_cmd = "f=\"$HOME/.config/devbox/saved-layout.kdl\"; [ -f \"$f\" ] && echo EXISTS";
-            let check = runtime
-                .exec_cmd(&sb_name, &["bash", "-c", check_cmd], false)
-                .await;
-            let exists = check.is_ok() && check.unwrap().stdout.trim().contains("EXISTS");
-
-            if !exists {
-                println!("No saved layout found for sandbox '{sb_name}'. Already using built-in layout.");
-                return Ok(());
-            }
-
-            // Remove saved layout
+            // Remove both old saved-layout.kdl and new layout-preference file
             runtime
                 .exec_cmd(
                     &sb_name,
-                    &["bash", "-c", "rm -f \"$HOME/.config/devbox/saved-layout.kdl\""],
+                    &["bash", "-c", "rm -f \"$HOME/.config/devbox/saved-layout.kdl\" \"$HOME/.config/devbox/layout-preference\""],
                     false,
                 )
                 .await?;
 
-            println!("Saved layout removed for sandbox '{sb_name}'.");
+            println!("Layout preference removed for sandbox '{sb_name}'.");
             println!("Next login will use the built-in '{}' layout.", state.layout);
             Ok(())
         }

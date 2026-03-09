@@ -392,7 +392,9 @@ fn generate_state_toml(sets: &[String], languages: &[String], username: &str) ->
 
     toml.push_str("[sets]\n");
     for s in &set_names {
-        let enabled = sets.iter().any(|active| active == s);
+        // Normalize: active sets use hyphens ("ai-code") but TOML keys use underscores ("ai_code")
+        let hyphenated = s.replace('_', "-");
+        let enabled = sets.iter().any(|active| active == s || active == &hyphenated);
         toml.push_str(&format!("{s} = {enabled}\n"));
     }
 
@@ -956,6 +958,22 @@ mod tests {
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
+    }
+
+    #[test]
+    fn generate_state_toml_hyphenated_sets() {
+        // active_sets() returns "ai-code" (hyphen), must match "ai_code" (underscore) in TOML
+        let sets = vec![
+            "system".to_string(),
+            "shell".to_string(),
+            "tools".to_string(),
+            "ai-code".to_string(),
+        ];
+        let langs = vec![];
+        let toml = generate_state_toml(&sets, &langs, "dev");
+
+        assert!(toml.contains("ai_code = true"));
+        assert!(toml.contains("ai_infra = false"));
     }
 
     #[test]

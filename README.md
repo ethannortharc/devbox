@@ -127,12 +127,25 @@ cp host-configs/ghostty/config ~/.config/ghostty/config
 | `devbox shell` | Attach to a sandbox |
 | `devbox exec <cmd>` | Run a one-off command |
 | `devbox stop` | Stop a sandbox |
-| `devbox destroy` | Remove a sandbox |
+| `devbox destroy` | Remove a sandbox (warns on uncommitted changes) |
 | `devbox list` | List all sandboxes |
 | `devbox status` | Show detailed status |
+| `devbox use <path>` | Remount a different directory into sandbox |
 | `devbox upgrade --tools go` | Add tools to a running sandbox |
 | `devbox packages` | Open TUI package manager |
+| `devbox layer status` | Show overlay changes summary |
+| `devbox layer diff` | Diff overlay changes vs host |
+| `devbox layer commit` | Sync overlay changes to host |
+| `devbox layer discard` | Throw away overlay changes |
+| `devbox layer stash` | Stash current overlay changes |
+| `devbox layer stash-pop` | Restore stashed changes |
 | `devbox layout list` | Show available layouts |
+| `devbox layout preview <name>` | ASCII preview of a layout |
+| `devbox layout save` | Save layout preference for sandbox |
+| `devbox layout reset` | Reset to built-in default layout |
+| `devbox layout create <name>` | Create a custom layout from template |
+| `devbox layout edit <name>` | Edit a layout in $EDITOR |
+| `devbox layout set-default <name>` | Set global default layout |
 | `devbox diff` | Show overlay changes vs host |
 | `devbox commit` | Sync overlay changes to host |
 | `devbox discard` | Throw away overlay changes |
@@ -168,7 +181,8 @@ editor = true               # neovim, helix, nano
 git = true                  # git, lazygit, gh
 container = true            # docker, compose, lazydocker
 network = false             # tailscale, mosh, nmap
-ai = false                  # claude-code, aider, ollama
+ai_code = true              # claude-code, codex, opencode, aichat, aider
+ai_infra = false            # ollama, open-webui, litellm
 
 [languages]
 go = true                   # auto-detected from go.mod
@@ -218,12 +232,18 @@ Devbox organizes 90+ tools into toggleable sets declared as NixOS packages. See 
 | **git** | git, lazygit, gh, git-lfs, git-crypt, pre-commit |
 | **container** | docker, docker-compose, lazydocker, dive, buildkit, skopeo |
 
+### AI sets
+
+| Set | Packages |
+|-----|----------|
+| **ai-code** (on by default) | claude-code, codex, opencode, aider-chat, aichat, continue |
+| **ai-infra** (off by default) | ollama, open-webui, litellm, mcp-hub, huggingface-hub |
+
 ### Optional sets (off by default)
 
 | Set | Packages |
 |-----|----------|
 | **network** | tailscale, mosh, nmap, tcpdump, bandwhich, trippy, doggo |
-| **ai** | claude-code, aider, ollama, open-webui, codex, huggingface-hub, and more (10 packages) |
 
 ### Language sets (enabled by detection or `--tools` flag)
 

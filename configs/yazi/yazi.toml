@@ -32,7 +32,7 @@ view = [
   { run = 'bat --paging=always --style=full "$@"', block = true, desc = "View with bat" },
 ]
 view-markdown = [
-  { run = 'glow -p "$@"', block = true, desc = "Render markdown" },
+  { run = 'glow -p -w $COLUMNS "$@"', block = true, desc = "Render markdown" },
 ]
 lazygit = [
   { run = 'lazygit', block = true, desc = "Open lazygit" },
@@ -46,10 +46,12 @@ open = [
 
 [open]
 rules = [
-  # Markdown — render with glow first, then edit
-  { mime = "text/markdown",    use = ["view-markdown", "edit"] },
+  # Markdown — render with glow on Enter, then edit option
+  # Name rules first (MIME detection may classify .md as text/plain)
   { name = "*.md",             use = ["view-markdown", "edit"] },
   { name = "*.mdx",            use = ["view-markdown", "edit"] },
+  { name = "README",           use = ["view-markdown", "edit"] },
+  { mime = "text/markdown",    use = ["view-markdown", "edit"] },
 
   # Git directory — open lazygit
   { name = ".git/",            use = ["lazygit"] },

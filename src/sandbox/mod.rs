@@ -223,45 +223,42 @@ impl SandboxManager {
             return Ok(());
         }
 
-        // Check for saved layout in VM (user customized via `devbox layout save`)
-        // Priority: CLI --layout flag > saved layout in VM > state default > built-in default
+        // Check for layout preference in VM (user set via management panel or `devbox layout save`)
+        // Priority: CLI --layout flag > layout preference in VM > state default > built-in default
         // Use $HOME inside the VM to resolve the correct path regardless of username.
-        let saved_layout_check = if layout_override.is_some() {
+        let layout_pref = if layout_override.is_some() {
             // Explicit --layout flag always wins
             None
         } else {
-            // Ask the VM for the actual path and check if it exists
+            // Check for layout preference file (contains layout name, not raw KDL)
             let check = runtime
                 .exec_cmd(
                     name,
-                    &["bash", "-c", "f=\"$HOME/.config/devbox/saved-layout.kdl\"; [ -f \"$f\" ] && echo \"$f\""],
+                    &["bash", "-c", "f=\"$HOME/.config/devbox/layout-preference\"; [ -f \"$f\" ] && cat \"$f\""],
                     false,
                 )
                 .await;
             match check {
                 Ok(ref r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-                    Some(r.stdout.trim().to_string())
+                    let pref = r.stdout.trim().to_string();
+                    if !pref.is_empty() { Some(pref) } else { None }
                 }
                 _ => None,
             }
         };
 
-        if let Some(saved_path) = saved_layout_check {
-            println!("Attaching to sandbox '{name}' (saved layout)...");
-            runtime
-                .exec_cmd(name, &["zellij", "--layout", &saved_path], true)
-                .await?;
-        } else {
-            // Push built-in layout KDL into the VM and launch Zellij
-            let layout_content = crate::tui::lookup_layout_kdl(&layout);
-            Self::push_layout_to_vm(runtime.as_ref(), name, &layout, layout_content).await?;
+        // Use preference as the layout name, falling back to state/default
+        let effective_layout = layout_pref.unwrap_or(layout);
 
-            let layout_path = format!("/tmp/devbox-layout-{layout}.kdl");
-            println!("Attaching to sandbox '{name}' (layout: {layout})...");
-            runtime
-                .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
-                .await?;
-        }
+        // Always use the template layout (with command directives) — never raw dump-layout
+        let layout_content = crate::tui::lookup_layout_kdl(&effective_layout);
+        Self::push_layout_to_vm(runtime.as_ref(), name, &effective_layout, layout_content).await?;
+
+        let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
+        println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
+        runtime
+            .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
+            .await?;
         Ok(())
     }
 

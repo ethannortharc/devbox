@@ -3,6 +3,7 @@
 set -e
 
 SAVED_LAYOUT="$HOME/.config/devbox/saved-layout.kdl"
+LAYOUT_PREF="$HOME/.config/devbox/layout-preference"
 OVERLAY_UPPER="/var/devbox/overlay/upper"
 OVERLAY_STASH="/var/devbox/overlay/stash"
 LOWER="/mnt/host"
@@ -270,12 +271,33 @@ do_layer_stash_pop() {
 
 do_layout_save() {
     echo ""
-    mkdir -p "$(dirname "$SAVED_LAYOUT")"
-    if zellij action dump-layout > "$SAVED_LAYOUT" 2>/dev/null; then
-        echo "  Layout saved. Will be used on next login."
+    echo "  Available layouts:"
+    # List layout files from /tmp/devbox-layout-*.kdl
+    local layouts=()
+    for f in /tmp/devbox-layout-*.kdl; do
+        [ -f "$f" ] || continue
+        local lname="${f##*devbox-layout-}"
+        lname="${lname%.kdl}"
+        layouts+=("$lname")
+        echo "    - $lname"
+    done
+    if [ ${#layouts[@]} -eq 0 ]; then
+        echo "    (none found)"
+        echo ""
+        read -p "  Press Enter to continue..." _
+        return
+    fi
+    echo ""
+    read -p "  Enter layout name to save as default (or Enter to cancel): " choice
+    if [ -z "$choice" ]; then
+        echo "  Cancelled."
     else
-        echo "  Failed to save layout. Is Zellij running?"
+        mkdir -p "$(dirname "$LAYOUT_PREF")"
+        echo "$choice" > "$LAYOUT_PREF"
+        # Also keep the old file for backwards compat
         rm -f "$SAVED_LAYOUT"
+        echo "  Layout preference saved: $choice"
+        echo "  Next login will use this layout."
     fi
     echo ""
     read -p "  Press Enter to continue..." _
@@ -283,12 +305,8 @@ do_layout_save() {
 
 do_layout_reset() {
     echo ""
-    if [ -f "$SAVED_LAYOUT" ]; then
-        rm -f "$SAVED_LAYOUT"
-        echo "  Saved layout removed. Next login uses built-in default."
-    else
-        echo "  No saved layout found. Already using built-in default."
-    fi
+    rm -f "$SAVED_LAYOUT" "$LAYOUT_PREF"
+    echo "  Layout preference removed. Next login uses built-in default."
     echo ""
     read -p "  Press Enter to continue..." _
 }
