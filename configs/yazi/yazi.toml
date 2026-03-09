@@ -14,6 +14,13 @@ show_symlink   = true
 max_width  = 1000
 max_height = 1000
 
+[plugin]
+prepend_previewers = [
+  { mime = "text/markdown", run = "glow" },
+  { name = "*.md",         run = "glow" },
+  { name = "*.mdx",        run = "glow" },
+]
+
 [opener]
 edit = [
   { run = 'nvim "$@"', block = true, desc = "Neovim" },

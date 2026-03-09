@@ -127,28 +127,18 @@ layout {{
             let state = manager.get_sandbox(&sb_name)?;
             let runtime = manager.runtime_for_sandbox(&state)?;
 
-            let username = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_else(|_| "dev".to_string());
-            let config_dir = format!("/home/{username}/.config/devbox");
-            let save_path = format!("{config_dir}/saved-layout.kdl");
-
-            // Create config dir
-            runtime
-                .exec_cmd(&sb_name, &["sudo", "mkdir", "-p", &config_dir], false)
-                .await?;
-            let chown = format!("chown -R {username}:{username} {config_dir}");
-            runtime
-                .exec_cmd(&sb_name, &["sudo", "bash", "-c", &chown], false)
-                .await?;
-
-            // Dump current zellij layout
-            let dump_cmd = format!("zellij action dump-layout > {save_path}");
+            // Use $HOME inside the VM to get the correct path
+            let save_cmd = concat!(
+                "d=\"$HOME/.config/devbox\"; ",
+                "mkdir -p \"$d\" && ",
+                "zellij action dump-layout > \"$d/saved-layout.kdl\" 2>/dev/null && ",
+                "echo OK || echo FAIL"
+            );
             let result = runtime
-                .exec_cmd(&sb_name, &["bash", "-c", &dump_cmd], false)
+                .exec_cmd(&sb_name, &["bash", "-c", save_cmd], false)
                 .await?;
 
-            if result.exit_code != 0 {
+            if !result.stdout.trim().contains("OK") {
                 anyhow::bail!(
                     "Failed to save layout. Is Zellij running in '{}'?\n\
                      Tip: Run this from inside the devbox, or attach first with `devbox shell`.",
@@ -166,23 +156,25 @@ layout {{
             let state = manager.get_sandbox(&sb_name)?;
             let runtime = manager.runtime_for_sandbox(&state)?;
 
-            let username = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_else(|_| "dev".to_string());
-            let save_path = format!("/home/{username}/.config/devbox/saved-layout.kdl");
-
-            // Check if saved layout exists
+            // Use $HOME inside the VM
+            let check_cmd = "f=\"$HOME/.config/devbox/saved-layout.kdl\"; [ -f \"$f\" ] && echo EXISTS";
             let check = runtime
-                .exec_cmd(&sb_name, &["test", "-f", &save_path], false)
+                .exec_cmd(&sb_name, &["bash", "-c", check_cmd], false)
                 .await;
-            if check.is_err() || check.unwrap().exit_code != 0 {
+            let exists = check.is_ok() && check.unwrap().stdout.trim().contains("EXISTS");
+
+            if !exists {
                 println!("No saved layout found for sandbox '{sb_name}'. Already using built-in layout.");
                 return Ok(());
             }
 
             // Remove saved layout
             runtime
-                .exec_cmd(&sb_name, &["rm", "-f", &save_path], false)
+                .exec_cmd(
+                    &sb_name,
+                    &["bash", "-c", "rm -f \"$HOME/.config/devbox/saved-layout.kdl\""],
+                    false,
+                )
                 .await?;
 
             println!("Saved layout removed for sandbox '{sb_name}'.");

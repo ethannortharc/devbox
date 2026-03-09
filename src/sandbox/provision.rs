@@ -35,6 +35,7 @@ const YAZI_CONFIG: &str = include_str!("../../configs/yazi/yazi.toml");
 const YAZI_KEYMAP: &str = include_str!("../../configs/yazi/keymap.toml");
 const YAZI_THEME: &str = include_str!("../../configs/yazi/theme.toml");
 const YAZI_INIT: &str = include_str!("../../configs/yazi/init.lua");
+const YAZI_GLOW_PLUGIN: &str = include_str!("../../configs/yazi/plugin/glow.yazi/init.lua");
 const AICHAT_ROLES: &str = include_str!("../../configs/aichat/roles.yaml");
 const MANAGEMENT_SCRIPT: &str = include_str!("../../configs/management.sh");
 
@@ -787,6 +788,13 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         let path = format!("{config_dir}/{filename}");
         write_file_to_vm(runtime, name, &path, content).await?;
     }
+
+    // Write glow previewer plugin
+    let plugin_dir = format!("{config_dir}/plugins/glow.yazi");
+    runtime
+        .exec_cmd(name, &["sudo", "mkdir", "-p", &plugin_dir], false)
+        .await?;
+    write_file_to_vm(runtime, name, &format!("{plugin_dir}/init.lua"), YAZI_GLOW_PLUGIN).await?;
 
     // Fix ownership
     let chown_cmd = format!("chown -R {username}:{username} /home/{username}/.config/yazi");

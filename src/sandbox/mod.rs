@@ -225,26 +225,31 @@ impl SandboxManager {
 
         // Check for saved layout in VM (user customized via `devbox layout save`)
         // Priority: CLI --layout flag > saved layout in VM > state default > built-in default
-        let username = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .unwrap_or_else(|_| "dev".to_string());
-        let saved_layout_path = format!("/home/{username}/.config/devbox/saved-layout.kdl");
-
-        let use_saved = if layout_override.is_some() {
+        // Use $HOME inside the VM to resolve the correct path regardless of username.
+        let saved_layout_check = if layout_override.is_some() {
             // Explicit --layout flag always wins
-            false
+            None
         } else {
-            // Check if saved layout exists in VM
+            // Ask the VM for the actual path and check if it exists
             let check = runtime
-                .exec_cmd(name, &["test", "-f", &saved_layout_path], false)
+                .exec_cmd(
+                    name,
+                    &["bash", "-c", "f=\"$HOME/.config/devbox/saved-layout.kdl\"; [ -f \"$f\" ] && echo \"$f\""],
+                    false,
+                )
                 .await;
-            check.is_ok() && check.unwrap().exit_code == 0
+            match check {
+                Ok(ref r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
+                    Some(r.stdout.trim().to_string())
+                }
+                _ => None,
+            }
         };
 
-        if use_saved {
+        if let Some(saved_path) = saved_layout_check {
             println!("Attaching to sandbox '{name}' (saved layout)...");
             runtime
-                .exec_cmd(name, &["zellij", "--layout", &saved_layout_path], true)
+                .exec_cmd(name, &["zellij", "--layout", &saved_path], true)
                 .await?;
         } else {
             // Push built-in layout KDL into the VM and launch Zellij
