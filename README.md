@@ -200,7 +200,7 @@ devbox snapshot restore <id>     # Roll back to a snapshot
 
 ## Tool Catalog
 
-Devbox ships with [**90+ tools**](#core-sets-always-installed) organized into toggleable sets. All packages come from [nixpkgs](https://search.nixos.org/packages), the largest and most up-to-date package repository.
+Devbox ships with [**90+ tools**](docs/PACKAGES.md) organized into toggleable sets. All packages come from [nixpkgs](https://search.nixos.org/packages), the largest and most up-to-date package repository. See the [full package reference](docs/PACKAGES.md) for detailed descriptions of every tool.
 
 ### Core Sets (always installed)
 
