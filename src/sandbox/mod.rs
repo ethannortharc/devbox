@@ -262,33 +262,39 @@ impl SandboxManager {
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
         let session_name = format!("devbox-{name}");
 
-        if force_new_session {
-            // Kill existing session so we can start fresh with new layout
-            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
+        // Check session state: alive, dead, or not found
+        // `zellij list-sessions` marks dead sessions with "(EXITED ...)"
+        let list_cmd = format!(
+            "zellij list-sessions 2>/dev/null | grep '^{session_name}'"
+        );
+        let session_line = runtime
+            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
+            .await
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().to_string())
+            .unwrap_or_default();
+
+        let session_alive = !session_line.is_empty() && !session_line.contains("EXITED");
+        let session_dead = !session_line.is_empty() && session_line.contains("EXITED");
+
+        // Clean up dead sessions or force-kill for restart
+        if session_dead || (session_alive && force_new_session) {
+            let delete_cmd = format!("zellij delete-session {session_name} 2>/dev/null; zellij kill-session {session_name} 2>/dev/null; true");
             let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
+                .exec_cmd(name, &["bash", "-c", &delete_cmd], false)
                 .await;
         }
 
-        // Check if a zellij session already exists
-        let list_cmd = format!(
-            "zellij list-sessions 2>/dev/null | grep -q '^{session_name}'"
-        );
-        let session_exists = runtime
-            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
-            .await
-            .map(|r| r.exit_code == 0)
-            .unwrap_or(false);
-
-        if session_exists {
-            // Reattach to existing session
+        if session_alive && !force_new_session {
+            // Reattach to existing live session
             println!("Reattaching to sandbox '{name}'...");
             runtime
                 .exec_cmd(name, &["zellij", "attach", &session_name], true)
                 .await?;
         } else {
             // Create new named session with layout.
-            // We write a small zellij config that sets the session name,
+            // Write a zellij config that sets the session name,
             // then launch with the layout file.
             let config_content = format!("session_name \"{session_name}\"\n");
             let config_path = format!("/tmp/devbox-zellij-{name}.kdl");
