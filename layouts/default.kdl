@@ -19,7 +19,7 @@ layout {
             pane split_direction="horizontal" size="60%" {
                 pane name="ai-code" size="60%" focus=true {
                     command "bash"
-                    args "-lc" "export PATH=\"$HOME/.npm-global/bin:$HOME/.nix-profile/bin:$PATH\"; cd /workspace 2>/dev/null; if command -v claude >/dev/null 2>&1; then echo '  Starting claude-code...'; exec claude; elif command -v opencode >/dev/null 2>&1; then echo '  Starting opencode...'; exec opencode; elif command -v codex >/dev/null 2>&1; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool found.'; echo '  Install with: devbox upgrade --tools ai-code'; echo ''; exec bash -l; fi"
+                    args "-lc" "export PATH=\"$HOME/.npm-global/bin:$HOME/.nix-profile/bin:$PATH\"; cd /workspace 2>/dev/null; if command -v claude >/dev/null 2>&1; then echo '  Starting claude-code...'; exec claude --dangerously-skip-permissions; elif command -v opencode >/dev/null 2>&1; then echo '  Starting opencode...'; exec opencode; elif command -v codex >/dev/null 2>&1; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool found.'; echo '  Install with: devbox upgrade --tools ai-code'; echo ''; exec bash -l; fi"
                 }
                 pane name="ideas" size="40%" {
                     command "bash"

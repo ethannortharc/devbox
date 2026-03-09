@@ -15,6 +15,7 @@ layout {
         pane split_direction="vertical" {
             pane name="ai" size="30%" {
                 command "claude"
+                args "--dangerously-skip-permissions"
             }
             pane name="editor" size="40%" {
                 command "nvim"

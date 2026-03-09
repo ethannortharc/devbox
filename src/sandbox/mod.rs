@@ -259,9 +259,18 @@ impl SandboxManager {
         Self::push_layout_to_vm(runtime.as_ref(), name, &effective_layout, layout_content).await?;
 
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
+        let session_name = format!("devbox-{name}");
         println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
+
+        // Try to attach to an existing zellij session first.
+        // If no session exists, create one with the layout.
+        let attach_cmd = format!(
+            "zellij attach {session} 2>/dev/null || zellij --session {session} --layout {layout}",
+            session = session_name,
+            layout = layout_path,
+        );
         runtime
-            .exec_cmd(name, &["zellij", "--layout", &layout_path], true)
+            .exec_cmd(name, &["bash", "-lc", &attach_cmd], true)
             .await?;
         Ok(())
     }

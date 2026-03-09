@@ -205,7 +205,10 @@ async fn provision_nixos(
         install_latest_claude_code(runtime, name).await;
     }
 
-    // 10. Copy devbox binary + help files + tool configs
+    // 10. Copy host git config into VM
+    setup_git_config(runtime, name).await?;
+
+    // 11. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
@@ -280,7 +283,10 @@ fi"#;
     // 5. Set up shell environment
     setup_ubuntu_shell(runtime, name).await?;
 
-    // 6. Create devbox directories and copy binary + help
+    // 6. Copy host git config into VM
+    setup_git_config(runtime, name).await?;
+
+    // 7. Create devbox directories and copy binary + help
     runtime
         .exec_cmd(
             name,
@@ -471,6 +477,36 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
         runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
     }
 
+    Ok(())
+}
+
+// ── Git Config ─────────────────────────────────────────────
+
+/// Copy host ~/.gitconfig into the VM so git user.name, user.email,
+/// remote aliases, and other settings carry over automatically.
+async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let gitconfig_path = home.join(".gitconfig");
+
+    if !gitconfig_path.exists() {
+        return Ok(());
+    }
+
+    let content = match std::fs::read_to_string(&gitconfig_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    let username = whoami();
+    let vm_path = format!("/home/{username}/.gitconfig");
+    write_file_to_vm(runtime, name, &vm_path, &content).await?;
+
+    let chown_cmd = format!("chown {username}:{username} {vm_path}");
+    runtime
+        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+        .await?;
+
+    println!("Synced host git config to VM.");
     Ok(())
 }
 
