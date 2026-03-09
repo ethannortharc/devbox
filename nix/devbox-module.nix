@@ -19,6 +19,10 @@ let
   langs = devboxConfig.languages or {};
   username = devboxConfig.user.name or "dev";
 in {
+  # ── Nixpkgs config ──────────────────────────────────
+  # Allow unfree packages (claude-code, codex, etc.)
+  nixpkgs.config.allowUnfree = true;
+
   # ── Packages ───────────────────────────────────────
   # Core sets (system + shell + tools) are always installed.
   # Optional sets and language sets are conditional on devbox-state.toml.
