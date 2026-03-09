@@ -19,16 +19,16 @@ layout {
             pane split_direction="horizontal" size="60%" {
                 pane name="ai-code" size="60%" focus=true {
                     command "bash"
-                    args "-c" "[ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; HAS_CLAUDE=false; if command -v claude >/dev/null 2>&1; then if [ -f ~/.claude/.credentials.json ] || [ -n \"$ANTHROPIC_API_KEY\" ]; then HAS_CLAUDE=true; fi; fi; HAS_OPENCODE=false; if command -v opencode >/dev/null 2>&1; then if [ -f ~/.config/opencode/config.json ] || [ -n \"$OPENAI_API_KEY\" ]; then HAS_OPENCODE=true; fi; fi; HAS_CODEX=false; if command -v codex >/dev/null 2>&1; then if [ -f ~/.codex/auth.json ] || [ -f ~/.codex/config.json ] || [ -n \"$OPENAI_API_KEY\" ]; then HAS_CODEX=true; fi; fi; if $HAS_CLAUDE; then echo '  Starting claude-code...'; exec claude --dangerously-skip-permissions; elif $HAS_OPENCODE; then echo '  Starting opencode...'; exec opencode; elif $HAS_CODEX; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool with valid auth found.'; echo ''; echo '  To configure, set one of:'; echo '    export ANTHROPIC_API_KEY=sk-ant-...  (for claude-code)'; echo '    export OPENAI_API_KEY=sk-...         (for opencode/codex)'; echo '  Or configure on host and run: devbox reprovision'; echo ''; exec bash; fi"
+                    args "-c" "cd /workspace 2>/dev/null; [ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if command -v claude >/dev/null 2>&1; then echo '  Starting claude-code...'; exec claude; elif command -v opencode >/dev/null 2>&1; then echo '  Starting opencode...'; exec opencode; elif command -v codex >/dev/null 2>&1; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool found.'; echo '  Install with: devbox upgrade --tools ai-code'; echo ''; exec bash; fi"
                 }
                 pane name="ideas" size="40%" {
                     command "bash"
-                    args "-c" "[ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if ! command -v aichat >/dev/null 2>&1; then echo '  aichat not available.'; echo '  Install with: devbox upgrade --tools ai-code'; exec bash; fi; if [ -f ~/.config/aichat/config.yaml ]; then exec aichat -r architect; else echo '  AI Brainstorming — First-time Setup'; echo ''; echo '  No aichat config found. Choose a provider:'; echo ''; echo '  1) Claude (Anthropic) — uses ANTHROPIC_API_KEY'; echo '  2) OpenAI (GPT)       — uses OPENAI_API_KEY'; echo '  3) Ollama (local)     — no key needed'; echo '  4) Custom             — run: aichat --list-models'; echo ''; read -p '  Choice [1-4]: ' choice; mkdir -p ~/.config/aichat; case $choice in 1) read -p '  ANTHROPIC_API_KEY: ' key; printf 'model: claude:claude-sonnet-4-20250514\\nclients:\\n- type: claude\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 2) read -p '  OPENAI_API_KEY: ' key; printf 'model: openai:gpt-4o\\nclients:\\n- type: openai\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 3) printf 'model: ollama:llama3.2\\n' > ~/.config/aichat/config.yaml ;; *) echo '  Run: aichat --list-models to see options'; exec bash ;; esac; echo '  Config saved. Starting aichat...'; exec aichat -r architect; fi"
+                    args "-c" "cd /workspace 2>/dev/null; [ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if ! command -v aichat >/dev/null 2>&1; then echo '  aichat not available.'; echo '  Install with: devbox upgrade --tools ai-code'; exec bash; fi; if [ -f ~/.config/aichat/config.yaml ]; then exec aichat -r architect; else echo '  AI Brainstorming — First-time Setup'; echo ''; echo '  No aichat config found. Choose a provider:'; echo ''; echo '  1) Claude (Anthropic) — uses ANTHROPIC_API_KEY'; echo '  2) OpenAI (GPT)       — uses OPENAI_API_KEY'; echo '  3) Ollama (local)     — no key needed'; echo '  4) Custom             — run: aichat --list-models'; echo ''; read -p '  Choice [1-4]: ' choice; mkdir -p ~/.config/aichat; case $choice in 1) read -p '  ANTHROPIC_API_KEY: ' key; printf 'model: claude:claude-sonnet-4-20250514\\nclients:\\n- type: claude\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 2) read -p '  OPENAI_API_KEY: ' key; printf 'model: openai:gpt-4o\\nclients:\\n- type: openai\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 3) printf 'model: ollama:llama3.2\\n' > ~/.config/aichat/config.yaml ;; *) echo '  Run: aichat --list-models to see options'; exec bash ;; esac; echo '  Config saved. Starting aichat...'; exec aichat -r architect; fi"
                 }
             }
             pane name="files" size="40%" {
-                command "yazi"
-                args "/workspace"
+                command "bash"
+                args "-c" "cd /workspace 2>/dev/null || cd ~; exec yazi ."
             }
         }
     }
@@ -61,7 +61,8 @@ layout {
 
     tab name="  Git" cwd="/workspace" {
         pane {
-            command "lazygit"
+            command "bash"
+            args "-c" "cd /workspace 2>/dev/null; exec lazygit"
         }
     }
 }
