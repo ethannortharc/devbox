@@ -262,6 +262,14 @@ impl SandboxManager {
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
         let session_name = format!("devbox-{name}");
 
+        if force_new_session {
+            // Kill existing session so we can start fresh with new layout
+            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
+            let _ = runtime
+                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
+                .await;
+        }
+
         // Check if a zellij session already exists
         let list_cmd = format!(
             "zellij list-sessions 2>/dev/null | grep -q '^{session_name}'"
@@ -272,28 +280,32 @@ impl SandboxManager {
             .map(|r| r.exit_code == 0)
             .unwrap_or(false);
 
-        if session_exists && force_new_session {
-            // Kill existing session so we can start fresh with new layout
-            println!("Restarting zellij session '{session_name}'...");
-            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
-            let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
-                .await;
-        }
-
-        if session_exists && !force_new_session {
+        if session_exists {
             // Reattach to existing session
             println!("Reattaching to sandbox '{name}'...");
             runtime
                 .exec_cmd(name, &["zellij", "attach", &session_name], true)
                 .await?;
         } else {
-            // Create new session with layout
+            // Create new named session with layout.
+            // We write a small zellij config that sets the session name,
+            // then launch with the layout file.
+            let config_content = format!("session_name \"{session_name}\"\n");
+            let config_path = format!("/tmp/devbox-zellij-{name}.kdl");
+            let write_cfg = format!(
+                "echo '{}' > {}",
+                config_content.replace('\'', "'\\''"),
+                config_path,
+            );
+            let _ = runtime
+                .exec_cmd(name, &["bash", "-c", &write_cfg], false)
+                .await;
+
             println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
             runtime
                 .exec_cmd(
                     name,
-                    &["zellij", "--session", &session_name, "--layout", &layout_path],
+                    &["zellij", "--config", &config_path, "--layout", &layout_path],
                     true,
                 )
                 .await?;
