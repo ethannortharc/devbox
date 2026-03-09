@@ -493,10 +493,10 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
         // Report what we found
         println!("Found {} configuration on host:", tool.name);
         for f in &found_files {
-            println!("  config: ~/{f}");
+            println!("  found: ~/{f}");
         }
         for v in &found_env_vars {
-            println!("  env:    {v}");
+            println!("  env:   {v}");
         }
 
         // Copy config files

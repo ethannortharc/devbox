@@ -19,16 +19,16 @@ layout {
             pane split_direction="horizontal" size="60%" {
                 pane name="ai-code" size="60%" focus=true {
                     command "bash"
-                    args "-c" "cd /workspace 2>/dev/null; [ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if command -v claude >/dev/null 2>&1; then echo '  Starting claude-code...'; exec claude; elif command -v opencode >/dev/null 2>&1; then echo '  Starting opencode...'; exec opencode; elif command -v codex >/dev/null 2>&1; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool found.'; echo '  Install with: devbox upgrade --tools ai-code'; echo ''; exec bash; fi"
+                    args "-lc" "cd /workspace 2>/dev/null; if command -v claude >/dev/null 2>&1; then echo '  Starting claude-code...'; exec claude; elif command -v opencode >/dev/null 2>&1; then echo '  Starting opencode...'; exec opencode; elif command -v codex >/dev/null 2>&1; then echo '  Starting codex...'; exec codex; else echo ''; echo '  No AI coding tool found.'; echo '  Install with: devbox upgrade --tools ai-code'; echo ''; exec bash -l; fi"
                 }
                 pane name="ideas" size="40%" {
                     command "bash"
-                    args "-c" "cd /workspace 2>/dev/null; [ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env; if ! command -v aichat >/dev/null 2>&1; then echo '  aichat not available.'; echo '  Install with: devbox upgrade --tools ai-code'; exec bash; fi; if [ -f ~/.config/aichat/config.yaml ]; then exec aichat -r architect; else echo '  AI Brainstorming — First-time Setup'; echo ''; echo '  No aichat config found. Choose a provider:'; echo ''; echo '  1) Claude (Anthropic) — uses ANTHROPIC_API_KEY'; echo '  2) OpenAI (GPT)       — uses OPENAI_API_KEY'; echo '  3) Ollama (local)     — no key needed'; echo '  4) Custom             — run: aichat --list-models'; echo ''; read -p '  Choice [1-4]: ' choice; mkdir -p ~/.config/aichat; case $choice in 1) read -p '  ANTHROPIC_API_KEY: ' key; printf 'model: claude:claude-sonnet-4-20250514\\nclients:\\n- type: claude\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 2) read -p '  OPENAI_API_KEY: ' key; printf 'model: openai:gpt-4o\\nclients:\\n- type: openai\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 3) printf 'model: ollama:llama3.2\\n' > ~/.config/aichat/config.yaml ;; *) echo '  Run: aichat --list-models to see options'; exec bash ;; esac; echo '  Config saved. Starting aichat...'; exec aichat -r architect; fi"
+                    args "-lc" "cd /workspace 2>/dev/null; if ! command -v aichat >/dev/null 2>&1; then echo '  aichat not available.'; echo '  Install with: devbox upgrade --tools ai-code'; exec bash -l; fi; if [ -f ~/.config/aichat/config.yaml ]; then exec aichat -r architect; else echo '  AI Brainstorming — First-time Setup'; echo ''; echo '  No aichat config found. Choose a provider:'; echo ''; echo '  1) Claude (Anthropic) — uses ANTHROPIC_API_KEY'; echo '  2) OpenAI (GPT)       — uses OPENAI_API_KEY'; echo '  3) Ollama (local)     — no key needed'; echo '  4) Custom             — run: aichat --list-models'; echo ''; read -p '  Choice [1-4]: ' choice; mkdir -p ~/.config/aichat; case $choice in 1) read -p '  ANTHROPIC_API_KEY: ' key; printf 'model: claude:claude-sonnet-4-20250514\\nclients:\\n- type: claude\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 2) read -p '  OPENAI_API_KEY: ' key; printf 'model: openai:gpt-4o\\nclients:\\n- type: openai\\n  api_key: '\"$key\"'\\n' > ~/.config/aichat/config.yaml ;; 3) printf 'model: ollama:llama3.2\\n' > ~/.config/aichat/config.yaml ;; *) echo '  Run: aichat --list-models to see options'; exec bash -l ;; esac; echo '  Config saved. Starting aichat...'; exec aichat -r architect; fi"
                 }
             }
             pane name="files" size="40%" {
                 command "bash"
-                args "-c" "cd /workspace 2>/dev/null || cd ~; exec yazi ."
+                args "-lc" "cd /workspace 2>/dev/null || cd ~; exec yazi ."
             }
         }
     }
@@ -38,18 +38,18 @@ layout {
             pane split_direction="vertical" size="55%" {
                 pane name="monitor" size="50%" {
                     command "bash"
-                    args "-c" "if command -v btm >/dev/null 2>&1; then exec btm --basic; elif command -v htop >/dev/null 2>&1; then exec htop; else exec top; fi"
+                    args "-lc" "if command -v btm >/dev/null 2>&1; then exec btm --basic; elif command -v htop >/dev/null 2>&1; then exec htop; else exec top; fi"
                 }
                 pane name="help" size="50%" {
                     command "bash"
-                    args "-c" "echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null; fi; echo ''; echo '  Type a tool name to view its guide:'; echo ''; while true; do echo '  devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie'; echo ''; read -p '  guide> ' tool; if [ -z \"$tool\" ]; then continue; fi; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"  No guide for: $tool\"; fi; done"
+                    args "-lc" "echo ''; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/index.md ]; then glow /etc/devbox/help/index.md; else cat /etc/devbox/help/index.md 2>/dev/null; fi; echo ''; echo '  Type a tool name to view its guide:'; echo ''; while true; do echo '  devbox zellij lazygit nvim fzf yazi rg fd bat docker git delta httpie'; echo ''; read -p '  guide> ' tool; if [ -z \"$tool\" ]; then continue; fi; if command -v glow >/dev/null 2>&1 && [ -f /etc/devbox/help/$tool.md ]; then glow -p /etc/devbox/help/$tool.md; elif [ -f /etc/devbox/help/$tool.md ]; then less /etc/devbox/help/$tool.md; else echo \"  No guide for: $tool\"; fi; done"
                 }
             }
             pane split_direction="vertical" size="45%" {
                 pane name="terminal" size="50%"
                 pane name="management" size="50%" {
                     command "bash"
-                    args "-c" "exec bash /etc/devbox/management.sh"
+                    args "-lc" "exec bash /etc/devbox/management.sh"
                 }
             }
         }
@@ -62,7 +62,7 @@ layout {
     tab name="  Git" cwd="/workspace" {
         pane {
             command "bash"
-            args "-c" "cd /workspace 2>/dev/null; exec lazygit"
+            args "-lc" "cd /workspace 2>/dev/null; exec lazygit"
         }
     }
 }
