@@ -17,12 +17,10 @@ pub fn detect_runtime() -> Result<Box<dyn Runtime>> {
         Box::new(DockerRuntime),
     ];
 
-    let mut available: Vec<Box<dyn Runtime>> = runtimes
-        .into_iter()
-        .filter(|r| r.is_available())
-        .collect();
+    let mut available: Vec<Box<dyn Runtime>> =
+        runtimes.into_iter().filter(|r| r.is_available()).collect();
 
-    available.sort_by(|a, b| b.priority().cmp(&a.priority()));
+    available.sort_by_key(|b| std::cmp::Reverse(b.priority()));
 
     match available.into_iter().next() {
         Some(rt) => {

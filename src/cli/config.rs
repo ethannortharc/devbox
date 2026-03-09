@@ -55,7 +55,11 @@ pub async fn run(args: ConfigArgs, manager: &SandboxManager) -> Result<()> {
         ConfigAction::Show => {
             let config = manager.load_global_config()?;
             println!("{}", "Global Config".bold());
-            println!("  {} = {}", "default.runtime".cyan(), config.default.runtime);
+            println!(
+                "  {} = {}",
+                "default.runtime".cyan(),
+                config.default.runtime
+            );
             println!("  {} = {}", "default.layout".cyan(), config.default.layout);
             println!(
                 "  {} = {}",

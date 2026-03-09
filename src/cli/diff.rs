@@ -21,7 +21,10 @@ pub async fn run(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
     let state = manager.get_sandbox(&name)?;
 
     if state.mount_mode == "writable" {
-        println!("Sandbox '{}' uses writable mode — no overlay to diff.", name);
+        println!(
+            "Sandbox '{}' uses writable mode — no overlay to diff.",
+            name
+        );
         return Ok(());
     }
 
@@ -33,9 +36,18 @@ pub async fn run(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    let added = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Added).count();
-    let modified = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Modified).count();
-    let deleted = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Deleted).count();
+    let added = changes
+        .iter()
+        .filter(|c| c.status == overlay::ChangeStatus::Added)
+        .count();
+    let modified = changes
+        .iter()
+        .filter(|c| c.status == overlay::ChangeStatus::Modified)
+        .count();
+    let deleted = changes
+        .iter()
+        .filter(|c| c.status == overlay::ChangeStatus::Deleted)
+        .count();
 
     for c in &changes {
         if !c.is_dir {

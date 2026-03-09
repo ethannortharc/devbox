@@ -34,7 +34,9 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
             anyhow::bail!(
                 "Sandbox '{}' exists in state but not in runtime '{}'. \
                  Run `devbox destroy {}` to clean up.",
-                name, state.runtime, name
+                name,
+                state.runtime,
+                name
             );
         }
         SandboxStatus::Unknown(s) => {
@@ -80,10 +82,10 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
 fn migrate_sets(sets: &[String]) -> Vec<String> {
     let mut result: Vec<String> = sets
         .iter()
-        .filter_map(|s| {
+        .map(|s| {
             match s.as_str() {
-                "ai" => Some("ai-code".to_string()), // old "ai" → "ai-code"
-                other => Some(other.to_string()),
+                "ai" => "ai-code".to_string(), // old "ai" → "ai-code"
+                other => other.to_string(),
             }
         })
         .collect();

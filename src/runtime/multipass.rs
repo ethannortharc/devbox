@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::cmd::{run_ok, run_cmd, run_interactive};
+use super::cmd::{run_cmd, run_interactive, run_ok};
 use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
 
 /// Multipass runtime — secondary on macOS (Canonical's VM manager).
@@ -61,13 +61,7 @@ impl Runtime for MultipassRuntime {
         for m in &opts.mounts {
             let host = m.host_path.display().to_string();
             let mount_target = format!("{vm}:{}", m.container_path);
-            let mount_args = vec![
-                "mount",
-                &host,
-                &mount_target,
-                "--type",
-                "native",
-            ];
+            let mount_args = vec!["mount", &host, &mount_target, "--type", "native"];
             // Ignore mount errors (best-effort)
             let _ = run_cmd("multipass", &mount_args).await;
         }
@@ -93,12 +87,7 @@ impl Runtime for MultipassRuntime {
         Ok(())
     }
 
-    async fn exec_cmd(
-        &self,
-        name: &str,
-        cmd: &[&str],
-        interactive: bool,
-    ) -> Result<ExecResult> {
+    async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult> {
         let vm = Self::vm_name(name);
 
         if interactive {
@@ -127,14 +116,14 @@ impl Runtime for MultipassRuntime {
             return Ok(SandboxStatus::NotFound);
         }
 
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout) {
-            if let Some(state) = v["info"][&vm]["state"].as_str() {
-                return Ok(match state {
-                    "Running" => SandboxStatus::Running,
-                    "Stopped" => SandboxStatus::Stopped,
-                    other => SandboxStatus::Unknown(other.to_string()),
-                });
-            }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout)
+            && let Some(state) = v["info"][&vm]["state"].as_str()
+        {
+            return Ok(match state {
+                "Running" => SandboxStatus::Running,
+                "Stopped" => SandboxStatus::Stopped,
+                other => SandboxStatus::Unknown(other.to_string()),
+            });
         }
 
         Ok(SandboxStatus::Unknown("parse error".to_string()))
@@ -148,32 +137,32 @@ impl Runtime for MultipassRuntime {
         }
 
         let mut infos = vec![];
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout) {
-            if let Some(list) = v["list"].as_array() {
-                for item in list {
-                    let name = item["name"].as_str().unwrap_or("").to_string();
-                    if !name.starts_with("devbox-") {
-                        continue;
-                    }
-                    let sandbox_name = name.strip_prefix("devbox-").unwrap_or(&name).to_string();
-                    let state = item["state"].as_str().unwrap_or("");
-                    let status = match state {
-                        "Running" => SandboxStatus::Running,
-                        "Stopped" => SandboxStatus::Stopped,
-                        other => SandboxStatus::Unknown(other.to_string()),
-                    };
-                    let ip = item["ipv4"].as_array().and_then(|arr| {
-                        arr.first().and_then(|v| v.as_str().map(|s| s.to_string()))
-                    });
-
-                    infos.push(SandboxInfo {
-                        name: sandbox_name,
-                        status,
-                        runtime: "multipass".to_string(),
-                        created_at: None,
-                        ip_address: ip,
-                    });
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout)
+            && let Some(list) = v["list"].as_array()
+        {
+            for item in list {
+                let name = item["name"].as_str().unwrap_or("").to_string();
+                if !name.starts_with("devbox-") {
+                    continue;
                 }
+                let sandbox_name = name.strip_prefix("devbox-").unwrap_or(&name).to_string();
+                let state = item["state"].as_str().unwrap_or("");
+                let status = match state {
+                    "Running" => SandboxStatus::Running,
+                    "Stopped" => SandboxStatus::Stopped,
+                    other => SandboxStatus::Unknown(other.to_string()),
+                };
+                let ip = item["ipv4"]
+                    .as_array()
+                    .and_then(|arr| arr.first().and_then(|v| v.as_str().map(|s| s.to_string())));
+
+                infos.push(SandboxInfo {
+                    name: sandbox_name,
+                    status,
+                    runtime: "multipass".to_string(),
+                    created_at: None,
+                    ip_address: ip,
+                });
             }
         }
 
@@ -194,25 +183,21 @@ impl Runtime for MultipassRuntime {
 
     async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
         let vm = Self::vm_name(name);
-        let result = run_cmd(
-            "multipass",
-            &["snapshot", "list", &vm, "--format", "json"],
-        )
-        .await?;
+        let result = run_cmd("multipass", &["snapshot", "list", &vm, "--format", "json"]).await?;
 
         if result.exit_code != 0 {
             return Ok(vec![]);
         }
 
         let mut snaps = vec![];
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout) {
-            if let Some(snapshots) = v["snapshots"].as_array() {
-                for s in snapshots {
-                    snaps.push(SnapshotInfo {
-                        name: s["name"].as_str().unwrap_or("").to_string(),
-                        created_at: s["created"].as_str().unwrap_or("").to_string(),
-                    });
-                }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.stdout)
+            && let Some(snapshots) = v["snapshots"].as_array()
+        {
+            for s in snapshots {
+                snaps.push(SnapshotInfo {
+                    name: s["name"].as_str().unwrap_or("").to_string(),
+                    created_at: s["created"].as_str().unwrap_or("").to_string(),
+                });
             }
         }
 

@@ -188,7 +188,10 @@ fn parse_mounts(mounts: &[String]) -> Result<Vec<Mount>> {
                 });
             }
             _ => {
-                anyhow::bail!("Invalid mount format: '{}'. Use host:container or host:container:ro", m);
+                anyhow::bail!(
+                    "Invalid mount format: '{}'. Use host:container or host:container:ro",
+                    m
+                );
             }
         }
     }

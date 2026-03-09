@@ -5,10 +5,10 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use self::rebuild::{nixos_rebuild, write_nix_file, write_state_toml};
+use self::sets::{NIX_SETS, generate_set_nix, generate_sets_default_nix, generate_state_toml};
 use crate::runtime::Runtime;
 use crate::sandbox::config::DevboxConfig;
-use self::rebuild::{nixos_rebuild, write_state_toml, write_nix_file};
-use self::sets::{generate_state_toml, generate_set_nix, generate_sets_default_nix, NIX_SETS};
 
 /// Push the full Nix set configuration to a sandbox VM and rebuild.
 ///
@@ -63,11 +63,7 @@ pub async fn upgrade_sets(
 }
 
 /// Add a custom Nix package (from nixpkgs or flake ref) to the sandbox.
-pub async fn add_package(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-    package: &str,
-) -> Result<()> {
+pub async fn add_package(runtime: &dyn Runtime, sandbox_name: &str, package: &str) -> Result<()> {
     if package.contains(':') || package.contains('#') {
         // Flake reference: github:user/repo#pkg or nixpkgs#pkg
         println!("Adding flake package: {package}");
@@ -148,4 +144,3 @@ fn languages_map(config: &DevboxConfig) -> HashMap<String, bool> {
     m.insert("ruby".to_string(), config.languages.ruby);
     m
 }
-

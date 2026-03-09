@@ -55,7 +55,12 @@ async fn check_latest(current: &str) -> Result<()> {
 async fn fetch_latest_version() -> Result<String> {
     // Use gh CLI if available, otherwise curl
     let output = tokio::process::Command::new("gh")
-        .args(["api", &format!("repos/{REPO}/releases/latest"), "--jq", ".tag_name"])
+        .args([
+            "api",
+            &format!("repos/{REPO}/releases/latest"),
+            "--jq",
+            ".tag_name",
+        ])
         .output()
         .await;
 
@@ -94,9 +99,7 @@ async fn fetch_latest_version() -> Result<String> {
 async fn install_version(version: &str) -> Result<()> {
     let target = detect_target()?;
     let asset = format!("{BINARY_NAME}-{target}.tar.gz");
-    let url = format!(
-        "https://github.com/{REPO}/releases/download/v{version}/{asset}"
-    );
+    let url = format!("https://github.com/{REPO}/releases/download/v{version}/{asset}");
 
     println!("Downloading {asset}...");
 
@@ -106,12 +109,7 @@ async fn install_version(version: &str) -> Result<()> {
     let archive_path = temp_dir.join(&asset);
 
     let status = tokio::process::Command::new("curl")
-        .args([
-            "-sL",
-            "-o",
-            archive_path.to_str().unwrap(),
-            &url,
-        ])
+        .args(["-sL", "-o", archive_path.to_str().unwrap(), &url])
         .status()
         .await?;
 
@@ -121,7 +119,12 @@ async fn install_version(version: &str) -> Result<()> {
 
     // Extract
     let status = tokio::process::Command::new("tar")
-        .args(["xzf", archive_path.to_str().unwrap(), "-C", temp_dir.to_str().unwrap()])
+        .args([
+            "xzf",
+            archive_path.to_str().unwrap(),
+            "-C",
+            temp_dir.to_str().unwrap(),
+        ])
         .status()
         .await?;
 
@@ -134,7 +137,10 @@ async fn install_version(version: &str) -> Result<()> {
     let new_binary = temp_dir.join(BINARY_NAME);
 
     if !new_binary.exists() {
-        bail!("Binary not found in archive. Expected: {}", new_binary.display());
+        bail!(
+            "Binary not found in archive. Expected: {}",
+            new_binary.display()
+        );
     }
 
     // Replace in place
@@ -171,7 +177,9 @@ mod tests {
         let target = detect_target().unwrap();
         assert!(!target.is_empty());
         // Should match current platform
-        assert!(target.contains(std::env::consts::OS.replace("macos", "apple").as_str())
-            || target.contains("linux"));
+        assert!(
+            target.contains(std::env::consts::OS.replace("macos", "apple").as_str())
+                || target.contains("linux")
+        );
     }
 }

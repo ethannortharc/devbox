@@ -29,7 +29,10 @@ pub async fn run(args: CommitArgs, manager: &SandboxManager) -> Result<()> {
     let state = manager.get_sandbox(&name)?;
 
     if state.mount_mode == "writable" {
-        println!("Sandbox '{}' uses writable mode — changes are already on host.", name);
+        println!(
+            "Sandbox '{}' uses writable mode — changes are already on host.",
+            name
+        );
         return Ok(());
     }
 

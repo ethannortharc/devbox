@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Global devbox defaults stored at ~/.devbox/config.toml.
@@ -47,8 +47,7 @@ impl GlobalConfig {
 
     pub fn save(&self, state_dir: &Path) -> Result<()> {
         let path = state_dir.join("config.toml");
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize global config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize global config")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())

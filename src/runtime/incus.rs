@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::cmd::{run_ok, run_cmd, run_interactive};
+use super::cmd::{run_cmd, run_interactive, run_ok};
 use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
 
 /// Incus runtime — primary on Linux (QEMU/KVM VM).
@@ -73,14 +73,7 @@ impl Runtime for IncusRuntime {
             let source_arg = format!("source={host}");
             let path_arg = format!("path={}", m.container_path);
 
-            let mut mount_args = vec![
-                "config",
-                "device",
-                "add",
-                &vm,
-                &device_name,
-                "disk",
-            ];
+            let mut mount_args = vec!["config", "device", "add", &vm, &device_name, "disk"];
             mount_args.push(&source_arg);
             mount_args.push(&path_arg);
 
@@ -112,12 +105,7 @@ impl Runtime for IncusRuntime {
         Ok(())
     }
 
-    async fn exec_cmd(
-        &self,
-        name: &str,
-        cmd: &[&str],
-        interactive: bool,
-    ) -> Result<ExecResult> {
+    async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult> {
         let vm = Self::vm_name(name);
 
         if interactive {
@@ -211,11 +199,7 @@ impl Runtime for IncusRuntime {
 
     async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
         let vm = Self::vm_name(name);
-        let result = run_cmd(
-            "incus",
-            &["snapshot", "list", &vm, "--format", "json"],
-        )
-        .await?;
+        let result = run_cmd("incus", &["snapshot", "list", &vm, "--format", "json"]).await?;
 
         if result.exit_code != 0 {
             return Ok(vec![]);

@@ -146,7 +146,10 @@ pub static LAYOUT_FILES: &[(&str, &str)] = &[
     ("debug", include_str!("../../layouts/debug.kdl")),
     ("monitor", include_str!("../../layouts/monitor.kdl")),
     ("git-review", include_str!("../../layouts/git-review.kdl")),
-    ("presentation", include_str!("../../layouts/presentation.kdl")),
+    (
+        "presentation",
+        include_str!("../../layouts/presentation.kdl"),
+    ),
 ];
 
 /// Look up a layout KDL file by name. Falls back to default.

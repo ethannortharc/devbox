@@ -8,14 +8,14 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Context, Result, bail};
 
-use crate::runtime::detect::{detect_runtime, select_runtime};
-use crate::runtime::{CreateOpts, Mount, Runtime, SandboxStatus};
-use crate::tools::detect::detect_languages;
 use self::config::DevboxConfig;
 use self::global_config::GlobalConfig;
 use self::state::SandboxState;
+use crate::runtime::detect::{detect_runtime, select_runtime};
+use crate::runtime::{CreateOpts, Mount, Runtime, SandboxStatus};
+use crate::tools::detect::detect_languages;
 
 /// Central manager for sandbox lifecycle.
 pub struct SandboxManager {
@@ -29,8 +29,7 @@ impl SandboxManager {
         let state_dir = home.join(".devbox");
 
         if !state_dir.exists() {
-            std::fs::create_dir_all(&state_dir)
-                .context("Failed to create ~/.devbox/")?;
+            std::fs::create_dir_all(&state_dir).context("Failed to create ~/.devbox/")?;
         }
 
         Ok(Self { state_dir })
@@ -62,6 +61,7 @@ impl SandboxManager {
     // ── Lifecycle ────────────────────────────────────────
 
     /// Create a new sandbox end-to-end.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_sandbox(
         &self,
         name: &str,
@@ -76,7 +76,11 @@ impl SandboxManager {
 
         // Check for name conflicts
         if self.sandbox_exists(name) {
-            bail!("Sandbox '{}' already exists. Use `devbox destroy {}` first.", name, name);
+            bail!(
+                "Sandbox '{}' already exists. Use `devbox destroy {}` first.",
+                name,
+                name
+            );
         }
 
         // Check for mount conflicts
@@ -140,8 +144,15 @@ impl SandboxManager {
         // Provision tools — pass mount_mode so NixOS module sets up overlay
         let mount_mode = &config.sandbox.mount_mode;
         if let Err(e) = provision::provision_vm_with_mode(
-            runtime, name, &active_sets, &active_langs, image, mount_mode,
-        ).await {
+            runtime,
+            name,
+            &active_sets,
+            &active_langs,
+            image,
+            mount_mode,
+        )
+        .await
+        {
             eprintln!("Warning: provisioning incomplete: {e}");
         }
 
@@ -159,13 +170,22 @@ impl SandboxManager {
         };
         state.save(&self.state_dir)?;
 
-        println!("Sandbox '{}' created successfully (runtime: {})", name, runtime.name());
+        println!(
+            "Sandbox '{}' created successfully (runtime: {})",
+            name,
+            runtime.name()
+        );
         Ok(())
     }
 
     /// Attach to a sandbox (start if stopped, then launch Zellij or shell).
     /// If `force_new_session` is true, any existing zellij session is killed first.
-    pub async fn attach(&self, name: &str, layout_override: Option<&str>, force_new_session: bool) -> Result<()> {
+    pub async fn attach(
+        &self,
+        name: &str,
+        layout_override: Option<&str>,
+        force_new_session: bool,
+    ) -> Result<()> {
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
 
@@ -239,7 +259,11 @@ impl SandboxManager {
             let check = runtime
                 .exec_cmd(
                     name,
-                    &["bash", "-c", "f=\"$HOME/.config/devbox/layout-preference\"; [ -f \"$f\" ] && cat \"$f\""],
+                    &[
+                        "bash",
+                        "-c",
+                        "f=\"$HOME/.config/devbox/layout-preference\"; [ -f \"$f\" ] && cat \"$f\"",
+                    ],
                     false,
                 )
                 .await;
@@ -277,9 +301,7 @@ impl SandboxManager {
         }
 
         // Check if a live session exists
-        let list_cmd = format!(
-            "zellij list-sessions 2>/dev/null | grep -q '{session_name}'"
-        );
+        let list_cmd = format!("zellij list-sessions 2>/dev/null | grep -q '{session_name}'");
         let session_alive = runtime
             .exec_cmd(name, &["bash", "-c", &list_cmd], false)
             .await
@@ -390,7 +412,10 @@ impl SandboxManager {
 
             // Check for uncommitted overlay changes before destroying
             if state.mount_mode == "overlay" && !force {
-                let vm_status = runtime.status(name).await.unwrap_or(SandboxStatus::NotFound);
+                let vm_status = runtime
+                    .status(name)
+                    .await
+                    .unwrap_or(SandboxStatus::NotFound);
                 if vm_status == SandboxStatus::Running {
                     let changes = overlay::diff(runtime.as_ref(), name).await;
                     if let Ok(changes) = changes {
@@ -400,8 +425,14 @@ impl SandboxManager {
                                 "Warning: {} uncommitted overlay change(s) in sandbox '{}'.",
                                 file_count, name
                             );
-                            eprintln!("  Run `devbox layer commit --name {}` to save them first,", name);
-                            eprintln!("  or use `devbox destroy --force --name {}` to discard.", name);
+                            eprintln!(
+                                "  Run `devbox layer commit --name {}` to save them first,",
+                                name
+                            );
+                            eprintln!(
+                                "  or use `devbox destroy --force --name {}` to discard.",
+                                name
+                            );
                             bail!("Aborting destroy due to uncommitted changes.");
                         }
                     }
@@ -469,7 +500,10 @@ impl SandboxManager {
                 }
             };
 
-            let status = runtime.status(&state.name).await.unwrap_or(SandboxStatus::NotFound);
+            let status = runtime
+                .status(&state.name)
+                .await
+                .unwrap_or(SandboxStatus::NotFound);
             if matches!(status, SandboxStatus::Stopped | SandboxStatus::NotFound) {
                 if let Err(e) = runtime.destroy(&state.name).await {
                     eprintln!("Warning: failed to destroy '{}': {e}", state.name);
@@ -526,7 +560,10 @@ impl SandboxManager {
         let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         let sandboxes = self.list_sandboxes()?;
         Ok(sandboxes.into_iter().find(|s| {
-            s.project_dir.canonicalize().unwrap_or_else(|_| s.project_dir.clone()) == canonical
+            s.project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| s.project_dir.clone())
+                == canonical
         }))
     }
 

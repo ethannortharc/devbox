@@ -68,40 +68,126 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
     match set {
         "system" => vec![
-            "coreutils", "gnugrep", "gnused", "gawk", "findutils", "diffutils",
-            "gzip", "gnutar", "xz", "bzip2", "file", "which", "tree", "less",
-            "curl", "wget", "openssh", "openssl", "cacert", "gnupg",
-            "gcc", "gnumake", "pkg-config", "man-db",
+            "coreutils",
+            "gnugrep",
+            "gnused",
+            "gawk",
+            "findutils",
+            "diffutils",
+            "gzip",
+            "gnutar",
+            "xz",
+            "bzip2",
+            "file",
+            "which",
+            "tree",
+            "less",
+            "curl",
+            "wget",
+            "openssh",
+            "openssl",
+            "cacert",
+            "gnupg",
+            "gcc",
+            "gnumake",
+            "pkg-config",
+            "man-db",
         ],
         "shell" => vec![
-            "zellij", "zsh", "zsh-autosuggestions", "zsh-syntax-highlighting",
-            "starship", "fzf", "zoxide", "direnv", "nix-direnv", "yazi", "micro",
+            "zellij",
+            "zsh",
+            "zsh-autosuggestions",
+            "zsh-syntax-highlighting",
+            "starship",
+            "fzf",
+            "zoxide",
+            "direnv",
+            "nix-direnv",
+            "yazi",
+            "micro",
         ],
         "tools" => vec![
-            "ripgrep", "fd", "bat", "eza", "delta", "sd", "choose",
-            "jq", "yq-go", "fx", "htop", "bottom", "procs", "dust", "duf",
-            "tokei", "hyperfine", "tealdeer", "httpie", "dog", "glow", "entr",
+            "ripgrep",
+            "fd",
+            "bat",
+            "eza",
+            "delta",
+            "sd",
+            "choose",
+            "jq",
+            "yq-go",
+            "fx",
+            "htop",
+            "bottom",
+            "procs",
+            "dust",
+            "duf",
+            "tokei",
+            "hyperfine",
+            "tealdeer",
+            "httpie",
+            "dog",
+            "glow",
+            "entr",
         ],
         "editor" => vec!["neovim", "helix", "nano"],
         "git" => vec!["git", "lazygit", "gh", "git-lfs", "git-crypt", "pre-commit"],
-        "container" => vec!["docker", "docker-compose", "lazydocker", "dive", "buildkit", "skopeo"],
-        "network" => vec!["tailscale", "mosh", "nmap", "tcpdump", "bandwhich", "trippy", "doggo"],
+        "container" => vec![
+            "docker",
+            "docker-compose",
+            "lazydocker",
+            "dive",
+            "buildkit",
+            "skopeo",
+        ],
+        "network" => vec![
+            "tailscale",
+            "mosh",
+            "nmap",
+            "tcpdump",
+            "bandwhich",
+            "trippy",
+            "doggo",
+        ],
         "ai-code" => vec![
-            "claude-code", "codex", "opencode", "aider-chat", "aichat", "continue",
+            "claude-code",
+            "codex",
+            "opencode",
+            "aider-chat",
+            "aichat",
+            "continue",
         ],
         "ai-infra" => vec![
-            "ollama", "open-webui", "litellm", "mcp-hub",
+            "ollama",
+            "open-webui",
+            "litellm",
+            "mcp-hub",
             "python312Packages.huggingface-hub",
         ],
         "lang-go" => vec!["go", "gopls", "golangci-lint", "delve", "gotools", "gore"],
-        "lang-rust" => vec!["rustup", "rust-analyzer", "cargo-watch", "cargo-edit", "cargo-expand", "sccache"],
+        "lang-rust" => vec![
+            "rustup",
+            "rust-analyzer",
+            "cargo-watch",
+            "cargo-edit",
+            "cargo-expand",
+            "sccache",
+        ],
         "lang-python" => vec![
-            "python312", "uv", "ruff", "pyright",
-            "python312Packages.ipython", "python312Packages.pytest",
+            "python312",
+            "uv",
+            "ruff",
+            "pyright",
+            "python312Packages.ipython",
+            "python312Packages.pytest",
         ],
         "lang-node" => vec![
-            "nodejs_22", "bun", "pnpm", "typescript",
-            "nodePackages.typescript-language-server", "biome",
+            "nodejs_22",
+            "bun",
+            "pnpm",
+            "typescript",
+            "nodePackages.typescript-language-server",
+            "biome",
         ],
         "lang-java" => vec!["jdk21", "gradle", "maven", "jdt-language-server"],
         "lang-ruby" => vec!["ruby_3_3", "bundler", "solargraph", "rubocop"],
@@ -113,6 +199,7 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
 
 /// Provision a VM with tools based on active sets and languages.
 /// Dispatches to NixOS or Ubuntu provisioning based on image type.
+#[allow(dead_code)]
 pub async fn provision_vm(
     runtime: &dyn Runtime,
     name: &str,
@@ -154,7 +241,13 @@ async fn provision_nixos(
     runtime
         .exec_cmd(
             name,
-            &["sudo", "mkdir", "-p", "/etc/devbox/sets", "/etc/devbox/help"],
+            &[
+                "sudo",
+                "mkdir",
+                "-p",
+                "/etc/devbox/sets",
+                "/etc/devbox/help",
+            ],
             false,
         )
         .await?;
@@ -169,7 +262,13 @@ async fn provision_nixos(
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     // 4. Push devbox-module.nix
-    write_file_to_vm(runtime, name, "/etc/devbox/devbox-module.nix", NIX_DEVBOX_MODULE).await?;
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/devbox/devbox-module.nix",
+        NIX_DEVBOX_MODULE,
+    )
+    .await?;
 
     // 5. Push all set .nix files
     for (filename, content) in NIX_SET_FILES {
@@ -239,7 +338,10 @@ fi"#;
         .await?;
 
     if result.exit_code != 0 {
-        eprintln!("Warning: Nix installation may have issues: {}", result.stderr.trim());
+        eprintln!(
+            "Warning: Nix installation may have issues: {}",
+            result.stderr.trim()
+        );
     }
 
     // 2. Collect all package names from active sets
@@ -259,7 +361,10 @@ fi"#;
         let pkg_args: Vec<String> = packages.iter().map(|p| format!("nixpkgs#{p}")).collect();
         let pkg_list = pkg_args.join(" ");
 
-        println!("Installing {} packages via Nix (this may take a few minutes)...", packages.len());
+        println!(
+            "Installing {} packages via Nix (this may take a few minutes)...",
+            packages.len()
+        );
 
         // Source the nix profile before running nix commands
         let install_cmd = format!(
@@ -271,7 +376,9 @@ fi"#;
 
         if result.exit_code != 0 {
             eprintln!("Warning: some packages failed to install.");
-            eprintln!("You can retry with: devbox exec --name {name} -- nix profile install <packages>");
+            eprintln!(
+                "You can retry with: devbox exec --name {name} -- nix profile install <packages>"
+            );
         } else {
             println!("Nix package installation complete.");
         }
@@ -288,11 +395,7 @@ fi"#;
 
     // 7. Create devbox directories and copy binary + help
     runtime
-        .exec_cmd(
-            name,
-            &["sudo", "mkdir", "-p", "/etc/devbox/help"],
-            false,
-        )
+        .exec_cmd(name, &["sudo", "mkdir", "-p", "/etc/devbox/help"], false)
         .await?;
 
     println!("Copying devbox into VM...");
@@ -308,11 +411,7 @@ fi"#;
 
 /// Install services that need OS-level integration on Ubuntu.
 /// Nix installs the binaries but systemd services need apt packages.
-async fn install_ubuntu_services(
-    runtime: &dyn Runtime,
-    name: &str,
-    sets: &[String],
-) -> Result<()> {
+async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[String]) -> Result<()> {
     let needs_docker = sets.iter().any(|s| s == "container");
     let needs_tailscale = sets.iter().any(|s| s == "network");
 
@@ -403,10 +502,10 @@ ZSHRC
     );
 
     let result = runtime.exec_cmd(name, &["bash", "-c", &setup], false).await;
-    if let Ok(r) = result {
-        if r.exit_code != 0 {
-            eprintln!("Warning: shell setup incomplete");
-        }
+    if let Ok(r) = result
+        && r.exit_code != 0
+    {
+        eprintln!("Warning: shell setup incomplete");
     }
 
     Ok(())
@@ -423,8 +522,7 @@ async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
         .await?;
 
     if check.exit_code != 0 {
-        let zshrc = format!(
-            r#"# Devbox shell configuration
+        let zshrc = r#"# Devbox shell configuration
 # Latest tools first (official installers take precedence over nixpkgs)
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
@@ -449,17 +547,18 @@ alias cat='bat --paging=never' 2>/dev/null
 alias top='htop' 2>/dev/null
 
 # Devbox identity
-export DEVBOX_NAME="${{DEVBOX_NAME:-devbox}}"
-export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
+export DEVBOX_NAME="${DEVBOX_NAME:-devbox}"
+export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 
 # Default to workspace directory
 [ -d /workspace ] && cd /workspace
-"#
-        );
-        write_file_to_vm(runtime, name, &zshrc_path, &zshrc).await?;
+"#;
+        write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
         let chown_cmd = format!("chown {username}:{username} {zshrc_path}");
-        runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
+        runtime
+            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+            .await?;
     }
 
     // Also create .profile for bash login shells (used by layout panes with bash -lc)
@@ -474,7 +573,9 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
         let chown_cmd = format!("chown {username}:{username} {profile_path}");
-        runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
+        runtime
+            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+            .await?;
     }
 
     Ok(())
@@ -513,8 +614,23 @@ async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 // ── Shared Helpers ──────────────────────────────────────────
 
 /// Generate devbox-state.toml content from active sets and languages.
-fn generate_state_toml(sets: &[String], languages: &[String], username: &str, mount_mode: &str) -> String {
-    let set_names = ["system", "shell", "tools", "editor", "git", "container", "network", "ai_code", "ai_infra"];
+fn generate_state_toml(
+    sets: &[String],
+    languages: &[String],
+    username: &str,
+    mount_mode: &str,
+) -> String {
+    let set_names = [
+        "system",
+        "shell",
+        "tools",
+        "editor",
+        "git",
+        "container",
+        "network",
+        "ai_code",
+        "ai_infra",
+    ];
     let lang_names = ["go", "rust", "python", "node", "java", "ruby"];
 
     let mut toml = String::from("[user]\n");
@@ -524,7 +640,9 @@ fn generate_state_toml(sets: &[String], languages: &[String], username: &str, mo
     for s in &set_names {
         // Normalize: active sets use hyphens ("ai-code") but TOML keys use underscores ("ai_code")
         let hyphenated = s.replace('_', "-");
-        let enabled = sets.iter().any(|active| active == s || active == &hyphenated);
+        let enabled = sets
+            .iter()
+            .any(|active| active == s || active == &hyphenated);
         toml.push_str(&format!("{s} = {enabled}\n"));
     }
 
@@ -565,9 +683,10 @@ static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
     },
     AiToolConfig {
         name: "opencode",
-        config_files: &[
-            (".config/opencode/config.json", ".config/opencode/config.json"),
-        ],
+        config_files: &[(
+            ".config/opencode/config.json",
+            ".config/opencode/config.json",
+        )],
         env_vars: &["OPENAI_API_KEY"],
     },
     AiToolConfig {
@@ -580,9 +699,7 @@ static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
     },
     AiToolConfig {
         name: "aichat",
-        config_files: &[
-            (".config/aichat/config.yaml", ".config/aichat/config.yaml"),
-        ],
+        config_files: &[(".config/aichat/config.yaml", ".config/aichat/config.yaml")],
         env_vars: &[],
     },
 ];
@@ -647,11 +764,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
             // Ensure parent directory exists with correct ownership
             let vm_parent = vm_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(&vm_path);
             runtime
-                .exec_cmd(
-                    name,
-                    &["sudo", "mkdir", "-p", vm_parent],
-                    false,
-                )
+                .exec_cmd(name, &["sudo", "mkdir", "-p", vm_parent], false)
                 .await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
@@ -689,7 +802,9 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
         }
 
         // Fix ownership for all copied files
-        let chown_cmd = format!("chown -R {username}:{username} {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true");
+        let chown_cmd = format!(
+            "chown -R {username}:{username} {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
+        );
         runtime
             .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
             .await?;
@@ -701,20 +816,18 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
     // Auto-generate aichat config from detected credentials if no host config was copied.
     let has_aichat_config = home.join(".config/aichat/config.yaml").exists();
-    if !has_aichat_config {
-        if let Some(config) = generate_aichat_config_from_credentials(&home) {
-            let config_dir = format!("{vm_home}/.config/aichat");
-            runtime
-                .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
-                .await?;
-            let config_path = format!("{config_dir}/config.yaml");
-            write_file_to_vm(runtime, name, &config_path, &config).await?;
-            let chown_cmd = format!("chown -R {username}:{username} {config_dir}");
-            runtime
-                .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-                .await?;
-            println!("Generated aichat config from detected AI tool credentials.");
-        }
+    if !has_aichat_config && let Some(config) = generate_aichat_config_from_credentials(&home) {
+        let config_dir = format!("{vm_home}/.config/aichat");
+        runtime
+            .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
+            .await?;
+        let config_path = format!("{config_dir}/config.yaml");
+        write_file_to_vm(runtime, name, &config_path, &config).await?;
+        let chown_cmd = format!("chown -R {username}:{username} {config_dir}");
+        runtime
+            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+            .await?;
+        println!("Generated aichat config from detected AI tool credentials.");
     }
 
     Ok(())
@@ -734,7 +847,8 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
         if content.contains("sk-ant-") {
             // Simple extraction — look for api_key field
             let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-            parsed.get("apiKey")
+            parsed
+                .get("apiKey")
                 .or_else(|| parsed.get("api_key"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
@@ -758,7 +872,8 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
         let opencode_path = home.join(".config/opencode/config.json");
         if let Ok(content) = std::fs::read_to_string(opencode_path) {
             let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-            parsed.get("apiKey")
+            parsed
+                .get("apiKey")
                 .or_else(|| parsed.get("api_key"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
@@ -789,9 +904,7 @@ async fn write_file_to_vm(
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
     let cmd = format!("echo '{encoded}' | base64 -d | sudo tee {path} > /dev/null");
-    let result = runtime
-        .exec_cmd(name, &["bash", "-c", &cmd], false)
-        .await?;
+    let result = runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
     if result.exit_code != 0 {
         eprintln!("Warning: failed to write {path}: {}", result.stderr.trim());
     }
@@ -889,22 +1002,24 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
             &["copy", &exe_str, &format!("{vm_name}:/tmp/devbox")],
         )
         .await;
-        if let Ok(r) = result {
-            if r.exit_code == 0 {
-                let _ = runtime
-                    .exec_cmd(
-                        name,
-                        &[
-                            "sudo", "install", "-m", "755",
-                            "/tmp/devbox", "/usr/local/bin/devbox",
-                        ],
-                        false,
-                    )
-                    .await;
-                let _ = runtime
-                    .exec_cmd(name, &["rm", "/tmp/devbox"], false)
-                    .await;
-            }
+        if let Ok(r) = result
+            && r.exit_code == 0
+        {
+            let _ = runtime
+                .exec_cmd(
+                    name,
+                    &[
+                        "sudo",
+                        "install",
+                        "-m",
+                        "755",
+                        "/tmp/devbox",
+                        "/usr/local/bin/devbox",
+                    ],
+                    false,
+                )
+                .await;
+            let _ = runtime.exec_cmd(name, &["rm", "/tmp/devbox"], false).await;
         }
     }
     Ok(())
@@ -937,7 +1052,13 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     runtime
         .exec_cmd(name, &["sudo", "mkdir", "-p", &plugin_dir], false)
         .await?;
-    write_file_to_vm(runtime, name, &format!("{plugin_dir}/init.lua"), YAZI_GLOW_PLUGIN).await?;
+    write_file_to_vm(
+        runtime,
+        name,
+        &format!("{plugin_dir}/init.lua"),
+        YAZI_GLOW_PLUGIN,
+    )
+    .await?;
 
     // Fix ownership
     let chown_cmd = format!("chown -R {username}:{username} /home/{username}/.config/yazi");
@@ -960,7 +1081,13 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         .await?;
 
     // Legacy format (older aichat versions)
-    write_file_to_vm(runtime, name, &format!("{config_dir}/roles.yaml"), AICHAT_ROLES).await?;
+    write_file_to_vm(
+        runtime,
+        name,
+        &format!("{config_dir}/roles.yaml"),
+        AICHAT_ROLES,
+    )
+    .await?;
 
     // Modern format: individual .md files in roles/ directory
     let role_files: &[(&str, &str)] = &[
@@ -981,9 +1108,19 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
 /// Push the management panel script to /etc/devbox/management.sh inside the VM.
 async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    write_file_to_vm(runtime, name, "/etc/devbox/management.sh", MANAGEMENT_SCRIPT).await?;
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/devbox/management.sh",
+        MANAGEMENT_SCRIPT,
+    )
+    .await?;
     runtime
-        .exec_cmd(name, &["sudo", "chmod", "+x", "/etc/devbox/management.sh"], false)
+        .exec_cmd(
+            name,
+            &["sudo", "chmod", "+x", "/etc/devbox/management.sh"],
+            false,
+        )
         .await?;
     Ok(())
 }
@@ -1033,7 +1170,8 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     // Ensure ~/.npm-global/bin is at front of PATH in both .zshrc and .profile
     // so latest claude takes precedence over the nixpkgs system version.
     // .profile is needed because layout panes use `bash -lc` (not zsh).
-    let path_line = r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
+    let path_line =
+        r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
     for rc_file in &[".zshrc", ".profile"] {
         let rc_path = format!("/home/{username}/{rc_file}");
         let add_path_cmd = format!(
@@ -1194,9 +1332,21 @@ mod tests {
     #[test]
     fn nix_packages_all_sets_have_packages() {
         let all_sets = [
-            "system", "shell", "tools", "editor", "git", "container",
-            "network", "ai-code", "ai-infra", "lang-go", "lang-rust", "lang-python",
-            "lang-node", "lang-java", "lang-ruby",
+            "system",
+            "shell",
+            "tools",
+            "editor",
+            "git",
+            "container",
+            "network",
+            "ai-code",
+            "ai-infra",
+            "lang-go",
+            "lang-rust",
+            "lang-python",
+            "lang-node",
+            "lang-java",
+            "lang-ruby",
         ];
         for set in &all_sets {
             let pkgs = nix_packages_for_set(set);

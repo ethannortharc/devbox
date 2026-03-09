@@ -73,9 +73,18 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
                 return Ok(());
             }
 
-            let added = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Added).count();
-            let modified = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Modified).count();
-            let deleted = changes.iter().filter(|c| c.status == overlay::ChangeStatus::Deleted).count();
+            let added = changes
+                .iter()
+                .filter(|c| c.status == overlay::ChangeStatus::Added)
+                .count();
+            let modified = changes
+                .iter()
+                .filter(|c| c.status == overlay::ChangeStatus::Modified)
+                .count();
+            let deleted = changes
+                .iter()
+                .filter(|c| c.status == overlay::ChangeStatus::Deleted)
+                .count();
 
             for c in &changes {
                 if !c.is_dir {

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::sandbox::SandboxManager;
-use crate::tui::{find_layout, LAYOUTS};
+use crate::tui::{LAYOUTS, find_layout};
 
 #[derive(Args, Debug)]
 pub struct LayoutArgs {
@@ -41,7 +41,7 @@ pub enum LayoutAction {
 pub async fn run(args: LayoutArgs, manager: &SandboxManager) -> Result<()> {
     match args.action {
         LayoutAction::List => {
-            println!("{:<16} {}", "NAME", "DESCRIPTION");
+            println!("{:<16} DESCRIPTION", "NAME");
             println!("{}", "-".repeat(60));
             for l in LAYOUTS {
                 println!("{:<16} {}", l.name, l.description);
@@ -57,7 +57,10 @@ pub async fn run(args: LayoutArgs, manager: &SandboxManager) -> Result<()> {
                     println!("{}", l.preview);
                 }
                 None => {
-                    anyhow::bail!("Layout '{}' not found. Run `devbox layout list` to see options.", name);
+                    anyhow::bail!(
+                        "Layout '{}' not found. Run `devbox layout list` to see options.",
+                        name
+                    );
                 }
             }
             Ok(())
@@ -72,9 +75,7 @@ pub async fn run(args: LayoutArgs, manager: &SandboxManager) -> Result<()> {
             }
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
-            let status = std::process::Command::new(&editor)
-                .arg(&path)
-                .status()?;
+            let status = std::process::Command::new(&editor).arg(&path).status()?;
             if !status.success() {
                 anyhow::bail!("Editor exited with non-zero status");
             }
@@ -162,7 +163,10 @@ layout {{
                 .await?;
 
             println!("Layout preference removed for sandbox '{sb_name}'.");
-            println!("Next login will use the built-in '{}' layout.", state.layout);
+            println!(
+                "Next login will use the built-in '{}' layout.",
+                state.layout
+            );
             Ok(())
         }
         LayoutAction::SetDefault { name } => {

@@ -23,7 +23,7 @@ fn help_flag() {
     let output = devbox().arg("--help").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("NixOS-powered developer VM"));
+    assert!(stdout.contains("Isolated developer VMs"));
     assert!(stdout.contains("create"));
     assert!(stdout.contains("shell"));
     assert!(stdout.contains("guide"));
@@ -32,9 +32,26 @@ fn help_flag() {
 #[test]
 fn subcommand_help() {
     let subcommands = [
-        "create", "shell", "exec", "stop", "destroy", "list", "status",
-        "snapshot", "upgrade", "config", "doctor", "layout", "packages",
-        "prune", "init", "nix", "commit", "diff", "discard", "guide",
+        "create",
+        "shell",
+        "exec",
+        "stop",
+        "destroy",
+        "list",
+        "status",
+        "snapshot",
+        "upgrade",
+        "config",
+        "doctor",
+        "layout",
+        "packages",
+        "prune",
+        "init",
+        "nix",
+        "commit",
+        "diff",
+        "discard",
+        "guide",
         "self-update",
     ];
 
@@ -68,7 +85,10 @@ fn guide_specific_tool() {
 
 #[test]
 fn guide_unknown_tool() {
-    let output = devbox().args(["guide", "nonexistent-tool"]).output().unwrap();
+    let output = devbox()
+        .args(["guide", "nonexistent-tool"])
+        .output()
+        .unwrap();
     assert!(output.status.success()); // exits 0, prints to stderr
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("No cheat sheet"));
@@ -78,9 +98,7 @@ fn guide_unknown_tool() {
 fn config_show() {
     let output = devbox().args(["config", "show"]).output().unwrap();
     // May succeed or fail depending on state, but should not panic
-    assert!(
-        output.status.success() || !String::from_utf8_lossy(&output.stderr).contains("panic")
-    );
+    assert!(output.status.success() || !String::from_utf8_lossy(&output.stderr).contains("panic"));
 }
 
 #[test]

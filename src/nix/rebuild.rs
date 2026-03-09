@@ -4,18 +4,11 @@ use crate::runtime::Runtime;
 
 /// Execute `nixos-rebuild switch` inside a sandbox VM.
 /// Returns Ok(()) on success, Err with rollback attempt on failure.
-pub async fn nixos_rebuild(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<()> {
+pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     println!("Running nixos-rebuild switch...");
 
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "nixos-rebuild", "switch"],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["sudo", "nixos-rebuild", "switch"], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -71,7 +64,10 @@ pub async fn write_state_toml(
         .await?;
 
     if result.exit_code != 0 {
-        bail!("Failed to write devbox-state.toml: {}", result.stderr.trim());
+        bail!(
+            "Failed to write devbox-state.toml: {}",
+            result.stderr.trim()
+        );
     }
 
     Ok(())
@@ -103,4 +99,3 @@ pub async fn write_nix_file(
 
     Ok(())
 }
-

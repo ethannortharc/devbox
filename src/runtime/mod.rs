@@ -98,12 +98,7 @@ pub trait Runtime: Send + Sync {
     async fn stop(&self, name: &str) -> Result<()>;
 
     /// Execute a command inside a sandbox.
-    async fn exec_cmd(
-        &self,
-        name: &str,
-        cmd: &[&str],
-        interactive: bool,
-    ) -> Result<ExecResult>;
+    async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult>;
 
     /// Destroy a sandbox permanently.
     async fn destroy(&self, name: &str) -> Result<()>;

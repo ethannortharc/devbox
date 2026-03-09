@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Persistent state for a sandbox instance, stored in ~/.devbox/sandboxes/<name>/state.json.
@@ -41,8 +41,8 @@ impl SandboxState {
             .with_context(|| format!("Failed to create state dir: {}", dir.display()))?;
 
         let path = dir.join("state.json");
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize sandbox state")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize sandbox state")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write sandbox state: {}", path.display()))?;
         Ok(())

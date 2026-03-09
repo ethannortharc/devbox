@@ -13,18 +13,13 @@ const STASH_DIR: &str = "/var/devbox/overlay/stash";
 
 /// List files changed in the overlay upper layer.
 /// Returns a list of (status, path) tuples.
-pub async fn diff(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<Vec<OverlayChange>> {
+pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<OverlayChange>> {
     // List all files in the upper directory
     let result = runtime
         .exec_cmd(
             sandbox_name,
             &[
-                "sudo", "find", UPPER,
-                "-not", "-path", UPPER,
-                "-printf", "%y %P\\n",
+                "sudo", "find", UPPER, "-not", "-path", UPPER, "-printf", "%y %P\\n",
             ],
             false,
         )
@@ -48,11 +43,7 @@ pub async fn diff(
         // Check if the file exists in the lower layer to determine add vs modify
         let lower_path = format!("{LOWER}/{path}");
         let check = runtime
-            .exec_cmd(
-                sandbox_name,
-                &["test", "-e", &lower_path],
-                false,
-            )
+            .exec_cmd(sandbox_name, &["test", "-e", &lower_path], false)
             .await?;
 
         let status = if kind == "c" {
@@ -78,10 +69,7 @@ pub async fn diff(
 
 /// Show overlay status summary (like `git status`).
 /// Returns the list of changes for further processing.
-pub async fn status(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<Vec<OverlayChange>> {
+pub async fn status(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<OverlayChange>> {
     let changes = diff(runtime, sandbox_name).await?;
     let stashed = has_stash(runtime, sandbox_name).await?;
 
@@ -91,9 +79,18 @@ pub async fn status(
     }
 
     let files: Vec<&OverlayChange> = changes.iter().filter(|c| !c.is_dir).collect();
-    let added = files.iter().filter(|c| c.status == ChangeStatus::Added).count();
-    let modified = files.iter().filter(|c| c.status == ChangeStatus::Modified).count();
-    let deleted = files.iter().filter(|c| c.status == ChangeStatus::Deleted).count();
+    let added = files
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Added)
+        .count();
+    let modified = files
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Modified)
+        .count();
+    let deleted = files
+        .iter()
+        .filter(|c| c.status == ChangeStatus::Deleted)
+        .count();
 
     if !files.is_empty() {
         println!("Overlay changes:");
@@ -173,14 +170,14 @@ pub async fn commit(
             ChangeStatus::Added | ChangeStatus::Modified => {
                 if change.is_dir {
                     let result = runtime
-                        .exec_cmd(
-                            sandbox_name,
-                            &["sudo", "mkdir", "-p", &lower_path],
-                            false,
-                        )
+                        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &lower_path], false)
                         .await?;
                     if result.exit_code != 0 {
-                        eprintln!("Warning: failed to create dir {}: {}", change.path, result.stderr.trim());
+                        eprintln!(
+                            "Warning: failed to create dir {}: {}",
+                            change.path,
+                            result.stderr.trim()
+                        );
                         continue;
                     }
                 } else {
@@ -194,11 +191,7 @@ pub async fn commit(
                     );
                     if !parent.is_empty() && parent != LOWER {
                         let _ = runtime
-                            .exec_cmd(
-                                sandbox_name,
-                                &["sudo", "mkdir", "-p", &parent],
-                                false,
-                            )
+                            .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &parent], false)
                             .await;
                     }
 
@@ -210,21 +203,25 @@ pub async fn commit(
                         )
                         .await?;
                     if result.exit_code != 0 {
-                        eprintln!("Warning: failed to commit {}: {}", change.path, result.stderr.trim());
+                        eprintln!(
+                            "Warning: failed to commit {}: {}",
+                            change.path,
+                            result.stderr.trim()
+                        );
                         continue;
                     }
                 }
             }
             ChangeStatus::Deleted => {
                 let result = runtime
-                    .exec_cmd(
-                        sandbox_name,
-                        &["sudo", "rm", "-rf", &lower_path],
-                        false,
-                    )
+                    .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &lower_path], false)
                     .await?;
                 if result.exit_code != 0 {
-                    eprintln!("Warning: failed to delete {}: {}", change.path, result.stderr.trim());
+                    eprintln!(
+                        "Warning: failed to delete {}: {}",
+                        change.path,
+                        result.stderr.trim()
+                    );
                     continue;
                 }
             }
@@ -255,11 +252,7 @@ pub async fn discard(
         for path in filter_paths {
             let upper_path = format!("{UPPER}/{}", path.trim_start_matches('/'));
             let result = runtime
-                .exec_cmd(
-                    sandbox_name,
-                    &["sudo", "rm", "-rf", &upper_path],
-                    false,
-                )
+                .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &upper_path], false)
                 .await?;
             if result.exit_code == 0 {
                 println!("  Discarded: {path}");
@@ -276,7 +269,9 @@ pub async fn discard(
             .exec_cmd(
                 sandbox_name,
                 &[
-                    "sudo", "bash", "-c",
+                    "sudo",
+                    "bash",
+                    "-c",
                     &format!("rm -rf {UPPER}/* {UPPER}/.[!.]* 2>/dev/null; true"),
                 ],
                 false,
@@ -294,21 +289,14 @@ pub async fn discard(
 
 /// Stash the current overlay upper layer (save and clear).
 /// Only one stash is supported at a time.
-pub async fn stash(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<()> {
+pub async fn stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     if has_stash(runtime, sandbox_name).await? {
         bail!("A stash already exists. Pop or discard it first (`devbox layer stash-pop`).");
     }
 
     // Move upper to stash
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "mv", UPPER, STASH_DIR],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["sudo", "mv", UPPER, STASH_DIR], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -317,15 +305,14 @@ pub async fn stash(
 
     // Recreate empty upper directory
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "mkdir", "-p", UPPER],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", UPPER], false)
         .await?;
 
     if result.exit_code != 0 {
-        bail!("Failed to recreate upper directory: {}", result.stderr.trim());
+        bail!(
+            "Failed to recreate upper directory: {}",
+            result.stderr.trim()
+        );
     }
 
     println!("Overlay changes stashed.");
@@ -333,10 +320,7 @@ pub async fn stash(
 }
 
 /// Restore a previously stashed overlay upper layer.
-pub async fn stash_pop(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<()> {
+pub async fn stash_pop(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     if !has_stash(runtime, sandbox_name).await? {
         bail!("No stash found. Nothing to pop.");
     }
@@ -346,11 +330,7 @@ pub async fn stash_pop(
         "cp -a {STASH_DIR}/* {UPPER}/ 2>/dev/null; cp -a {STASH_DIR}/.[!.]* {UPPER}/ 2>/dev/null; true"
     );
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "bash", "-c", &merge_cmd],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &merge_cmd], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -359,11 +339,7 @@ pub async fn stash_pop(
 
     // Remove the stash directory
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "rm", "-rf", STASH_DIR],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", STASH_DIR], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -375,20 +351,11 @@ pub async fn stash_pop(
 }
 
 /// Check if a stash exists and is non-empty.
-pub async fn has_stash(
-    runtime: &dyn Runtime,
-    sandbox_name: &str,
-) -> Result<bool> {
+pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool> {
     // Check if stash directory exists and has contents
-    let check_cmd = format!(
-        "test -d {STASH_DIR} && [ \"$(ls -A {STASH_DIR} 2>/dev/null)\" ]"
-    );
+    let check_cmd = format!("test -d {STASH_DIR} && [ \"$(ls -A {STASH_DIR} 2>/dev/null)\" ]");
     let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["bash", "-c", &check_cmd],
-            false,
-        )
+        .exec_cmd(sandbox_name, &["bash", "-c", &check_cmd], false)
         .await?;
 
     Ok(result.exit_code == 0)

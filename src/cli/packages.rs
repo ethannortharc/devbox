@@ -39,9 +39,7 @@ pub async fn run(args: PackagesArgs, manager: &SandboxManager) -> Result<()> {
     let tools_to_apply: Vec<String> = final_toggles
         .iter()
         .filter(|(_, enabled)| **enabled)
-        .map(|(name, _)| {
-            name.strip_prefix("lang-").unwrap_or(name).to_string()
-        })
+        .map(|(name, _)| name.strip_prefix("lang-").unwrap_or(name).to_string())
         .collect();
 
     if tools_to_apply.is_empty() && final_toggles.values().all(|v| !v) {

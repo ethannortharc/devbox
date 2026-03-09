@@ -25,7 +25,10 @@ pub async fn run(args: DiscardArgs, manager: &SandboxManager) -> Result<()> {
     let state = manager.get_sandbox(&name)?;
 
     if state.mount_mode == "writable" {
-        println!("Sandbox '{}' uses writable mode — no overlay to discard.", name);
+        println!(
+            "Sandbox '{}' uses writable mode — no overlay to discard.",
+            name
+        );
         return Ok(());
     }
 

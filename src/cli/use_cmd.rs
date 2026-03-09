@@ -27,7 +27,10 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     let mount_mode = if args.writable { "writable" } else { "overlay" };
 
     // If already pointing at same dir with same mode and running, just attach
-    let same_dir = state.project_dir.canonicalize().unwrap_or_else(|_| state.project_dir.clone())
+    let same_dir = state
+        .project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state.project_dir.clone())
         == cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     let same_mode = state.mount_mode == mount_mode;
 
@@ -35,7 +38,11 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         let runtime = manager.runtime_for_sandbox(&state)?;
         let status = runtime.status(name).await?;
         if status == crate::runtime::SandboxStatus::Running {
-            println!("Already using '{}' with {}. Attaching...", cwd.display(), mount_mode);
+            println!(
+                "Already using '{}' with {}. Attaching...",
+                cwd.display(),
+                mount_mode
+            );
             return manager.attach(name, None, false).await;
         }
     }
@@ -68,8 +75,15 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     if is_overlay {
         println!("Setting up OverlayFS mount via NixOS...");
         if let Err(e) = provision::provision_vm_with_mode(
-            runtime.as_ref(), name, &state.sets, &state.languages, &state.image, "overlay",
-        ).await {
+            runtime.as_ref(),
+            name,
+            &state.sets,
+            &state.languages,
+            &state.image,
+            "overlay",
+        )
+        .await
+        {
             eprintln!("Warning: overlay mount setup failed: {e}");
         }
     }

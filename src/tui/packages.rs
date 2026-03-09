@@ -2,17 +2,19 @@ use std::io;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Terminal;
 
-use crate::tools::registry::TOOL_SETS;
 use crate::nix::sets::NIX_SETS;
+use crate::tools::registry::TOOL_SETS;
 
 /// View mode for the TUI.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,20 +35,16 @@ struct SetRow {
 
 /// Run the interactive TUI package manager.
 /// Returns a list of set toggle actions (set_name, enabled).
-pub fn run_packages_tui(
-    active_sets: &[String],
-) -> Result<Vec<(String, bool)>> {
+pub fn run_packages_tui(active_sets: &[String]) -> Result<Vec<(String, bool)>> {
     // Build set rows
     let mut rows: Vec<SetRow> = TOOL_SETS
         .iter()
-        .map(|ts| {
-            SetRow {
-                name: ts.name.to_string(),
-                description: ts.description.to_string(),
-                package_count: ts.package_count,
-                active: active_sets.contains(&ts.name.to_string()),
-                locked: ts.locked,
-            }
+        .map(|ts| SetRow {
+            name: ts.name.to_string(),
+            description: ts.description.to_string(),
+            package_count: ts.package_count,
+            active: active_sets.contains(&ts.name.to_string()),
+            locked: ts.locked,
         })
         .collect();
 
@@ -66,11 +64,7 @@ pub fn run_packages_tui(
         terminal.draw(|f| {
             let area = centered_rect(75, 80, f.area());
 
-            let chunks = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ])
-            .split(area);
+            let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
 
             match &view {
                 View::Sets => {
@@ -97,11 +91,11 @@ pub fn run_packages_tui(
                         list_state.select(Some(next));
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(i) = list_state.selected() {
-                            if !rows[i].locked {
-                                rows[i].active = !rows[i].active;
-                                toggles.push((rows[i].name.clone(), rows[i].active));
-                            }
+                        if let Some(i) = list_state.selected()
+                            && !rows[i].locked
+                        {
+                            rows[i].active = !rows[i].active;
+                            toggles.push((rows[i].name.clone(), rows[i].active));
                         }
                     }
                     KeyCode::Enter => {
@@ -124,7 +118,11 @@ pub fn run_packages_tui(
                             .map(|s| s.packages.len())
                             .unwrap_or(0);
                         let i = pkg_state.selected().unwrap_or(0);
-                        let next = if pkg_count == 0 || i >= pkg_count - 1 { 0 } else { i + 1 };
+                        let next = if pkg_count == 0 || i >= pkg_count - 1 {
+                            0
+                        } else {
+                            i + 1
+                        };
                         pkg_state.select(Some(next));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -135,7 +133,11 @@ pub fn run_packages_tui(
                             .map(|s| s.packages.len())
                             .unwrap_or(0);
                         let i = pkg_state.selected().unwrap_or(0);
-                        let next = if i == 0 { pkg_count.saturating_sub(1) } else { i - 1 };
+                        let next = if i == 0 {
+                            pkg_count.saturating_sub(1)
+                        } else {
+                            i - 1
+                        };
                         pkg_state.select(Some(next));
                     }
                     _ => {}
@@ -167,17 +169,20 @@ fn draw_sets_view(
             } else {
                 "○"
             };
-            let status_color = if r.active { Color::Green } else { Color::DarkGray };
+            let status_color = if r.active {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
             let status_text = if r.active { "active" } else { "off" };
 
             let line = Line::from(vec![
-                Span::styled(
-                    format!(" {marker} "),
-                    Style::default().fg(status_color),
-                ),
+                Span::styled(format!(" {marker} "), Style::default().fg(status_color)),
                 Span::styled(
                     format!("{:<16}", r.name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:>3} pkgs   ", r.package_count),
@@ -187,10 +192,7 @@ fn draw_sets_view(
                     format!("{:<8}", status_text),
                     Style::default().fg(status_color),
                 ),
-                Span::styled(
-                    &r.description,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(&r.description, Style::default().fg(Color::DarkGray)),
             ]);
             ListItem::new(line)
         })
@@ -231,7 +233,10 @@ fn draw_packages_view(
     set_index: usize,
     state: &mut ListState,
 ) {
-    let set_name = TOOL_SETS.get(set_index).map(|s| s.name).unwrap_or("unknown");
+    let set_name = TOOL_SETS
+        .get(set_index)
+        .map(|s| s.name)
+        .unwrap_or("unknown");
 
     let packages: Vec<&str> = NIX_SETS
         .iter()
@@ -243,20 +248,18 @@ fn draw_packages_view(
         .iter()
         .map(|pkg| {
             let line = Line::from(vec![
-                Span::styled(
-                    "  ● ",
-                    Style::default().fg(Color::Green),
-                ),
-                Span::styled(
-                    format!("{pkg}"),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled(pkg.to_string(), Style::default().fg(Color::Cyan)),
             ]);
             ListItem::new(line)
         })
         .collect();
 
-    let title = format!(" devbox packages > {} ({} packages) ", set_name, packages.len());
+    let title = format!(
+        " devbox packages > {} ({} packages) ",
+        set_name,
+        packages.len()
+    );
     let list = List::new(items)
         .block(
             Block::default()

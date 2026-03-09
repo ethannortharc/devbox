@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// devbox.toml — project-level configuration.
@@ -162,8 +162,7 @@ impl DevboxConfig {
     /// Save to devbox.toml.
     #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
@@ -198,7 +197,8 @@ impl DevboxConfig {
                     self.sets.ai_code = true;
                     self.sets.ai_infra = true;
                 }
-                "ai-code" | "coding" | "claude-code" | "claude" | "aider" | "codex" | "opencode" => {
+                "ai-code" | "coding" | "claude-code" | "claude" | "aider" | "codex"
+                | "opencode" => {
                     self.sets.ai_code = true;
                 }
                 "ai-infra" | "ollama" | "mcp-hub" | "litellm" | "open-webui" => {
@@ -217,31 +217,67 @@ impl DevboxConfig {
         sets.push("shell".to_string());
         sets.push("tools".to_string());
         // Toggleable sets
-        if self.sets.editor { sets.push("editor".to_string()); }
-        if self.sets.git { sets.push("git".to_string()); }
-        if self.sets.container { sets.push("container".to_string()); }
-        if self.sets.network { sets.push("network".to_string()); }
-        if self.sets.ai_code { sets.push("ai-code".to_string()); }
-        if self.sets.ai_infra { sets.push("ai-infra".to_string()); }
+        if self.sets.editor {
+            sets.push("editor".to_string());
+        }
+        if self.sets.git {
+            sets.push("git".to_string());
+        }
+        if self.sets.container {
+            sets.push("container".to_string());
+        }
+        if self.sets.network {
+            sets.push("network".to_string());
+        }
+        if self.sets.ai_code {
+            sets.push("ai-code".to_string());
+        }
+        if self.sets.ai_infra {
+            sets.push("ai-infra".to_string());
+        }
         // Language sets
-        if self.languages.go { sets.push("lang-go".to_string()); }
-        if self.languages.rust { sets.push("lang-rust".to_string()); }
-        if self.languages.python { sets.push("lang-python".to_string()); }
-        if self.languages.node { sets.push("lang-node".to_string()); }
-        if self.languages.java { sets.push("lang-java".to_string()); }
-        if self.languages.ruby { sets.push("lang-ruby".to_string()); }
+        if self.languages.go {
+            sets.push("lang-go".to_string());
+        }
+        if self.languages.rust {
+            sets.push("lang-rust".to_string());
+        }
+        if self.languages.python {
+            sets.push("lang-python".to_string());
+        }
+        if self.languages.node {
+            sets.push("lang-node".to_string());
+        }
+        if self.languages.java {
+            sets.push("lang-java".to_string());
+        }
+        if self.languages.ruby {
+            sets.push("lang-ruby".to_string());
+        }
         sets
     }
 
     /// Return active language names (without "lang-" prefix).
     pub fn active_languages(&self) -> Vec<String> {
         let mut langs = vec![];
-        if self.languages.go { langs.push("go".to_string()); }
-        if self.languages.rust { langs.push("rust".to_string()); }
-        if self.languages.python { langs.push("python".to_string()); }
-        if self.languages.node { langs.push("node".to_string()); }
-        if self.languages.java { langs.push("java".to_string()); }
-        if self.languages.ruby { langs.push("ruby".to_string()); }
+        if self.languages.go {
+            langs.push("go".to_string());
+        }
+        if self.languages.rust {
+            langs.push("rust".to_string());
+        }
+        if self.languages.python {
+            langs.push("python".to_string());
+        }
+        if self.languages.node {
+            langs.push("node".to_string());
+        }
+        if self.languages.java {
+            langs.push("java".to_string());
+        }
+        if self.languages.ruby {
+            langs.push("ruby".to_string());
+        }
         langs
     }
 }

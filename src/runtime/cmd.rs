@@ -1,6 +1,6 @@
 use std::process::Stdio;
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 use super::ExecResult;

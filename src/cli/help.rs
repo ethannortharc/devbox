@@ -32,14 +32,14 @@ fn show_cheat_sheet(name: &str) -> Result<()> {
     // If inside a running Zellij session and stdout is a terminal, open a floating pane.
     // Skip when stdout is piped/captured (e.g., in tests or scripts).
     use std::io::IsTerminal;
-    if is_inside_zellij() && std::io::stdout().is_terminal() {
-        if let Some(content) = lookup_embedded(name) {
-            if show_in_zellij_float(name, content).is_ok() {
-                return Ok(());
-            }
-            // Float failed — fall through to inline rendering
-        }
+    if is_inside_zellij()
+        && std::io::stdout().is_terminal()
+        && let Some(content) = lookup_embedded(name)
+        && show_in_zellij_float(name, content).is_ok()
+    {
+        return Ok(());
     }
+    // Float failed — fall through to inline rendering
 
     // 1. Check /etc/devbox/help/ (inside VM)
     let vm_path = Path::new("/etc/devbox/help").join(format!("{name}.md"));
@@ -57,9 +57,7 @@ fn show_cheat_sheet(name: &str) -> Result<()> {
         return render_markdown(content);
     }
 
-    eprintln!(
-        "No cheat sheet for '{name}'. Run `devbox guide` to see available topics."
-    );
+    eprintln!("No cheat sheet for '{name}'. Run `devbox guide` to see available topics.");
     Ok(())
 }
 
@@ -67,10 +65,7 @@ fn show_cheat_sheet(name: &str) -> Result<()> {
 /// ZELLIJ env var is set to the session name when inside Zellij.
 /// Some systems set ZELLIJ=0 or empty when not inside — check for a real session.
 fn is_inside_zellij() -> bool {
-    match std::env::var("ZELLIJ_SESSION_NAME") {
-        Ok(val) if !val.is_empty() => true,
-        _ => false,
-    }
+    matches!(std::env::var("ZELLIJ_SESSION_NAME"), Ok(val) if !val.is_empty())
 }
 
 /// Open a floating Zellij pane with pretty markdown rendering.
@@ -81,16 +76,19 @@ fn show_in_zellij_float(name: &str, content: &str) -> Result<()> {
     std::fs::write(&tmp_path, content)?;
 
     // Open floating pane with glow (pager mode) or fall back to less
-    let cmd = format!(
-        "glow -p {} 2>/dev/null || less {}",
-        tmp_path, tmp_path
-    );
+    let cmd = format!("glow -p {} 2>/dev/null || less {}", tmp_path, tmp_path);
     let pane_name = format!("guide: {name}");
     let status = std::process::Command::new("zellij")
         .args([
-            "run", "--floating", "--close-on-exit",
-            "--name", &pane_name,
-            "--", "bash", "-c", &cmd,
+            "run",
+            "--floating",
+            "--close-on-exit",
+            "--name",
+            &pane_name,
+            "--",
+            "bash",
+            "-c",
+            &cmd,
         ])
         .status()
         .map_err(|e| anyhow::anyhow!("Failed to launch Zellij floating pane: {e}"))?;
@@ -106,8 +104,8 @@ fn render_markdown(content: &str) -> Result<()> {
     // Only try glow when stdout is a terminal (not piped/captured)
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() && which::which("glow").is_ok() {
-        use std::process::Stdio;
         use std::io::Write;
+        use std::process::Stdio;
 
         if let Ok(mut child) = std::process::Command::new("glow")
             .arg("-")
@@ -117,10 +115,10 @@ fn render_markdown(content: &str) -> Result<()> {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(content.as_bytes());
             }
-            if let Ok(status) = child.wait() {
-                if status.success() {
-                    return Ok(());
-                }
+            if let Ok(status) = child.wait()
+                && status.success()
+            {
+                return Ok(());
             }
         }
     }

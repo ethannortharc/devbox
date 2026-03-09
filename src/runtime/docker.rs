@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::cmd::{run_ok, run_cmd, run_interactive};
+use super::cmd::{run_cmd, run_interactive, run_ok};
 use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
 
 /// Docker runtime — fallback (weaker isolation, shared kernel).
@@ -119,12 +119,7 @@ impl Runtime for DockerRuntime {
         Ok(())
     }
 
-    async fn exec_cmd(
-        &self,
-        name: &str,
-        cmd: &[&str],
-        interactive: bool,
-    ) -> Result<ExecResult> {
+    async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult> {
         let container = Self::container_name(name);
 
         if interactive {
@@ -149,7 +144,13 @@ impl Runtime for DockerRuntime {
         let container = Self::container_name(name);
         let result = run_cmd(
             "docker",
-            &["container", "inspect", "--format", "{{.State.Status}}", &container],
+            &[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &container,
+            ],
         )
         .await?;
 

@@ -1,6 +1,6 @@
 use std::env;
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use colored::Colorize;
 
@@ -19,9 +19,7 @@ pub async fn run(args: InitArgs, manager: &SandboxManager) -> Result<()> {
     let config_path = cwd.join("devbox.toml");
 
     if config_path.exists() && !args.force {
-        bail!(
-            "devbox.toml already exists. Use --force to overwrite."
-        );
+        bail!("devbox.toml already exists. Use --force to overwrite.");
     }
 
     let config = manager.generate_config(&cwd);
@@ -78,9 +76,9 @@ fn generate_commented_toml(
     // [sets]
     s.push_str("[sets]\n");
     s.push_str("# Toggle which Nix sets are active\n");
-    s.push_str(&format!("system = true              # Locked: always true\n"));
-    s.push_str(&format!("shell = true               # Locked: always true\n"));
-    s.push_str(&format!("tools = true               # Locked: always true\n"));
+    s.push_str("system = true              # Locked: always true\n");
+    s.push_str("shell = true               # Locked: always true\n");
+    s.push_str("tools = true               # Locked: always true\n");
     s.push_str(&format!("editor = {}\n", config.sets.editor));
     s.push_str(&format!("git = {}\n", config.sets.git));
     s.push_str(&format!("container = {}\n", config.sets.container));
@@ -92,18 +90,57 @@ fn generate_commented_toml(
     // [languages]
     s.push_str("[languages]\n");
     s.push_str("# Auto-detected from project files, or explicit\n");
-    let go_comment = if detected.go { "  # Detected: go.mod" } else { "" };
-    let rust_comment = if detected.rust { "  # Detected: Cargo.toml" } else { "" };
-    let python_comment = if detected.python { "  # Detected: pyproject.toml/setup.py/requirements.txt" } else { "" };
-    let node_comment = if detected.node { "  # Detected: package.json" } else { "" };
-    let java_comment = if detected.java { "  # Detected: pom.xml/build.gradle" } else { "" };
-    let ruby_comment = if detected.ruby { "  # Detected: Gemfile" } else { "" };
+    let go_comment = if detected.go {
+        "  # Detected: go.mod"
+    } else {
+        ""
+    };
+    let rust_comment = if detected.rust {
+        "  # Detected: Cargo.toml"
+    } else {
+        ""
+    };
+    let python_comment = if detected.python {
+        "  # Detected: pyproject.toml/setup.py/requirements.txt"
+    } else {
+        ""
+    };
+    let node_comment = if detected.node {
+        "  # Detected: package.json"
+    } else {
+        ""
+    };
+    let java_comment = if detected.java {
+        "  # Detected: pom.xml/build.gradle"
+    } else {
+        ""
+    };
+    let ruby_comment = if detected.ruby {
+        "  # Detected: Gemfile"
+    } else {
+        ""
+    };
     s.push_str(&format!("go = {}{}\n", config.languages.go, go_comment));
-    s.push_str(&format!("rust = {}{}\n", config.languages.rust, rust_comment));
-    s.push_str(&format!("python = {}{}\n", config.languages.python, python_comment));
-    s.push_str(&format!("node = {}{}\n", config.languages.node, node_comment));
-    s.push_str(&format!("java = {}{}\n", config.languages.java, java_comment));
-    s.push_str(&format!("ruby = {}{}\n", config.languages.ruby, ruby_comment));
+    s.push_str(&format!(
+        "rust = {}{}\n",
+        config.languages.rust, rust_comment
+    ));
+    s.push_str(&format!(
+        "python = {}{}\n",
+        config.languages.python, python_comment
+    ));
+    s.push_str(&format!(
+        "node = {}{}\n",
+        config.languages.node, node_comment
+    ));
+    s.push_str(&format!(
+        "java = {}{}\n",
+        config.languages.java, java_comment
+    ));
+    s.push_str(&format!(
+        "ruby = {}{}\n",
+        config.languages.ruby, ruby_comment
+    ));
     s.push('\n');
 
     // [mounts]

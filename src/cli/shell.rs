@@ -21,5 +21,7 @@ pub struct ShellArgs {
 pub async fn run(args: ShellArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.name.as_deref())?;
     let force_new = args.restart || args.layout.is_some();
-    manager.attach(&name, args.layout.as_deref(), force_new).await
+    manager
+        .attach(&name, args.layout.as_deref(), force_new)
+        .await
 }
