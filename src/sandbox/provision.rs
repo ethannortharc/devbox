@@ -197,12 +197,15 @@ async fn provision_nixos(
         println!("NixOS rebuild complete.");
     }
 
-    // 8. Install latest claude-code via npm (nixpkgs version lags behind)
+    // 8. Set up user shell (zshrc with PATH, aliases, etc.)
+    setup_nixos_shell(runtime, name).await?;
+
+    // 9. Install latest claude-code (nixpkgs version lags behind)
     if sets.iter().any(|s| s == "ai-code" || s == "ai_code") {
         install_latest_claude_code(runtime, name).await;
     }
 
-    // 9. Copy devbox binary + help files + tool configs
+    // 10. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
@@ -398,6 +401,59 @@ ZSHRC
         if r.exit_code != 0 {
             eprintln!("Warning: shell setup incomplete");
         }
+    }
+
+    Ok(())
+}
+
+/// Set up user shell environment on NixOS (zshrc with PATH, aliases, workspace cd).
+async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let username = whoami();
+    let zshrc_path = format!("/home/{username}/.zshrc");
+
+    // Only create if .zshrc doesn't exist yet (don't overwrite user customizations)
+    let check = runtime
+        .exec_cmd(name, &["test", "-f", &zshrc_path], false)
+        .await?;
+
+    if check.exit_code != 0 {
+        let zshrc = format!(
+            r#"# Devbox shell configuration
+# Latest tools first (official installers take precedence over nixpkgs)
+export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+
+# Starship prompt
+if command -v starship >/dev/null 2>&1; then
+  eval "$(starship init zsh)"
+fi
+
+# Zoxide
+if command -v zoxide >/dev/null 2>&1; then
+  eval "$(zoxide init zsh)"
+fi
+
+# fzf
+if command -v fzf >/dev/null 2>&1; then
+  source <(fzf --zsh) 2>/dev/null
+fi
+
+# Aliases
+alias ls='eza --icons' 2>/dev/null
+alias cat='bat --paging=never' 2>/dev/null
+alias top='htop' 2>/dev/null
+
+# Devbox identity
+export DEVBOX_NAME="${{DEVBOX_NAME:-devbox}}"
+export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
+
+# Default to workspace directory
+[ -d /workspace ] && cd /workspace
+"#
+        );
+        write_file_to_vm(runtime, name, &zshrc_path, &zshrc).await?;
+
+        let chown_cmd = format!("chown {username}:{username} {zshrc_path}");
+        runtime.exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false).await?;
     }
 
     Ok(())
@@ -883,17 +939,23 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
 
 /// Install the latest claude-code using the official installer.
 /// Falls back to npm if the official installer is unavailable.
+/// Also ensures ~/.local/bin is in PATH so the latest version takes precedence
+/// over the (potentially older) nixpkgs system version.
 async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
+    let username = whoami();
     println!("Installing latest claude-code...");
+
+    // Run official installer as the user (installs to ~/.local/bin/)
     let install_cmd = concat!(
-        "export PATH=\"/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
+        "export PATH=\"$HOME/.local/bin:$HOME/.claude/bin:/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
         "curl -fsSL https://claude.ai/install.sh | sh 2>&1 | tail -5; ",
         "if ! command -v claude >/dev/null 2>&1; then ",
         "echo 'Official installer failed, trying npm...'; ",
         "if command -v npm >/dev/null 2>&1; then ",
         "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
         "fi; ",
-        "fi"
+        "fi; ",
+        "claude --version 2>/dev/null || echo 'claude not found in PATH'"
     );
     let result = runtime
         .exec_cmd(name, &["bash", "-lc", install_cmd], true)
@@ -906,6 +968,18 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
             eprintln!("Warning: could not install latest claude-code. Using nixpkgs version.");
         }
     }
+
+    // Ensure ~/.local/bin is at front of PATH in .zshrc so latest claude
+    // takes precedence over the nixpkgs system version
+    let path_line = r#"export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
+    let add_path_cmd = format!(
+        "grep -qF '.local/bin' /home/{username}/.zshrc 2>/dev/null || \
+         sed -i '1i\\{path_line}' /home/{username}/.zshrc 2>/dev/null || \
+         echo '{path_line}' >> /home/{username}/.zshrc"
+    );
+    let _ = runtime
+        .exec_cmd(name, &["bash", "-c", &add_path_cmd], false)
+        .await;
 }
 
 /// Write embedded help files to /etc/devbox/help/ inside the VM.
