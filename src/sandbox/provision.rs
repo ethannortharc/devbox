@@ -169,6 +169,7 @@ async fn provision_nixos(
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
     let rebuild_cmd = concat!(
         "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && ",
+        "export NIXPKGS_ALLOW_UNFREE=1 && ",
         "nixos-rebuild switch"
     );
     let result = runtime
