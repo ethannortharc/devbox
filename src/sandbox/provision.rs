@@ -195,7 +195,12 @@ async fn provision_nixos(
         println!("NixOS rebuild complete.");
     }
 
-    // 8. Copy devbox binary + help files + tool configs
+    // 8. Install latest claude-code via npm (nixpkgs version lags behind)
+    if sets.iter().any(|s| s == "ai-code" || s == "ai_code") {
+        install_latest_claude_code(runtime, name).await;
+    }
+
+    // 9. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
@@ -861,6 +866,34 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
         .exec_cmd(name, &["sudo", "chmod", "+x", "/etc/devbox/management.sh"], false)
         .await?;
     Ok(())
+}
+
+/// Install the latest claude-code via npm (nixpkgs version often lags behind).
+/// Uses the node/npm that comes with the nixpkgs claude-code package.
+async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
+    println!("Installing latest claude-code via npm...");
+    // Source nix profile so npm/node from nixpkgs are in PATH
+    let install_cmd = concat!(
+        "export PATH=\"/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
+        "if command -v npm >/dev/null 2>&1; then ",
+        "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
+        "else ",
+        "echo 'npm not available — installing nodejs first'; ",
+        "nix profile install nixpkgs#nodejs_22 2>/dev/null && ",
+        "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
+        "fi"
+    );
+    let result = runtime
+        .exec_cmd(name, &["sudo", "bash", "-lc", install_cmd], true)
+        .await;
+    match result {
+        Ok(r) if r.exit_code == 0 => {
+            println!("claude-code installed (latest).");
+        }
+        _ => {
+            eprintln!("Warning: could not install latest claude-code via npm. Using nixpkgs version.");
+        }
+    }
 }
 
 /// Write embedded help files to /etc/devbox/help/ inside the VM.
