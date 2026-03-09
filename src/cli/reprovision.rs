@@ -54,22 +54,17 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     }
 
     // Re-run full provisioning with the (migrated) sets/languages
+    // Pass mount_mode so NixOS module sets up overlay declaratively
     let image = state.image.as_str();
-    provision::provision_vm(
+    provision::provision_vm_with_mode(
         runtime.as_ref(),
         &name,
         &sets,
         &state.languages,
         image,
+        &state.mount_mode,
     )
     .await?;
-
-    // Ensure overlay mount is set up if in overlay mode
-    if state.mount_mode == "overlay" {
-        if let Err(e) = provision::setup_overlay_mount(runtime.as_ref(), &name).await {
-            eprintln!("Warning: overlay mount setup failed: {e}");
-        }
-    }
 
     // Update saved state with migrated sets
     let mut updated_state = state.clone();

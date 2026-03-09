@@ -64,12 +64,13 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     );
     runtime.update_mounts(name, &mounts).await?;
 
-    // If overlay mode, set up the overlay mount inside the VM
+    // If overlay mode, reprovision so NixOS module sets up the overlay mount
     if is_overlay {
-        println!("Setting up OverlayFS mount...");
-        if let Err(e) = provision::setup_overlay_mount(runtime.as_ref(), name).await {
+        println!("Setting up OverlayFS mount via NixOS...");
+        if let Err(e) = provision::provision_vm_with_mode(
+            runtime.as_ref(), name, &state.sets, &state.languages, &state.image, "overlay",
+        ).await {
             eprintln!("Warning: overlay mount setup failed: {e}");
-            eprintln!("You may need to run overlay setup manually inside the VM.");
         }
     }
 

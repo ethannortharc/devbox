@@ -137,15 +137,12 @@ impl SandboxManager {
         let active_sets = config.active_sets();
         let active_langs = config.active_languages();
         let image = config.sandbox.image.as_str();
-        if let Err(e) = provision::provision_vm(runtime, name, &active_sets, &active_langs, image).await {
+        // Provision tools — pass mount_mode so NixOS module sets up overlay
+        let mount_mode = &config.sandbox.mount_mode;
+        if let Err(e) = provision::provision_vm_with_mode(
+            runtime, name, &active_sets, &active_langs, image, mount_mode,
+        ).await {
             eprintln!("Warning: provisioning incomplete: {e}");
-        }
-
-        // Set up OverlayFS mount if in overlay mode
-        if is_overlay {
-            if let Err(e) = provision::setup_overlay_mount(runtime, name).await {
-                eprintln!("Warning: overlay mount setup failed: {e}");
-            }
         }
 
         // Save state

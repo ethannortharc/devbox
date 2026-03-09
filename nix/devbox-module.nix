@@ -18,6 +18,9 @@ let
   sets = devboxConfig.sets or {};
   langs = devboxConfig.languages or {};
   username = devboxConfig.user.name or "dev";
+  sandbox = devboxConfig.sandbox or {};
+  mountMode = sandbox.mount_mode or "overlay";
+  isOverlay = mountMode == "overlay";
 in {
   # ── Nixpkgs config ──────────────────────────────────
   # Allow unfree packages (claude-code, codex, etc.)
@@ -65,6 +68,28 @@ in {
     shell = lib.mkForce pkgs.zsh;
     extraGroups = lib.mkAfter [ "wheel" "docker" ];
   };
+
+  # ── OverlayFS Workspace Mount ─────────────────────────
+  # In overlay mode, /mnt/host is the read-only host mount from Lima.
+  # We overlay it at /workspace with a writable upper layer.
+  fileSystems."/workspace" = lib.mkIf isOverlay {
+    device = "overlay";
+    fsType = "overlay";
+    options = [
+      "lowerdir=/mnt/host"
+      "upperdir=/var/devbox/overlay/upper"
+      "workdir=/var/devbox/overlay/work"
+    ];
+    depends = [ "/mnt/host" ];
+  };
+
+  # Create overlay directories on boot
+  systemd.tmpfiles.rules = lib.mkIf isOverlay [
+    "d /var/devbox/overlay/upper 0755 root root -"
+    "d /var/devbox/overlay/work 0755 root root -"
+    "d /mnt/host 0755 root root -"
+    "d /workspace 0755 root root -"
+  ];
 
   # ── Nix Garbage Collection ─────────────────────────
   nix.gc = {

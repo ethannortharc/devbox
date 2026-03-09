@@ -118,9 +118,20 @@ pub async fn provision_vm(
     languages: &[String],
     image: &str,
 ) -> Result<()> {
+    provision_vm_with_mode(runtime, name, sets, languages, image, "overlay").await
+}
+
+pub async fn provision_vm_with_mode(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    image: &str,
+    mount_mode: &str,
+) -> Result<()> {
     match image {
         "ubuntu" => provision_ubuntu(runtime, name, sets, languages).await,
-        _ => provision_nixos(runtime, name, sets, languages).await,
+        _ => provision_nixos(runtime, name, sets, languages, mount_mode).await,
     }
 }
 
@@ -132,6 +143,7 @@ async fn provision_nixos(
     name: &str,
     sets: &[String],
     languages: &[String],
+    mount_mode: &str,
 ) -> Result<()> {
     let username = whoami();
 
@@ -150,8 +162,8 @@ async fn provision_nixos(
     //    run nixos-generate-config to create the hardware and base configs.
     ensure_nixos_config(runtime, name).await?;
 
-    // 3. Push devbox-state.toml
-    let state_toml = generate_state_toml(sets, languages, &username);
+    // 3. Push devbox-state.toml (includes mount_mode for overlay setup)
+    let state_toml = generate_state_toml(sets, languages, &username, mount_mode);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     // 4. Push devbox-module.nix
@@ -387,7 +399,7 @@ ZSHRC
 // ── Shared Helpers ──────────────────────────────────────────
 
 /// Generate devbox-state.toml content from active sets and languages.
-fn generate_state_toml(sets: &[String], languages: &[String], username: &str) -> String {
+fn generate_state_toml(sets: &[String], languages: &[String], username: &str, mount_mode: &str) -> String {
     let set_names = ["system", "shell", "tools", "editor", "git", "container", "network", "ai_code", "ai_infra"];
     let lang_names = ["go", "rust", "python", "node", "java", "ruby"];
 
@@ -408,6 +420,9 @@ fn generate_state_toml(sets: &[String], languages: &[String], username: &str) ->
             || sets.iter().any(|active| active == &format!("lang-{l}"));
         toml.push_str(&format!("{l} = {enabled}\n"));
     }
+
+    toml.push_str("\n[sandbox]\n");
+    toml.push_str(&format!("mount_mode = \"{mount_mode}\"\n"));
 
     toml
 }
@@ -863,142 +878,9 @@ fn whoami() -> String {
         .unwrap_or_else(|_| "dev".to_string())
 }
 
-// ── Overlay Mount Setup ─────────────────────────────────────
-
-/// Set up OverlayFS mount inside the VM.
-/// Creates overlay directories and a systemd mount unit so that
-/// /mnt/host (read-only host mount) is overlaid onto /workspace
-/// with a writable upper layer at /var/devbox/overlay/upper.
-///
-/// Only call this when mount_mode is "overlay" (not "writable").
-#[allow(dead_code)]
-pub async fn setup_overlay_mount(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    // Check if /mnt/host has content (i.e., Lima mounted the host dir there).
-    // If /mnt/host is empty, the VM was created with an older binary that
-    // mounts directly to /workspace — skip overlay setup to avoid clobbering.
-    let check = runtime
-        .exec_cmd(
-            name,
-            &["bash", "-c", "ls /mnt/host/ 2>/dev/null | head -1"],
-            false,
-        )
-        .await;
-    let mnt_host_has_content = check.is_ok()
-        && check.as_ref().unwrap().exit_code == 0
-        && !check.as_ref().unwrap().stdout.trim().is_empty();
-
-    if !mnt_host_has_content {
-        // Check if host dir is mounted directly at /workspace (old-style VM)
-        let ws_check = runtime
-            .exec_cmd(
-                name,
-                &["bash", "-c", "ls /workspace/ 2>/dev/null | head -1"],
-                false,
-            )
-            .await;
-        let ws_has_content = ws_check.is_ok()
-            && ws_check.as_ref().unwrap().exit_code == 0
-            && !ws_check.as_ref().unwrap().stdout.trim().is_empty();
-
-        if ws_has_content {
-            println!("Host dir mounted at /workspace (writable mode). Overlay skipped.");
-            return Ok(());
-        }
-
-        // Neither has content — create dirs but don't mount (nothing to overlay)
-        runtime
-            .exec_cmd(name, &["sudo", "mkdir", "-p", "/workspace"], false)
-            .await?;
-        println!("Warning: /mnt/host is empty. Overlay mount skipped.");
-        println!("Hint: The VM may need to be recreated with the latest devbox for overlay support.");
-        return Ok(());
-    }
-
-    // 1. Create overlay directories
-    runtime
-        .exec_cmd(
-            name,
-            &[
-                "sudo", "mkdir", "-p",
-                "/var/devbox/overlay/upper",
-                "/var/devbox/overlay/work",
-                "/mnt/host",
-                "/workspace",
-            ],
-            false,
-        )
-        .await?;
-
-    // 2. Write systemd mount unit
-    let mount_unit = r#"[Unit]
-Description=DevBox OverlayFS workspace
-After=local-fs.target
-RequiresMountsFor=/mnt/host
-
-[Mount]
-What=overlay
-Where=/workspace
-Type=overlay
-Options=lowerdir=/mnt/host,upperdir=/var/devbox/overlay/upper,workdir=/var/devbox/overlay/work
-
-[Install]
-WantedBy=multi-user.target
-"#;
-
-    write_file_to_vm(runtime, name, "/etc/systemd/system/workspace.mount", mount_unit).await?;
-
-    // 3. Unmount /workspace if it's already mounted (stale overlay or old mount)
-    runtime
-        .exec_cmd(
-            name,
-            &["sudo", "umount", "/workspace"],
-            false,
-        )
-        .await
-        .ok(); // ignore error if not mounted
-
-    // 4. Enable and start the mount
-    runtime
-        .exec_cmd(
-            name,
-            &["sudo", "systemctl", "daemon-reload"],
-            false,
-        )
-        .await?;
-
-    runtime
-        .exec_cmd(
-            name,
-            &["sudo", "systemctl", "enable", "--now", "workspace.mount"],
-            false,
-        )
-        .await?;
-
-    // 5. Verify the mount worked
-    let verify = runtime
-        .exec_cmd(
-            name,
-            &["bash", "-c", "mountpoint -q /workspace && ls /workspace/ | head -1"],
-            false,
-        )
-        .await;
-    match verify {
-        Ok(ref r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-            println!("OverlayFS workspace mount configured.");
-        }
-        _ => {
-            eprintln!("Warning: OverlayFS mount may have failed. Checking status...");
-            let status = runtime
-                .exec_cmd(name, &["sudo", "systemctl", "status", "workspace.mount"], false)
-                .await;
-            if let Ok(s) = status {
-                eprintln!("{}", s.stdout);
-                eprintln!("{}", s.stderr);
-            }
-        }
-    }
-    Ok(())
-}
+// Overlay mount is now handled declaratively by devbox-module.nix via
+// fileSystems."/workspace" when mount_mode = "overlay" in devbox-state.toml.
+// The nixos-rebuild switch creates the systemd mount automatically.
 
 // ── Tests ───────────────────────────────────────────────────
 
@@ -1017,7 +899,7 @@ mod tests {
             "container".to_string(),
         ];
         let langs = vec!["go".to_string()];
-        let toml = generate_state_toml(&sets, &langs, "testuser");
+        let toml = generate_state_toml(&sets, &langs, "testuser", "overlay");
 
         assert!(toml.contains("name = \"testuser\""));
         assert!(toml.contains("system = true"));
@@ -1039,7 +921,7 @@ mod tests {
             "lang-rust".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev");
+        let toml = generate_state_toml(&sets, &langs, "dev", "overlay");
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
@@ -1055,7 +937,7 @@ mod tests {
             "ai-code".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev");
+        let toml = generate_state_toml(&sets, &langs, "dev", "overlay");
 
         assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("ai_infra = false"));
@@ -1065,7 +947,7 @@ mod tests {
     fn generate_state_toml_bare() {
         let sets = vec![];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "user");
+        let toml = generate_state_toml(&sets, &langs, "user", "overlay");
 
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));
