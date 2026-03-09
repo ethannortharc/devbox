@@ -36,7 +36,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         let status = runtime.status(name).await?;
         if status == crate::runtime::SandboxStatus::Running {
             println!("Already using '{}' with {}. Attaching...", cwd.display(), mount_mode);
-            return manager.attach(name, None).await;
+            return manager.attach(name, None, false).await;
         }
     }
 
@@ -80,5 +80,5 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     state.save(&manager.state_dir)?;
 
     println!("Sandbox '{}' updated. Attaching...", name);
-    manager.attach(name, None).await
+    manager.attach(name, None, false).await
 }

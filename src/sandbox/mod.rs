@@ -164,7 +164,8 @@ impl SandboxManager {
     }
 
     /// Attach to a sandbox (start if stopped, then launch Zellij or shell).
-    pub async fn attach(&self, name: &str, layout_override: Option<&str>) -> Result<()> {
+    /// If `force_new_session` is true, any existing zellij session is killed first.
+    pub async fn attach(&self, name: &str, layout_override: Option<&str>, force_new_session: bool) -> Result<()> {
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
 
@@ -260,18 +261,43 @@ impl SandboxManager {
 
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
         let session_name = format!("devbox-{name}");
-        println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
 
-        // Try to attach to an existing zellij session first.
-        // If no session exists, create one with the layout.
-        let attach_cmd = format!(
-            "zellij attach {session} 2>/dev/null || zellij --session {session} --layout {layout}",
-            session = session_name,
-            layout = layout_path,
+        // Check if a zellij session already exists
+        let list_cmd = format!(
+            "zellij list-sessions 2>/dev/null | grep -q '^{session_name}'"
         );
-        runtime
-            .exec_cmd(name, &["bash", "-lc", &attach_cmd], true)
-            .await?;
+        let session_exists = runtime
+            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
+            .await
+            .map(|r| r.exit_code == 0)
+            .unwrap_or(false);
+
+        if session_exists && force_new_session {
+            // Kill existing session so we can start fresh with new layout
+            println!("Restarting zellij session '{session_name}'...");
+            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
+            let _ = runtime
+                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
+                .await;
+        }
+
+        if session_exists && !force_new_session {
+            // Reattach to existing session
+            println!("Reattaching to sandbox '{name}'...");
+            runtime
+                .exec_cmd(name, &["zellij", "attach", &session_name], true)
+                .await?;
+        } else {
+            // Create new session with layout
+            println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
+            runtime
+                .exec_cmd(
+                    name,
+                    &["zellij", "--session", &session_name, "--layout", &layout_path],
+                    true,
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -307,7 +333,7 @@ impl SandboxManager {
         let name = self.name_from_dir(&cwd);
 
         if self.sandbox_exists(&name) {
-            self.attach(&name, None).await
+            self.attach(&name, None, false).await
         } else {
             let runtime = self.resolve_runtime(None)?;
             let mut config = self.generate_config(&cwd);
@@ -324,7 +350,7 @@ impl SandboxManager {
                 false,
             )
             .await?;
-            self.attach(&name, None).await
+            self.attach(&name, None, false).await
         }
     }
 

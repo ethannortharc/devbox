@@ -165,7 +165,7 @@ pub async fn run(args: CreateArgs, manager: &SandboxManager) -> Result<()> {
         .await?;
 
     // Attach immediately after create
-    manager.attach(&name, None).await
+    manager.attach(&name, None, false).await
 }
 
 fn parse_mounts(mounts: &[String]) -> Result<Vec<Mount>> {
