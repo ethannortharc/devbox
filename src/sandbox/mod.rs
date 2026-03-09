@@ -141,6 +141,13 @@ impl SandboxManager {
             eprintln!("Warning: provisioning incomplete: {e}");
         }
 
+        // Set up OverlayFS mount if in overlay mode
+        if is_overlay {
+            if let Err(e) = provision::setup_overlay_mount(runtime, name).await {
+                eprintln!("Warning: overlay mount setup failed: {e}");
+            }
+        }
+
         // Save state
         let state = SandboxState {
             name: name.to_string(),

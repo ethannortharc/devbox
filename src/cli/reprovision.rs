@@ -64,6 +64,13 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     )
     .await?;
 
+    // Ensure overlay mount is set up if in overlay mode
+    if state.mount_mode == "overlay" {
+        if let Err(e) = provision::setup_overlay_mount(runtime.as_ref(), &name).await {
+            eprintln!("Warning: overlay mount setup failed: {e}");
+        }
+    }
+
     // Update saved state with migrated sets
     let mut updated_state = state.clone();
     updated_state.sets = sets;
