@@ -10,7 +10,7 @@ cd my-project
 devbox
 ```
 
-That's it. Devbox detects your project type, provisions a NixOS VM with [90+ tools](#tool-catalog), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
+That's it. Devbox detects your project type, provisions a NixOS VM with [90+ tools](docs/PACKAGES.md), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
 
 ### Why a sandbox for AI coding?
 
@@ -40,7 +40,7 @@ Devbox is a complete developer environment for everyone:
 | "It works on my machine" | Reproducible NixOS VMs with declarative configuration |
 | Polluting your host OS with dev tools | Everything runs in an isolated VM; your host stays clean |
 | Tool version conflicts | Each sandbox is independent with its own package set |
-| Setting up a new machine takes hours | One command installs [90+ tools](#tool-catalog) from a binary cache in minutes |
+| Setting up a new machine takes hours | One command installs [90+ tools](docs/PACKAGES.md) from a binary cache in minutes |
 | Security and compliance requirements | Full VM boundary with audit trail via overlay diff/commit |
 
 ## Key Design Principles
@@ -378,7 +378,7 @@ devbox config show
 
 ## Base Images
 
-Both images install the same 90+ tools from [nixpkgs](https://search.nixos.org/packages).
+Both images install the same [90+ tools](docs/PACKAGES.md) from [nixpkgs](https://search.nixos.org/packages).
 
 | Image | Method | Rollback | Best For |
 |-------|--------|----------|----------|
