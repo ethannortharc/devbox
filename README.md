@@ -3,14 +3,27 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-**Instant, isolated, fully-loaded developer VMs.** One command to go from zero to a complete development environment with 90+ pre-configured tools.
+**The sandbox that AI coding agents deserve.** Isolated developer VMs where Claude, Codex, and Aider can write, build, and test code freely -- without ever touching your host machine.
 
 ```bash
 cd my-project
 devbox
 ```
 
-That's it. Devbox detects your project type, provisions a NixOS VM with the right tools, and drops you into a ready-to-code workspace -- isolated from your host, safe by default.
+That's it. Devbox detects your project type, provisions a NixOS VM with the right tools, and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
+
+### Why a sandbox for AI coding?
+
+AI coding agents are powerful, but they need guardrails. They `rm -rf` the wrong directory. They overwrite config files. They install conflicting dependencies. When an agent runs on your host machine, every mistake is permanent and every action is a security risk.
+
+Devbox solves this by giving each project a **full VM sandbox** with read-only host mounts:
+
+- **Your host stays pristine.** No dev tools, no language runtimes, no global npm packages, no Docker images piling up. Everything lives inside disposable VMs. Uninstall a sandbox and it's gone -- zero residue on your machine.
+- **AI agents can't break your system.** The host filesystem is mounted read-only via OverlayFS. Agents write freely inside the VM, but nothing touches your real files until you explicitly run `devbox commit`.
+- **Every change is reviewable.** Run `devbox diff` to see exactly what the agent modified. Accept what's good, discard the rest. It's like a code review for your filesystem.
+- **Mistakes are free.** Bad refactor? Agent went rogue? `devbox discard` throws away everything and you're back to clean state. `devbox snapshot restore` rolls back even further.
+- **Audit and policy control.** Full VM isolation means you can enforce security policies, restrict network access, and audit every action. Run untrusted code, test third-party packages, or let junior developers experiment -- all without risk to production systems.
+- **Multiple agents, zero conflicts.** Each sandbox is independent. Run Claude in one, Codex in another, with different tool versions and configurations. No interference.
 
 ### Default Workspace Layout
 
@@ -18,19 +31,22 @@ That's it. Devbox detects your project type, provisions a NixOS VM with the righ
 
 Four tabs, ready to go: **Workspace** (AI coding + brainstorm + file browser), **DevBox** (monitor + help + management), **Shell** (plain terminal), and **Git** (lazygit).
 
-## Why Devbox
+### It's not just for AI
+
+Devbox is a complete developer environment for everyone:
 
 | Problem | Devbox Solution |
 |---------|----------------|
 | "It works on my machine" | Reproducible NixOS VMs with declarative configuration |
 | Polluting your host OS with dev tools | Everything runs in an isolated VM; your host stays clean |
-| Accidental file changes | OverlayFS mounts your project read-only; changes require explicit commit |
 | Tool version conflicts | Each sandbox is independent with its own package set |
 | Setting up a new machine takes hours | One command installs 90+ tools from a binary cache in minutes |
+| Security and compliance requirements | Full VM boundary with audit trail via overlay diff/commit |
 
 ## Key Design Principles
 
-- **Safe by default** -- Host filesystem is read-only via OverlayFS. All writes happen in an isolated overlay layer. Changes sync to host only with explicit `devbox commit`.
+- **AI-first workspace** -- Pre-configured layouts for AI pair programming. Claude Code, Codex, Aider, and aichat are installed and ready. The default layout opens an AI coding assistant, a brainstorming panel, and a file browser side by side.
+- **Safe by default** -- Host filesystem is read-only via OverlayFS. All writes happen in an isolated overlay layer. Changes sync to host only with explicit `devbox commit`. AI agents and developers alike can experiment without fear.
 - **Zero configuration** -- Auto-detects Go, Rust, Python, Node, Java, Ruby from project files and installs the right toolchain.
 - **Clean abstraction** -- The CLI provides a consistent interface across VM runtimes (Lima, Incus, Multipass, Docker). Switch runtimes without changing workflows.
 - **Self-contained binary** -- All NixOS configurations, layouts, and help files are compiled into a single binary. No external dependencies beyond a VM runtime.

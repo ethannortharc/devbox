@@ -2,7 +2,7 @@
 name = "devbox"
 version = "0.1.0"
 edition = "2024"
-description = "NixOS-powered developer VM CLI"
+description = "Isolated developer VMs for AI coding agents and humans. Safe by default."
 license = "Apache-2.0"
 repository = "https://github.com/ethannortharc/devbox"
 
