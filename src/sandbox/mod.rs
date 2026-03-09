@@ -262,31 +262,31 @@ impl SandboxManager {
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
         let session_name = format!("devbox-{name}");
 
-        // Check session state: alive, dead, or not found
-        // `zellij list-sessions` marks dead sessions with "(EXITED ...)"
-        let list_cmd = format!(
-            "zellij list-sessions 2>/dev/null | grep '^{session_name}'"
-        );
-        let session_line = runtime
-            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
-            .await
-            .ok()
-            .filter(|r| r.exit_code == 0)
-            .map(|r| r.stdout.trim().to_string())
-            .unwrap_or_default();
+        // Always clean up dead sessions first, then check for alive ones.
+        // `zellij delete-all-sessions` removes only dead (EXITED) sessions.
+        let _ = runtime
+            .exec_cmd(name, &["zellij", "delete-all-sessions", "-y"], false)
+            .await;
 
-        let session_alive = !session_line.is_empty() && !session_line.contains("EXITED");
-        let session_dead = !session_line.is_empty() && session_line.contains("EXITED");
-
-        // Clean up dead sessions or force-kill for restart
-        if session_dead || (session_alive && force_new_session) {
-            let delete_cmd = format!("zellij delete-session {session_name} 2>/dev/null; zellij kill-session {session_name} 2>/dev/null; true");
+        if force_new_session {
+            // Kill the live session so we can start fresh
+            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
             let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &delete_cmd], false)
+                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
                 .await;
         }
 
-        if session_alive && !force_new_session {
+        // Check if a live session exists
+        let list_cmd = format!(
+            "zellij list-sessions 2>/dev/null | grep -q '{session_name}'"
+        );
+        let session_alive = runtime
+            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
+            .await
+            .map(|r| r.exit_code == 0)
+            .unwrap_or(false);
+
+        if session_alive {
             // Reattach to existing live session
             println!("Reattaching to sandbox '{name}'...");
             runtime
