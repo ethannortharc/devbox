@@ -367,6 +367,9 @@ alias top='htop' 2>/dev/null
 # Devbox identity
 export DEVBOX_NAME="${{DEVBOX_NAME:-devbox}}"
 export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
+
+# Default to workspace directory
+[ -d /workspace ] && cd /workspace
 ZSHRC
 "#
     );
@@ -512,7 +515,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
             let vm_path = format!("{vm_home}/{vm_suffix}");
 
-            // Ensure parent directory exists
+            // Ensure parent directory exists with correct ownership
             let vm_parent = vm_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(&vm_path);
             runtime
                 .exec_cmd(
@@ -523,6 +526,13 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
                 .await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
+
+            // Set restrictive permissions for credential/auth files
+            if vm_suffix.contains("credential") || vm_suffix.contains("auth") {
+                runtime
+                    .exec_cmd(name, &["sudo", "chmod", "600", &vm_path], false)
+                    .await?;
+            }
             copied_any = true;
         }
 
