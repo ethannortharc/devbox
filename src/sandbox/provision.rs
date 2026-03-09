@@ -961,12 +961,20 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     let username = whoami();
     println!("Installing latest claude-code...");
 
-    // Install via npm with a writable global prefix
+    // Install via npm with a writable global prefix.
+    // On NixOS, npm may not be in PATH (claude-code nix pkg bundles its own node
+    // but doesn't expose npm). Use nix-shell to bring nodejs/npm into scope.
     let install_cmd = concat!(
         "export PATH=\"/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
         "export NPM_CONFIG_PREFIX=\"$HOME/.npm-global\"; ",
         "mkdir -p \"$HOME/.npm-global\"; ",
+        "if command -v npm >/dev/null 2>&1; then ",
+        "echo 'Using system npm...'; ",
         "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -5; ",
+        "else ",
+        "echo 'npm not found, using nix-shell...'; ",
+        "nix-shell -p nodejs_22 --run 'NPM_CONFIG_PREFIX=$HOME/.npm-global npm install -g @anthropic-ai/claude-code@latest' 2>&1 | tail -5; ",
+        "fi; ",
         "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\""
     );
     let result = runtime
