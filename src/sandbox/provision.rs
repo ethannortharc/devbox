@@ -947,7 +947,17 @@ WantedBy=multi-user.target
 
     write_file_to_vm(runtime, name, "/etc/systemd/system/workspace.mount", mount_unit).await?;
 
-    // 3. Enable and start the mount
+    // 3. Unmount /workspace if it's already mounted (stale overlay or old mount)
+    runtime
+        .exec_cmd(
+            name,
+            &["sudo", "umount", "/workspace"],
+            false,
+        )
+        .await
+        .ok(); // ignore error if not mounted
+
+    // 4. Enable and start the mount
     runtime
         .exec_cmd(
             name,
@@ -964,7 +974,29 @@ WantedBy=multi-user.target
         )
         .await?;
 
-    println!("OverlayFS workspace mount configured.");
+    // 5. Verify the mount worked
+    let verify = runtime
+        .exec_cmd(
+            name,
+            &["bash", "-c", "mountpoint -q /workspace && ls /workspace/ | head -1"],
+            false,
+        )
+        .await;
+    match verify {
+        Ok(ref r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
+            println!("OverlayFS workspace mount configured.");
+        }
+        _ => {
+            eprintln!("Warning: OverlayFS mount may have failed. Checking status...");
+            let status = runtime
+                .exec_cmd(name, &["sudo", "systemctl", "status", "workspace.mount"], false)
+                .await;
+            if let Ok(s) = status {
+                eprintln!("{}", s.stdout);
+                eprintln!("{}", s.stderr);
+            }
+        }
+    }
     Ok(())
 }
 
