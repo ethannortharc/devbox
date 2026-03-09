@@ -1,1 +1,11 @@
 /target
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+secrets/
+id_rsa*
+findings.md
+progress.md
+task_plan.md
