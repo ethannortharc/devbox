@@ -37,6 +37,8 @@ const YAZI_THEME: &str = include_str!("../../configs/yazi/theme.toml");
 const YAZI_INIT: &str = include_str!("../../configs/yazi/init.lua");
 const YAZI_GLOW_PLUGIN: &str = include_str!("../../configs/yazi/plugin/glow.yazi/init.lua");
 const AICHAT_ROLES: &str = include_str!("../../configs/aichat/roles.yaml");
+const AICHAT_ROLE_ARCHITECT: &str = include_str!("../../configs/aichat/roles/architect.md");
+const AICHAT_ROLE_REVIEWER: &str = include_str!("../../configs/aichat/roles/reviewer.md");
 const MANAGEMENT_SCRIPT: &str = include_str!("../../configs/management.sh");
 
 /// All set nix files: (filename, content)
@@ -840,16 +842,27 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 }
 
 /// Push aichat config (roles) to user home directory in the VM.
+/// Writes both legacy roles.yaml and modern roles/*.md format for compatibility.
 async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let username = whoami();
     let config_dir = format!("/home/{username}/.config/aichat");
+    let roles_dir = format!("{config_dir}/roles");
 
     runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
+        .exec_cmd(name, &["sudo", "mkdir", "-p", &roles_dir], false)
         .await?;
 
-    let path = format!("{config_dir}/roles.yaml");
-    write_file_to_vm(runtime, name, &path, AICHAT_ROLES).await?;
+    // Legacy format (older aichat versions)
+    write_file_to_vm(runtime, name, &format!("{config_dir}/roles.yaml"), AICHAT_ROLES).await?;
+
+    // Modern format: individual .md files in roles/ directory
+    let role_files: &[(&str, &str)] = &[
+        ("architect.md", AICHAT_ROLE_ARCHITECT),
+        ("reviewer.md", AICHAT_ROLE_REVIEWER),
+    ];
+    for (filename, content) in role_files {
+        write_file_to_vm(runtime, name, &format!("{roles_dir}/{filename}"), content).await?;
+    }
 
     let chown_cmd = format!("chown -R {username}:{username} {config_dir}");
     runtime
@@ -868,30 +881,29 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
     Ok(())
 }
 
-/// Install the latest claude-code via npm (nixpkgs version often lags behind).
-/// Uses the node/npm that comes with the nixpkgs claude-code package.
+/// Install the latest claude-code using the official installer.
+/// Falls back to npm if the official installer is unavailable.
 async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
-    println!("Installing latest claude-code via npm...");
-    // Source nix profile so npm/node from nixpkgs are in PATH
+    println!("Installing latest claude-code...");
     let install_cmd = concat!(
         "export PATH=\"/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
+        "curl -fsSL https://claude.ai/install.sh | sh 2>&1 | tail -5; ",
+        "if ! command -v claude >/dev/null 2>&1; then ",
+        "echo 'Official installer failed, trying npm...'; ",
         "if command -v npm >/dev/null 2>&1; then ",
         "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
-        "else ",
-        "echo 'npm not available — installing nodejs first'; ",
-        "nix profile install nixpkgs#nodejs_22 2>/dev/null && ",
-        "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
+        "fi; ",
         "fi"
     );
     let result = runtime
-        .exec_cmd(name, &["sudo", "bash", "-lc", install_cmd], true)
+        .exec_cmd(name, &["bash", "-lc", install_cmd], true)
         .await;
     match result {
         Ok(r) if r.exit_code == 0 => {
             println!("claude-code installed (latest).");
         }
         _ => {
-            eprintln!("Warning: could not install latest claude-code via npm. Using nixpkgs version.");
+            eprintln!("Warning: could not install latest claude-code. Using nixpkgs version.");
         }
     }
 }
