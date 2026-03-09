@@ -526,6 +526,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
                 .await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
+            println!("  copied: ~/{host_suffix} → {vm_path}");
 
             // Set restrictive permissions for credential/auth files
             if vm_suffix.contains("credential") || vm_suffix.contains("auth") {
@@ -872,6 +873,47 @@ fn whoami() -> String {
 /// Only call this when mount_mode is "overlay" (not "writable").
 #[allow(dead_code)]
 pub async fn setup_overlay_mount(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Check if /mnt/host has content (i.e., Lima mounted the host dir there).
+    // If /mnt/host is empty, the VM was created with an older binary that
+    // mounts directly to /workspace — skip overlay setup to avoid clobbering.
+    let check = runtime
+        .exec_cmd(
+            name,
+            &["bash", "-c", "ls /mnt/host/ 2>/dev/null | head -1"],
+            false,
+        )
+        .await;
+    let mnt_host_has_content = check.is_ok()
+        && check.as_ref().unwrap().exit_code == 0
+        && !check.as_ref().unwrap().stdout.trim().is_empty();
+
+    if !mnt_host_has_content {
+        // Check if host dir is mounted directly at /workspace (old-style VM)
+        let ws_check = runtime
+            .exec_cmd(
+                name,
+                &["bash", "-c", "ls /workspace/ 2>/dev/null | head -1"],
+                false,
+            )
+            .await;
+        let ws_has_content = ws_check.is_ok()
+            && ws_check.as_ref().unwrap().exit_code == 0
+            && !ws_check.as_ref().unwrap().stdout.trim().is_empty();
+
+        if ws_has_content {
+            println!("Host dir mounted at /workspace (writable mode). Overlay skipped.");
+            return Ok(());
+        }
+
+        // Neither has content — create dirs but don't mount (nothing to overlay)
+        runtime
+            .exec_cmd(name, &["sudo", "mkdir", "-p", "/workspace"], false)
+            .await?;
+        println!("Warning: /mnt/host is empty. Overlay mount skipped.");
+        println!("Hint: The VM may need to be recreated with the latest devbox for overlay support.");
+        return Ok(());
+    }
+
     // 1. Create overlay directories
     runtime
         .exec_cmd(
