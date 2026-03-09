@@ -45,17 +45,49 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     println!("Re-provisioning sandbox '{name}'...");
     println!("This will push all config files and rebuild the system.");
 
-    // Re-run full provisioning with the saved sets/languages
+    // Migrate old set names (e.g., "ai" → "ai-code" + "ai-infra")
+    let mut sets = migrate_sets(&state.sets);
+
+    // Ensure ai-code is always present (default on)
+    if !sets.iter().any(|s| s == "ai-code") {
+        sets.push("ai-code".to_string());
+    }
+
+    // Re-run full provisioning with the (migrated) sets/languages
     let image = state.image.as_str();
     provision::provision_vm(
         runtime.as_ref(),
         &name,
-        &state.sets,
+        &sets,
         &state.languages,
         image,
     )
     .await?;
 
+    // Update saved state with migrated sets
+    let mut updated_state = state.clone();
+    updated_state.sets = sets;
+    updated_state.save(&manager.state_dir)?;
+
     println!("Re-provisioning complete. Run `devbox shell --name {name}` to attach.");
     Ok(())
+}
+
+/// Migrate old set names to current names.
+/// "ai" → "ai-code" (ai-infra stays off unless explicitly added).
+fn migrate_sets(sets: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = sets
+        .iter()
+        .filter_map(|s| {
+            match s.as_str() {
+                "ai" => Some("ai-code".to_string()), // old "ai" → "ai-code"
+                other => Some(other.to_string()),
+            }
+        })
+        .collect();
+
+    // Deduplicate
+    result.sort();
+    result.dedup();
+    result
 }

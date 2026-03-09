@@ -34,5 +34,5 @@ pub async fn run(args: DestroyArgs, manager: &SandboxManager) -> Result<()> {
         }
     }
 
-    manager.destroy_sandbox(&name).await
+    manager.destroy_sandbox(&name, args.force).await
 }

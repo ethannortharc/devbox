@@ -323,10 +323,32 @@ impl SandboxManager {
     }
 
     /// Destroy a sandbox permanently.
-    pub async fn destroy_sandbox(&self, name: &str) -> Result<()> {
+    /// Warns if there are uncommitted overlay changes.
+    pub async fn destroy_sandbox(&self, name: &str, force: bool) -> Result<()> {
         let state = self.get_sandbox(name);
         if let Ok(state) = &state {
             let runtime = self.runtime_for_sandbox(state)?;
+
+            // Check for uncommitted overlay changes before destroying
+            if state.mount_mode == "overlay" && !force {
+                let vm_status = runtime.status(name).await.unwrap_or(SandboxStatus::NotFound);
+                if vm_status == SandboxStatus::Running {
+                    let changes = overlay::diff(runtime.as_ref(), name).await;
+                    if let Ok(changes) = changes {
+                        let file_count = changes.iter().filter(|c| !c.is_dir).count();
+                        if file_count > 0 {
+                            eprintln!(
+                                "Warning: {} uncommitted overlay change(s) in sandbox '{}'.",
+                                file_count, name
+                            );
+                            eprintln!("  Run `devbox layer commit --name {}` to save them first,", name);
+                            eprintln!("  or use `devbox destroy --force --name {}` to discard.", name);
+                            bail!("Aborting destroy due to uncommitted changes.");
+                        }
+                    }
+                }
+            }
+
             // Attempt runtime destroy (may fail if already removed)
             if let Err(e) = runtime.destroy(name).await {
                 eprintln!("Warning: runtime destroy failed: {e}");
