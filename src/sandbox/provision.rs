@@ -420,7 +420,7 @@ async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
         let zshrc = format!(
             r#"# Devbox shell configuration
 # Latest tools first (official installers take precedence over nixpkgs)
-export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
 # Starship prompt
 if command -v starship >/dev/null 2>&1; then
@@ -463,8 +463,8 @@ export DEVBOX_RUNTIME="${{DEVBOX_RUNTIME:-unknown}}"
         .await?;
     if profile_check.exit_code != 0 {
         let profile = r#"# Devbox bash profile
-# Latest tools first (official installers take precedence over nixpkgs)
-export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+# Latest tools first (npm-global and official installers take precedence over nixpkgs)
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
         let chown_cmd = format!("chown {username}:{username} {profile_path}");
@@ -952,25 +952,22 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
     Ok(())
 }
 
-/// Install the latest claude-code using the official installer.
-/// Falls back to npm if the official installer is unavailable.
-/// Also ensures ~/.local/bin is in PATH so the latest version takes precedence
-/// over the (potentially older) nixpkgs system version.
+/// Install the latest claude-code via npm with a writable prefix.
+///
+/// On NixOS, the official binary installer fails (non-standard dynamic linker),
+/// and `npm install -g` fails (Nix store is read-only). We work around this by
+/// setting NPM_CONFIG_PREFIX to ~/.npm-global, then adding that to PATH.
 async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     let username = whoami();
     println!("Installing latest claude-code...");
 
-    // Run official installer as the user (installs to ~/.local/bin/)
+    // Install via npm with a writable global prefix
     let install_cmd = concat!(
-        "export PATH=\"$HOME/.local/bin:$HOME/.claude/bin:/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
-        "curl -fsSL https://claude.ai/install.sh | sh 2>&1 | tail -5; ",
-        "if ! command -v claude >/dev/null 2>&1; then ",
-        "echo 'Official installer failed, trying npm...'; ",
-        "if command -v npm >/dev/null 2>&1; then ",
-        "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -3; ",
-        "fi; ",
-        "fi; ",
-        "claude --version 2>/dev/null || echo 'claude not found in PATH'"
+        "export PATH=\"/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH\"; ",
+        "export NPM_CONFIG_PREFIX=\"$HOME/.npm-global\"; ",
+        "mkdir -p \"$HOME/.npm-global\"; ",
+        "npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -5; ",
+        "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\""
     );
     let result = runtime
         .exec_cmd(name, &["bash", "-lc", install_cmd], true)
@@ -984,14 +981,14 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
         }
     }
 
-    // Ensure ~/.local/bin is at front of PATH in both .zshrc and .profile
+    // Ensure ~/.npm-global/bin is at front of PATH in both .zshrc and .profile
     // so latest claude takes precedence over the nixpkgs system version.
     // .profile is needed because layout panes use `bash -lc` (not zsh).
-    let path_line = r#"export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
+    let path_line = r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
     for rc_file in &[".zshrc", ".profile"] {
         let rc_path = format!("/home/{username}/{rc_file}");
         let add_path_cmd = format!(
-            "grep -qF '.local/bin' {rc_path} 2>/dev/null || \
+            "grep -qF '.npm-global/bin' {rc_path} 2>/dev/null || \
              echo '{path_line}' >> {rc_path}"
         );
         let _ = runtime
