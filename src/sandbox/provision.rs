@@ -155,25 +155,20 @@ async fn provision_nixos(
         write_file_to_vm(runtime, name, &path, content).await?;
     }
 
-    // 6. Run nixos-rebuild switch
+    // 6. Run nixos-rebuild switch (interactive so user sees progress)
     //    NixOS Lima images use flake-based NIX_PATH (nixpkgs=flake:nixpkgs)
     //    which doesn't include nixos-config. We must set it explicitly.
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
     let rebuild_cmd = concat!(
         "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && ",
-        "nixos-rebuild switch --show-trace 2>&1"
+        "nixos-rebuild switch"
     );
     let result = runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", rebuild_cmd], false)
+        .exec_cmd(name, &["sudo", "bash", "-c", rebuild_cmd], true)
         .await?;
 
     if result.exit_code != 0 {
-        eprintln!("Warning: nixos-rebuild failed (exit {}):", result.exit_code);
-        let stderr_lines: Vec<&str> = result.stderr.lines().collect();
-        let start = stderr_lines.len().saturating_sub(20);
-        for line in &stderr_lines[start..] {
-            eprintln!("  {line}");
-        }
+        eprintln!("Warning: nixos-rebuild failed (exit {})", result.exit_code);
         eprintln!("You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
     } else {
         println!("NixOS rebuild complete.");
@@ -234,16 +229,11 @@ fi"#;
             ". /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && nix profile install {pkg_list}"
         );
         let result = runtime
-            .exec_cmd(name, &["bash", "-c", &install_cmd], false)
+            .exec_cmd(name, &["bash", "-c", &install_cmd], true)
             .await?;
 
         if result.exit_code != 0 {
-            eprintln!("Warning: some packages failed to install:");
-            let stderr_lines: Vec<&str> = result.stderr.lines().collect();
-            let start = stderr_lines.len().saturating_sub(15);
-            for line in &stderr_lines[start..] {
-                eprintln!("  {line}");
-            }
+            eprintln!("Warning: some packages failed to install.");
             eprintln!("You can retry with: devbox exec --name {name} -- nix profile install <packages>");
         } else {
             println!("Nix package installation complete.");
