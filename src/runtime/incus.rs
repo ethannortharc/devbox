@@ -217,32 +217,40 @@ impl Runtime for IncusRuntime {
         let vm = Self::vm_name(name);
 
         if interactive {
-            // For interactive sessions (shell attach, etc.), run as the
-            // non-root user with correct HOME and working directory.
-            let uid_str = Self::detect_vm_uid(&vm).await.unwrap_or("1000".to_string());
-            let home_env = Self::detect_vm_home(&vm, &uid_str).await;
-
-            let mut args = vec![
-                "exec".to_string(),
-                vm,
-                "--user".to_string(),
-                uid_str,
-                "--cwd".to_string(),
-                "/workspace".to_string(),
-                "--env".to_string(),
-                home_env,
-                "--".to_string(),
-            ];
-            for c in cmd {
-                args.push(c.to_string());
-            }
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            run_interactive("incus", &arg_refs).await
+            let mut args = vec!["exec", &vm, "--"];
+            args.extend_from_slice(cmd);
+            run_interactive("incus", &args).await
         } else {
             let mut args = vec!["exec", &vm, "--"];
             args.extend_from_slice(cmd);
             run_cmd("incus", &args).await
         }
+    }
+
+    /// Execute an interactive command as the non-root user.
+    /// Incus exec defaults to root, so we detect the first UID >= 1000
+    /// and set --user, HOME, and CWD for proper user sessions.
+    async fn exec_as_user(&self, name: &str, cmd: &[&str]) -> Result<ExecResult> {
+        let vm = Self::vm_name(name);
+        let uid_str = Self::detect_vm_uid(&vm).await.unwrap_or("1000".to_string());
+        let home_env = Self::detect_vm_home(&vm, &uid_str).await;
+
+        let mut args = vec![
+            "exec".to_string(),
+            vm,
+            "--user".to_string(),
+            uid_str,
+            "--cwd".to_string(),
+            "/workspace".to_string(),
+            "--env".to_string(),
+            home_env,
+            "--".to_string(),
+        ];
+        for c in cmd {
+            args.push(c.to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_interactive("incus", &arg_refs).await
     }
 
     async fn destroy(&self, name: &str) -> Result<()> {
