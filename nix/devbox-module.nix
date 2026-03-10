@@ -50,6 +50,11 @@ in {
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);
   services.tailscale.enable = lib.mkDefault (sets.network or false);
 
+  # ── Dynamic linker compat ─────────────────────────
+  # Required for VS Code Server, Cursor, and other dynamically linked
+  # binaries that expect a standard FHS layout (ld-linux, libc, etc.).
+  programs.nix-ld.enable = true;
+
   # ── Shell ──────────────────────────────────────────
   programs.zsh.enable = true;
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
