@@ -25,7 +25,7 @@ impl IncusRuntime {
     fn remote_image(image_type: &str) -> &'static str {
         match image_type {
             "ubuntu" => "images:ubuntu/24.04",
-            _ => "images:nixos/24.11",
+            _ => "images:nixos/25.11",
         }
     }
 
@@ -106,7 +106,7 @@ impl Runtime for IncusRuntime {
         // Launch the VM
         println!("Creating Incus VM '{vm}'...");
         let image = Self::image_alias(&opts.image);
-        let mut launch_args = vec!["launch", image, &vm, "--vm"];
+        let mut launch_args = vec!["launch", image, &vm, "--vm", "-c", "security.secureboot=false"];
 
         let cpu_str;
         if opts.cpu > 0 {
