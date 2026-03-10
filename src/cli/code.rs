@@ -67,7 +67,9 @@ async fn open_via_lima(
         );
     }
 
-    let ssh_config = result.stdout.trim().to_string();
+    // Lima's output has its own Host line (e.g. "Host lima-devbox-test2").
+    // Replace it with our ssh_host so VS Code can find the right config entry.
+    let ssh_config = rewrite_ssh_host(ssh_host, result.stdout.trim());
     write_ssh_config(ssh_host, &ssh_config)?;
 
     launch_editor(editor, ssh_host, path)
@@ -137,6 +139,21 @@ fn extract_incus_ip(json_output: &str) -> Result<String> {
     }
 
     bail!("Could not find IP address for Incus VM. Is it running?")
+}
+
+/// Replace the `Host` line in an SSH config block with our desired host alias.
+fn rewrite_ssh_host(desired_host: &str, config: &str) -> String {
+    config
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("Host ") {
+                format!("Host {desired_host}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Write or update an SSH config block in ~/.ssh/config for the devbox host.
