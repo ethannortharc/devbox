@@ -264,6 +264,33 @@ Host filesystem ──(read-only)──> /mnt/host (lower layer)
 | `devbox discard` | — | Wipe the upper layer. Back to clean state. |
 | `devbox layer stash` | — | Save upper layer aside for later. |
 
+### What Happens in Each Scenario
+
+**On `devbox layer refresh`** (re-read host files):
+
+| Your sandbox (upper) | Host (lower) | After refresh |
+|----------------------|--------------|---------------|
+| Didn't touch the file | Host updated it | You see the new host version |
+| You edited the file | Host didn't change | Your edit is preserved |
+| You edited the file | Host also changed | **Your edit wins** (upper always overrides lower) |
+| You deleted the file | Host didn't change | File stays deleted |
+| You deleted the file | Host also changed | File stays deleted (your whiteout wins) |
+| Didn't touch the file | Host deleted it | File disappears |
+| You created a new file | — | Your new file is preserved |
+| — | Host added a new file | You see the new file |
+
+**On `devbox commit`** (sync your changes to host):
+
+| Your sandbox (upper) | Host (lower) | After commit |
+|----------------------|--------------|--------------|
+| You edited a file | Host didn't change | Host gets your version |
+| You edited a file | Host also changed | **Host is overwritten** with your version |
+| You created a new file | File doesn't exist on host | File is created on host |
+| You deleted a file | File exists on host | File is deleted on host |
+| Didn't touch the file | — | No change (not in upper layer) |
+
+> **Key rule:** `refresh` never loses your work (upper always wins in the merge). `commit` always overwrites the host with your version. Use `devbox layer conflicts` before either operation to see what overlaps.
+
 When you run `devbox shell`, devbox automatically detects if host files changed and prompts you to refresh. Conflicts (files modified on both sides) are flagged — your sandbox version always takes precedence, but you can review and merge manually.
 
 All layer operations are also available in the **DevBox Management Panel** inside the sandbox (press `r` for refresh, `f` for conflicts).
