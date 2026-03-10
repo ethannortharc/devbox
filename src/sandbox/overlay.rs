@@ -363,7 +363,11 @@ pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool
 
 /// Remount the overlay to pick up host-side changes in the lower layer.
 /// This clears stale file handles. Upper layer (your edits) is preserved.
+///
+/// Newer kernels don't allow `mount -o remount` on OverlayFS, so we
+/// unmount and remount with the same options instead.
 pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
+    // Try simple remount first (works on older kernels)
     let result = runtime
         .exec_cmd(
             sandbox_name,
@@ -372,8 +376,23 @@ pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
         )
         .await?;
 
+    if result.exit_code == 0 {
+        println!("Overlay refreshed — host changes are now visible.");
+        return Ok(());
+    }
+
+    // Remount not supported — unmount and remount manually.
+    // The upper layer is on disk, so nothing is lost.
+    let remount_cmd = format!(
+        "umount {WORKSPACE} && mount -t overlay overlay \
+         -o lowerdir={LOWER},upperdir={UPPER},workdir={WORK} {WORKSPACE}"
+    );
+    let result = runtime
+        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &remount_cmd], false)
+        .await?;
+
     if result.exit_code != 0 {
-        bail!("Failed to remount overlay: {}", result.stderr.trim());
+        bail!("Failed to refresh overlay: {}", result.stderr.trim());
     }
 
     println!("Overlay refreshed — host changes are now visible.");

@@ -298,7 +298,13 @@ do_layer_refresh() {
     if [ "$confirm" = "n" ] || [ "$confirm" = "N" ]; then
         echo "  Skipped."
     else
-        sudo mount -o remount /workspace
+        if ! sudo mount -o remount /workspace 2>/dev/null; then
+            # Newer kernels don't allow remount on OverlayFS — unmount/remount
+            sudo umount /workspace && \
+            sudo mount -t overlay overlay \
+                -o "lowerdir=$LOWER,upperdir=$OVERLAY_UPPER,workdir=/var/devbox/overlay/work" \
+                /workspace
+        fi
         echo "  Overlay refreshed — host changes are now visible."
     fi
     echo ""
