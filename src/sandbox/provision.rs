@@ -248,16 +248,34 @@ async fn provision_nixos(
         .exec_cmd(name, &["bash", "-c", &mkdir_cmd], false)
         .await?;
 
-    // 2. Generate base NixOS config if it doesn't exist
+    // 2. Ensure NixOS channel is available (images:nixos/* may not have it)
+    //    nixos-rebuild needs `<nixpkgs/nixos>` in NIX_PATH, which comes from
+    //    the nixos channel. If the channel isn't set up, add and update it.
+    ensure_nixos_channel(runtime, name).await?;
+
+    // 3. Generate base NixOS config if it doesn't exist
     //    NixOS Lima images ship with an empty /etc/nixos/ — we need to
     //    run nixos-generate-config to create the hardware and base configs.
     ensure_nixos_config(runtime, name).await?;
 
-    // 3. Push devbox-state.toml (includes mount_mode for overlay setup)
+    // 4. Ensure user home directory exists (the user may not exist yet on
+    //    fresh images:nixos/* images — nixos-rebuild will create it via
+    //    devbox-module.nix, but we need the homedir for writing config files
+    //    before rebuild. We create it manually and let NixOS fix ownership later.)
+    let home_dir = format!("/home/{username}");
+    run_in_vm(
+        runtime,
+        name,
+        &format!("sudo mkdir -p {home_dir} && sudo chown $(id -u {username} 2>/dev/null || echo 1000):users {home_dir} 2>/dev/null; true"),
+        false,
+    )
+    .await?;
+
+    // 5. Push devbox-state.toml (includes mount_mode for overlay setup)
     let state_toml = generate_state_toml(sets, languages, &username, mount_mode);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
-    // 4. Push devbox-module.nix
+    // 6. Push devbox-module.nix
     write_file_to_vm(
         runtime,
         name,
@@ -266,15 +284,13 @@ async fn provision_nixos(
     )
     .await?;
 
-    // 5. Push all set .nix files
+    // 7. Push all set .nix files
     for (filename, content) in NIX_SET_FILES {
         let path = format!("/etc/devbox/sets/{filename}");
         write_file_to_vm(runtime, name, &path, content).await?;
     }
 
-    // 6. Run nixos-rebuild switch (interactive so user sees progress)
-    //    NixOS Lima images use flake-based NIX_PATH (nixpkgs=flake:nixpkgs)
-    //    which doesn't include nixos-config. We must set it explicitly.
+    // 8. Run nixos-rebuild switch (interactive so user sees progress)
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
     let rebuild_cmd = format!(
         "{NIXOS_PATH_PREFIX}\
@@ -293,7 +309,7 @@ async fn provision_nixos(
         println!("NixOS rebuild complete.");
     }
 
-    // 8. Set up user shell (zshrc with PATH, aliases, etc.)
+    // 9. Set up user shell (zshrc with PATH, aliases, etc.)
     setup_nixos_shell(runtime, name).await?;
 
     // 9. Install latest claude-code (nixpkgs version lags behind)
@@ -948,6 +964,43 @@ async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     eprintln!("\nWarning: network may not be ready — provisioning will continue but downloads may fail.");
+    Ok(())
+}
+
+/// Ensure the NixOS channel is available so `nixos-rebuild` can find `<nixpkgs/nixos>`.
+///
+/// The `images:nixos/*` Incus images may not have channels configured, causing
+/// `nixos-rebuild` to fail with "file 'nixpkgs/nixos' was not found in the Nix search path".
+/// We check if the nixos channel exists and add it if missing.
+async fn ensure_nixos_channel(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Check if nixpkgs is already in NIX_PATH
+    let check = run_in_vm(
+        runtime,
+        name,
+        "nix-instantiate --eval -E '<nixpkgs>' 2>/dev/null && echo found",
+        false,
+    )
+    .await?;
+
+    if check.stdout.contains("found") {
+        return Ok(());
+    }
+
+    println!("Setting up NixOS channel (required for nixos-rebuild)...");
+    let channel_cmd = concat!(
+        "sudo nix-channel --add https://nixos.org/channels/nixos-25.05 nixos && ",
+        "sudo nix-channel --update"
+    );
+    let result = run_in_vm(runtime, name, channel_cmd, false).await?;
+    if result.exit_code != 0 {
+        eprintln!(
+            "Warning: failed to set up NixOS channel: {}",
+            result.stderr.trim()
+        );
+    } else {
+        println!("NixOS channel configured.");
+    }
+
     Ok(())
 }
 
