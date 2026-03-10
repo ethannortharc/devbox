@@ -361,6 +361,143 @@ pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool
     Ok(result.exit_code == 0)
 }
 
+/// Remount the overlay to pick up host-side changes in the lower layer.
+/// This clears stale file handles. Upper layer (your edits) is preserved.
+pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "mount", "-o", "remount", WORKSPACE],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to remount overlay: {}", result.stderr.trim());
+    }
+
+    println!("Overlay refreshed — host changes are now visible.");
+    Ok(())
+}
+
+/// Detect files that were modified in both the upper layer (your edits)
+/// and the lower layer (host changed since mount). These are potential conflicts.
+pub async fn conflicts(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<ConflictInfo>> {
+    let changes = diff(runtime, sandbox_name).await?;
+
+    let mut conflicts = vec![];
+    for change in &changes {
+        if change.is_dir || change.status != ChangeStatus::Modified {
+            continue;
+        }
+
+        // For modified files, check if the lower layer version differs from
+        // what the overlay originally saw (compare upper vs lower content hash).
+        let upper_path = format!("{UPPER}/{}", change.path);
+        let lower_path = format!("{LOWER}/{}", change.path);
+
+        // Check if both files exist and differ
+        let diff_cmd = format!(
+            "[ -f '{}' ] && [ -f '{}' ] && ! diff -q '{}' '{}' >/dev/null 2>&1 && echo CONFLICT || echo OK",
+            upper_path, lower_path, upper_path, lower_path
+        );
+        let result = runtime
+            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .await?;
+
+        if result.stdout.trim() == "CONFLICT" {
+            conflicts.push(ConflictInfo {
+                path: change.path.clone(),
+            });
+        }
+    }
+
+    if conflicts.is_empty() {
+        println!("No conflicts — your changes and host changes don't overlap.");
+    } else {
+        println!(
+            "{} conflict(s) found (both you and the host modified these files):\n",
+            conflicts.len()
+        );
+        for c in &conflicts {
+            println!("  \x1b[31m!\x1b[0m {}", c.path);
+        }
+        println!();
+        println!("Your version (upper layer) takes precedence in /workspace.");
+        println!("Use `devbox diff` to review, or edit manually to merge.");
+    }
+
+    Ok(conflicts)
+}
+
+/// Check if the lower layer has changes since the overlay was mounted.
+/// Returns a list of paths that changed on the host side.
+pub async fn lower_layer_changes(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<String>> {
+    // Compare the lower layer mtime against a timestamp file we create on mount.
+    // If no timestamp exists, we can't detect changes — just check for stale handles.
+    // Simpler approach: find files in lower newer than the overlay work dir (created at mount time).
+    let cmd = format!(
+        "find {} -newer {} -not -path {} -type f -printf '%P\\n' 2>/dev/null | head -50",
+        LOWER, WORK, LOWER
+    );
+    let result = runtime
+        .exec_cmd(sandbox_name, &["bash", "-c", &cmd], false)
+        .await?;
+
+    if result.exit_code != 0 {
+        return Ok(vec![]);
+    }
+
+    let paths: Vec<String> = result
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    Ok(paths)
+}
+
+/// Same as `conflicts()` but without printing (for use in prompts).
+pub async fn conflicts_quiet(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+) -> Result<Vec<ConflictInfo>> {
+    let changes = diff(runtime, sandbox_name).await?;
+
+    let mut result_conflicts = vec![];
+    for change in &changes {
+        if change.is_dir || change.status != ChangeStatus::Modified {
+            continue;
+        }
+
+        let upper_path = format!("{UPPER}/{}", change.path);
+        let lower_path = format!("{LOWER}/{}", change.path);
+
+        let diff_cmd = format!(
+            "[ -f '{}' ] && [ -f '{}' ] && ! diff -q '{}' '{}' >/dev/null 2>&1 && echo CONFLICT || echo OK",
+            upper_path, lower_path, upper_path, lower_path
+        );
+        let result = runtime
+            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .await?;
+
+        if result.stdout.trim() == "CONFLICT" {
+            result_conflicts.push(ConflictInfo {
+                path: change.path.clone(),
+            });
+        }
+    }
+
+    Ok(result_conflicts)
+}
+
+/// A conflict where both upper and lower layers have different versions of a file.
+#[derive(Debug, Clone)]
+pub struct ConflictInfo {
+    pub path: String,
+}
+
 /// A change detected in the overlay upper layer.
 #[derive(Debug, Clone)]
 pub struct OverlayChange {

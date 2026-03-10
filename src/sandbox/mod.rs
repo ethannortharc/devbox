@@ -223,6 +223,11 @@ impl SandboxManager {
             let _ = e;
         }
 
+        // Check for host-side changes and prompt for refresh (overlay mode only)
+        if state.mount_mode != "writable" {
+            Self::check_and_prompt_refresh(runtime.as_ref(), name).await;
+        }
+
         // Determine layout: CLI flag > saved state > "default"
         let layout = layout_override
             .map(|s| s.to_string())
@@ -339,6 +344,63 @@ impl SandboxManager {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Check if the host (lower layer) has changed and prompt user to refresh.
+    async fn check_and_prompt_refresh(runtime: &dyn crate::runtime::Runtime, name: &str) {
+        use std::io::Write;
+
+        let changed = match overlay::lower_layer_changes(runtime, name).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        if changed.is_empty() {
+            return;
+        }
+
+        println!(
+            "\n  Host files changed since last mount ({} file{}):",
+            changed.len(),
+            if changed.len() == 1 { "" } else { "s" }
+        );
+        for (i, path) in changed.iter().enumerate() {
+            if i >= 10 {
+                println!("  ... and {} more", changed.len() - 10);
+                break;
+            }
+            println!("  \x1b[33m~\x1b[0m {path}");
+        }
+
+        // Check for conflicts (files modified on both sides)
+        if let Ok(conflicts) = overlay::conflicts_quiet(runtime, name).await
+            && !conflicts.is_empty()
+        {
+            println!(
+                "\n  \x1b[31m{} conflict(s)\x1b[0m (modified on both host and sandbox):",
+                conflicts.len()
+            );
+            for c in &conflicts {
+                println!("  \x1b[31m!\x1b[0m {}", c.path);
+            }
+            println!("  Your sandbox version takes precedence after refresh.");
+        }
+
+        print!("\n  Refresh overlay to pick up host changes? [Y/n] ");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let answer = input.trim();
+            if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+                match overlay::refresh(runtime, name).await {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("  Warning: refresh failed: {e}"),
+                }
+            } else {
+                println!("  Skipped. Run `devbox layer refresh` later to pick up changes.");
+            }
+        }
+        println!();
     }
 
     /// Probe for zsh in the VM, fall back to bash.

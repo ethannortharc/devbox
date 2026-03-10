@@ -35,6 +35,10 @@ pub enum LayerAction {
         #[arg(long)]
         path: Option<Vec<String>>,
     },
+    /// Refresh overlay (pick up host-side changes)
+    Refresh,
+    /// Show files modified on both sides (potential conflicts)
+    Conflicts,
     /// Stash overlay changes
     Stash,
     /// Restore stashed changes
@@ -120,6 +124,12 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
             }
             let paths = path.as_deref();
             overlay::discard(runtime.as_ref(), &name, paths).await?;
+        }
+        LayerAction::Refresh => {
+            overlay::refresh(runtime.as_ref(), &name).await?;
+        }
+        LayerAction::Conflicts => {
+            overlay::conflicts(runtime.as_ref(), &name).await?;
         }
         LayerAction::Stash => {
             overlay::stash(runtime.as_ref(), &name).await?;

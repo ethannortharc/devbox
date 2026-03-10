@@ -241,6 +241,33 @@ devbox discard                   # Throw away all changes
 devbox snapshot restore <id>     # Roll back to a snapshot
 ```
 
+### Overlay Layer Lifecycle
+
+The overlay layer is the bridge between your sandbox and the host. Here's the complete workflow:
+
+```
+Host filesystem ──(read-only)──> /mnt/host (lower layer)
+                                      │
+                                      ▼
+                                OverlayFS merge ──> /workspace (what you see)
+                                      ▲
+                                      │
+                        /var/devbox/overlay/upper (your changes)
+```
+
+| Command | Direction | What it does |
+|---------|-----------|--------------|
+| `devbox layer refresh` | Host → VM (read) | Re-read host changes; your edits preserved. Clears stale file handles. |
+| `devbox layer conflicts` | — | Show files modified on both host and sandbox sides. |
+| `devbox diff` | — | Show what's in the upper layer vs the lower layer. |
+| `devbox commit` | VM → Host (write) | Copy upper layer changes to host. The **only** operation that writes to host. |
+| `devbox discard` | — | Wipe the upper layer. Back to clean state. |
+| `devbox layer stash` | — | Save upper layer aside for later. |
+
+When you run `devbox shell`, devbox automatically detects if host files changed and prompts you to refresh. Conflicts (files modified on both sides) are flagged — your sandbox version always takes precedence, but you can review and merge manually.
+
+All layer operations are also available in the **DevBox Management Panel** inside the sandbox (press `r` for refresh, `f` for conflicts).
+
 ---
 
 ## Commands
@@ -262,6 +289,8 @@ devbox snapshot restore <id>     # Roll back to a snapshot
 | `devbox commit` | Sync overlay changes to host |
 | `devbox discard` | Throw away overlay changes |
 | `devbox layer status` | Overlay layer summary |
+| `devbox layer refresh` | Pick up host-side file changes |
+| `devbox layer conflicts` | Show files modified on both sides |
 | `devbox layer stash` | Stash current overlay changes |
 | `devbox layer stash-pop` | Restore stashed changes |
 | `devbox layout list` | List available layouts |

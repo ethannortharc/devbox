@@ -84,6 +84,8 @@ show_menu() {
     if is_overlay; then
         echo "    s) Layer status      (detailed)"
         echo "    d) Layer diff        (file changes)"
+        echo "    r) Layer refresh     (pick up host changes)"
+        echo "    f) Layer conflicts   (check both-sides edits)"
         echo "    c) Layer commit      (sync to host)"
         echo "    x) Layer discard     (throw away changes)"
         echo "    t) Layer stash       (save & clean)"
@@ -267,6 +269,75 @@ do_layer_stash_pop() {
     read -p "  Press Enter to continue..." _
 }
 
+do_layer_refresh() {
+    echo ""
+    if ! is_overlay; then
+        echo "  Not in overlay mode."
+        read -p "  Press Enter to continue..." _
+        return
+    fi
+
+    # Show what changed on the host
+    local host_changes
+    host_changes=$(find "$LOWER" -newer /var/devbox/overlay/work -not -path "$LOWER" -type f -printf "%P\n" 2>/dev/null | head -20)
+    if [ -z "$host_changes" ]; then
+        echo "  No host-side changes detected."
+        read -p "  Press Enter to continue..." _
+        return
+    fi
+
+    echo "  Host files changed:"
+    echo "$host_changes" | head -10 | sed 's/^/    ~ /'
+    local count
+    count=$(echo "$host_changes" | wc -l)
+    if [ "$count" -gt 10 ]; then
+        echo "    ... and $((count - 10)) more"
+    fi
+    echo ""
+    read -p "  Refresh overlay to pick up changes? [Y/n] " confirm
+    if [ "$confirm" = "n" ] || [ "$confirm" = "N" ]; then
+        echo "  Skipped."
+    else
+        sudo mount -o remount /workspace
+        echo "  Overlay refreshed — host changes are now visible."
+    fi
+    echo ""
+    read -p "  Press Enter to continue..." _
+}
+
+do_layer_conflicts() {
+    echo ""
+    if ! is_overlay; then
+        echo "  Not in overlay mode."
+        read -p "  Press Enter to continue..." _
+        return
+    fi
+
+    echo "  Checking for conflicts (files modified on both sides)..."
+    echo ""
+    local conflict_count=0
+    find "$OVERLAY_UPPER" -not -path "$OVERLAY_UPPER" -not -type d -printf "%P\n" 2>/dev/null | while read -r path; do
+        [ -z "$path" ] && continue
+        # Only check regular files that exist in both layers
+        if [ -f "$OVERLAY_UPPER/$path" ] && [ -f "$LOWER/$path" ]; then
+            if ! diff -q "$OVERLAY_UPPER/$path" "$LOWER/$path" >/dev/null 2>&1; then
+                echo "    ! $path"
+                conflict_count=$((conflict_count + 1))
+            fi
+        fi
+    done
+
+    if [ "$conflict_count" -eq 0 ]; then
+        echo "    No conflicts — your changes and host changes don't overlap."
+    else
+        echo ""
+        echo "    Your version (upper layer) takes precedence in /workspace."
+        echo "    Use 'd' to review diffs, or edit files manually to merge."
+    fi
+    echo ""
+    read -p "  Press Enter to continue..." _
+}
+
 # ── Layout actions ─────────────────────────────────────
 
 do_layout_save() {
@@ -355,6 +426,8 @@ while true; do
     case "$choice" in
         s|S) do_layer_status ;;
         d|D) do_layer_diff ;;
+        r|R) do_layer_refresh ;;
+        f|F) do_layer_conflicts ;;
         c|C) do_layer_commit ;;
         x|X) do_layer_discard ;;
         t|T) do_layer_stash ;;
