@@ -938,23 +938,26 @@ async fn write_file_to_vm(
 /// Wait for network connectivity inside the VM.
 ///
 /// On freshly booted Incus VMs, the network (especially DNS) may not be ready
-/// even after the agent responds. We poll for DNS resolution of cache.nixos.org
-/// since that's needed for `nixos-rebuild` and `nix-env` operations.
+/// even after the agent responds. We first wait for basic IP connectivity
+/// (ping), then check DNS resolution. If basic connectivity never comes up,
+/// we bail early with actionable diagnostics instead of letting every
+/// subsequent download time out.
 async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let max_attempts = 20; // 20 * 3s = 60s
-    for i in 0..max_attempts {
+    // Phase 1: Wait for basic IP connectivity (ping 8.8.8.8)
+    // This distinguishes "network not ready yet" from "no route / firewall blocks"
+    let ping_attempts = 10; // 10 * 3s = 30s
+    let mut got_ping = false;
+    for i in 0..ping_attempts {
         let result = run_in_vm(
             runtime,
             name,
-            "getent hosts cache.nixos.org >/dev/null 2>&1 && echo ok",
+            "ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && echo ok",
             false,
         )
         .await?;
         if result.exit_code == 0 && result.stdout.trim() == "ok" {
-            if i > 0 {
-                println!("Network is ready.");
-            }
-            return Ok(());
+            got_ping = true;
+            break;
         }
         if i == 0 {
             print!("Waiting for network connectivity...");
@@ -963,7 +966,41 @@ async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
-    eprintln!("\nWarning: network may not be ready — provisioning will continue but downloads may fail.");
+
+    if !got_ping {
+        println!();
+        eprintln!("\x1b[31mError: VM has no network connectivity.\x1b[0m");
+        eprintln!("The VM cannot reach the internet. This is usually caused by");
+        eprintln!("missing iptables FORWARD rules for the Incus bridge.\n");
+        eprintln!("Quick fix (run on the host):");
+        eprintln!("  sudo iptables -I FORWARD -i incusbr0 -j ACCEPT");
+        eprintln!("  sudo iptables -I FORWARD -o incusbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT");
+        eprintln!("  sudo iptables -t nat -A POSTROUTING -s 10.195.64.0/24 ! -o incusbr0 -j MASQUERADE\n");
+        eprintln!("Run `devbox doctor` for full network diagnostics.");
+        anyhow::bail!("VM network connectivity check failed — cannot provision without internet access");
+    }
+
+    // Phase 2: Wait for DNS resolution
+    let dns_attempts = 10; // 10 * 3s = 30s
+    for i in 0..dns_attempts {
+        let result = run_in_vm(
+            runtime,
+            name,
+            "getent hosts cache.nixos.org >/dev/null 2>&1 && echo ok",
+            false,
+        )
+        .await?;
+        if result.exit_code == 0 && result.stdout.trim() == "ok" {
+            println!(" ready.");
+            return Ok(());
+        }
+        if i % 5 == 0 {
+            print!(" (DNS {}s)", i * 3);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    println!();
+    eprintln!("Warning: DNS resolution not working yet — provisioning will continue but downloads may fail.");
     Ok(())
 }
 
