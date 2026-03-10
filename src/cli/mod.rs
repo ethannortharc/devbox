@@ -1,3 +1,4 @@
+pub mod code;
 pub mod commit;
 pub mod config;
 pub mod create;
@@ -134,6 +135,9 @@ pub enum Command {
     /// Manage overlay layer (status, diff, commit, stash, ...)
     Layer(layer::LayerArgs),
 
+    /// Open VS Code / Cursor into a sandbox via Remote SSH
+    Code(code::CodeArgs),
+
     /// Switch sandbox to use current directory
     #[command(name = "use")]
     Use(use_cmd::UseArgs),
@@ -165,6 +169,7 @@ impl Command {
             Command::Reprovision(args) => reprovision::run(args, manager).await,
             Command::SelfUpdate(args) => self_update::run(args, manager).await,
             Command::Layer(args) => layer::run(args, manager).await,
+            Command::Code(args) => code::run(args, manager).await,
             Command::Use(args) => use_cmd::run(args, manager).await,
         }
     }
