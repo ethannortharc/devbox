@@ -50,6 +50,26 @@ in {
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);
   services.tailscale.enable = lib.mkDefault (sets.network or false);
 
+  # ── Incus/LXD Agent ─────────────────────────────────
+  # Required for `incus exec` to work after nixos-rebuild.
+  # The agent binary is mounted at /run/incus_agent/ by the hypervisor;
+  # this service starts it on boot so the host can communicate with the VM.
+  systemd.services.incus-agent = {
+    description = "Incus VM Agent";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network.target" "local-fs.target" ];
+    serviceConfig = {
+      Type = "notify";
+      ExecStart = "/run/incus_agent/incus-agent";
+      Restart = "always";
+      RestartSec = 5;
+      WorkingDirectory = "/run/incus_agent";
+    };
+    unitConfig = {
+      ConditionPathExists = "/run/incus_agent/incus-agent";
+    };
+  };
+
   # ── Dynamic linker compat ─────────────────────────
   # Required for VS Code Server, Cursor, and other dynamically linked
   # binaries that expect a standard FHS layout (ld-linux, libc, etc.).
