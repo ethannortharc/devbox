@@ -27,13 +27,13 @@ in {
   nixpkgs.config.allowUnfree = true;
 
   # ── Packages ───────────────────────────────────────
-  # Core sets (system + shell + tools) are always installed.
+  # Core sets (system + shell + tools + editor) are always installed.
   # Optional sets and language sets are conditional on devbox-state.toml.
   environment.systemPackages =
     devboxSets.system
     ++ devboxSets.shell
     ++ devboxSets.tools
-    ++ (lib.optionals (sets.editor or true) devboxSets.editor)
+    ++ devboxSets.editor
     ++ (lib.optionals (sets.git or true) devboxSets.git)
     ++ (lib.optionals (sets.container or false) devboxSets.container)
     ++ (lib.optionals (sets.network or false) devboxSets.network)
@@ -66,7 +66,7 @@ in {
   users.users.${username} = {
     isNormalUser = true;
     shell = lib.mkForce pkgs.zsh;
-    extraGroups = lib.mkAfter [ "wheel" "docker" ];
+    extraGroups = lib.mkAfter ([ "wheel" ] ++ lib.optionals (sets.container or false) [ "docker" ]);
   };
 
   # ── OverlayFS Workspace Mount ─────────────────────────

@@ -32,7 +32,7 @@ pub static TOOL_SETS: &[ToolSet] = &[
         name: "editor",
         description: "Terminal Editors (neovim, helix, nano)",
         package_count: 3,
-        locked: false,
+        locked: true,
     },
     ToolSet {
         name: "git",

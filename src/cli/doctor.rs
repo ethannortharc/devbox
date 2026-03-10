@@ -25,28 +25,13 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
         has_any_runtime |= found;
     }
 
-    if os == "macos" || os == "linux" {
-        let found = check_binary_with_install(
-            "  Lima",
-            "limactl",
-            if os == "macos" {
-                "brew install lima"
-            } else {
-                "brew install lima  # or: https://lima-vm.io/docs/installation/"
-            },
-        );
+    if os == "macos" {
+        let found = check_binary_with_install("  Lima", "limactl", "brew install lima");
         if found {
             has_any_runtime = true;
-        } else if !has_any_runtime {
-            let found = check_binary_with_install(
-                "  Multipass",
-                "multipass",
-                if os == "macos" {
-                    "brew install multipass"
-                } else {
-                    "sudo snap install multipass"
-                },
-            );
+        } else {
+            let found =
+                check_binary_with_install("  Multipass", "multipass", "brew install multipass");
             has_any_runtime |= found;
         }
     }

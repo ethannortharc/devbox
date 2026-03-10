@@ -79,7 +79,7 @@ fn generate_commented_toml(
     s.push_str("system = true              # Locked: always true\n");
     s.push_str("shell = true               # Locked: always true\n");
     s.push_str("tools = true               # Locked: always true\n");
-    s.push_str(&format!("editor = {}\n", config.sets.editor));
+    s.push_str("editor = true              # Locked: always true\n");
     s.push_str(&format!("git = {}\n", config.sets.git));
     s.push_str(&format!("container = {}\n", config.sets.container));
     s.push_str(&format!("network = {}\n", config.sets.network));

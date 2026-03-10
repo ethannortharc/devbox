@@ -13,9 +13,63 @@ impl IncusRuntime {
         format!("devbox-{name}")
     }
 
-    /// Base NixOS image alias.
-    fn image_name() -> &'static str {
-        "devbox-nixos"
+    /// Local image alias for the given image type.
+    fn image_alias(image_type: &str) -> &'static str {
+        match image_type {
+            "ubuntu" => "devbox-ubuntu",
+            _ => "devbox-nixos",
+        }
+    }
+
+    /// Remote source in the official images: remote for each supported image type.
+    fn remote_image(image_type: &str) -> &'static str {
+        match image_type {
+            "ubuntu" => "images:ubuntu/24.04",
+            _ => "images:nixos/24.11",
+        }
+    }
+
+    /// Ensure the base image exists locally, downloading it from the official
+    /// `images:` remote if necessary.
+    async fn ensure_image(image_type: &str) -> Result<()> {
+        let alias = Self::image_alias(image_type);
+
+        // Check whether the image already exists locally.
+        let result = run_cmd(
+            "incus",
+            &[
+                "image",
+                "list",
+                &format!("local:{alias}"),
+                "--format",
+                "json",
+            ],
+        )
+        .await?;
+
+        if result.exit_code == 0 {
+            // Parse the JSON array — an empty array means no match.
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result.stdout)
+                && !arr.is_empty()
+            {
+                return Ok(());
+            }
+        }
+
+        let remote = Self::remote_image(image_type);
+
+        println!(
+            "Base image '{alias}' not found locally. Downloading from {remote} — this may take a few minutes..."
+        );
+
+        run_ok(
+            "incus",
+            &["image", "copy", remote, "local:", "--alias", alias, "--vm"],
+        )
+        .await?;
+
+        println!("Image '{alias}' imported successfully.");
+        Ok(())
     }
 }
 
@@ -46,9 +100,13 @@ impl Runtime for IncusRuntime {
             );
         }
 
+        // Ensure the base image is available (auto-download if missing).
+        Self::ensure_image(&opts.image).await?;
+
         // Launch the VM
         println!("Creating Incus VM '{vm}'...");
-        let mut launch_args = vec!["launch", Self::image_name(), &vm, "--vm"];
+        let image = Self::image_alias(&opts.image);
+        let mut launch_args = vec!["launch", image, &vm, "--vm"];
 
         let cpu_str;
         if opts.cpu > 0 {

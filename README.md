@@ -10,7 +10,7 @@ cd my-project
 devbox
 ```
 
-That's it. Devbox detects your project type, provisions a NixOS VM with [90+ tools](docs/PACKAGES.md), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
+That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
 
 ### Why a sandbox for AI coding?
 
@@ -40,7 +40,7 @@ Devbox is a complete developer environment for everyone:
 | "It works on my machine" | Reproducible NixOS VMs with declarative configuration |
 | Polluting your host OS with dev tools | Everything runs in an isolated VM; your host stays clean |
 | Tool version conflicts | Each sandbox is independent with its own package set |
-| Setting up a new machine takes hours | One command installs [90+ tools](docs/PACKAGES.md) from a binary cache in minutes |
+| Setting up a new machine takes hours | One command installs [120+ tools](docs/PACKAGES.md) from a binary cache in minutes |
 | Security and compliance requirements | Full VM boundary with audit trail via overlay diff/commit |
 
 ## Key Design Principles
@@ -58,7 +58,6 @@ Devbox is a complete developer environment for everyone:
 
 ### Prerequisites
 
-- **Rust** 1.85+ (to build from source)
 - A VM runtime:
   - [Lima](https://lima-vm.io/) (macOS, recommended)
   - [Incus](https://linuxcontainers.org/incus/) (Linux, recommended)
@@ -66,6 +65,12 @@ Devbox is a complete developer environment for everyone:
   - [Docker](https://www.docker.com/) (any platform, fallback)
 
 ### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ethannortharc/devbox/main/install.sh | sh
+```
+
+Or build from source (requires Rust 1.85+):
 
 ```bash
 git clone https://github.com/ethannortharc/devbox.git
@@ -200,7 +205,7 @@ devbox snapshot restore <id>     # Roll back to a snapshot
 
 ## Tool Catalog
 
-Devbox ships with [**90+ tools**](docs/PACKAGES.md) organized into toggleable sets. All packages come from [nixpkgs](https://search.nixos.org/packages), the largest and most up-to-date package repository. See the [full package reference](docs/PACKAGES.md) for detailed descriptions of every tool.
+Devbox ships with [**120+ tools**](docs/PACKAGES.md) organized into toggleable sets. All packages come from [nixpkgs](https://search.nixos.org/packages), the largest and most up-to-date package repository. See the [full package reference](docs/PACKAGES.md) for detailed descriptions of every tool.
 
 ### Core Sets (always installed)
 
@@ -217,7 +222,9 @@ coreutils, gnugrep, gnused, gawk, findutils, diffutils, gzip, gnutar, xz, bzip2,
 | Package | Description |
 |---------|-------------|
 | zellij | Terminal multiplexer (workspace layouts) |
-| zsh | Shell with autosuggestions and syntax highlighting |
+| zsh | Z shell with advanced scripting |
+| zsh-autosuggestions | Fish-like autosuggestions for zsh |
+| zsh-syntax-highlighting | Syntax highlighting for zsh |
 | starship | Cross-shell prompt |
 | fzf | Fuzzy finder |
 | zoxide | Smart cd (remembers directories) |
@@ -241,7 +248,7 @@ coreutils, gnugrep, gnused, gawk, findutils, diffutils, gzip, gnutar, xz, bzip2,
 | sd | Regex find-and-replace |
 | choose | Field selection (replaces cut/awk) |
 | jq | JSON processor |
-| yq | YAML/TOML/XML processor |
+| yq-go | YAML/TOML/XML processor |
 | fx | Interactive JSON viewer |
 | htop | Interactive process viewer |
 | bottom | System monitor (btm) |
@@ -275,9 +282,9 @@ git, lazygit (TUI), gh (GitHub CLI), git-lfs, git-crypt, pre-commit
 </details>
 
 <details>
-<summary><b>ai-code</b> -- 5 packages (AI coding assistants)</summary>
+<summary><b>ai-code</b> -- 6 packages (AI coding assistants)</summary>
 
-claude-code, codex, opencode, aider-chat, aichat
+claude-code, codex, opencode, aider-chat, aichat, continue
 
 </details>
 
@@ -352,7 +359,7 @@ editor = true               # neovim, helix, nano
 git = true                  # git, lazygit, gh
 container = false           # docker, compose, lazydocker
 network = false             # tailscale, mosh, nmap
-ai_code = true              # claude-code, codex, aichat
+ai_code = true              # claude-code, codex, aider, aichat, ...
 ai_infra = false            # ollama, open-webui
 
 [languages]
@@ -378,7 +385,7 @@ devbox config show
 
 ## Base Images
 
-Both images install the same [90+ tools](docs/PACKAGES.md) from [nixpkgs](https://search.nixos.org/packages).
+Both images install the same [120+ tools](docs/PACKAGES.md) from [nixpkgs](https://search.nixos.org/packages).
 
 | Image | Method | Rollback | Best For |
 |-------|--------|----------|----------|

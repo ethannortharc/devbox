@@ -490,6 +490,8 @@ export VISUAL=nvim
 alias ls='eza --icons' 2>/dev/null
 alias cat='bat --paging=never' 2>/dev/null
 alias top='htop' 2>/dev/null
+alias vim='nvim' 2>/dev/null
+alias vi='nvim' 2>/dev/null
 
 # Devbox identity
 export DEVBOX_NAME="${{DEVBOX_NAME:-devbox}}"
@@ -545,6 +547,8 @@ fi
 alias ls='eza --icons' 2>/dev/null
 alias cat='bat --paging=never' 2>/dev/null
 alias top='htop' 2>/dev/null
+alias vim='nvim' 2>/dev/null
+alias vi='nvim' 2>/dev/null
 
 # Devbox identity
 export DEVBOX_NAME="${DEVBOX_NAME:-devbox}"

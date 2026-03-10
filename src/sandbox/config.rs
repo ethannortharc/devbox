@@ -211,15 +211,14 @@ impl DevboxConfig {
 
     /// Return a list of all active set names.
     pub fn active_sets(&self) -> Vec<String> {
-        let mut sets = vec![];
         // Locked sets (always on)
-        sets.push("system".to_string());
-        sets.push("shell".to_string());
-        sets.push("tools".to_string());
+        let mut sets = vec![
+            "system".to_string(),
+            "shell".to_string(),
+            "tools".to_string(),
+            "editor".to_string(),
+        ];
         // Toggleable sets
-        if self.sets.editor {
-            sets.push("editor".to_string());
-        }
         if self.sets.git {
             sets.push("git".to_string());
         }

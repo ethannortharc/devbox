@@ -37,7 +37,7 @@ Essential POSIX and GNU utilities that form the baseline environment. *Status: a
 
 ---
 
-## Shell (10 packages)
+## Shell (11 packages)
 
 Terminal multiplexer, shell configuration, prompt, and navigation tools. *Status: on by default*
 
@@ -53,10 +53,11 @@ Terminal multiplexer, shell configuration, prompt, and navigation tools. *Status
 | direnv | Load and unload environment variables per directory | https://direnv.net/ |
 | nix-direnv | Fast, persistent use_nix/use_flake implementation for direnv | https://github.com/nix-community/nix-direnv |
 | yazi | Blazing-fast terminal file manager with async I/O | https://yazi-rs.github.io/ |
+| micro | Modern and intuitive terminal-based text editor | https://micro-editor.github.io/ |
 
 ---
 
-## Tools (21 packages)
+## Tools (22 packages)
 
 Modern command-line replacements and productivity utilities. *Status: on by default*
 
@@ -73,6 +74,7 @@ Modern command-line replacements and productivity utilities. *Status: on by defa
 | yq-go | YAML, JSON, and XML processor (Go implementation) | https://github.com/mikefarah/yq |
 | fx | Terminal JSON viewer and processor | https://fx.wtf/ |
 | htop | Interactive process viewer for Unix systems | https://htop.dev/ |
+| bottom | Graphical system/process monitor for the terminal | https://github.com/ClementTsang/bottom |
 | procs | Modern replacement for ps written in Rust | https://github.com/dalance/procs |
 | dust | More intuitive version of du (disk usage) | https://github.com/bootandy/dust |
 | duf | Disk usage/free utility with a modern interface | https://github.com/muesli/duf |
@@ -144,22 +146,32 @@ Network diagnostics, monitoring, and connectivity tools. *Status: off by default
 
 ---
 
-## AI (10 packages)
+## AI Code (6 packages)
 
-AI coding assistants, local inference, and LLM tooling. *Status: off by default*
+AI coding assistants for the terminal. *Status: off by default*
 
 | Package | Description | Homepage |
 |---------|-------------|----------|
 | claude-code | Anthropic's agentic coding assistant for the terminal | https://docs.anthropic.com/en/docs/claude-code |
+| codex | OpenAI's CLI coding agent | https://github.com/openai/codex |
+| opencode | Terminal-based AI coding assistant | https://opencode.ai/ |
 | aider-chat | AI pair programming in the terminal via LLMs | https://aider.chat/ |
+| aichat | All-in-one LLM CLI tool for chat, execute, and shell | https://github.com/sigoden/aichat |
+| continue | Open-source AI code assistant IDE extension | https://continue.dev/ |
+
+---
+
+## AI Infra (5 packages)
+
+Local AI inference and LLM infrastructure tooling. *Status: off by default*
+
+| Package | Description | Homepage |
+|---------|-------------|----------|
 | ollama | Run large language models locally | https://ollama.com/ |
 | open-webui | Self-hosted web UI for interacting with LLMs | https://openwebui.com/ |
-| codex | OpenAI's CLI coding agent | https://github.com/openai/codex |
-| huggingface-hub | CLI and Python library for the Hugging Face Hub | https://huggingface.co/docs/huggingface_hub/ |
-| mcp-hub | Central hub for managing Model Context Protocol servers | https://github.com/modelcontextprotocol/servers |
 | litellm | Unified interface to call 100+ LLM APIs in OpenAI format | https://litellm.ai/ |
-| continue | Open-source AI code assistant IDE extension | https://continue.dev/ |
-| opencode | Terminal-based AI coding assistant | https://opencode.ai/ |
+| mcp-hub | Central hub for managing Model Context Protocol servers | https://github.com/modelcontextprotocol/servers |
+| huggingface-hub | CLI and Python library for the Hugging Face Hub | https://huggingface.co/docs/huggingface_hub/ |
 
 ---
 
