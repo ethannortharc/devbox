@@ -199,9 +199,11 @@ fn launch_editor(editor: &str, ssh_host: &str, path: &str) -> Result<()> {
 
     println!("Opening {editor} → {ssh_host}:{path}");
 
-    let remote_arg = format!("--remote=ssh-remote+{ssh_host}{path}");
+    let remote_arg = format!("ssh-remote+{ssh_host}");
     let status = std::process::Command::new(editor)
+        .arg("--remote")
         .arg(&remote_arg)
+        .arg(path)
         .status()
         .map_err(|e| anyhow::anyhow!("Failed to launch {editor}: {e}"))?;
 
