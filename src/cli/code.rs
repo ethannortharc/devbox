@@ -4,6 +4,7 @@ use clap::Args;
 use crate::runtime::cmd::run_cmd;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
+use crate::sandbox::overlay;
 
 #[derive(Args, Debug)]
 pub struct CodeArgs {
@@ -34,6 +35,14 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
         }
         SandboxStatus::NotFound => bail!("Sandbox '{name}' not found."),
         SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),
+    }
+
+    // Refresh overlay before opening editor to avoid stale file handles
+    if state.mount_mode != "writable" {
+        println!("Refreshing overlay layer...");
+        if let Err(e) = overlay::refresh(runtime.as_ref(), &name).await {
+            eprintln!("Warning: overlay refresh failed: {e}");
+        }
     }
 
     let vm_name = format!("devbox-{name}");
