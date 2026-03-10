@@ -236,20 +236,16 @@ async fn provision_nixos(
 ) -> Result<()> {
     let username = whoami();
 
+    // 0. Wait for network connectivity (DNS resolution can lag behind the agent)
+    wait_for_network(runtime, name).await?;
+
     // 1. Create directory structure
     println!("Setting up NixOS configuration...");
+    let mkdir_cmd = format!(
+        "{NIXOS_PATH_PREFIX}sudo mkdir -p /etc/devbox/sets /etc/devbox/help"
+    );
     runtime
-        .exec_cmd(
-            name,
-            &[
-                "sudo",
-                "mkdir",
-                "-p",
-                "/etc/devbox/sets",
-                "/etc/devbox/help",
-            ],
-            false,
-        )
+        .exec_cmd(name, &["bash", "-c", &mkdir_cmd], false)
         .await?;
 
     // 2. Generate base NixOS config if it doesn't exist
@@ -280,13 +276,14 @@ async fn provision_nixos(
     //    NixOS Lima images use flake-based NIX_PATH (nixpkgs=flake:nixpkgs)
     //    which doesn't include nixos-config. We must set it explicitly.
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
-    let rebuild_cmd = concat!(
-        "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && ",
-        "export NIXPKGS_ALLOW_UNFREE=1 && ",
-        "nixos-rebuild switch"
+    let rebuild_cmd = format!(
+        "{NIXOS_PATH_PREFIX}\
+         export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && \
+         export NIXPKGS_ALLOW_UNFREE=1 && \
+         sudo -E nixos-rebuild switch"
     );
     let result = runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", rebuild_cmd], true)
+        .exec_cmd(name, &["bash", "-c", &rebuild_cmd], true)
         .await?;
 
     if result.exit_code != 0 {
@@ -559,9 +556,9 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 "#;
         write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
-        let chown_cmd = format!("chown {username}:users {zshrc_path}");
+        let chown_cmd = format!("{NIXOS_PATH_PREFIX}sudo chown {username}:users {zshrc_path}");
         runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+            .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
             .await?;
     }
 
@@ -576,9 +573,9 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
-        let chown_cmd = format!("chown {username}:users {profile_path}");
+        let chown_cmd = format!("{NIXOS_PATH_PREFIX}sudo chown {username}:users {profile_path}");
         runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+            .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
             .await?;
     }
 
@@ -606,10 +603,8 @@ async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let vm_path = format!("/home/{username}/.gitconfig");
     write_file_to_vm(runtime, name, &vm_path, &content).await?;
 
-    let chown_cmd = format!("chown {username}:users {vm_path}");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    let chown_cmd = format!("sudo chown {username}:users {vm_path}");
+    run_in_vm(runtime, name, &chown_cmd, false).await?;
 
     println!("Synced host git config to VM.");
     Ok(())
@@ -767,18 +762,14 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
             // Ensure parent directory exists with correct ownership
             let vm_parent = vm_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(&vm_path);
-            runtime
-                .exec_cmd(name, &["sudo", "mkdir", "-p", vm_parent], false)
-                .await?;
+            run_in_vm(runtime, name, &format!("sudo mkdir -p {vm_parent}"), false).await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
             println!("  copied: ~/{host_suffix} → {vm_path}");
 
             // Set restrictive permissions for credential/auth files
             if vm_suffix.contains("credential") || vm_suffix.contains("auth") {
-                runtime
-                    .exec_cmd(name, &["sudo", "chmod", "600", &vm_path], false)
-                    .await?;
+                run_in_vm(runtime, name, &format!("sudo chmod 600 {vm_path}"), false).await?;
             }
             copied_any = true;
         }
@@ -807,11 +798,9 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
         // Fix ownership for all copied files
         let chown_cmd = format!(
-            "chown -R {username}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
+            "sudo chown -R {username}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
         );
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(runtime, name, &chown_cmd, false).await?;
     }
 
     if copied_any {
@@ -822,15 +811,10 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
     let has_aichat_config = home.join(".config/aichat/config.yaml").exists();
     if !has_aichat_config && let Some(config) = generate_aichat_config_from_credentials(&home) {
         let config_dir = format!("{vm_home}/.config/aichat");
-        runtime
-            .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
-            .await?;
+        run_in_vm(runtime, name, &format!("sudo mkdir -p {config_dir}"), false).await?;
         let config_path = format!("{config_dir}/config.yaml");
         write_file_to_vm(runtime, name, &config_path, &config).await?;
-        let chown_cmd = format!("chown -R {username}:users {config_dir}");
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(runtime, name, &format!("sudo chown -R {username}:users {config_dir}"), false).await?;
         println!("Generated aichat config from detected AI tool credentials.");
     }
 
@@ -898,6 +882,26 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
     None
 }
 
+/// NixOS PATH prefix — `incus exec` doesn't set up a login shell, so
+/// system binaries (sudo, base64, nixos-generate-config, etc.) in
+/// /run/current-system/sw/bin/ aren't in PATH by default.
+/// Harmless on non-NixOS guests (dirs simply don't exist).
+const NIXOS_PATH_PREFIX: &str =
+    "export PATH=\"/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH\"; ";
+
+/// Run a command in the VM with the NixOS PATH prefix applied.
+/// This ensures `sudo`, `base64`, and other system binaries are found
+/// even when `incus exec` doesn't source the NixOS profile.
+async fn run_in_vm(
+    runtime: &dyn Runtime,
+    name: &str,
+    cmd: &str,
+    interactive: bool,
+) -> Result<crate::runtime::ExecResult> {
+    let full_cmd = format!("{NIXOS_PATH_PREFIX}{cmd}");
+    runtime.exec_cmd(name, &["bash", "-c", &full_cmd], interactive).await
+}
+
 /// Write a file into the VM using base64-encoded content via exec_cmd.
 async fn write_file_to_vm(
     runtime: &dyn Runtime,
@@ -907,11 +911,43 @@ async fn write_file_to_vm(
 ) -> Result<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-    let cmd = format!("echo '{encoded}' | base64 -d | sudo tee {path} > /dev/null");
+    let cmd = format!("{NIXOS_PATH_PREFIX}echo '{encoded}' | base64 -d | sudo tee {path} > /dev/null");
     let result = runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
     if result.exit_code != 0 {
         eprintln!("Warning: failed to write {path}: {}", result.stderr.trim());
     }
+    Ok(())
+}
+
+/// Wait for network connectivity inside the VM.
+///
+/// On freshly booted Incus VMs, the network (especially DNS) may not be ready
+/// even after the agent responds. We poll for DNS resolution of cache.nixos.org
+/// since that's needed for `nixos-rebuild` and `nix-env` operations.
+async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let max_attempts = 20; // 20 * 3s = 60s
+    for i in 0..max_attempts {
+        let result = run_in_vm(
+            runtime,
+            name,
+            "getent hosts cache.nixos.org >/dev/null 2>&1 && echo ok",
+            false,
+        )
+        .await?;
+        if result.exit_code == 0 && result.stdout.trim() == "ok" {
+            if i > 0 {
+                println!("Network is ready.");
+            }
+            return Ok(());
+        }
+        if i == 0 {
+            print!("Waiting for network connectivity...");
+        } else if i % 5 == 0 {
+            print!(" ({}s)", i * 3);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    eprintln!("\nWarning: network may not be ready — provisioning will continue but downloads may fail.");
     Ok(())
 }
 
@@ -933,8 +969,9 @@ async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
     if hw_check.exit_code != 0 {
         println!("  Generating hardware configuration...");
+        let gen_cmd = format!("{NIXOS_PATH_PREFIX}sudo nixos-generate-config");
         let result = runtime
-            .exec_cmd(name, &["sudo", "nixos-generate-config"], false)
+            .exec_cmd(name, &["bash", "-c", &gen_cmd], false)
             .await?;
         if result.exit_code != 0 {
             eprintln!(
@@ -1009,20 +1046,13 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
         if let Ok(r) = result
             && r.exit_code == 0
         {
-            let _ = runtime
-                .exec_cmd(
-                    name,
-                    &[
-                        "sudo",
-                        "install",
-                        "-m",
-                        "755",
-                        "/tmp/devbox",
-                        "/usr/local/bin/devbox",
-                    ],
-                    false,
-                )
-                .await;
+            let _ = run_in_vm(
+                runtime,
+                name,
+                "sudo install -m 755 /tmp/devbox /usr/local/bin/devbox",
+                false,
+            )
+            .await;
             let _ = runtime.exec_cmd(name, &["rm", "/tmp/devbox"], false).await;
         }
     }
@@ -1035,9 +1065,7 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let config_dir = format!("/home/{username}/.config/yazi");
 
     // Create config directory
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("sudo mkdir -p {config_dir}"), false).await?;
 
     // Write all yazi config files
     let files: &[(&str, &str)] = &[
@@ -1053,9 +1081,7 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
     // Write glow previewer plugin
     let plugin_dir = format!("{config_dir}/plugins/glow.yazi");
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &plugin_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("sudo mkdir -p {plugin_dir}"), false).await?;
     write_file_to_vm(
         runtime,
         name,
@@ -1065,10 +1091,7 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     .await?;
 
     // Fix ownership
-    let chown_cmd = format!("chown -R {username}:users /home/{username}/.config/yazi");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("sudo chown -R {username}:users /home/{username}/.config/yazi"), false).await?;
 
     Ok(())
 }
@@ -1080,9 +1103,7 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let config_dir = format!("/home/{username}/.config/aichat");
     let roles_dir = format!("{config_dir}/roles");
 
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &roles_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("sudo mkdir -p {roles_dir}"), false).await?;
 
     // Legacy format (older aichat versions)
     write_file_to_vm(
@@ -1102,10 +1123,7 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         write_file_to_vm(runtime, name, &format!("{roles_dir}/{filename}"), content).await?;
     }
 
-    let chown_cmd = format!("chown -R {username}:users {config_dir}");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("sudo chown -R {username}:users {config_dir}"), false).await?;
 
     Ok(())
 }
@@ -1119,13 +1137,7 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
         MANAGEMENT_SCRIPT,
     )
     .await?;
-    runtime
-        .exec_cmd(
-            name,
-            &["sudo", "chmod", "+x", "/etc/devbox/management.sh"],
-            false,
-        )
-        .await?;
+    run_in_vm(runtime, name, "sudo chmod +x /etc/devbox/management.sh", false).await?;
     Ok(())
 }
 
@@ -1188,10 +1200,10 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     }
     // Fix ownership
     let chown_cmd = format!(
-        "chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
+        "{NIXOS_PATH_PREFIX}sudo chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
     );
     let _ = runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
+        .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
         .await;
 }
 
