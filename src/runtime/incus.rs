@@ -71,6 +71,23 @@ impl IncusRuntime {
         println!("Image '{alias}' imported successfully.");
         Ok(())
     }
+    /// Wait for the Incus VM agent to become ready (up to 120 seconds).
+    /// The agent starts after the guest OS boots and runs incus-agent.
+    async fn wait_for_agent(vm: &str) -> Result<()> {
+        let max_attempts = 40; // 40 * 3s = 120s
+        for i in 0..max_attempts {
+            let result = run_cmd("incus", &["exec", vm, "--", "echo", "ready"]).await?;
+            if result.exit_code == 0 && result.stdout.trim() == "ready" {
+                println!("VM agent is ready.");
+                return Ok(());
+            }
+            if i > 0 && i % 10 == 0 {
+                println!("  Still waiting for VM agent... ({i}s)", i = i * 3);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        bail!("VM agent did not become ready within 120 seconds. The VM may still be booting — try `devbox shell` in a minute.")
+    }
 }
 
 #[async_trait]
@@ -124,6 +141,11 @@ impl Runtime for IncusRuntime {
 
         run_ok("incus", &launch_args).await?;
 
+        // Wait for the VM agent to be ready before provisioning.
+        // The guest agent takes time to start after boot.
+        println!("Waiting for VM agent to be ready...");
+        Self::wait_for_agent(&vm).await?;
+
         // Add mounts
         for (i, m) in opts.mounts.iter().enumerate() {
             let device_name = format!("mount{i}");
@@ -154,6 +176,7 @@ impl Runtime for IncusRuntime {
     async fn start(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         run_ok("incus", &["start", &vm]).await?;
+        Self::wait_for_agent(&vm).await?;
         Ok(())
     }
 
