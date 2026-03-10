@@ -559,7 +559,7 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 "#;
         write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
-        let chown_cmd = format!("chown {username}:{username} {zshrc_path}");
+        let chown_cmd = format!("chown {username}:users {zshrc_path}");
         runtime
             .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
             .await?;
@@ -576,7 +576,7 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
-        let chown_cmd = format!("chown {username}:{username} {profile_path}");
+        let chown_cmd = format!("chown {username}:users {profile_path}");
         runtime
             .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
             .await?;
@@ -606,7 +606,7 @@ async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let vm_path = format!("/home/{username}/.gitconfig");
     write_file_to_vm(runtime, name, &vm_path, &content).await?;
 
-    let chown_cmd = format!("chown {username}:{username} {vm_path}");
+    let chown_cmd = format!("chown {username}:users {vm_path}");
     runtime
         .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
         .await?;
@@ -807,7 +807,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
         // Fix ownership for all copied files
         let chown_cmd = format!(
-            "chown -R {username}:{username} {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
+            "chown -R {username}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
         );
         runtime
             .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
@@ -827,7 +827,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
             .await?;
         let config_path = format!("{config_dir}/config.yaml");
         write_file_to_vm(runtime, name, &config_path, &config).await?;
-        let chown_cmd = format!("chown -R {username}:{username} {config_dir}");
+        let chown_cmd = format!("chown -R {username}:users {config_dir}");
         runtime
             .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
             .await?;
@@ -1065,7 +1065,7 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     .await?;
 
     // Fix ownership
-    let chown_cmd = format!("chown -R {username}:{username} /home/{username}/.config/yazi");
+    let chown_cmd = format!("chown -R {username}:users /home/{username}/.config/yazi");
     runtime
         .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
         .await?;
@@ -1102,7 +1102,7 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         write_file_to_vm(runtime, name, &format!("{roles_dir}/{filename}"), content).await?;
     }
 
-    let chown_cmd = format!("chown -R {username}:{username} {config_dir}");
+    let chown_cmd = format!("chown -R {username}:users {config_dir}");
     runtime
         .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
         .await?;
@@ -1188,7 +1188,7 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     }
     // Fix ownership
     let chown_cmd = format!(
-        "chown {username}:{username} /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
+        "chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
     );
     let _ = runtime
         .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)

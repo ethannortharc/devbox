@@ -85,10 +85,10 @@ in {
 
   # Create overlay directories on boot (owned by user so writes land as the user)
   systemd.tmpfiles.rules = lib.mkIf isOverlay [
-    "d /var/devbox/overlay/upper 0755 ${username} ${username} -"
+    "d /var/devbox/overlay/upper 0755 ${username} users -"
     "d /var/devbox/overlay/work 0755 root root -"
     "d /mnt/host 0755 root root -"
-    "d /workspace 0755 ${username} ${username} -"
+    "d /workspace 0755 ${username} users -"
   ];
 
   # Fix /workspace ownership after overlay mount (overlay resets to root)
@@ -98,7 +98,7 @@ in {
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
       Type = "oneshot";
-      ExecStart = "${pkgs.coreutils}/bin/chown ${username}:${username} /workspace";
+      ExecStart = "${pkgs.coreutils}/bin/chown ${username}:users /workspace /var/devbox/overlay/upper";
       RemainAfterExit = true;
     };
   };
