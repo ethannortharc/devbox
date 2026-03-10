@@ -23,6 +23,21 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
             "sudo apt install incus  # or: snap install incus",
         );
         has_any_runtime |= found;
+
+        // QEMU and virtiofsd are required for Incus VMs on Linux
+        if found {
+            println!("\nIncus VM dependencies:");
+            check_binary_with_install(
+                "  QEMU",
+                "qemu-system-x86_64",
+                "sudo apt install qemu-system-x86 qemu-utils -y",
+            );
+            check_binary_with_install(
+                "  virtiofsd",
+                "virtiofsd",
+                "sudo apt install virtiofsd -y  # or: sudo apt install qemu-system-common -y",
+            );
+        }
     }
 
     if os == "macos" {
