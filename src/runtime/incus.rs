@@ -159,12 +159,13 @@ impl Runtime for IncusRuntime {
             launch_args.push(&cpu_str);
         }
 
+        // Default to 4GiB memory for Incus VMs — NixOS rebuild needs 2-4GB
+        // for evaluating the full module system. The default Incus 1GB is too little.
         let mem_str;
-        if !opts.memory.is_empty() {
-            mem_str = format!("limits.memory={}", opts.memory);
-            launch_args.push("-c");
-            launch_args.push(&mem_str);
-        }
+        let memory = if opts.memory.is_empty() { "4GiB" } else { &opts.memory };
+        mem_str = format!("limits.memory={memory}");
+        launch_args.push("-c");
+        launch_args.push(&mem_str);
 
         run_ok("incus", &launch_args).await?;
 

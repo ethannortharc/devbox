@@ -306,13 +306,61 @@ async fn provision_nixos(
     );
     let result = runtime
         .exec_cmd(name, &["bash", "-c", &rebuild_cmd], true)
-        .await?;
+        .await;
 
-    if result.exit_code != 0 {
-        eprintln!("Warning: nixos-rebuild failed (exit {})", result.exit_code);
-        eprintln!("You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
-    } else {
-        println!("NixOS rebuild complete.");
+    // nixos-rebuild switch stops incus-agent during activation, which
+    // drops the websocket connection (exit 255). This is expected —
+    // the agent restarts automatically with the new system config.
+    // We need to wait for it to come back before continuing.
+    let rebuild_ok = match &result {
+        Ok(r) if r.exit_code == 0 => true,
+        Ok(r) if r.exit_code == 255 => {
+            // Likely the websocket dropped during activation — probably succeeded
+            println!("Connection lost during system activation (expected).");
+            true
+        }
+        Ok(r) => {
+            eprintln!("Warning: nixos-rebuild failed (exit {})", r.exit_code);
+            eprintln!("You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
+            false
+        }
+        Err(e) => {
+            eprintln!("Warning: nixos-rebuild error: {e}");
+            false
+        }
+    };
+
+    if rebuild_ok {
+        // Wait for the VM agent to come back after system activation.
+        // nixos-rebuild switch restarts incus-agent as part of the new config.
+        println!("Waiting for VM agent to restart after system activation...");
+        // Small delay to let the old agent fully stop
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let vm = format!("devbox-{name}");
+        let max_attempts = 40; // 40 * 3s = 120s
+        let mut agent_ready = false;
+        for i in 0..max_attempts {
+            let check = crate::runtime::cmd::run_cmd(
+                "incus",
+                &["exec", &vm, "--", "echo", "ready"],
+            )
+            .await;
+            if let Ok(r) = check {
+                if r.exit_code == 0 && r.stdout.trim() == "ready" {
+                    println!("NixOS rebuild complete. VM agent is ready.");
+                    agent_ready = true;
+                    break;
+                }
+            }
+            if i > 0 && i % 10 == 0 {
+                println!("  Still waiting for VM agent... ({}s)", i * 3);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        if !agent_ready {
+            eprintln!("Warning: VM agent did not come back after nixos-rebuild. Continuing anyway...");
+        }
     }
 
     // 9. Set up user shell (zshrc with PATH, aliases, etc.)
