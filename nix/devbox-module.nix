@@ -83,13 +83,25 @@ in {
     depends = [ "/mnt/host" ];
   };
 
-  # Create overlay directories on boot
+  # Create overlay directories on boot (owned by user so writes land as the user)
   systemd.tmpfiles.rules = lib.mkIf isOverlay [
-    "d /var/devbox/overlay/upper 0755 root root -"
+    "d /var/devbox/overlay/upper 0755 ${username} ${username} -"
     "d /var/devbox/overlay/work 0755 root root -"
     "d /mnt/host 0755 root root -"
-    "d /workspace 0755 root root -"
+    "d /workspace 0755 ${username} ${username} -"
   ];
+
+  # Fix /workspace ownership after overlay mount (overlay resets to root)
+  systemd.services.devbox-workspace-perms = lib.mkIf isOverlay {
+    description = "Set /workspace ownership for devbox user";
+    after = [ "local-fs.target" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.coreutils}/bin/chown ${username}:${username} /workspace";
+      RemainAfterExit = true;
+    };
+  };
 
   # ── Nix Garbage Collection ─────────────────────────
   nix.gc = {

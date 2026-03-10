@@ -12,45 +12,133 @@ devbox
 
 That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
 
-### Why a sandbox for AI coding?
+---
 
-AI coding agents are powerful, but they need guardrails. They `rm -rf` the wrong directory. They overwrite config files. They install conflicting dependencies. When an agent runs on your host machine, every mistake is permanent and every action is a security risk.
+## How It Works
 
-Devbox solves this by giving each project a **full VM sandbox** with read-only host mounts:
+```bash
+cd my-project
+devbox                          # 1. Create sandbox (auto-detects Go, Rust, Python, etc.)
 
-- **Your host stays pristine.** No dev tools, no language runtimes, no global npm packages, no Docker images piling up. Everything lives inside disposable VMs. Uninstall a sandbox and it's gone -- zero residue on your machine.
-- **AI agents can't break your system.** The host filesystem is mounted read-only via OverlayFS. Agents write freely inside the VM, but nothing touches your real files until you explicitly run `devbox commit`.
-- **Every change is reviewable.** Run `devbox diff` to see exactly what the agent modified. Accept what's good, discard the rest. It's like a code review for your filesystem.
-- **Mistakes are free.** Bad refactor? Agent went rogue? `devbox discard` throws away everything and you're back to clean state. `devbox snapshot restore` rolls back even further.
-- **Audit and policy control.** Full VM isolation means you can enforce security policies, restrict network access, and audit every action. Run untrusted code, test third-party packages, or let junior developers experiment -- all without risk to production systems.
-- **Multiple agents, zero conflicts.** Each sandbox is independent. Run Claude in one, Codex in another, with different tool versions and configurations. No interference.
+# ... AI agent writes code, installs packages, does whatever it wants ...
 
-### Default Workspace Layout
+devbox diff                     # 2. See exactly what changed
+devbox commit                   # 3. Accept the good changes
+devbox discard                  # 3. Or throw everything away
+```
+
+Your project directory is mounted **read-only** inside the VM. Every file write goes to an isolated overlay layer. Nothing reaches your real files until you explicitly run `devbox commit`. It's like a code review for your entire filesystem.
+
+> **Claude just `rm -rf`'d your src directory?**
+> With devbox: `devbox discard`. Done. Your files were never touched.
+
+---
+
+## Why Devbox?
+
+| Without Devbox | With Devbox |
+|----------------|-------------|
+| AI agent deletes your files | `devbox discard` — instant recovery |
+| Agent installs conflicting deps | Each sandbox is isolated with its own packages |
+| Dev tools pollute your host OS | Everything lives in disposable VMs — zero residue |
+| "It works on my machine" | Reproducible NixOS VMs with declarative config |
+| Reviewing AI changes is painful | `devbox diff` shows every change, `devbox commit --path src/` accepts selectively |
+| Security and compliance concerns | Full VM boundary with audit trail |
+
+---
+
+## Default Workspace
 
 ![Default Workspace](docs/screenshot-workspace.png)
 
 Four tabs, ready to go: **Workspace** (AI coding + brainstorm + file browser), **DevBox** (monitor + help + management), **Shell** (plain terminal), and **Git** (lazygit).
 
-### It's not just for AI
+---
 
-Devbox is a complete developer environment for everyone:
+## Customizable Layouts
 
-| Problem | Devbox Solution |
-|---------|----------------|
-| "It works on my machine" | Reproducible NixOS VMs with declarative configuration |
-| Polluting your host OS with dev tools | Everything runs in an isolated VM; your host stays clean |
-| Tool version conflicts | Each sandbox is independent with its own package set |
-| Setting up a new machine takes hours | One command installs [120+ tools](docs/PACKAGES.md) from a binary cache in minutes |
-| Security and compliance requirements | Full VM boundary with audit trail via overlay diff/commit |
+Devbox uses [Zellij](https://zellij.dev/) for workspace layouts. Pick a built-in layout or create your own in minutes.
 
-## Key Design Principles
+| Layout | Description |
+|--------|-------------|
+| `default` | AI assistant + brainstorm + file browser + monitor + git |
+| `ai-pair` | AI coding + editor + terminal (pair programming) |
+| `fullstack` | Frontend, backend, and database panes |
+| `tdd` | Editor + test runner side-by-side |
+| `debug` | Editor + debugger + logs |
+| `monitor` | System metrics dashboard |
+| `git-review` | Diff viewer + lazygit + editor |
+| `presentation` | Wide editor, minimal chrome |
 
-- **AI-first workspace** -- Pre-configured layouts for AI pair programming. Claude Code, Codex, Aider, and aichat are installed and ready. The default layout opens an AI coding assistant, a brainstorming panel, and a file browser side by side.
-- **Safe by default** -- Host filesystem is read-only via OverlayFS. All writes happen in an isolated overlay layer. Changes sync to host only with explicit `devbox commit`. AI agents and developers alike can experiment without fear.
-- **Zero configuration** -- Auto-detects Go, Rust, Python, Node, Java, Ruby from project files and installs the right toolchain.
-- **Clean abstraction** -- The CLI provides a consistent interface across VM runtimes (Lima, Incus, Multipass, Docker). Switch runtimes without changing workflows.
-- **Self-contained binary** -- All NixOS configurations, layouts, and help files are compiled into a single binary. No external dependencies beyond a VM runtime.
-- **User-friendly** -- Built-in cheat sheets (`devbox guide <tool>`), TUI package manager, interactive layout picker, and comprehensive error messages with suggested fixes.
+```bash
+devbox layout list                    # See all layouts
+devbox layout preview ai-pair         # ASCII preview
+devbox create --layout tdd            # Use a layout on create
+devbox layout set-default tdd         # Set your global default
+```
+
+**Create your own layout:**
+
+```bash
+devbox layout create my-workflow      # Generates ~/.devbox/layouts/my-workflow.kdl
+devbox layout edit my-workflow        # Opens in your $EDITOR
+```
+
+Layouts are simple KDL files — define panes, commands, and splits. Your custom layouts override built-ins and are automatically available across all sandboxes.
+
+```kdl
+// Example: custom two-pane layout
+layout {
+    tab name="Dev" {
+        pane split_direction="vertical" {
+            pane name="editor" size="60%" {
+                command "nvim"
+                args "."
+            }
+            pane name="terminal" size="40%"
+        }
+    }
+}
+```
+
+---
+
+## Remote Access via SSH
+
+Devbox VMs run a full SSH server, making them accessible from any machine on your network. This is useful for headless servers, remote development, or managing sandboxes from a different workstation.
+
+```bash
+# SSH into a sandbox directly (Lima)
+ssh -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
+
+# Or use Lima's built-in shortcut
+limactl shell devbox-myapp
+
+# Incus VMs
+incus exec devbox-myapp -- bash
+```
+
+**SSH agent forwarding** is enabled by default on Lima, so your host SSH keys (for GitHub, GitLab, etc.) work seamlessly inside the sandbox — no need to copy keys.
+
+**Port forwarding** for web development:
+
+```bash
+# Forward port 3000 from the sandbox to your host
+ssh -L 3000:localhost:3000 -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
+
+# Or use Lima's port forwarding (auto-forwards common ports)
+# Access your dev server at localhost:3000 from the host browser
+```
+
+**Remote team workflow:**
+
+```bash
+# On the server: create a sandbox
+devbox create --name shared-api --tools go,docker
+
+# From your laptop: SSH in and attach
+ssh yourserver -t "devbox shell --name shared-api"
+```
 
 ---
 
@@ -121,15 +209,6 @@ devbox stop --name myapp
 devbox destroy --name myapp
 ```
 
-### Working with layouts
-
-```bash
-devbox layout list                # Show all available layouts
-devbox layout preview ai-pair     # ASCII preview of a layout
-devbox create --layout tdd        # Use a layout on create
-devbox layout set-default tdd     # Set your global default
-```
-
 ### Managing tools
 
 ```bash
@@ -187,6 +266,8 @@ devbox snapshot restore <id>     # Roll back to a snapshot
 | `devbox layer stash-pop` | Restore stashed changes |
 | `devbox layout list` | List available layouts |
 | `devbox layout preview <name>` | ASCII preview of a layout |
+| `devbox layout create <name>` | Create a custom layout |
+| `devbox layout edit <name>` | Edit a layout in $EDITOR |
 | `devbox layout save` | Save layout preference |
 | `devbox layout set-default <n>` | Set global default layout |
 | `devbox snapshot save` | Create a snapshot |
@@ -265,14 +346,14 @@ coreutils, gnugrep, gnused, gawk, findutils, diffutils, gzip, gnutar, xz, bzip2,
 
 </details>
 
-### Default Sets (on by default)
-
 <details>
 <summary><b>editor</b> -- neovim, helix, nano</summary>
 
-Three terminal editors covering different preferences. Neovim for power users, Helix for modal editing with LSP built-in, Nano for quick edits.
+Three terminal editors covering different preferences. Neovim for power users, Helix for modal editing with LSP built-in, Nano for quick edits. `vim` and `vi` are aliased to `nvim`.
 
 </details>
+
+### Default Sets (on by default)
 
 <details>
 <summary><b>git</b> -- 6 packages</summary>
@@ -321,23 +402,6 @@ ollama, open-webui, litellm, mcp-hub, huggingface-hub
 | **Node.js** | `package.json` | node 22, bun, pnpm, typescript, ts-language-server, biome |
 | **Java** | `pom.xml`, `build.gradle` | jdk 21, gradle, maven, jdt-language-server |
 | **Ruby** | `Gemfile` | ruby 3.3, bundler, solargraph, rubocop |
-
----
-
-## Workspace Layouts
-
-Pre-built [Zellij](https://zellij.dev/) layouts for common workflows. Each layout configures pane splits, commands, and working directories.
-
-| Layout | Description |
-|--------|-------------|
-| `default` | AI assistant + brainstorm + file browser + monitor + git |
-| `ai-pair` | AI coding + editor + terminal (pair programming) |
-| `fullstack` | Frontend, backend, and database panes |
-| `tdd` | Editor + test runner side-by-side |
-| `debug` | Editor + debugger + logs |
-| `monitor` | System metrics dashboard |
-| `git-review` | Diff viewer + lazygit + editor |
-| `presentation` | Wide editor, minimal chrome |
 
 ---
 
@@ -453,7 +517,7 @@ devbox (single binary)
 # Build
 cargo build --release
 
-# Test (51 unit + 15 integration tests)
+# Test (52 unit + 15 integration tests)
 cargo test
 
 # Lint
