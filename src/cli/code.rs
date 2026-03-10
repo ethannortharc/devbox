@@ -4,6 +4,7 @@ use clap::Args;
 use crate::runtime::cmd::run_cmd;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
+use crate::sandbox::overlay;
 
 #[derive(Args, Debug)]
 pub struct CodeArgs {
@@ -34,6 +35,14 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
         }
         SandboxStatus::NotFound => bail!("Sandbox '{name}' not found."),
         SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),
+    }
+
+    // Refresh overlay before opening editor to avoid stale file handles
+    if state.mount_mode != "writable" {
+        println!("Refreshing overlay layer...");
+        if let Err(e) = overlay::refresh(runtime.as_ref(), &name).await {
+            eprintln!("Warning: overlay refresh failed: {e}");
+        }
     }
 
     let vm_name = format!("devbox-{name}");
@@ -67,7 +76,9 @@ async fn open_via_lima(
         );
     }
 
-    let ssh_config = result.stdout.trim().to_string();
+    // Lima's output has its own Host line (e.g. "Host lima-devbox-test2").
+    // Replace it with our ssh_host so VS Code can find the right config entry.
+    let ssh_config = rewrite_ssh_host(ssh_host, result.stdout.trim());
     write_ssh_config(ssh_host, &ssh_config)?;
 
     launch_editor(editor, ssh_host, path)
@@ -139,6 +150,21 @@ fn extract_incus_ip(json_output: &str) -> Result<String> {
     bail!("Could not find IP address for Incus VM. Is it running?")
 }
 
+/// Replace the `Host` line in an SSH config block with our desired host alias.
+fn rewrite_ssh_host(desired_host: &str, config: &str) -> String {
+    config
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("Host ") {
+                format!("Host {desired_host}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Write or update an SSH config block in ~/.ssh/config for the devbox host.
 fn write_ssh_config(host: &str, config_block: &str) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
@@ -199,9 +225,11 @@ fn launch_editor(editor: &str, ssh_host: &str, path: &str) -> Result<()> {
 
     println!("Opening {editor} → {ssh_host}:{path}");
 
-    let remote_arg = format!("--remote=ssh-remote+{ssh_host}{path}");
+    let remote_arg = format!("ssh-remote+{ssh_host}");
     let status = std::process::Command::new(editor)
+        .arg("--remote")
         .arg(&remote_arg)
+        .arg(path)
         .status()
         .map_err(|e| anyhow::anyhow!("Failed to launch {editor}: {e}"))?;
 
