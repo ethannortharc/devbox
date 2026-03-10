@@ -237,7 +237,7 @@ impl SandboxManager {
         if layout == "plain" {
             println!("Attaching to sandbox '{name}'...");
             let shell = Self::probe_shell(runtime.as_ref(), name).await;
-            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
+            runtime.exec_as_user(name, &[&shell, "-l"]).await?;
             return Ok(());
         }
 
@@ -249,7 +249,7 @@ impl SandboxManager {
             // No Zellij — fall back to raw shell
             println!("Attaching to sandbox '{name}'...");
             let shell = Self::probe_shell(runtime.as_ref(), name).await;
-            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
+            runtime.exec_as_user(name, &[&shell, "-l"]).await?;
             return Ok(());
         }
 
@@ -317,7 +317,7 @@ impl SandboxManager {
             // Reattach to existing live session
             println!("Reattaching to sandbox '{name}'...");
             runtime
-                .exec_cmd(name, &["zellij", "attach", &session_name], true)
+                .exec_as_user(name, &["zellij", "attach", &session_name])
                 .await?;
         } else {
             // Create new named session with layout.
@@ -336,10 +336,9 @@ impl SandboxManager {
 
             println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
             runtime
-                .exec_cmd(
+                .exec_as_user(
                     name,
                     &["zellij", "--config", &config_path, "--layout", &layout_path],
-                    true,
                 )
                 .await?;
         }

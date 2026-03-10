@@ -126,4 +126,11 @@ pub trait Runtime: Send + Sync {
     /// Update mount points for an existing sandbox.
     /// Stops the VM, updates mounts in the config, and restarts.
     async fn update_mounts(&self, name: &str, mounts: &[Mount]) -> Result<()>;
+
+    /// Execute an interactive command as the non-root user.
+    /// Used for shell attach — defaults to exec_cmd with interactive=true.
+    /// Runtimes like Incus override this to set --user, HOME, and CWD.
+    async fn exec_as_user(&self, name: &str, cmd: &[&str]) -> Result<ExecResult> {
+        self.exec_cmd(name, cmd, true).await
+    }
 }
