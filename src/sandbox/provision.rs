@@ -291,10 +291,16 @@ async fn provision_nixos(
     }
 
     // 8. Run nixos-rebuild switch (interactive so user sees progress)
+    //    We must set NIX_PATH explicitly because:
+    //    - incus exec doesn't source /etc/profile (no login shell)
+    //    - images:nixos/* may not have channels in the default NIX_PATH
+    //    - After nix-channel --update, nixpkgs lives at the channel profile path
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
     let rebuild_cmd = format!(
         "{NIXOS_PATH_PREFIX}\
-         export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && \
+         export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
+         nixos-config=/etc/nixos/configuration.nix:\
+         /nix/var/nix/profiles/per-user/root/channels\" && \
          export NIXPKGS_ALLOW_UNFREE=1 && \
          sudo -E nixos-rebuild switch"
     );
@@ -1010,16 +1016,18 @@ async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
 /// `nixos-rebuild` to fail with "file 'nixpkgs/nixos' was not found in the Nix search path".
 /// We check if the nixos channel exists and add it if missing.
 async fn ensure_nixos_channel(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    // Check if nixpkgs is already in NIX_PATH
+    // Check if the nixos channel is already available for root.
+    // We check the channel profile path directly since NIX_PATH may not be set
+    // in the non-login incus exec shell.
     let check = run_in_vm(
         runtime,
         name,
-        "nix-instantiate --eval -E '<nixpkgs>' 2>/dev/null && echo found",
+        "test -d /nix/var/nix/profiles/per-user/root/channels/nixos && echo found",
         false,
     )
     .await?;
 
-    if check.stdout.contains("found") {
+    if check.stdout.trim() == "found" {
         return Ok(());
     }
 
@@ -1028,7 +1036,7 @@ async fn ensure_nixos_channel(runtime: &dyn Runtime, name: &str) -> Result<()> {
         "sudo nix-channel --add https://nixos.org/channels/nixos-25.05 nixos && ",
         "sudo nix-channel --update"
     );
-    let result = run_in_vm(runtime, name, channel_cmd, false).await?;
+    let result = run_in_vm(runtime, name, channel_cmd, true).await?;
     if result.exit_code != 0 {
         eprintln!(
             "Warning: failed to set up NixOS channel: {}",

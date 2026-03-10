@@ -71,6 +71,33 @@ impl IncusRuntime {
         println!("Image '{alias}' imported successfully.");
         Ok(())
     }
+    /// Detect the UID of the first non-root user in the VM.
+    async fn detect_vm_uid(vm: &str) -> Option<String> {
+        // Find first user with UID >= 1000 (standard non-system user)
+        let result = run_cmd(
+            "incus",
+            &["exec", vm, "--", "bash", "-c",
+              "awk -F: '$3 >= 1000 && $3 < 65534 { print $3; exit }' /etc/passwd"],
+        ).await.ok()?;
+        let uid = result.stdout.trim().to_string();
+        if uid.is_empty() { None } else { Some(uid) }
+    }
+
+    /// Detect the HOME directory for a given UID in the VM.
+    async fn detect_vm_home(vm: &str, uid: &str) -> String {
+        let result = run_cmd(
+            "incus",
+            &["exec", vm, "--", "bash", "-c",
+              &format!("getent passwd {uid} | cut -d: -f6")],
+        ).await;
+        match result {
+            Ok(r) if !r.stdout.trim().is_empty() => {
+                format!("HOME={}", r.stdout.trim())
+            }
+            _ => format!("HOME=/home/dev"),
+        }
+    }
+
     /// Wait for the Incus VM agent to become ready (up to 120 seconds).
     /// The agent starts after the guest OS boots and runs incus-agent.
     async fn wait_for_agent(vm: &str) -> Result<()> {
@@ -190,9 +217,27 @@ impl Runtime for IncusRuntime {
         let vm = Self::vm_name(name);
 
         if interactive {
-            let mut args = vec!["exec", &vm, "--"];
-            args.extend_from_slice(cmd);
-            run_interactive("incus", &args).await
+            // For interactive sessions (shell attach, etc.), run as the
+            // non-root user with correct HOME and working directory.
+            let uid_str = Self::detect_vm_uid(&vm).await.unwrap_or("1000".to_string());
+            let home_env = Self::detect_vm_home(&vm, &uid_str).await;
+
+            let mut args = vec![
+                "exec".to_string(),
+                vm,
+                "--user".to_string(),
+                uid_str,
+                "--cwd".to_string(),
+                "/workspace".to_string(),
+                "--env".to_string(),
+                home_env,
+                "--".to_string(),
+            ];
+            for c in cmd {
+                args.push(c.to_string());
+            }
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            run_interactive("incus", &arg_refs).await
         } else {
             let mut args = vec!["exec", &vm, "--"];
             args.extend_from_slice(cmd);
