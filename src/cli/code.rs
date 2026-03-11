@@ -37,11 +37,18 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
         SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),
     }
 
-    // Refresh overlay before opening editor to avoid stale file handles
+    // Refresh overlay before opening editor to avoid stale file handles.
+    // If a Zellij session is still attached, /workspace will be busy — that's
+    // fine; the editor will still work with the current overlay state.
     if state.mount_mode != "writable" {
         println!("Refreshing overlay layer...");
         if let Err(e) = overlay::refresh(runtime.as_ref(), &name).await {
-            eprintln!("Warning: overlay refresh failed: {e}");
+            let msg = e.to_string();
+            if msg.contains("target is busy") || msg.contains("device is busy") {
+                eprintln!("Note: overlay refresh skipped — /workspace is in use (e.g. Zellij session). This is normal.");
+            } else {
+                eprintln!("Warning: overlay refresh failed: {e}");
+            }
         }
     }
 
@@ -198,7 +205,20 @@ async fn ensure_ssh_key_auth(vm_name: &str, username: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if a network interface name belongs to a container/virtual bridge
+/// that should be skipped when looking for the VM's primary IP.
+fn is_bridge_interface(iface: &str) -> bool {
+    iface == "lo"
+        || iface == "docker0"
+        || iface.starts_with("br-")
+        || iface.starts_with("veth")
+        || iface.starts_with("virbr")
+        || iface.starts_with("lxdbr")
+        || iface.starts_with("incusbr")
+}
+
 /// Extract the first IPv4 address from `incus list --format json` output.
+/// Skips loopback, Docker bridge, and other virtual bridge interfaces.
 fn extract_incus_ip(json_output: &str) -> Result<String> {
     let arr: Vec<serde_json::Value> = serde_json::from_str(json_output)
         .map_err(|e| anyhow::anyhow!("Failed to parse Incus JSON: {e}"))?;
@@ -208,7 +228,7 @@ fn extract_incus_ip(json_output: &str) -> Result<String> {
             if let Some(network) = state.get("network") {
                 if let Some(obj) = network.as_object() {
                     for (iface, data) in obj {
-                        if iface == "lo" {
+                        if is_bridge_interface(iface) {
                             continue;
                         }
                         if let Some(addrs) = data.get("addresses") {
