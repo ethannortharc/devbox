@@ -70,7 +70,7 @@ pub async fn add_package(runtime: &dyn Runtime, sandbox_name: &str, package: &st
         let result = runtime
             .exec_cmd(
                 sandbox_name,
-                &["sudo", "nix", "profile", "install", package],
+                &["bash", "-lc", &format!("nix profile install {package}")],
                 false,
             )
             .await?;
@@ -84,7 +84,7 @@ pub async fn add_package(runtime: &dyn Runtime, sandbox_name: &str, package: &st
         let result = runtime
             .exec_cmd(
                 sandbox_name,
-                &["sudo", "nix", "profile", "install", &flake_ref],
+                &["bash", "-lc", &format!("nix profile install {flake_ref}")],
                 false,
             )
             .await?;
@@ -107,7 +107,7 @@ pub async fn remove_package(
     let result = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "nix", "profile", "remove", package],
+            &["bash", "-lc", &format!("nix profile remove {package}")],
             false,
         )
         .await?;

@@ -19,7 +19,8 @@ pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<Overl
         .exec_cmd(
             sandbox_name,
             &[
-                "sudo", "find", UPPER, "-not", "-path", UPPER, "-printf", "%y %P\\n",
+                "bash", "-lc",
+                &format!("find {UPPER} -not -path {UPPER} -printf '%y %P\\n'"),
             ],
             false,
         )
@@ -170,7 +171,7 @@ pub async fn commit(
             ChangeStatus::Added | ChangeStatus::Modified => {
                 if change.is_dir {
                     let result = runtime
-                        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &lower_path], false)
+                        .exec_cmd(sandbox_name, &["mkdir", "-p", &lower_path], false)
                         .await?;
                     if result.exit_code != 0 {
                         eprintln!(
@@ -191,14 +192,14 @@ pub async fn commit(
                     );
                     if !parent.is_empty() && parent != LOWER {
                         let _ = runtime
-                            .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &parent], false)
+                            .exec_cmd(sandbox_name, &["mkdir", "-p", &parent], false)
                             .await;
                     }
 
                     let result = runtime
                         .exec_cmd(
                             sandbox_name,
-                            &["sudo", "cp", "-a", &upper_path, &lower_path],
+                            &["cp", "-a", &upper_path, &lower_path],
                             false,
                         )
                         .await?;
@@ -214,7 +215,7 @@ pub async fn commit(
             }
             ChangeStatus::Deleted => {
                 let result = runtime
-                    .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &lower_path], false)
+                    .exec_cmd(sandbox_name, &["rm", "-rf", &lower_path], false)
                     .await?;
                 if result.exit_code != 0 {
                     eprintln!(
@@ -252,7 +253,7 @@ pub async fn discard(
         for path in filter_paths {
             let upper_path = format!("{UPPER}/{}", path.trim_start_matches('/'));
             let result = runtime
-                .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &upper_path], false)
+                .exec_cmd(sandbox_name, &["rm", "-rf", &upper_path], false)
                 .await?;
             if result.exit_code == 0 {
                 println!("  Discarded: {path}");
@@ -269,9 +270,8 @@ pub async fn discard(
             .exec_cmd(
                 sandbox_name,
                 &[
-                    "sudo",
                     "bash",
-                    "-c",
+                    "-lc",
                     &format!("rm -rf {UPPER}/* {UPPER}/.[!.]* 2>/dev/null; true"),
                 ],
                 false,
@@ -296,7 +296,7 @@ pub async fn stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
 
     // Move upper to stash
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "mv", UPPER, STASH_DIR], false)
+        .exec_cmd(sandbox_name, &["mv", UPPER, STASH_DIR], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -305,7 +305,7 @@ pub async fn stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
 
     // Recreate empty upper directory
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", UPPER], false)
+        .exec_cmd(sandbox_name, &["mkdir", "-p", UPPER], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -330,7 +330,7 @@ pub async fn stash_pop(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> 
         "cp -a {STASH_DIR}/* {UPPER}/ 2>/dev/null; cp -a {STASH_DIR}/.[!.]* {UPPER}/ 2>/dev/null; true"
     );
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &merge_cmd], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", &merge_cmd], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -339,7 +339,7 @@ pub async fn stash_pop(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> 
 
     // Remove the stash directory
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", STASH_DIR], false)
+        .exec_cmd(sandbox_name, &["rm", "-rf", STASH_DIR], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -355,7 +355,7 @@ pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool
     // Check if stash directory exists and has contents
     let check_cmd = format!("test -d {STASH_DIR} && [ \"$(ls -A {STASH_DIR} 2>/dev/null)\" ]");
     let result = runtime
-        .exec_cmd(sandbox_name, &["bash", "-c", &check_cmd], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", &check_cmd], false)
         .await?;
 
     Ok(result.exit_code == 0)
@@ -371,7 +371,7 @@ pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     let result = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "mount", "-o", "remount", WORKSPACE],
+            &["bash", "-lc", &format!("mount -o remount {WORKSPACE}")],
             false,
         )
         .await?;
@@ -388,7 +388,7 @@ pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
          -o lowerdir={LOWER},upperdir={UPPER},workdir={WORK} {WORKSPACE}"
     );
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &remount_cmd], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", &remount_cmd], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -421,7 +421,7 @@ pub async fn conflicts(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<
             upper_path, lower_path, upper_path, lower_path
         );
         let result = runtime
-            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .exec_cmd(sandbox_name, &["bash", "-lc", &diff_cmd], false)
             .await?;
 
         if result.stdout.trim() == "CONFLICT" {
@@ -460,7 +460,7 @@ pub async fn lower_layer_changes(runtime: &dyn Runtime, sandbox_name: &str) -> R
         LOWER, WORK, LOWER
     );
     let result = runtime
-        .exec_cmd(sandbox_name, &["bash", "-c", &cmd], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", &cmd], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -498,7 +498,7 @@ pub async fn conflicts_quiet(
             upper_path, lower_path, upper_path, lower_path
         );
         let result = runtime
-            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .exec_cmd(sandbox_name, &["bash", "-lc", &diff_cmd], false)
             .await?;
 
         if result.stdout.trim() == "CONFLICT" {
