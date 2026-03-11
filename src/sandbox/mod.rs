@@ -318,25 +318,25 @@ impl SandboxManager {
         let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
         let session_name = format!("devbox-{name}");
 
-        // Always clean up dead sessions first, then check for alive ones.
-        // `zellij delete-all-sessions` removes only dead (EXITED) sessions.
-        // Use bash -lc for NixOS PATH compatibility.
+        // Clean up dead sessions and check for live ones.
+        // Must run as the non-root user because Zellij sessions are per-user.
+        // On Incus, exec_cmd runs as root which can't see the user's sessions.
         let _ = runtime
-            .exec_cmd(name, &["bash", "-lc", "zellij delete-all-sessions -y"], false)
+            .exec_as_user(name, &["bash", "-lc", "zellij delete-all-sessions -y 2>/dev/null; true"])
             .await;
 
         if force_new_session {
             // Kill the live session so we can start fresh
             let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
             let _ = runtime
-                .exec_cmd(name, &["bash", "-lc", &kill_cmd], false)
+                .exec_as_user(name, &["bash", "-lc", &kill_cmd])
                 .await;
         }
 
-        // Check if a live session exists
+        // Check if a live session exists (must run as user to see user sessions)
         let list_cmd = format!("zellij list-sessions 2>/dev/null | grep -q '{session_name}'");
         let session_alive = runtime
-            .exec_cmd(name, &["bash", "-lc", &list_cmd], false)
+            .exec_as_user(name, &["bash", "-lc", &list_cmd])
             .await
             .map(|r| r.exit_code == 0)
             .unwrap_or(false);

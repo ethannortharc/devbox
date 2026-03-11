@@ -104,11 +104,11 @@ async fn open_via_incus(
 
     let ip = extract_incus_ip(&result.stdout)?;
 
-    // Detect actual username in the VM
+    // Detect actual username in the VM (filter to /home/ users to skip nixbld*)
     let uid_result = run_cmd(
         "incus",
         &["exec", vm_name, "--", "bash", "-lc",
-          "awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }' /etc/passwd"],
+          "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $1; exit }' /etc/passwd"],
     ).await?;
     let username = uid_result.stdout.trim();
     let username = if username.is_empty() { "dev" } else { username };

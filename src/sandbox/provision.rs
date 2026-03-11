@@ -269,10 +269,7 @@ pub async fn post_cache_setup(
 ) -> Result<()> {
     let username = whoami();
 
-    // Wait for VM to be reachable
-    wait_for_network(runtime, name).await?;
-
-    // Detect VM user/home
+    // Detect VM user/home (no network needed — just reading /etc/passwd)
     let vm_user = detect_vm_username(runtime, name).await;
     let vm_home = detect_vm_home(runtime, name, &vm_user).await;
 

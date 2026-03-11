@@ -47,6 +47,13 @@ in {
     ++ (lib.optionals (langs.ruby or false) devboxSets.lang_ruby);
 
   # ── Services ───────────────────────────────────────
+  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      PermitRootLogin = "no";
+    };
+  };
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);
   services.tailscale.enable = lib.mkDefault (sets.network or false);
 
