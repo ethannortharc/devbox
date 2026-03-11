@@ -236,6 +236,14 @@ impl Runtime for IncusRuntime {
         let uid_str = Self::detect_vm_uid(&vm).await.unwrap_or("1000".to_string());
         let home_env = Self::detect_vm_home(&vm, &uid_str).await;
 
+        // Detect the user's home directory from the HOME env string
+        let home_dir = home_env.strip_prefix("HOME=").unwrap_or("/home/dev");
+        let path_env = format!(
+            "PATH={home_dir}/.npm-global/bin:{home_dir}/.local/bin:{home_dir}/.claude/bin:\
+             /run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:\
+             /usr/local/bin:/usr/bin:/bin"
+        );
+
         let mut args = vec![
             "exec".to_string(),
             vm,
@@ -245,6 +253,8 @@ impl Runtime for IncusRuntime {
             "/workspace".to_string(),
             "--env".to_string(),
             home_env,
+            "--env".to_string(),
+            path_env,
             "--".to_string(),
         ];
         for c in cmd {
