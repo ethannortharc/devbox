@@ -74,9 +74,10 @@ impl IncusRuntime {
     /// Detect the UID of the first non-root user in the VM.
     async fn detect_vm_uid(vm: &str) -> Option<String> {
         // Find first user with UID >= 1000 (standard non-system user)
+        // Use bash -lc to get login shell PATH (NixOS needs /run/current-system/sw/bin/)
         let result = run_cmd(
             "incus",
-            &["exec", vm, "--", "bash", "-c",
+            &["exec", vm, "--", "bash", "-lc",
               "awk -F: '$3 >= 1000 && $3 < 65534 { print $3; exit }' /etc/passwd"],
         ).await.ok()?;
         let uid = result.stdout.trim().to_string();
@@ -85,9 +86,10 @@ impl IncusRuntime {
 
     /// Detect the HOME directory for a given UID in the VM.
     async fn detect_vm_home(vm: &str, uid: &str) -> String {
+        // Use bash -lc to get login shell PATH (getent is in /run/current-system/sw/bin/ on NixOS)
         let result = run_cmd(
             "incus",
-            &["exec", vm, "--", "bash", "-c",
+            &["exec", vm, "--", "bash", "-lc",
               &format!("getent passwd {uid} | cut -d: -f6")],
         ).await;
         match result {
