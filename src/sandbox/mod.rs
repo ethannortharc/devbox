@@ -426,7 +426,7 @@ impl SandboxManager {
         let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
         let path = format!("/tmp/devbox-layout-{layout_name}.kdl");
         let cmd = format!("echo '{encoded}' | base64 -d > {path}");
-        runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
+        runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await?;
         Ok(())
     }
 
