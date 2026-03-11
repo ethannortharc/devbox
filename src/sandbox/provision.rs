@@ -241,12 +241,7 @@ async fn provision_nixos(
 
     // 1. Create directory structure
     println!("Setting up NixOS configuration...");
-    let mkdir_cmd = format!(
-        "{NIXOS_PATH_PREFIX}mkdir -p /etc/devbox/sets /etc/devbox/help"
-    );
-    runtime
-        .exec_cmd(name, &["bash", "-c", &mkdir_cmd], false)
-        .await?;
+    run_in_vm(runtime, name, "mkdir -p /etc/devbox/sets /etc/devbox/help", false).await?;
 
     // 2. Ensure NixOS channel is available (images:nixos/* may not have it)
     //    nixos-rebuild needs `<nixpkgs/nixos>` in NIX_PATH, which comes from
@@ -296,16 +291,16 @@ async fn provision_nixos(
     //    - images:nixos/* may not have channels in the default NIX_PATH
     //    - After nix-channel --update, nixpkgs lives at the channel profile path
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
+    let sudo = runtime.sudo_prefix();
     let rebuild_cmd = format!(
-        "{NIXOS_PATH_PREFIX}\
-         export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
+        "export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
          nixos-config=/etc/nixos/configuration.nix:\
          /nix/var/nix/profiles/per-user/root/channels\" && \
          export NIXPKGS_ALLOW_UNFREE=1 && \
-         nixos-rebuild switch"
+         {sudo}nixos-rebuild switch"
     );
     let result = runtime
-        .exec_cmd(name, &["bash", "-c", &rebuild_cmd], true)
+        .exec_cmd(name, &["bash", "-lc", &rebuild_cmd], true)
         .await;
 
     // nixos-rebuild switch stops incus-agent during activation, which
@@ -461,9 +456,7 @@ fi"#;
     setup_git_config(runtime, name).await?;
 
     // 7. Create devbox directories and copy binary + help
-    runtime
-        .exec_cmd(name, &["mkdir", "-p", "/etc/devbox/help"], false)
-        .await?;
+    run_in_vm(runtime, name, "mkdir -p /etc/devbox/help", false).await?;
 
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
@@ -484,12 +477,13 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
 
     if needs_docker {
         print!("  Setting up Docker service...");
-        let cmd = "export DEBIAN_FRONTEND=noninteractive && \
-            apt-get update -qq && \
-            apt-get install -y -qq docker.io >/dev/null 2>&1 && \
-            usermod -aG docker $(whoami) && \
-            systemctl enable --now docker";
-        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+        let sudo = runtime.sudo_prefix();
+        let cmd = format!("export DEBIAN_FRONTEND=noninteractive && \
+            {sudo}apt-get update -qq && \
+            {sudo}apt-get install -y -qq docker.io >/dev/null 2>&1 && \
+            {sudo}usermod -aG docker $(whoami) && \
+            {sudo}systemctl enable --now docker");
+        let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -498,9 +492,10 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
 
     if needs_tailscale {
         print!("  Setting up Tailscale service...");
-        let cmd = "curl -fsSL https://tailscale.com/install.sh | sh && \
-            systemctl enable --now tailscaled";
-        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+        let sudo = runtime.sudo_prefix();
+        let cmd = format!("curl -fsSL https://tailscale.com/install.sh | {sudo}sh && \
+            {sudo}systemctl enable --now tailscaled");
+        let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -570,7 +565,7 @@ ZSHRC
 "#
     );
 
-    let result = runtime.exec_cmd(name, &["bash", "-c", &setup], false).await;
+    let result = run_in_vm(runtime, name, &setup, false).await;
     if let Ok(r) = result
         && r.exit_code != 0
     {
@@ -626,10 +621,7 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 "#;
         write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
-        let chown_cmd = format!("{NIXOS_PATH_PREFIX}chown {username}:users {zshrc_path}");
-        runtime
-            .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(runtime, name, &format!("chown {username}:users {zshrc_path}"), false).await?;
     }
 
     // Also create .profile for bash login shells (used by layout panes with bash -lc)
@@ -643,10 +635,7 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
-        let chown_cmd = format!("{NIXOS_PATH_PREFIX}chown {username}:users {profile_path}");
-        runtime
-            .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(runtime, name, &format!("chown {username}:users {profile_path}"), false).await?;
     }
 
     Ok(())
@@ -952,27 +941,22 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
     None
 }
 
-/// NixOS PATH prefix — `incus exec` doesn't set up a login shell, so
-/// system binaries (base64, nixos-generate-config, etc.) in
-/// /run/current-system/sw/bin/ aren't in PATH by default.
-/// Harmless on non-NixOS guests (dirs simply don't exist).
-const NIXOS_PATH_PREFIX: &str =
-    "export PATH=\"/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH\"; ";
-
-/// Run a command in the VM with the NixOS PATH prefix applied.
-/// This ensures `base64` and other system binaries are found
-/// even when `incus exec` doesn't source the NixOS profile.
+/// Run a command in the VM as root with login shell (for PATH).
+/// Uses `bash -lc` so NixOS and Ubuntu both get proper PATH.
+/// Prepends `sudo` on runtimes where exec_cmd runs as user (Lima).
 async fn run_in_vm(
     runtime: &dyn Runtime,
     name: &str,
     cmd: &str,
     interactive: bool,
 ) -> Result<crate::runtime::ExecResult> {
-    let full_cmd = format!("{NIXOS_PATH_PREFIX}{cmd}");
-    runtime.exec_cmd(name, &["bash", "-c", &full_cmd], interactive).await
+    let sudo = runtime.sudo_prefix();
+    let full_cmd = format!("{sudo}{cmd}");
+    runtime.exec_cmd(name, &["bash", "-lc", &full_cmd], interactive).await
 }
 
 /// Write a file into the VM using base64-encoded content via exec_cmd.
+/// Uses sudo on runtimes where exec_cmd doesn't run as root.
 async fn write_file_to_vm(
     runtime: &dyn Runtime,
     name: &str,
@@ -981,8 +965,9 @@ async fn write_file_to_vm(
 ) -> Result<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-    let cmd = format!("{NIXOS_PATH_PREFIX}echo '{encoded}' | base64 -d | tee {path} > /dev/null");
-    let result = runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
+    let sudo = runtime.sudo_prefix();
+    let cmd = format!("echo '{encoded}' | base64 -d | {sudo}tee {path} > /dev/null");
+    let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await?;
     if result.exit_code != 0 {
         eprintln!("Warning: failed to write {path}: {}", result.stderr.trim());
     }
@@ -1115,10 +1100,7 @@ async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
     if hw_check.exit_code != 0 {
         println!("  Generating hardware configuration...");
-        let gen_cmd = format!("{NIXOS_PATH_PREFIX}nixos-generate-config");
-        let result = runtime
-            .exec_cmd(name, &["bash", "-c", &gen_cmd], false)
-            .await?;
+        let result = run_in_vm(runtime, name, "nixos-generate-config", false).await?;
         if result.exit_code != 0 {
             eprintln!(
                 "Warning: nixos-generate-config failed: {}",
@@ -1345,12 +1327,11 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
             .await;
     }
     // Fix ownership
-    let chown_cmd = format!(
-        "{NIXOS_PATH_PREFIX}chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
-    );
-    let _ = runtime
-        .exec_cmd(name, &["bash", "-c", &chown_cmd], false)
-        .await;
+    let _ = run_in_vm(
+        runtime, name,
+        &format!("chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"),
+        false,
+    ).await;
 }
 
 /// Write embedded help files to /etc/devbox/help/ inside the VM.

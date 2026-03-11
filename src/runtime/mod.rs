@@ -133,4 +133,16 @@ pub trait Runtime: Send + Sync {
     async fn exec_as_user(&self, name: &str, cmd: &[&str]) -> Result<ExecResult> {
         self.exec_cmd(name, cmd, true).await
     }
+
+    /// Whether exec_cmd runs as root by default.
+    /// Incus: true (incus exec defaults to root)
+    /// Lima: false (limactl shell runs as the configured user)
+    fn exec_runs_as_root(&self) -> bool {
+        false
+    }
+
+    /// Returns "sudo " if exec_cmd runs as user (needs elevation), "" if already root.
+    fn sudo_prefix(&self) -> &str {
+        if self.exec_runs_as_root() { "" } else { "sudo " }
+    }
 }
