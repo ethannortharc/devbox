@@ -354,25 +354,30 @@ async fn provision_nixos(
         }
     }
 
-    // 9. Set up user shell (zshrc with PATH, aliases, etc.)
-    setup_nixos_shell(runtime, name).await?;
+    // Detect the actual VM user/home after nixos-rebuild (may differ from
+    // host username — e.g. Lima creates "ethan.linux" from host "ethan").
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
 
-    // 9. Install latest claude-code (nixpkgs version lags behind)
+    // 9. Set up user shell (zshrc with PATH, aliases, etc.)
+    setup_nixos_shell(runtime, name, &vm_user, &vm_home).await?;
+
+    // 10. Install latest claude-code (nixpkgs version lags behind)
     if sets.iter().any(|s| s == "ai-code" || s == "ai_code") {
-        install_latest_claude_code(runtime, name).await;
+        install_latest_claude_code(runtime, name, &vm_user, &vm_home).await;
     }
 
-    // 10. Copy host git config into VM
-    setup_git_config(runtime, name).await?;
+    // 11. Copy host git config into VM
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
 
-    // 11. Copy devbox binary + help files + tool configs
+    // 12. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
     setup_management_script(runtime, name).await?;
-    setup_yazi_config(runtime, name).await?;
-    setup_aichat_config(runtime, name).await?;
-    setup_ai_tool_configs(runtime, name).await?;
+    setup_yazi_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_aichat_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_ai_tool_configs(runtime, name, &vm_user, &vm_home).await?;
 
     Ok(())
 }
@@ -448,8 +453,12 @@ fi"#;
     // 5. Set up shell environment
     setup_ubuntu_shell(runtime, name).await?;
 
+    // Detect the actual VM user/home (may differ from host username)
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
+
     // 6. Copy host git config into VM
-    setup_git_config(runtime, name).await?;
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
 
     // 7. Create devbox directories and copy binary + help
     run_in_vm(runtime, name, "mkdir -p /etc/devbox/help", false).await?;
@@ -458,9 +467,9 @@ fi"#;
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
     setup_management_script(runtime, name).await?;
-    setup_yazi_config(runtime, name).await?;
-    setup_aichat_config(runtime, name).await?;
-    setup_ai_tool_configs(runtime, name).await?;
+    setup_yazi_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_aichat_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_ai_tool_configs(runtime, name, &vm_user, &vm_home).await?;
 
     Ok(())
 }
@@ -570,9 +579,8 @@ ZSHRC
 }
 
 /// Set up user shell environment on NixOS (zshrc with PATH, aliases, workspace cd).
-async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let zshrc_path = format!("/home/{username}/.zshrc");
+async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) -> Result<()> {
+    let zshrc_path = format!("{vm_home}/.zshrc");
 
     // Only create if .zshrc doesn't exist yet (don't overwrite user customizations)
     let check = runtime
@@ -615,11 +623,11 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 "#;
         write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
-        run_in_vm(runtime, name, &format!("chown {username}:users {zshrc_path}"), false).await?;
+        run_in_vm(runtime, name, &format!("chown {vm_user}:users {zshrc_path}"), false).await?;
     }
 
     // Also create .profile for bash login shells (used by layout panes with bash -lc)
-    let profile_path = format!("/home/{username}/.profile");
+    let profile_path = format!("{vm_home}/.profile");
     let profile_check = runtime
         .exec_cmd(name, &["test", "-f", &profile_path], false)
         .await?;
@@ -629,7 +637,7 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
-        run_in_vm(runtime, name, &format!("chown {username}:users {profile_path}"), false).await?;
+        run_in_vm(runtime, name, &format!("chown {vm_user}:users {profile_path}"), false).await?;
     }
 
     Ok(())
@@ -639,7 +647,7 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
 /// Copy host ~/.gitconfig into the VM so git user.name, user.email,
 /// remote aliases, and other settings carry over automatically.
-async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+async fn setup_git_config(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let gitconfig_path = home.join(".gitconfig");
 
@@ -652,11 +660,10 @@ async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let username = whoami();
-    let vm_path = format!("/home/{username}/.gitconfig");
+    let vm_path = format!("{vm_home}/.gitconfig");
     write_file_to_vm(runtime, name, &vm_path, &content).await?;
 
-    let chown_cmd = format!("chown {username}:users {vm_path}");
+    let chown_cmd = format!("chown {vm_user}:users {vm_path}");
     run_in_vm(runtime, name, &chown_cmd, false).await?;
 
     println!("Synced host git config to VM.");
@@ -759,10 +766,8 @@ static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
 /// Detect AI tool configurations on the host and copy them into the VM.
 /// Checks for config files and API key env vars in priority order:
 /// claude-code → opencode → codex → aichat.
-async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> {
+async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
-    let username = whoami();
-    let vm_home = format!("/home/{username}");
     let mut copied_any = false;
 
     for tool in AI_TOOL_CONFIGS {
@@ -851,7 +856,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
         // Fix ownership for all copied files
         let chown_cmd = format!(
-            "chown -R {username}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
+            "chown -R {vm_user}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
         );
         run_in_vm(runtime, name, &chown_cmd, false).await?;
     }
@@ -867,7 +872,7 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
         run_in_vm(runtime, name, &format!("mkdir -p {config_dir}"), false).await?;
         let config_path = format!("{config_dir}/config.yaml");
         write_file_to_vm(runtime, name, &config_path, &config).await?;
-        run_in_vm(runtime, name, &format!("chown -R {username}:users {config_dir}"), false).await?;
+        run_in_vm(runtime, name, &format!("chown -R {vm_user}:users {config_dir}"), false).await?;
         println!("Generated aichat config from detected AI tool credentials.");
     }
 
@@ -1179,9 +1184,8 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
 }
 
 /// Push yazi config files to all user home directories in the VM.
-async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let config_dir = format!("/home/{username}/.config/yazi");
+async fn setup_yazi_config(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) -> Result<()> {
+    let config_dir = format!("{vm_home}/.config/yazi");
 
     // Create config directory
     run_in_vm(runtime, name, &format!("mkdir -p {config_dir}"), false).await?;
@@ -1210,16 +1214,15 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     .await?;
 
     // Fix ownership
-    run_in_vm(runtime, name, &format!("chown -R {username}:users /home/{username}/.config/yazi"), false).await?;
+    run_in_vm(runtime, name, &format!("chown -R {vm_user}:users {vm_home}/.config/yazi"), false).await?;
 
     Ok(())
 }
 
 /// Push aichat config (roles) to user home directory in the VM.
 /// Writes both legacy roles.yaml and modern roles/*.md format for compatibility.
-async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let config_dir = format!("/home/{username}/.config/aichat");
+async fn setup_aichat_config(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) -> Result<()> {
+    let config_dir = format!("{vm_home}/.config/aichat");
     let roles_dir = format!("{config_dir}/roles");
 
     run_in_vm(runtime, name, &format!("mkdir -p {roles_dir}"), false).await?;
@@ -1242,7 +1245,7 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         write_file_to_vm(runtime, name, &format!("{roles_dir}/{filename}"), content).await?;
     }
 
-    run_in_vm(runtime, name, &format!("chown -R {username}:users {config_dir}"), false).await?;
+    run_in_vm(runtime, name, &format!("chown -R {vm_user}:users {config_dir}"), false).await?;
 
     Ok(())
 }
@@ -1265,32 +1268,27 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
 /// On NixOS, the official binary installer fails (non-standard dynamic linker),
 /// and `npm install -g` fails (Nix store is read-only). We work around this by
 /// setting NPM_CONFIG_PREFIX to ~/.npm-global, then adding that to PATH.
-async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
-    let username = whoami();
-    let user_home = format!("/home/{username}");
+async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str, vm_user: &str, vm_home: &str) {
     println!("Installing latest claude-code...");
 
     // Install via npm with a writable global prefix.
-    // IMPORTANT: We explicitly set HOME to the non-root user's home directory
-    // because on Incus, exec_cmd runs as root ($HOME=/root), but we want
-    // claude installed to the user's home so Zellij panes (which run as user)
-    // can find it at ~/.npm-global/bin/claude.
-    //
-    // On NixOS, npm may not be in PATH — use nix-env to install nodejs first.
+    // We explicitly set HOME to the VM user's home directory because on
+    // Incus exec_cmd runs as root ($HOME=/root). We need claude installed
+    // to the user's home so Zellij panes (which run as user) find it.
     let install_cmd = format!(
-        "export HOME={user_home}; \
-         export PATH=\"{user_home}/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; \
-         export NPM_CONFIG_PREFIX=\"{user_home}/.npm-global\"; \
-         mkdir -p \"{user_home}/.npm-global\"; \
+        "export HOME={vm_home}; \
+         export PATH=\"{vm_home}/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; \
+         export NPM_CONFIG_PREFIX=\"{vm_home}/.npm-global\"; \
+         mkdir -p \"{vm_home}/.npm-global\"; \
          if ! command -v npm >/dev/null 2>&1; then \
            echo 'npm not found, installing nodejs via nix-env...'; \
            nix-env -iA nixos.nodejs_22 2>&1; \
-           export PATH=\"{user_home}/.nix-profile/bin:$PATH\"; \
+           export PATH=\"{vm_home}/.nix-profile/bin:$PATH\"; \
          fi; \
          echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; \
          if command -v npm >/dev/null 2>&1; then \
            npm install -g @anthropic-ai/claude-code@latest 2>&1; \
-           echo \"Installed: $({user_home}/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; \
+           echo \"Installed: $({vm_home}/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; \
          else \
            echo 'ERROR: npm still not available after nix-env install'; \
          fi"
@@ -1310,17 +1308,16 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     // Fix ownership of installed files (may have been created as root on Incus)
     let _ = run_in_vm(
         runtime, name,
-        &format!("chown -R {username}:users {user_home}/.npm-global {user_home}/.nix-profile 2>/dev/null; true"),
+        &format!("chown -R {vm_user}:users {vm_home}/.npm-global {vm_home}/.nix-profile 2>/dev/null; true"),
         false,
     ).await;
 
     // Ensure ~/.npm-global/bin is at front of PATH in both .zshrc and .profile
     // so latest claude takes precedence over the nixpkgs system version.
-    // .profile is needed because layout panes use `bash -lc` (not zsh).
     let path_line =
         r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
     for rc_file in &[".zshrc", ".profile"] {
-        let rc_path = format!("{user_home}/{rc_file}");
+        let rc_path = format!("{vm_home}/{rc_file}");
         let add_path_cmd = format!(
             "grep -qF '.npm-global/bin' {rc_path} 2>/dev/null || \
              echo '{path_line}' >> {rc_path}"
@@ -1332,7 +1329,7 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     // Fix ownership
     let _ = run_in_vm(
         runtime, name,
-        &format!("chown {username}:users {user_home}/.zshrc {user_home}/.profile 2>/dev/null; true"),
+        &format!("chown {vm_user}:users {vm_home}/.zshrc {vm_home}/.profile 2>/dev/null; true"),
         false,
     ).await;
 }
@@ -1346,10 +1343,46 @@ async fn setup_help_in_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns the host username (for state TOML and NixOS user creation).
 fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "dev".to_string())
+}
+
+/// Detect the actual non-root username inside the VM.
+/// On Incus, exec_cmd runs as root so we can't use `whoami` — instead we
+/// find the first user with UID >= 1000 from /etc/passwd.
+/// On Lima, exec_cmd runs as the Lima user, so `whoami` works.
+/// Falls back to the host username if detection fails.
+async fn detect_vm_username(runtime: &dyn Runtime, name: &str) -> String {
+    let result = runtime
+        .exec_cmd(
+            name,
+            &["bash", "-lc", "awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }' /etc/passwd"],
+            false,
+        )
+        .await;
+    match result {
+        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
+        _ => whoami(),
+    }
+}
+
+/// Detect the home directory for a given username inside the VM.
+/// Falls back to /home/{username}.
+async fn detect_vm_home(runtime: &dyn Runtime, name: &str, username: &str) -> String {
+    let result = runtime
+        .exec_cmd(
+            name,
+            &["bash", "-lc", &format!("getent passwd {username} | cut -d: -f6")],
+            false,
+        )
+        .await;
+    match result {
+        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
+        _ => format!("/home/{username}"),
+    }
 }
 
 // Overlay mount is now handled declaratively by devbox-module.nix via
