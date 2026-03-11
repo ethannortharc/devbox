@@ -242,7 +242,8 @@ impl SandboxManager {
         }
 
         // Check if Zellij is available in the VM
-        let zellij_check = runtime.exec_cmd(name, &["which", "zellij"], false).await;
+        // Use bash -lc to get login shell PATH (NixOS puts binaries in /run/current-system/sw/bin/)
+        let zellij_check = runtime.exec_cmd(name, &["bash", "-lc", "which zellij"], false).await;
         let has_zellij = zellij_check.is_ok() && zellij_check.unwrap().exit_code == 0;
 
         if !has_zellij {
@@ -293,22 +294,23 @@ impl SandboxManager {
 
         // Always clean up dead sessions first, then check for alive ones.
         // `zellij delete-all-sessions` removes only dead (EXITED) sessions.
+        // Use bash -lc for NixOS PATH compatibility.
         let _ = runtime
-            .exec_cmd(name, &["zellij", "delete-all-sessions", "-y"], false)
+            .exec_cmd(name, &["bash", "-lc", "zellij delete-all-sessions -y"], false)
             .await;
 
         if force_new_session {
             // Kill the live session so we can start fresh
             let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
             let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
+                .exec_cmd(name, &["bash", "-lc", &kill_cmd], false)
                 .await;
         }
 
         // Check if a live session exists
         let list_cmd = format!("zellij list-sessions 2>/dev/null | grep -q '{session_name}'");
         let session_alive = runtime
-            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
+            .exec_cmd(name, &["bash", "-lc", &list_cmd], false)
             .await
             .map(|r| r.exit_code == 0)
             .unwrap_or(false);
@@ -404,7 +406,8 @@ impl SandboxManager {
 
     /// Probe for zsh in the VM, fall back to bash.
     async fn probe_shell(runtime: &dyn crate::runtime::Runtime, name: &str) -> String {
-        let probe = runtime.exec_cmd(name, &["which", "zsh"], false).await;
+        // Use bash -lc to get login shell PATH (NixOS puts binaries in /run/current-system/sw/bin/)
+        let probe = runtime.exec_cmd(name, &["bash", "-lc", "which zsh"], false).await;
         if probe.is_ok() && probe.unwrap().exit_code == 0 {
             "zsh".to_string()
         } else {
