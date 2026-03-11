@@ -323,20 +323,14 @@ async fn provision_nixos(
 
     if rebuild_ok {
         // Wait for the VM agent to come back after system activation.
-        // nixos-rebuild switch restarts incus-agent as part of the new config.
+        // On Incus, nixos-rebuild restarts incus-agent; on Lima, SSH may drop briefly.
         println!("Waiting for VM agent to restart after system activation...");
-        // Small delay to let the old agent fully stop
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let vm = format!("devbox-{name}");
         let max_attempts = 40; // 40 * 3s = 120s
         let mut agent_ready = false;
         for i in 0..max_attempts {
-            let check = crate::runtime::cmd::run_cmd(
-                "incus",
-                &["exec", &vm, "--", "echo", "ready"],
-            )
-            .await;
+            let check = runtime.exec_cmd(name, &["echo", "ready"], false).await;
             if let Ok(r) = check {
                 if r.exit_code == 0 && r.stdout.trim() == "ready" {
                     println!("NixOS rebuild complete. VM agent is ready.");
@@ -1355,11 +1349,14 @@ fn whoami() -> String {
 /// find the first user with UID >= 1000 from /etc/passwd.
 /// On Lima, exec_cmd runs as the Lima user, so `whoami` works.
 /// Falls back to the host username if detection fails.
+///
+/// Filters: UID 1000-65533, home under /home/ (excludes NixOS nixbld* users
+/// which have UID 30001+ but home /var/empty).
 async fn detect_vm_username(runtime: &dyn Runtime, name: &str) -> String {
     let result = runtime
         .exec_cmd(
             name,
-            &["bash", "-lc", "awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }' /etc/passwd"],
+            &["bash", "-lc", "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $1; exit }' /etc/passwd"],
             false,
         )
         .await;
