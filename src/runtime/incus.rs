@@ -150,13 +150,18 @@ impl Runtime for IncusRuntime {
             );
         }
 
-        // Ensure the base image is available (auto-download if missing).
-        Self::ensure_image(&opts.image).await?;
+        // Determine which image to launch from: cached or base
+        let image = if let Some(cached) = &opts.cached_image {
+            println!("Launching from cached image '{cached}'...");
+            cached.clone()
+        } else {
+            Self::ensure_image(&opts.image).await?;
+            Self::image_alias(&opts.image).to_string()
+        };
 
         // Launch the VM
         println!("Creating Incus VM '{vm}'...");
-        let image = Self::image_alias(&opts.image);
-        let mut launch_args = vec!["launch", image, &vm, "--vm", "-c", "security.secureboot=false"];
+        let mut launch_args = vec!["launch", &image, &vm, "--vm", "-c", "security.secureboot=false"];
 
         let cpu_str;
         if opts.cpu > 0 {
@@ -175,13 +180,14 @@ impl Runtime for IncusRuntime {
 
         run_ok("incus", &launch_args).await?;
 
-        // Expand the root disk to 20GB (Incus default is 10GB, too small for
-        // NixOS with dev tools). Must be done after launch, before provisioning.
-        let _ = run_ok(
-            "incus",
-            &["config", "device", "override", &vm, "root", "size=20GiB"],
-        )
-        .await;
+        // Expand disk only for base images (cached images already have 20GB)
+        if opts.cached_image.is_none() {
+            let _ = run_ok(
+                "incus",
+                &["config", "device", "override", &vm, "root", "size=20GiB"],
+            )
+            .await;
+        }
 
         // Wait for the VM agent to be ready before provisioning.
         // The guest agent takes time to start after boot.
@@ -383,6 +389,44 @@ impl Runtime for IncusRuntime {
 
     async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<()> {
         bail!("Updating mounts is not supported for the Incus runtime")
+    }
+
+    async fn cached_image(&self, cache_key: &str) -> Option<String> {
+        let alias = format!("devbox-cache-{cache_key}");
+        let result = run_cmd(
+            "incus",
+            &["image", "list", &format!("local:{alias}"), "--format", "json"],
+        )
+        .await
+        .ok()?;
+        if result.exit_code == 0 {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result.stdout) {
+                if !arr.is_empty() {
+                    return Some(alias);
+                }
+            }
+        }
+        None
+    }
+
+    async fn cache_image(&self, name: &str, cache_key: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        let alias = format!("devbox-cache-{cache_key}");
+
+        println!("Caching provisioned image as '{alias}'...");
+
+        // Stop VM before publishing (required by incus publish)
+        let _ = run_cmd("incus", &["stop", &vm]).await;
+
+        // Publish the VM as a reusable image
+        run_ok("incus", &["publish", &vm, "--alias", &alias]).await?;
+
+        // Restart the VM
+        run_ok("incus", &["start", &vm]).await?;
+        Self::wait_for_agent(&vm).await?;
+
+        println!("Image cached successfully.");
+        Ok(())
     }
 }
 

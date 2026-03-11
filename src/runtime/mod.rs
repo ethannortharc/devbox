@@ -55,6 +55,9 @@ pub struct CreateOpts {
     pub writable: bool,
     /// Base image type: "nixos" or "ubuntu"
     pub image: String,
+    /// If set, create from this cached image instead of the base image.
+    /// For Incus: an image alias; for Lima: a path to a cached disk file.
+    pub cached_image: Option<String>,
 }
 
 /// A host-to-VM mount point.
@@ -141,15 +144,15 @@ pub trait Runtime: Send + Sync {
         false
     }
 
-    /// Check if a cached provisioned image exists for the given tool set.
-    /// Returns the image alias if found.
-    async fn cached_image(&self, _image: &str, _sets: &[String], _languages: &[String]) -> Option<String> {
+    /// Check if a cached provisioned image exists for the given cache key.
+    /// Returns the image alias/path if found.
+    async fn cached_image(&self, _cache_key: &str) -> Option<String> {
         None
     }
 
     /// Cache the current VM as a provisioned image for reuse.
     /// Called after successful provisioning to speed up future creates.
-    async fn cache_image(&self, _name: &str, _image: &str, _sets: &[String], _languages: &[String]) -> Result<()> {
+    async fn cache_image(&self, _name: &str, _cache_key: &str) -> Result<()> {
         Ok(())
     }
 
