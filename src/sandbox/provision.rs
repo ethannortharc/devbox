@@ -1267,31 +1267,36 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
 /// setting NPM_CONFIG_PREFIX to ~/.npm-global, then adding that to PATH.
 async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     let username = whoami();
+    let user_home = format!("/home/{username}");
     println!("Installing latest claude-code...");
 
     // Install via npm with a writable global prefix.
-    // On NixOS, npm may not be in PATH (claude-code nix pkg bundles its own node
-    // but doesn't expose npm). Use nix-env (stable, no experimental features needed)
-    // to install nodejs to user profile first if needed.
-    let install_cmd = concat!(
-        "export PATH=\"$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; ",
-        "export NPM_CONFIG_PREFIX=\"$HOME/.npm-global\"; ",
-        "mkdir -p \"$HOME/.npm-global\"; ",
-        "if ! command -v npm >/dev/null 2>&1; then ",
-        "echo 'npm not found, installing nodejs via nix-env...'; ",
-        "nix-env -iA nixos.nodejs_22 2>&1; ",
-        "export PATH=\"$HOME/.nix-profile/bin:$PATH\"; ",
-        "fi; ",
-        "echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; ",
-        "if command -v npm >/dev/null 2>&1; then ",
-        "npm install -g @anthropic-ai/claude-code@latest 2>&1; ",
-        "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; ",
-        "else ",
-        "echo 'ERROR: npm still not available after nix-env install'; ",
-        "fi"
+    // IMPORTANT: We explicitly set HOME to the non-root user's home directory
+    // because on Incus, exec_cmd runs as root ($HOME=/root), but we want
+    // claude installed to the user's home so Zellij panes (which run as user)
+    // can find it at ~/.npm-global/bin/claude.
+    //
+    // On NixOS, npm may not be in PATH — use nix-env to install nodejs first.
+    let install_cmd = format!(
+        "export HOME={user_home}; \
+         export PATH=\"{user_home}/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; \
+         export NPM_CONFIG_PREFIX=\"{user_home}/.npm-global\"; \
+         mkdir -p \"{user_home}/.npm-global\"; \
+         if ! command -v npm >/dev/null 2>&1; then \
+           echo 'npm not found, installing nodejs via nix-env...'; \
+           nix-env -iA nixos.nodejs_22 2>&1; \
+           export PATH=\"{user_home}/.nix-profile/bin:$PATH\"; \
+         fi; \
+         echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; \
+         if command -v npm >/dev/null 2>&1; then \
+           npm install -g @anthropic-ai/claude-code@latest 2>&1; \
+           echo \"Installed: $({user_home}/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; \
+         else \
+           echo 'ERROR: npm still not available after nix-env install'; \
+         fi"
     );
     let result = runtime
-        .exec_cmd(name, &["bash", "-lc", install_cmd], true)
+        .exec_cmd(name, &["bash", "-lc", &install_cmd], true)
         .await;
     match result {
         Ok(r) if r.exit_code == 0 => {
@@ -1302,13 +1307,20 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
         }
     }
 
+    // Fix ownership of installed files (may have been created as root on Incus)
+    let _ = run_in_vm(
+        runtime, name,
+        &format!("chown -R {username}:users {user_home}/.npm-global {user_home}/.nix-profile 2>/dev/null; true"),
+        false,
+    ).await;
+
     // Ensure ~/.npm-global/bin is at front of PATH in both .zshrc and .profile
     // so latest claude takes precedence over the nixpkgs system version.
     // .profile is needed because layout panes use `bash -lc` (not zsh).
     let path_line =
         r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
     for rc_file in &[".zshrc", ".profile"] {
-        let rc_path = format!("/home/{username}/{rc_file}");
+        let rc_path = format!("{user_home}/{rc_file}");
         let add_path_cmd = format!(
             "grep -qF '.npm-global/bin' {rc_path} 2>/dev/null || \
              echo '{path_line}' >> {rc_path}"
@@ -1320,7 +1332,7 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
     // Fix ownership
     let _ = run_in_vm(
         runtime, name,
-        &format!("chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"),
+        &format!("chown {username}:users {user_home}/.zshrc {user_home}/.profile 2>/dev/null; true"),
         false,
     ).await;
 }
