@@ -175,6 +175,14 @@ impl Runtime for IncusRuntime {
 
         run_ok("incus", &launch_args).await?;
 
+        // Expand the root disk to 20GB (Incus default is 10GB, too small for
+        // NixOS with dev tools). Must be done after launch, before provisioning.
+        let _ = run_ok(
+            "incus",
+            &["config", "device", "override", &vm, "root", "size=20GiB"],
+        )
+        .await;
+
         // Wait for the VM agent to be ready before provisioning.
         // The guest agent takes time to start after boot.
         println!("Waiting for VM agent to be ready...");

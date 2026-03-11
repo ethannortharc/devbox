@@ -82,6 +82,7 @@ vmOpts:
 
 cpus: {cpu}
 memory: "{memory}"
+disk: "20GiB"
 
 mounts:
 {mounts_yaml}
