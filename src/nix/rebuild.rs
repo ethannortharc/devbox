@@ -7,9 +7,8 @@ use crate::runtime::Runtime;
 pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     println!("Running nixos-rebuild switch...");
 
-    let sudo = runtime.sudo_prefix();
     let result = runtime
-        .exec_cmd(sandbox_name, &["bash", "-lc", &format!("{sudo}nixos-rebuild switch")], false)
+        .run_as_root(sandbox_name, "nixos-rebuild switch", false)
         .await?;
 
     if result.exit_code != 0 {
@@ -17,11 +16,7 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
         eprintln!("Attempting rollback...");
 
         let rollback = runtime
-            .exec_cmd(
-                sandbox_name,
-                &["bash", "-lc", &format!("{sudo}nixos-rebuild switch --rollback")],
-                false,
-            )
+            .run_as_root(sandbox_name, "nixos-rebuild switch --rollback", false)
             .await;
 
         match rollback {
@@ -50,20 +45,10 @@ pub async fn write_state_toml(
     sandbox_name: &str,
     toml_content: &str,
 ) -> Result<()> {
-    // Use tee to write the file as root
-    let sudo = runtime.sudo_prefix();
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &[
-                "bash", "-lc",
-                &format!(
-                    "{sudo}mkdir -p /etc/devbox && {sudo}tee /etc/devbox/devbox-state.toml > /dev/null << 'DEVBOX_EOF'\n{toml_content}\nDEVBOX_EOF"
-                ),
-            ],
-            false,
-        )
-        .await?;
+    let cmd = format!(
+        "mkdir -p /etc/devbox && tee /etc/devbox/devbox-state.toml > /dev/null << 'DEVBOX_EOF'\n{toml_content}\nDEVBOX_EOF"
+    );
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!(
@@ -82,19 +67,10 @@ pub async fn write_nix_file(
     filename: &str,
     content: &str,
 ) -> Result<()> {
-    let sudo = runtime.sudo_prefix();
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &[
-                "bash", "-lc",
-                &format!(
-                    "{sudo}mkdir -p /etc/devbox/sets && {sudo}tee /etc/devbox/sets/{filename} > /dev/null << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
-                ),
-            ],
-            false,
-        )
-        .await?;
+    let cmd = format!(
+        "mkdir -p /etc/devbox/sets && tee /etc/devbox/sets/{filename} > /dev/null << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
+    );
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to write {filename}: {}", result.stderr.trim());

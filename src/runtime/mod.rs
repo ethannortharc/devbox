@@ -141,8 +141,20 @@ pub trait Runtime: Send + Sync {
         false
     }
 
-    /// Returns "sudo " if exec_cmd runs as user (needs elevation), "" if already root.
-    fn sudo_prefix(&self) -> &str {
-        if self.exec_runs_as_root() { "" } else { "sudo " }
+    /// Execute a shell command as root with a login shell.
+    ///
+    /// This is the correct abstraction for running privileged commands:
+    /// - Incus: `bash -lc <cmd>` (already root, login shell for PATH)
+    /// - Lima:  `sudo bash -lc <cmd>` (elevate, login shell for PATH)
+    ///
+    /// Unlike a simple `sudo` prefix, this wraps the ENTIRE command inside
+    /// the sudo boundary, so environment variables set within `cmd` (like
+    /// `export NIX_PATH=...`) are preserved for the privileged process.
+    async fn run_as_root(&self, name: &str, cmd: &str, interactive: bool) -> Result<ExecResult> {
+        if self.exec_runs_as_root() {
+            self.exec_cmd(name, &["bash", "-lc", cmd], interactive).await
+        } else {
+            self.exec_cmd(name, &["sudo", "bash", "-lc", cmd], interactive).await
+        }
     }
 }
