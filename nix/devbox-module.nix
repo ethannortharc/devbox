@@ -52,23 +52,11 @@ in {
 
   # ── Incus/LXD Agent ─────────────────────────────────
   # Required for `incus exec` to work after nixos-rebuild.
-  # The agent binary is mounted at /run/incus_agent/ by the hypervisor;
-  # this service starts it on boot so the host can communicate with the VM.
-  systemd.services.incus-agent = {
-    description = "Incus VM Agent";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "network.target" "local-fs.target" ];
-    serviceConfig = {
-      Type = "notify";
-      ExecStart = "/run/incus_agent/incus-agent";
-      Restart = "always";
-      RestartSec = 5;
-      WorkingDirectory = "/run/incus_agent";
-    };
-    unitConfig = {
-      ConditionPathExists = "/run/incus_agent/incus-agent";
-    };
-  };
+  # This NixOS module installs the agent service with proper udev rules,
+  # 9p mount setup, and critically: restartIfChanged=false / stopIfChanged=false
+  # so nixos-rebuild doesn't kill the agent mid-switch (which would drop our
+  # incus exec connection).
+  virtualisation.incus.agent.enable = true;
 
   # ── Dynamic linker compat ─────────────────────────
   # Required for VS Code Server, Cursor, and other dynamically linked
