@@ -291,17 +291,13 @@ async fn provision_nixos(
     //    - images:nixos/* may not have channels in the default NIX_PATH
     //    - After nix-channel --update, nixpkgs lives at the channel profile path
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
-    let sudo = runtime.sudo_prefix();
-    let rebuild_cmd = format!(
-        "export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
+    let rebuild_cmd = "\
+         export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
          nixos-config=/etc/nixos/configuration.nix:\
          /nix/var/nix/profiles/per-user/root/channels\" && \
          export NIXPKGS_ALLOW_UNFREE=1 && \
-         {sudo}nixos-rebuild switch"
-    );
-    let result = runtime
-        .exec_cmd(name, &["bash", "-lc", &rebuild_cmd], true)
-        .await;
+         nixos-rebuild switch";
+    let result = run_in_vm(runtime, name, rebuild_cmd, true).await;
 
     // nixos-rebuild switch stops incus-agent during activation, which
     // drops the websocket connection (exit 255). This is expected —
@@ -477,13 +473,12 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
 
     if needs_docker {
         print!("  Setting up Docker service...");
-        let sudo = runtime.sudo_prefix();
-        let cmd = format!("export DEBIAN_FRONTEND=noninteractive && \
-            {sudo}apt-get update -qq && \
-            {sudo}apt-get install -y -qq docker.io >/dev/null 2>&1 && \
-            {sudo}usermod -aG docker $(whoami) && \
-            {sudo}systemctl enable --now docker");
-        let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await;
+        let cmd = "export DEBIAN_FRONTEND=noninteractive && \
+            apt-get update -qq && \
+            apt-get install -y -qq docker.io >/dev/null 2>&1 && \
+            usermod -aG docker $(whoami) && \
+            systemctl enable --now docker";
+        let result = run_in_vm(runtime, name, cmd, false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -492,10 +487,9 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
 
     if needs_tailscale {
         print!("  Setting up Tailscale service...");
-        let sudo = runtime.sudo_prefix();
-        let cmd = format!("curl -fsSL https://tailscale.com/install.sh | {sudo}sh && \
-            {sudo}systemctl enable --now tailscaled");
-        let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await;
+        let cmd = "curl -fsSL https://tailscale.com/install.sh | sh && \
+            systemctl enable --now tailscaled";
+        let result = run_in_vm(runtime, name, cmd, false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -941,22 +935,20 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
     None
 }
 
-/// Run a command in the VM as root with login shell (for PATH).
-/// Uses `bash -lc` so NixOS and Ubuntu both get proper PATH.
-/// Prepends `sudo` on runtimes where exec_cmd runs as user (Lima).
+/// Run a command as root inside the VM with a login shell.
+/// Delegates to `runtime.run_as_root()` which handles the platform
+/// difference: Incus runs as root directly, Lima wraps in `sudo`.
 async fn run_in_vm(
     runtime: &dyn Runtime,
     name: &str,
     cmd: &str,
     interactive: bool,
 ) -> Result<crate::runtime::ExecResult> {
-    let sudo = runtime.sudo_prefix();
-    let full_cmd = format!("{sudo}{cmd}");
-    runtime.exec_cmd(name, &["bash", "-lc", &full_cmd], interactive).await
+    runtime.run_as_root(name, cmd, interactive).await
 }
 
-/// Write a file into the VM using base64-encoded content via exec_cmd.
-/// Uses sudo on runtimes where exec_cmd doesn't run as root.
+/// Write a file into the VM using base64-encoded content.
+/// Runs the entire pipeline as root via `run_as_root`.
 async fn write_file_to_vm(
     runtime: &dyn Runtime,
     name: &str,
@@ -965,9 +957,8 @@ async fn write_file_to_vm(
 ) -> Result<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-    let sudo = runtime.sudo_prefix();
-    let cmd = format!("echo '{encoded}' | base64 -d | {sudo}tee {path} > /dev/null");
-    let result = runtime.exec_cmd(name, &["bash", "-lc", &cmd], false).await?;
+    let cmd = format!("echo '{encoded}' | base64 -d | tee {path} > /dev/null");
+    let result = runtime.run_as_root(name, &cmd, false).await?;
     if result.exit_code != 0 {
         eprintln!("Warning: failed to write {path}: {}", result.stderr.trim());
     }
