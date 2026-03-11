@@ -8,7 +8,7 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
     println!("Running nixos-rebuild switch...");
 
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "nixos-rebuild", "switch"], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", "nixos-rebuild switch"], false)
         .await?;
 
     if result.exit_code != 0 {
@@ -18,7 +18,7 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
         let rollback = runtime
             .exec_cmd(
                 sandbox_name,
-                &["sudo", "nixos-rebuild", "switch", "--rollback"],
+                &["bash", "-lc", "nixos-rebuild switch --rollback"],
                 false,
             )
             .await;
@@ -54,7 +54,7 @@ pub async fn write_state_toml(
         .exec_cmd(
             sandbox_name,
             &[
-                "sudo", "bash", "-c",
+                "bash", "-lc",
                 &format!(
                     "mkdir -p /etc/devbox && cat > /etc/devbox/devbox-state.toml << 'DEVBOX_EOF'\n{toml_content}\nDEVBOX_EOF"
                 ),
@@ -84,7 +84,7 @@ pub async fn write_nix_file(
         .exec_cmd(
             sandbox_name,
             &[
-                "sudo", "bash", "-c",
+                "bash", "-lc",
                 &format!(
                     "mkdir -p /etc/devbox/sets && cat > /etc/devbox/sets/{filename} << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
                 ),
