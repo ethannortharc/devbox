@@ -141,6 +141,18 @@ pub trait Runtime: Send + Sync {
         false
     }
 
+    /// Check if a cached provisioned image exists for the given tool set.
+    /// Returns the image alias if found.
+    async fn cached_image(&self, _image: &str, _sets: &[String], _languages: &[String]) -> Option<String> {
+        None
+    }
+
+    /// Cache the current VM as a provisioned image for reuse.
+    /// Called after successful provisioning to speed up future creates.
+    async fn cache_image(&self, _name: &str, _image: &str, _sets: &[String], _languages: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     /// Execute a shell command as root with a login shell.
     ///
     /// This is the correct abstraction for running privileged commands:
