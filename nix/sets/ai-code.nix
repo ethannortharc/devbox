@@ -3,8 +3,9 @@
 # Uses tryEval with meta.license check to handle both missing and unfree packages.
 { pkgs }:
 let
+  # claude-code is installed separately via npm (latest version, smaller footprint)
+  # — the nixpkgs package bundles sharp/libvips (~500MB) and lags behind releases.
   wanted = [
-    "claude-code"
     "codex"
     "opencode"
     "aider-chat"

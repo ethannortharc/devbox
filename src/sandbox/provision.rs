@@ -149,8 +149,8 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
             "trippy",
             "doggo",
         ],
+        // claude-code is installed separately via npm (latest version, smaller footprint)
         "ai-code" => vec![
-            "claude-code",
             "codex",
             "opencode",
             "aider-chat",
