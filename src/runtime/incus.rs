@@ -133,6 +133,10 @@ impl Runtime for IncusRuntime {
         30
     }
 
+    fn exec_runs_as_root(&self) -> bool {
+        true
+    }
+
     async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
         let vm = Self::vm_name(&opts.name);
 
