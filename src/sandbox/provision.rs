@@ -195,6 +195,40 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
     }
 }
 
+// ── Cache Key ───────────────────────────────────────────────
+
+/// Hash of all embedded nix configuration files.
+/// Changes when any nix set file or module is updated → automatic cache invalidation.
+fn config_version() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for (_, content) in NIX_SET_FILES {
+        content.hash(&mut hasher);
+    }
+    NIX_DEVBOX_MODULE.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compute a deterministic cache key for a given image + tool set combination.
+/// Same inputs always produce the same key. Changes to nix set files
+/// automatically invalidate the cache (via config_version).
+pub fn cache_key(image: &str, sets: &[String], languages: &[String], mount_mode: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    image.hash(&mut hasher);
+    mount_mode.hash(&mut hasher);
+    let mut sorted_sets: Vec<&String> = sets.iter().collect();
+    sorted_sets.sort();
+    sorted_sets.hash(&mut hasher);
+    let mut sorted_langs: Vec<&String> = languages.iter().collect();
+    sorted_langs.sort();
+    sorted_langs.hash(&mut hasher);
+    config_version().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 // ── Public API ──────────────────────────────────────────────
 
 /// Provision a VM with tools based on active sets and languages.
@@ -222,6 +256,39 @@ pub async fn provision_vm_with_mode(
         "ubuntu" => provision_ubuntu(runtime, name, sets, languages).await,
         _ => provision_nixos(runtime, name, sets, languages, mount_mode).await,
     }
+}
+
+/// Lightweight setup after launching from a cached image.
+/// Applies host-specific config (git, devbox binary) without re-provisioning.
+pub async fn post_cache_setup(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    mount_mode: &str,
+) -> Result<()> {
+    let username = whoami();
+
+    // Wait for VM to be reachable
+    wait_for_network(runtime, name).await?;
+
+    // Detect VM user/home
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
+
+    // Update state file with current sandbox metadata
+    let state_toml = generate_state_toml(sets, languages, &username, mount_mode);
+    write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
+
+    // Copy current host git config (host-specific, may have changed)
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
+
+    // Update devbox binary + help files (may have been updated since cache was created)
+    copy_devbox_to_vm(runtime, name).await?;
+    setup_help_in_vm(runtime, name).await?;
+    setup_management_script(runtime, name).await?;
+
+    Ok(())
 }
 
 // ── NixOS Provisioning ─────────────────────────────────────
@@ -1528,5 +1595,48 @@ mod tests {
             let pkgs = nix_packages_for_set(set);
             assert!(!pkgs.is_empty(), "set '{set}' should have packages");
         }
+    }
+
+    #[test]
+    fn cache_key_deterministic() {
+        let sets = vec!["system".to_string(), "shell".to_string()];
+        let langs = vec!["go".to_string()];
+        let k1 = cache_key("nixos", &sets, &langs, "overlay");
+        let k2 = cache_key("nixos", &sets, &langs, "overlay");
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len(), 16); // 16-char hex string
+    }
+
+    #[test]
+    fn cache_key_order_independent() {
+        let sets_a = vec!["shell".to_string(), "system".to_string()];
+        let sets_b = vec!["system".to_string(), "shell".to_string()];
+        let langs = vec!["go".to_string()];
+        let k1 = cache_key("nixos", &sets_a, &langs, "overlay");
+        let k2 = cache_key("nixos", &sets_b, &langs, "overlay");
+        assert_eq!(k1, k2, "cache key should be order-independent");
+    }
+
+    #[test]
+    fn cache_key_differs_on_inputs() {
+        let sets = vec!["system".to_string()];
+        let langs = vec![];
+        let k_nixos = cache_key("nixos", &sets, &langs, "overlay");
+        let k_ubuntu = cache_key("ubuntu", &sets, &langs, "overlay");
+        assert_ne!(k_nixos, k_ubuntu, "different image → different key");
+
+        let k_overlay = cache_key("nixos", &sets, &langs, "overlay");
+        let k_writable = cache_key("nixos", &sets, &langs, "writable");
+        assert_ne!(k_overlay, k_writable, "different mount_mode → different key");
+
+        let sets2 = vec!["system".to_string(), "ai-code".to_string()];
+        let k_more = cache_key("nixos", &sets2, &langs, "overlay");
+        assert_ne!(k_nixos, k_more, "different sets → different key");
+    }
+
+    #[test]
+    fn config_version_nonzero() {
+        let v = config_version();
+        assert_ne!(v, 0, "config_version should be non-zero");
     }
 }

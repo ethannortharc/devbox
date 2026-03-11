@@ -176,8 +176,13 @@ impl Runtime for LimaRuntime {
         } else {
             "NixOS"
         };
-        println!("Creating {image_label} VM '{vm}'...");
-        println!("  (first run downloads {image_label} image, this may take a few minutes)");
+
+        if opts.cached_image.is_some() {
+            println!("Creating {image_label} VM '{vm}' from cache...");
+        } else {
+            println!("Creating {image_label} VM '{vm}'...");
+            println!("  (first run downloads {image_label} image, this may take a few minutes)");
+        }
         run_ok(
             "limactl",
             &[
@@ -189,6 +194,21 @@ impl Runtime for LimaRuntime {
             ],
         )
         .await?;
+
+        // If we have a cached disk, copy it over before first start.
+        // Lima creates the disk structure during `create`; we overwrite
+        // `diffdisk` with the cached provisioned state before `start` boots it.
+        if let Some(cached_disk) = &opts.cached_image {
+            let home = dirs::home_dir().unwrap_or_default();
+            let diffdisk = home.join(format!(".lima/{vm}/diffdisk"));
+            println!("Restoring cached disk image...");
+            // Use cp -c for APFS clone (instant, zero-cost on macOS)
+            let _ = run_cmd(
+                "cp",
+                &["-c", cached_disk, &diffdisk.to_string_lossy()],
+            )
+            .await;
+        }
 
         println!("Starting {image_label} VM '{vm}'...");
         run_ok("limactl", &["start", &vm]).await?;
@@ -377,6 +397,57 @@ impl Runtime for LimaRuntime {
 
         Ok(())
     }
+
+    async fn cached_image(&self, cache_key: &str) -> Option<String> {
+        let cache_path = dirs::home_dir()?
+            .join(format!(".devbox/cache/lima-{cache_key}.disk"));
+        if cache_path.exists() {
+            Some(cache_path.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    }
+
+    async fn cache_image(&self, name: &str, cache_key: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        let home = dirs::home_dir().unwrap_or_default();
+        let diffdisk = home.join(format!(".lima/{vm}/diffdisk"));
+
+        if !diffdisk.exists() {
+            bail!("Lima disk not found at {}", diffdisk.display());
+        }
+
+        let cache_dir = home.join(".devbox/cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let cache_path = cache_dir.join(format!("lima-{cache_key}.disk"));
+
+        println!("Caching provisioned image...");
+
+        // Stop VM before copying disk for consistency
+        let _ = run_cmd("limactl", &["stop", &vm]).await;
+
+        // Use cp -c for APFS clone (instant, zero-cost on macOS)
+        let result = run_cmd(
+            "cp",
+            &["-c", &diffdisk.to_string_lossy(), &cache_path.to_string_lossy()],
+        )
+        .await;
+
+        // Fall back to regular copy if APFS clone fails (non-APFS filesystem)
+        if result.is_err() || result.as_ref().is_ok_and(|r| r.exit_code != 0) {
+            let _ = run_cmd(
+                "cp",
+                &[&diffdisk.to_string_lossy(), &cache_path.to_string_lossy()],
+            )
+            .await;
+        }
+
+        // Restart the VM
+        run_ok("limactl", &["start", &vm]).await?;
+
+        println!("Image cached successfully.");
+        Ok(())
+    }
 }
 
 fn chrono_now() -> String {
@@ -412,6 +483,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("cpus: 4"));
@@ -440,6 +512,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("cpus: 4"));
@@ -477,6 +550,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "ubuntu".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("ubuntu-24.04"));
@@ -502,6 +576,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("nixos-lima"));

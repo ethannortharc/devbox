@@ -119,6 +119,14 @@ impl SandboxManager {
             .collect();
         mounts.extend_from_slice(extra_mounts);
 
+        // Check for a cached provisioned image
+        let active_sets = config.active_sets();
+        let active_langs = config.active_languages();
+        let image = config.sandbox.image.as_str();
+        let mount_mode = &config.sandbox.mount_mode;
+        let key = provision::cache_key(image, &active_sets, &active_langs, mount_mode);
+        let cached = runtime.cached_image(&key).await;
+
         let opts = CreateOpts {
             name: name.to_string(),
             mounts,
@@ -132,28 +140,46 @@ impl SandboxManager {
             bare,
             writable: config.sandbox.mount_mode == "writable",
             image: config.sandbox.image.clone(),
+            cached_image: cached.clone(),
         };
 
         // Create via runtime
         let info = runtime.create(&opts).await?;
 
-        // Provision tools in the VM based on selected sets
-        let active_sets = config.active_sets();
-        let active_langs = config.active_languages();
-        let image = config.sandbox.image.as_str();
-        // Provision tools — pass mount_mode so NixOS module sets up overlay
-        let mount_mode = &config.sandbox.mount_mode;
-        if let Err(e) = provision::provision_vm_with_mode(
-            runtime,
-            name,
-            &active_sets,
-            &active_langs,
-            image,
-            mount_mode,
-        )
-        .await
-        {
-            eprintln!("Warning: provisioning incomplete: {e}");
+        if cached.is_some() {
+            // Launched from cached image — skip full provisioning,
+            // only apply host-specific config (git, devbox binary, state file).
+            println!("Using cached image — skipping provisioning.");
+            if let Err(e) = provision::post_cache_setup(
+                runtime,
+                name,
+                &active_sets,
+                &active_langs,
+                mount_mode,
+            )
+            .await
+            {
+                eprintln!("Warning: post-cache setup incomplete: {e}");
+            }
+        } else {
+            // No cache — full provisioning
+            if let Err(e) = provision::provision_vm_with_mode(
+                runtime,
+                name,
+                &active_sets,
+                &active_langs,
+                image,
+                mount_mode,
+            )
+            .await
+            {
+                eprintln!("Warning: provisioning incomplete: {e}");
+            }
+
+            // Cache the provisioned image for future creates
+            if let Err(e) = runtime.cache_image(name, &key).await {
+                eprintln!("Warning: could not cache image: {e}");
+            }
         }
 
         // Save state
