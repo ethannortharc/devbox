@@ -269,6 +269,10 @@ pub async fn post_cache_setup(
 ) -> Result<()> {
     let username = whoami();
 
+    // Cached images may boot with a different NIC name/MAC than the original VM.
+    // Restart networking to ensure DHCP picks up an IP on the new interface.
+    ensure_network_after_cache(runtime, name).await?;
+
     // Detect VM user/home (no network needed — just reading /etc/passwd)
     let vm_user = detect_vm_username(runtime, name).await;
     let vm_home = detect_vm_home(runtime, name, &vm_user).await;
@@ -285,6 +289,54 @@ pub async fn post_cache_setup(
     setup_help_in_vm(runtime, name).await?;
     setup_management_script(runtime, name).await?;
 
+    Ok(())
+}
+
+/// Ensure network is up after launching from a cached image.
+/// The cached image may have been built with a different NIC name/MAC.
+/// We restart DHCP/NetworkManager and wait for an IP address.
+async fn ensure_network_after_cache(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Restart networking services to pick up DHCP on potentially new interfaces
+    let _ = run_in_vm(
+        runtime,
+        name,
+        "systemctl restart systemd-networkd 2>/dev/null; \
+         systemctl restart NetworkManager 2>/dev/null; \
+         systemctl restart dhcpcd 2>/dev/null; \
+         true",
+        false,
+    )
+    .await;
+
+    // Wait for an IP address to appear (up to 30s)
+    let attempts = 10;
+    for i in 0..attempts {
+        let result = runtime
+            .exec_cmd(
+                name,
+                &[
+                    "bash", "-lc",
+                    "ip -4 addr show scope global | grep -q 'inet '",
+                ],
+                false,
+            )
+            .await;
+        if let Ok(r) = result {
+            if r.exit_code == 0 {
+                return Ok(());
+            }
+        }
+        if i == 0 {
+            print!("Waiting for network...");
+        } else {
+            print!(".");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    println!();
+    eprintln!("Warning: VM may not have network connectivity. SSH and package installs may fail.");
     Ok(())
 }
 
