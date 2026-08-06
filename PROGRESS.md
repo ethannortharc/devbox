@@ -897,3 +897,45 @@ as the mirror-list guard (ADR-0022), same reason: one home for the constant.
 
 **Gate** — 384 Rust unit + 52 integration/e2e across all 8 suites, 10 Go
 packages, 65 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-07T02:30Z — Codex review round 9: 13 findings, all addressed
+
+Series: **23, 23, 14, 27, 9, 14, 11, 13, 13.**
+
+The finding worth reading twice: **I wrote two ADRs that contradicted each
+other, and shipped the contradiction.** ADR-0034 said an enforcement failure
+must not be fatal — refusing to start a box whose firewall failed "would strand
+the user with no way in to fix it." ADR-0037 then made it fatal, because a
+caller that cannot see a failure cannot act on it. Round 9 found the result: a
+box whose posture could not be applied became permanently inaccessible, with
+terminal, attach, and exec all repeating the same error. Exactly the stranding
+the first ADR named, caused by the second.
+
+ADR-0044 resolves it by asking who is asking. `policy set` means "make this
+true" — the failure is the answer and must reach the exit status. Start/attach/
+exec means "let me in" — and the box is no more exposed than it was a moment
+earlier, running without the posture while nobody was blocked. Two ADRs can
+each be locally right and jointly produce a broken system; nothing in a
+per-change review catches that.
+
+**Container egress bypassed policy entirely.** The ruleset filtered `hook
+output`, but a nested Docker container's packets are *forwarded*. `docker run …
+curl` walked past `isolated` and every allowlist — the command a developer is
+most likely to run inside a sandboxed box was the one the sandbox did not cover
+(ADR-0045).
+
+And a third instance of cross-file drift: `conntrack` was in the checked-in
+`system.nix` but only the *network* set in the generated catalog, so any Sets
+apply regenerated the box without it and silently disarmed the conntrack flush.
+
+**On that last one — I fixed the class, not the instance.** Two earlier
+instances of this drift were each patched individually before anyone
+generalized. The guard now covers **every** set: for all fifteen, the catalog
+and the checked-in module must agree, and a catalogued set with no module in
+the list fails too, so the check cannot quietly stop covering something. A
+second guard does the same for the Ubuntu package mapping, which is a third
+source of the same truth. Verified by deleting `git-crypt` from `git.nix` and
+confirming the failure names the package and the file.
+
+**Gate** — 395 Rust unit + 52 integration/e2e, 10 Go packages, 66 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.

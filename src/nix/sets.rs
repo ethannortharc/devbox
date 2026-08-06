@@ -312,28 +312,66 @@ mod tests {
         }
     }
 
-    /// The generated `system` set and the checked-in `system.nix` must agree.
+    /// **Every** set's catalog entry and checked-in module must agree.
     ///
-    /// Provisioning pushes the checked-in module; `write_set_modules`
-    /// regenerates from this catalog. When they disagree, a box gets one set
-    /// of packages at create and a different one after any Sets apply — which
-    /// is how `conntrack` came to be present on a fresh box and absent after
-    /// the user touched a checkbox, silently disarming the conntrack flush
-    /// that makes a tightened policy take effect.
+    /// Provisioning pushes the checked-in modules; `write_set_modules`
+    /// regenerates from this catalog. When the two disagree, a box gets one
+    /// set of packages at create and a different one after any Sets apply.
+    /// That is how `conntrack` came to be present on a fresh box and absent
+    /// once the user touched a checkbox — silently disarming the flush that
+    /// makes a tightened policy take effect.
+    ///
+    /// Written for all sets rather than the one that broke: the same drift can
+    /// happen in any of them, and the two earlier instances of this class were
+    /// each fixed individually before anyone generalized it.
     #[test]
-    fn system_set_matches_the_checked_in_module() {
-        let module = include_str!("../../nix/sets/system.nix");
-        let system = super::NIX_SETS
-            .iter()
-            .find(|s| s.name == "system")
-            .expect("a system set");
+    fn every_set_matches_its_checked_in_module() {
+        // (name, module source) — `include_str!` needs a literal path.
+        let modules: &[(&str, &str)] = &[
+            ("system", include_str!("../../nix/sets/system.nix")),
+            ("shell", include_str!("../../nix/sets/shell.nix")),
+            ("tools", include_str!("../../nix/sets/tools.nix")),
+            ("editor", include_str!("../../nix/sets/editor.nix")),
+            ("git", include_str!("../../nix/sets/git.nix")),
+            ("container", include_str!("../../nix/sets/container.nix")),
+            ("network", include_str!("../../nix/sets/network.nix")),
+            ("ai-code", include_str!("../../nix/sets/ai-code.nix")),
+            ("ai-infra", include_str!("../../nix/sets/ai-infra.nix")),
+            ("lang-go", include_str!("../../nix/sets/lang-go.nix")),
+            ("lang-rust", include_str!("../../nix/sets/lang-rust.nix")),
+            (
+                "lang-python",
+                include_str!("../../nix/sets/lang-python.nix"),
+            ),
+            ("lang-node", include_str!("../../nix/sets/lang-node.nix")),
+            ("lang-java", include_str!("../../nix/sets/lang-java.nix")),
+            ("lang-ruby", include_str!("../../nix/sets/lang-ruby.nix")),
+        ];
 
-        for package in system.packages {
+        // Every catalogued set needs a module here, or the check silently
+        // stops covering it — the failure mode this test exists to prevent.
+        for set in super::NIX_SETS {
             assert!(
-                module.contains(package),
-                "`{package}` is in the generated system set but not in \
-                 nix/sets/system.nix; a Sets apply would remove it from the box"
+                modules.iter().any(|(name, _)| *name == set.name),
+                "set `{}` has no checked-in module in this list; add it",
+                set.name
             );
+        }
+
+        for (name, module) in modules {
+            let set = super::NIX_SETS
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("`{name}` is not in the catalog"));
+
+            for package in set.packages {
+                assert!(
+                    module.contains(package),
+                    "`{package}` is in the `{name}` catalog but not in \
+                     nix/sets/{name}.nix; a Sets apply would change what the \
+                     box has"
+                );
+            }
         }
     }
 
