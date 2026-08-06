@@ -103,7 +103,11 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     }
 
     let load = runtime
-        .exec_cmd(sandbox_name, &["sudo", "nft", "-f", RULESET_PATH], false)
+        .exec_cmd(
+            sandbox_name,
+            &["sudo", "bash", "-c", &load_command()],
+            false,
+        )
         .await?;
     if load.exit_code != 0 {
         // The most common cause by far, worth naming rather than making the
@@ -184,6 +188,25 @@ async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
     }
     let cmdline = result.stdout;
     !cmdline.contains("-no-ebpf") && !cmdline.contains("-fixture")
+}
+
+/// The shell that loads the ruleset and drops connections it no longer allows.
+///
+/// The ruleset accepts `ct state established,related` first, so a connection
+/// opened before a tightening keeps flowing under the old policy — a box moved
+/// from `open` to `isolated` stays connected to everything it had already
+/// reached, for as long as those connections live. Someone tightening a policy
+/// means it to take effect now, not at the next reconnect.
+///
+/// Flushing runs *after* the load, so the new rules are what the reopened
+/// connections are judged against. `conntrack` is best-effort: not every box
+/// has the tool, and a ruleset that loaded is worth more than one that failed
+/// because a helper was missing.
+fn load_command() -> String {
+    format!(
+        "nft -f {RULESET_PATH} && \
+         (conntrack -F 2>/dev/null || true)"
+    )
 }
 
 /// The shell that writes the agent's policy file.
@@ -362,6 +385,20 @@ mod tests {
     fn json_escaping_survives_a_multiline_ruleset() {
         let spec = agent_policy_json(&Policy::default(), "line one\nline \"two\"");
         assert!(spec.contains("line one\\nline \\\"two\\\""), "{spec}");
+    }
+
+    #[test]
+    fn tightening_a_policy_drops_the_connections_it_no_longer_allows() {
+        let cmd = load_command();
+        // Order matters: flush after the load, so what reconnects is judged
+        // against the new rules rather than the old ones.
+        let load = cmd.find("nft -f").expect("the ruleset must load");
+        let flush = cmd.find("conntrack -F").expect("conntrack must be flushed");
+        assert!(load < flush);
+        // A box without the tool still gets its ruleset.
+        assert!(cmd.contains("|| true"));
+        // And a *failed* load must not be papered over by the flush.
+        assert!(cmd.contains("&&"));
     }
 
     #[test]
