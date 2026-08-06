@@ -109,6 +109,10 @@ type StatusRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// bootstrap serves the shell script DHCP option 67 points at.
+//
+// The script lives in a Go raw string, so it must contain no backticks —
+// including in comments. Use double quotes when naming a command.
 func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
 	// A shell script, because that is what a blank node can run: no
 	// interpreter to install, no package to fetch first.
@@ -173,14 +177,22 @@ fi
 # neighbour Idle — so the old check reported healthy for a router with no
 # routing at all, and the fabric declared convergence on it. What matters is
 # that peers reach Established, and that takes a moment after a restart.
+# Positively: count sessions that are Established, and require at least one.
+#
+# Checking for the *absence* of Idle/Active/Connect passes on "No BGP neighbors
+# found", on OpenSent/OpenConfirm, and on any state nobody thought to list —
+# so a router with no sessions at all reported healthy. Absence of the states
+# you remembered is not presence of the state you need.
 _ok=0
 _try=0
 while [ "$_try" -lt 30 ]; do
   _summary="$(vtysh -c 'show bgp summary' 2>/dev/null || true)"
   if [ -n "$_summary" ]; then
-    # A neighbour still coming up shows Idle/Active/Connect in the state
-    # column; none of those present means every session is established.
-    if ! echo "$_summary" | grep -qE '(Idle|Active|Connect)'; then
+    # "show bgp summary" prints one row per neighbour; Established rows carry
+    # an uptime in the Up/Down column instead of a state word.
+    _est="$(echo "$_summary" | grep -cE 'Established|[0-9]{2}:[0-9]{2}:[0-9]{2}' || true)"
+    _pending="$(echo "$_summary" | grep -cE 'Idle|Active|Connect|OpenSent|OpenConfirm' || true)"
+    if [ "$_est" -gt 0 ] && [ "$_pending" -eq 0 ]; then
       _ok=1
       break
     fi
@@ -192,7 +204,7 @@ done
 if [ "$_ok" -eq 1 ]; then
   report healthy
 else
-  report failed "bgp did not establish within 60s"
+  report failed "no established bgp session within 60s"
 fi
 `, s.bootURL)
 }

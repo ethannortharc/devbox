@@ -107,6 +107,39 @@ pub fn is_public(path: &str) -> bool {
 /// browser considers same-origin with the attacker. Requiring a loopback
 /// `Host` closes that door: `evil.example` never appears here, whatever it
 /// resolves to.
+/// Does this request originate from the console's own origin?
+///
+/// `Origin` is set by the browser and cannot be forged by page script, so it
+/// is the honest answer to "who is asking". It is absent on ordinary top-level
+/// navigations, which is why absence is allowed — but *present and different*
+/// is a cross-origin request, and the console has none it needs to serve.
+///
+/// The comparison includes the port, which is exactly what `SameSite` does not
+/// do and why this check exists at all.
+fn origin_is_self<B>(req: &axum::http::Request<B>) -> bool {
+    let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return true; // absent: a top-level navigation, not a cross-site call
+    };
+
+    // `null` is what a sandboxed iframe or a `file://` page sends. Neither is
+    // the console.
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority))
+}
+
 pub fn is_loopback_host(host: &str) -> bool {
     // Strip the port, tolerating a bracketed IPv6 literal.
     let name = match host.strip_prefix('[') {
@@ -150,6 +183,18 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         .is_some_and(|t| tokens_match(t, &state.token));
 
     if cookie_ok {
+        // The cookie alone is not enough. `SameSite=Strict` compares *sites*,
+        // and a site ignores the port — so a hostile page served from another
+        // 127.0.0.1 port is same-site with the console, and the browser
+        // attaches this cookie to its requests. The Host check above does not
+        // help: the attacker aims at loopback on purpose.
+        //
+        // So a cookie-authenticated request must also prove where it came
+        // from. A same-origin request either sends a matching Origin or, for
+        // plain top-level navigations, none at all.
+        if !origin_is_self(&req) {
+            return unauthorized();
+        }
         return next.run(req).await;
     }
 
@@ -192,6 +237,48 @@ fn unauthorized() -> Response {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use axum::http::Request;
+
+    fn req(host: &str, origin: Option<&str>) -> Request<()> {
+        let mut b = Request::builder().header(header::HOST, host);
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn a_page_on_another_loopback_port_is_not_us() {
+        // The attack this exists for: `SameSite` compares sites, and a site
+        // ignores the port, so the browser sends the console's cookie to a
+        // request forged by a page on another 127.0.0.1 port.
+        assert!(!origin_is_self(&req(
+            "127.0.0.1:7777",
+            Some("http://127.0.0.1:9999")
+        )));
+        assert!(!origin_is_self(&req(
+            "localhost:7777",
+            Some("http://evil.example")
+        )));
+        // A sandboxed iframe or a file:// page.
+        assert!(!origin_is_self(&req("127.0.0.1:7777", Some("null"))));
+    }
+
+    #[test]
+    fn our_own_page_and_plain_navigations_are_accepted() {
+        assert!(origin_is_self(&req(
+            "127.0.0.1:7777",
+            Some("http://127.0.0.1:7777")
+        )));
+        // Ordinary top-level navigation: browsers send no Origin, and
+        // rejecting it would make the console unopenable.
+        assert!(origin_is_self(&req("127.0.0.1:7777", None)));
+    }
 }
 
 #[cfg(test)]

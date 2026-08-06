@@ -435,12 +435,16 @@ impl SandboxManager {
 
         // Start if stopped
         let status = runtime.status(name).await?;
-        if status == SandboxStatus::Stopped {
-            runtime.start(name).await?;
-            crate::policy::enforce::apply_saved(self, &state, name).await?;
-        } else if status == SandboxStatus::NotFound {
+        if status == SandboxStatus::NotFound {
             bail!("Sandbox '{}' not found in runtime", name);
         }
+        if status == SandboxStatus::Stopped {
+            runtime.start(name).await?;
+        }
+        // Whether or not this call started it. A box already running may have
+        // been started outside devbox, and running a command in it is exactly
+        // the moment its posture has to be true.
+        crate::policy::enforce::apply_saved(self, &state, name).await?;
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let result = runtime.exec_cmd(name, &cmd_refs, interactive).await?;

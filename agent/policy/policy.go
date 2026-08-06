@@ -76,6 +76,11 @@ func (NFT) AddElement(ctx context.Context, set, addr string) error {
 // this decides when the agent is willing to add it again.
 const AllowTTL = time.Hour
 
+// AllowRefreshAfter is how long the agent waits before renewing an address it
+// has already added. Comfortably inside AllowTTL, so an element is refreshed
+// while it is still live rather than after it has lapsed.
+const AllowRefreshAfter = AllowTTL * 3 / 4
+
 // now is injectable so the expiry logic is testable without sleeping.
 var now = time.Now
 
@@ -170,14 +175,20 @@ func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error)
 			continue
 		}
 
-		// "Seen recently", not "seen ever". The nftables entry carries a
-		// timeout, so an address that has aged out of the set must be
-		// re-addable — otherwise a domain in continuous use would be allowed
-		// for the first hour and silently blocked thereafter.
+		// Refreshed *before* the kernel entry expires, not after.
+		//
+		// The nftables element ages out at AllowTTL. Waiting the same AllowTTL
+		// before re-adding means a resolution that lands just inside the
+		// window is skipped, the element then expires, and the application —
+		// still holding a valid cached DNS answer, so it will not look up
+		// again — is blocked until its own cache turns over. Re-adding once
+		// the entry is into its final quarter keeps the element alive for as
+		// long as the domain is genuinely in use, and costs one nft call per
+		// address per refresh window.
 		e.mu.RLock()
 		at, dup := e.seen[answer]
 		e.mu.RUnlock()
-		if dup && now().Sub(at) < AllowTTL {
+		if dup && now().Sub(at) < AllowRefreshAfter {
 			continue
 		}
 

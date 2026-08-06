@@ -209,7 +209,14 @@ impl Diff {
     /// something is rarely alarming; a run that starts contacting a new domain
     /// is exactly what a behaviour diff is for.
     pub fn has_new_behavior(&self) -> bool {
-        !self.new_domains.is_empty() || !self.new_processes.is_empty() || self.new_violations > 0
+        !self.new_domains.is_empty()
+            || !self.new_processes.is_empty()
+            // A run that starts writing somewhere it never wrote before is
+            // exactly as reportable as one that contacts a new domain, and
+            // `is_empty` already counted it — leaving it out here meant the
+            // two disagreed about whether anything happened.
+            || !self.new_files.is_empty()
+            || self.new_violations > 0
     }
 }
 

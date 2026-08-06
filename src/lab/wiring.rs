@@ -241,13 +241,25 @@ pub fn down_commands(topology: &Topology) -> Vec<Vec<String>> {
     topology
         .nodes
         .iter()
-        .map(|node| {
-            privileged(vec![
-                "ip".into(),
-                "netns".into(),
-                "del".into(),
-                netns(&topology.lab.name, &node.name),
-            ])
+        .flat_map(|node| {
+            let ns = netns(&topology.lab.name, &node.name);
+            // Stop the routing daemons first. Deleting a namespace out from
+            // under a running zebra/bgpd leaves them alive with no interfaces,
+            // holding their pidfiles and sockets — so the next `lab up`
+            // starts a second set that cannot bind, and the lab comes up
+            // half-wired with no obvious cause.
+            vec![
+                privileged(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "ip netns pids {ns} 2>/dev/null | xargs -r kill 2>/dev/null; \
+                         rm -rf /run/devbox/lab/{}/{}; exit 0",
+                        topology.lab.name, node.name
+                    ),
+                ]),
+                privileged(vec!["ip".into(), "netns".into(), "del".into(), ns]),
+            ]
         })
         .collect()
 }
@@ -496,9 +508,23 @@ mod tests {
         let t = clos();
         let cmds: Vec<String> = down_commands(&t).iter().map(|c| render(c)).collect();
 
-        assert_eq!(cmds.len(), 3);
+        // Two per node: stop what is running in the namespace, then delete it.
+        assert_eq!(cmds.len(), 6);
         for node in ["leaf1", "leaf2", "spine1"] {
-            assert!(cmds.contains(&format!("sudo ip netns del devbox-clos-{node}")));
+            let del = format!("sudo ip netns del devbox-clos-{node}");
+            let kill = cmds
+                .iter()
+                .position(|c| c.contains(&format!("ip netns pids devbox-clos-{node}")))
+                .expect("daemons must be stopped");
+            let delete = cmds
+                .iter()
+                .position(|c| *c == del)
+                .expect("namespace deleted");
+            assert!(
+                kill < delete,
+                "deleting the namespace first strands zebra/bgpd holding their \
+                 pidfiles, so the next `lab up` cannot bind"
+            );
         }
     }
 

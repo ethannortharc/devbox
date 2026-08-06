@@ -105,13 +105,16 @@ where
 ///
 /// `None` for a file means it did not exist — restoring then removes it, so a
 /// box that never had a selection does not end up with an empty one.
-type Generated = Vec<(&'static str, Option<String>)>;
+pub type Generated = Vec<(&'static str, Option<String>)>;
 
 /// Files `write_set_modules` overwrites.
 const GENERATED_FILES: &[&str] = &["/etc/devbox/devbox.nix", "/etc/devbox/devbox-state.toml"];
 
 /// Read the generated files so a failed rebuild can put them back.
-async fn snapshot_generated(runtime: &dyn crate::runtime::Runtime, box_name: &str) -> Generated {
+pub async fn snapshot_generated(
+    runtime: &dyn crate::runtime::Runtime,
+    box_name: &str,
+) -> Generated {
     let mut out = Vec::new();
     for path in GENERATED_FILES {
         let content = runtime
@@ -127,7 +130,7 @@ async fn snapshot_generated(runtime: &dyn crate::runtime::Runtime, box_name: &st
 
 /// Put the generated files back. Best effort: a box that is now unreachable
 /// cannot be repaired from here, and saying so is the rebuild error's job.
-async fn restore_generated(
+pub async fn restore_generated(
     runtime: &dyn crate::runtime::Runtime,
     box_name: &str,
     backup: &Generated,

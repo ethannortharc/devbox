@@ -32,9 +32,10 @@ async fn open_console_for_cwd(manager: &SandboxManager, tools: Option<&[String]>
     // does not otherwise touch the start lifecycle — so a project with a
     // restrictive posture would sit unrestricted behind a console reporting
     // it, until the user happened to open a terminal.
-    if let Ok(state) = manager.get_sandbox(&name) {
-        devbox::policy::enforce::apply_saved(manager, &state, &name).await?;
-    }
+    // `ensure_box_for_cwd` creates a box if there is none, but an existing one
+    // may be stopped — and applying a posture to a stopped box fails on its
+    // first exec. Start it, exactly as every other console entry point does.
+    devbox::web::service::ensure_running(manager, &name).await?;
 
     let manager = Arc::new(SandboxManager {
         state_dir: manager.state_dir.clone(),

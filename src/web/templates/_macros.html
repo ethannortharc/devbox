@@ -120,6 +120,15 @@
     mutually exclusive, and each carries its own one-line explanation so the
     choice does not need a manual. -#}
 {% macro policy_editor(name, view) %}
+{%- if let Some(error) = view.error %}
+{#- Unknown, which is not the same as open: the box may still be firewalled.
+    No posture is preselected, because any choice here would be a guess. -#}
+<div class="notice error">
+  <strong>This box's posture could not be read.</strong>
+  {{ error }}
+  <br />Fix <code>devbox.toml</code>, or set a posture below to overwrite it.
+</div>
+{%- endif %}
 <form hx-put="/api/boxes/{{ name }}/policy"
       hx-target="#policy-result"
       hx-swap="innerHTML">

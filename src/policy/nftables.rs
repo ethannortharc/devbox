@@ -24,6 +24,10 @@ pub const TABLE: &str = "devbox";
 pub const SET_V4: &str = "allow_v4";
 pub const SET_V6: &str = "allow_v6";
 
+/// Sets holding the CIDRs the user stated, which never expire.
+pub const SET_STATIC_V4: &str = "static_v4";
+pub const SET_STATIC_V6: &str = "static_v6";
+
 /// How long a DNS-derived allow-set entry lives.
 ///
 /// Long enough that an active session is not interrupted by an expiry between
@@ -52,28 +56,42 @@ pub fn ruleset(policy: &Policy) -> String {
 
     // Sets exist in every posture so the agent can populate them without
     // caring which posture is in force.
-    let _ = writeln!(nft, "  set {SET_V4} {{");
+    // Four sets, not two.
+    //
+    // A set-level `timeout` is the *default* for elements that do not state
+    // one — including the initializer elements below. Putting stated CIDRs and
+    // DNS-derived addresses in one timed set therefore expired the CIDRs after
+    // an hour, and nothing repopulates them: a CIDR-only allowlist would start
+    // working and then quietly stop. Static and inferred entries have opposite
+    // lifetimes, so they get their own sets.
+    let _ = writeln!(nft, "  set {SET_STATIC_V4} {{");
     let _ = writeln!(nft, "    type ipv4_addr");
-    // `timeout` as well as `interval`: entries the agent derives from DNS must
-    // age out. Without it, an address an allowlisted domain used once stays
-    // reachable for the life of the box — and a CDN address that gets
-    // reassigned elsewhere silently widens a default-deny posture over time.
-    // CIDRs written into `elements` below carry no timeout and so never
-    // expire, which is right: they were stated, not inferred.
-    let _ = writeln!(nft, "    flags interval,timeout");
-    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
+    let _ = writeln!(nft, "    flags interval");
     if !cidrs_v4(policy).is_empty() {
         let _ = writeln!(nft, "    elements = {{ {} }}", cidrs_v4(policy).join(", "));
     }
     let _ = writeln!(nft, "  }}");
 
-    let _ = writeln!(nft, "  set {SET_V6} {{");
+    let _ = writeln!(nft, "  set {SET_STATIC_V6} {{");
     let _ = writeln!(nft, "    type ipv6_addr");
-    let _ = writeln!(nft, "    flags interval,timeout");
-    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
+    let _ = writeln!(nft, "    flags interval");
     if !cidrs_v6(policy).is_empty() {
         let _ = writeln!(nft, "    elements = {{ {} }}", cidrs_v6(policy).join(", "));
     }
+    let _ = writeln!(nft, "  }}");
+
+    // The agent's sets: every element ages out unless a fresh DNS answer
+    // refreshes it. No `interval`, because these hold single addresses.
+    let _ = writeln!(nft, "  set {SET_V4} {{");
+    let _ = writeln!(nft, "    type ipv4_addr");
+    let _ = writeln!(nft, "    flags timeout");
+    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
+    let _ = writeln!(nft, "  }}");
+
+    let _ = writeln!(nft, "  set {SET_V6} {{");
+    let _ = writeln!(nft, "    type ipv6_addr");
+    let _ = writeln!(nft, "    flags timeout");
+    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
     let _ = writeln!(nft, "  }}");
 
     let verdict = if policy.egress.enforces() {
@@ -125,6 +143,8 @@ pub fn ruleset(policy: &Policy) -> String {
             let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
         }
         Posture::Allowlist | Posture::MirrorOnly => {
+            let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
+            let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
             let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
             let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
             // Logging is what turns a dropped packet into a `policy` event:
@@ -272,18 +292,48 @@ mod tests {
     }
 
     #[test]
+    fn stated_cidrs_never_expire_but_resolved_addresses_do() {
+        // A set-level timeout is the default for its initializer elements, so
+        // one shared set made stated CIDRs expire after an hour with nothing
+        // to repopulate them: a CIDR-only allowlist that stopped working.
+        let nft = ruleset(&policy(Posture::Allowlist, &["10.0.0.0/8", "github.com"]));
+
+        let statics = nft.split("set static_v4 {").nth(1).unwrap();
+        let statics = statics.split('}').next().unwrap();
+        assert!(statics.contains("10.0.0.0/8"));
+        assert!(
+            !statics.contains("timeout"),
+            "a stated CIDR is a decision, not an observation: {statics}"
+        );
+
+        let resolved = nft.split("set allow_v4 {").nth(1).unwrap();
+        let resolved = resolved.split('}').next().unwrap();
+        assert!(resolved.contains("timeout"));
+        assert!(
+            !resolved.contains("elements"),
+            "the agent fills this set; nothing is seeded into it: {resolved}"
+        );
+
+        // Both are consulted, or half the allowlist silently does nothing.
+        let chain = nft.split("chain output {").nth(1).unwrap();
+        assert!(chain.contains("@static_v4 accept"));
+        assert!(chain.contains("@allow_v4 accept"));
+    }
+
+    #[test]
     fn cidrs_seed_the_right_set_by_family() {
         let nft = ruleset(&policy(
             Posture::Allowlist,
             &["10.0.0.0/8", "2001:db8::/32", "github.com"],
         ));
 
-        let v4 = nft.split("set allow_v4 {").nth(1).unwrap();
+        // Stated CIDRs go in the *static* sets, by family.
+        let v4 = nft.split("set static_v4 {").nth(1).unwrap();
         let v4 = v4.split('}').next().unwrap();
         assert!(v4.contains("10.0.0.0/8"));
         assert!(!v4.contains("2001:db8::/32"));
 
-        let v6 = nft.split("set allow_v6 {").nth(1).unwrap();
+        let v6 = nft.split("set static_v6 {").nth(1).unwrap();
         let v6 = v6.split('}').next().unwrap();
         assert!(v6.contains("2001:db8::/32"));
         assert!(!v6.contains("10.0.0.0/8"));

@@ -207,13 +207,18 @@ impl Store {
         let mut sql = String::from("SELECT raw FROM events WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+        // `ts_wall` is compared as text, which only works if both sides are in
+        // the same normal form. A user-supplied `--since 2026-08-06T14:00:00+02:00`
+        // sorts as the literal string it is, so it would select events by the
+        // digits of a different timezone's clock. Normalizing to UTC makes the
+        // comparison mean what the caller wrote.
         if let Some(since) = &q.since {
             sql.push_str(" AND ts_wall >= ?");
-            args.push(Box::new(since.clone()));
+            args.push(Box::new(normalize_ts(since)));
         }
         if let Some(until) = &q.until {
             sql.push_str(" AND ts_wall < ?");
-            args.push(Box::new(until.clone()));
+            args.push(Box::new(normalize_ts(until)));
         }
         if let Some(pid) = q.pid {
             sql.push_str(" AND pid = ?");
@@ -346,6 +351,22 @@ impl Store {
             )
             .context("failed to enforce retention")?;
         Ok(removed as u64)
+    }
+}
+
+/// Put an RFC 3339 timestamp into the same normal form the store writes.
+///
+/// Events are stored with a UTC `Z` suffix and compared as text, so a bound in
+/// another offset would be compared digit by digit against a different clock.
+/// Anything unparseable is passed through: a caller who writes a bare date
+/// gets a prefix comparison, which is what they almost certainly meant.
+fn normalize_ts(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+        Err(_) => ts.to_string(),
     }
 }
 

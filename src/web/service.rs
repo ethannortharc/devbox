@@ -332,6 +332,12 @@ pub struct PolicyView {
     pub alert_on_violation: bool,
     /// Number of package hosts `mirror-only` permits, for the explanation.
     pub mirror_hosts: usize,
+    /// Why the posture could not be read, when it could not.
+    ///
+    /// Set means "unknown", which is a third state beside the postures — and a
+    /// meaningfully different one from `open`, since the box may well still be
+    /// firewalled.
+    pub error: Option<String>,
 }
 
 /// Build the Policy tab view model.
@@ -349,6 +355,30 @@ pub fn policy_view(policy: &crate::policy::Policy) -> PolicyView {
         allow: policy.allow.join("\n"),
         alert_on_violation: policy.alert_on_violation,
         mirror_hosts: crate::policy::mirrors::all_hosts().len(),
+        error: None,
+    }
+}
+
+/// The Policy tab for a box whose config cannot be read.
+///
+/// No posture is marked selected: showing one would be a guess, and the guess
+/// that `load_or_default` used to make was `open` — the least restrictive
+/// answer, for a box that may be fully locked down.
+pub fn policy_view_error(message: &str) -> PolicyView {
+    PolicyView {
+        postures: crate::policy::Posture::ALL
+            .iter()
+            .map(|p| PostureOption {
+                name: p.as_str().to_string(),
+                description: p.describe(),
+                selected: false,
+                enforces: p.enforces(),
+            })
+            .collect(),
+        allow: String::new(),
+        alert_on_violation: false,
+        mirror_hosts: crate::policy::mirrors::all_hosts().len(),
+        error: Some(message.to_string()),
     }
 }
 

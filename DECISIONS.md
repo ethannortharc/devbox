@@ -948,10 +948,18 @@ The allow sets now carry `flags interval,timeout` with a one-hour default, and
 again. A domain in steady use never lapses, because every fresh resolution
 refreshes it.
 
-CIDRs written into `elements` carry no timeout and never expire. The
-distinction is the point: an address the user stated is a decision, an address
+The distinction matters: an address the user stated is a decision, an address
 the agent inferred from a DNS answer is an observation, and observations should
 not outlive their evidence.
+
+**Correction (round 8):** this ADR originally claimed CIDRs written into
+`elements` carry no timeout and never expire. That was false. A set-level
+`timeout` is the *default* for elements that do not state one, including
+initializer elements — so the stated CIDRs expired after an hour with nothing
+to repopulate them, and a CIDR-only allowlist would work and then silently
+stop. The two kinds now live in separate sets (`static_v4`/`static_v6` without
+a timeout, `allow_v4`/`allow_v6` with one), and both are consulted. Asserting
+the intended behaviour in prose is not the same as implementing it.
 
 ## ADR-0043: convergence counts what was expected, not what showed up
 

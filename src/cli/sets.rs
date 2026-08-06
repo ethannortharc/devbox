@@ -133,12 +133,27 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // Both the file writes and the rebuild run *inside* the guest, so a stopped
     // box fails on the first exec. Every other live-box action starts it first.
     crate::web::service::ensure_running(manager, &name).await?;
-    crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
-    crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await?;
 
-    let config = after.to_config(&crate::sandbox::config::DevboxConfig::load_for_edit(
-        &state.project_dir,
-    )?);
+    // Validate the project config *before* touching the box. It is read again
+    // below to record the result, and discovering it is malformed after the
+    // rebuild has switched the generation would leave the guest on the new
+    // selection and the host unable to write down what happened.
+    let base = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
+
+    // Snapshot for the same reason the console path does: a failed rebuild
+    // leaves the active generation alone but the generated *sources* already
+    // replaced, so a later manual rebuild would apply a selection this command
+    // reported as failed.
+    let backup = crate::web::build::snapshot_generated(runtime.as_ref(), &name).await;
+    crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
+    if let Err(e) = crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await {
+        if crate::web::build::restore_generated(runtime.as_ref(), &name, &backup).await {
+            eprintln!("devbox: generated files restored to the last good selection");
+        }
+        return Err(e);
+    }
+
+    let config = after.to_config(&base);
     let mut state = state;
     state.sets = config.active_sets();
     state.languages = config.active_languages();

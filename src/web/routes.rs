@@ -179,9 +179,14 @@ async fn box_detail(
             .cloned()
             .collect::<Vec<_>>()
             .join(" "),
-        policy: service::policy_view(
-            &service::load_policy(&state.manager, &name).unwrap_or_default(),
-        ),
+        // `unwrap_or_default()` here rendered a malformed devbox.toml as the
+        // default `open` posture, so the page showed "Open" for a box whose
+        // firewall was still restrictive — the opposite of the truth, and the
+        // one place the user goes to check.
+        policy: match service::load_policy(&state.manager, &name) {
+            Ok(policy) => service::policy_view(&policy),
+            Err(e) => service::policy_view_error(&e.to_string()),
+        },
         boxinfo,
         behavior: crate::obs::behavior::render_markdown(&act.summary),
         stream: act.stream,

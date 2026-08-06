@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Persistent state for a sandbox instance, stored in ~/.devbox/sandboxes/<name>/state.json.
@@ -76,6 +76,18 @@ impl SandboxState {
 
     /// Remove sandbox state.
     pub fn remove(state_dir: &Path, name: &str) -> Result<()> {
+        // Guarded here, at the `remove_dir_all`, rather than in each caller.
+        // A name of `..` joins to the `sandboxes` directory's parent and a
+        // name of `.` to `sandboxes` itself — so a crafted request that failed
+        // to load a box could still recursively delete every box, or the whole
+        // state directory. The route that reaches this is one of several; the
+        // dangerous operation is one.
+        if !is_safe_name(name) {
+            bail!(
+                "refusing to remove sandbox state for {name:?}: a box name must not \
+                 be a path component"
+            );
+        }
         let dir = state_dir.join("sandboxes").join(name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
@@ -85,9 +97,53 @@ impl SandboxState {
     }
 }
 
+/// Is this a name that can safely be joined onto a directory path?
+///
+/// Deliberately narrow: everything devbox itself generates satisfies it, and
+/// anything that does not is either a mistake or an attempt to escape the
+/// state directory. Separators and `.`/`..` are the whole point; the length
+/// cap and control-character check keep the rest of the filesystem happy.
+pub fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.chars().any(|c| c.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_component_is_not_a_box_name() {
+        // `..` joins to the parent of `sandboxes`, `.` to `sandboxes` itself —
+        // either one turns a failed lookup into a recursive delete of every
+        // box devbox knows about.
+        for bad in ["..", ".", "", "a/b", "a\\b", "../../etc", "a\0b"] {
+            assert!(!is_safe_name(bad), "{bad:?} must be rejected");
+        }
+        for good in ["myapp", "devbox-e2e", "a_b.c", "box1"] {
+            assert!(is_safe_name(good), "{good:?} is a normal box name");
+        }
+    }
+
+    #[test]
+    fn remove_refuses_to_escape_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandboxes = dir.path().join("sandboxes");
+        std::fs::create_dir_all(sandboxes.join("real")).unwrap();
+
+        assert!(SandboxState::remove(dir.path(), "..").is_err());
+        assert!(SandboxState::remove(dir.path(), ".").is_err());
+        assert!(
+            sandboxes.join("real").exists(),
+            "a rejected name must not have deleted anything"
+        );
+    }
 
     fn test_state() -> SandboxState {
         SandboxState {

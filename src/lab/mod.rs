@@ -208,7 +208,8 @@ mod tests {
         assert_eq!(lab.plan.links.len(), 2);
         assert_eq!(lab.router_configs().len(), 3);
         assert!(!lab.up_commands().unwrap().is_empty());
-        assert_eq!(lab.down_commands().len(), 3);
+        // Two per node: stop the daemons, then delete the namespace.
+        assert_eq!(lab.down_commands().len(), 6);
     }
 
     #[test]
