@@ -284,6 +284,35 @@ mod tests {
     }
 
     #[test]
+    fn isolated_ignores_the_allowlist_entirely() {
+        // docs/observability.md promises `isolated` blocks everything
+        // "including for hosts you explicitly allowlisted". That is a strong
+        // claim about a security control, and it held only because this match
+        // arm happens not to mention the allow sets — nothing stated it. An
+        // edit that let isolated fall through to the allowlist arm would break
+        // the promise silently, which is exactly how the round-8 CIDR-expiry
+        // bug got in.
+        let nft = ruleset(&policy(
+            Posture::Isolated,
+            &["github.com", "203.0.113.0/24"],
+        ));
+        let chain = nft.split("chain output {").nth(1).unwrap();
+
+        assert!(
+            !chain.contains("@allow_v4"),
+            "isolated consulted DNS answers"
+        );
+        assert!(
+            !chain.contains("@static_v4"),
+            "isolated consulted the CIDRs"
+        );
+        assert!(
+            !chain.contains("203.0.113.0/24"),
+            "the allowlisted CIDR leaked into the chain"
+        );
+    }
+
+    #[test]
     fn isolated_still_permits_lab_subnets() {
         let nft = ruleset(&policy(Posture::Isolated, &[]));
         assert!(nft.contains("10.0.0.0/8"));
