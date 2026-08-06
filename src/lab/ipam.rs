@@ -129,6 +129,21 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
     let mut plan = Plan::default();
     let mut next_link: u32 = 0;
 
+    // Prefixes an explicit link has taken. Automatic allocation walks past
+    // these instead of handing out a prefix that is already spoken for — the
+    // mixed explicit/automatic topology used to allocate a collision and then
+    // fail its own verification.
+    let mut claimed: Vec<(Ipv4Addr, u8)> = topology
+        .links
+        .iter()
+        .filter_map(|link| link.subnet.as_deref())
+        .filter_map(parse_v4_cidr)
+        .map(|(addr, len)| {
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            (Ipv4Addr::from(u32::from(addr) & mask), len)
+        })
+        .collect();
+
     for (index, link) in topology.links.iter().enumerate() {
         let (a, b) = link.parse_endpoints()?;
 
@@ -153,22 +168,37 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
                 (canonical, len)
             }
             None => {
-                // Each derived link takes the next /31 inside the base.
+                // Each derived link takes the next *free* /31 inside the base.
                 // Links live in the lower half of the base prefix.
+                //
+                // "Free" is the point: a mixed topology, where one link names
+                // its prefix and the rest are derived, used to hand the
+                // derived allocation the same /31 the explicit one had taken —
+                // and then fail its own verification.
                 let link_capacity = host_capacity(base_len).map(|c| c / 2);
-                let offset = next_link
-                    .checked_mul(2)
-                    .filter(|o| link_capacity.is_none_or(|cap| *o + 1 < cap))
-                    .with_context(|| {
-                        format!(
-                            "the lab base '{}' has no room for link {index}",
-                            topology.lab.base
-                        )
-                    })?;
-                next_link += 1;
-                (offset_addr(base, offset), P2P_PREFIX)
+                loop {
+                    let offset = next_link
+                        .checked_mul(2)
+                        .filter(|o| link_capacity.is_none_or(|cap| *o + 1 < cap))
+                        .with_context(|| {
+                            format!(
+                                "the lab base '{}' has no room for link {index}",
+                                topology.lab.base
+                            )
+                        })?;
+                    next_link += 1;
+                    let candidate = offset_addr(base, offset);
+                    if !claimed
+                        .iter()
+                        .any(|(net, len)| overlaps((candidate, P2P_PREFIX), (*net, *len)))
+                    {
+                        break (candidate, P2P_PREFIX);
+                    }
+                }
             }
         };
+
+        claimed.push((network, prefix_len));
 
         // With a /31 the two addresses are the network address and the one
         // after it; with anything wider, skip the network address.
@@ -240,6 +270,21 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
 ///
 /// Checked after every allocation rather than trusted, because an overlapping
 /// address plan produces a lab that comes up and then behaves inexplicably.
+/// Do two IPv4 prefixes cover any address in common?
+///
+/// Comparing canonical subnet *strings* only catches exact duplicates. A `/29`
+/// that contains a `/31` assigns different endpoint addresses, so it passed the
+/// string check and installed two overlapping routes into the same fabric.
+fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
+    let shorter = a.1.min(b.1);
+    let mask = if shorter == 0 {
+        0
+    } else {
+        u32::MAX << (32 - shorter)
+    };
+    (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
+}
+
 pub fn verify(plan: &Plan) -> Result<()> {
     let addrs = plan.all_addrs();
     for pair in addrs.windows(2) {
@@ -248,11 +293,21 @@ pub fn verify(plan: &Plan) -> Result<()> {
         }
     }
 
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen: Vec<(Ipv4Addr, u8)> = Vec::new();
     for link in &plan.links {
-        if !seen.insert(link.subnet.clone()) {
-            bail!("subnet {} is assigned to two links", link.subnet);
+        let (net, len) = parse_v4_cidr(&link.subnet)
+            .with_context(|| format!("link subnet '{}' is not a prefix", link.subnet))?;
+        if let Some((other, other_len)) = seen
+            .iter()
+            .find(|existing| overlaps((net, len), **existing))
+        {
+            bail!(
+                "subnet {} overlaps {other}/{other_len}: overlapping links install \
+                 ambiguous routes and the fabric comes up but never behaves",
+                link.subnet
+            );
         }
+        seen.push((net, len));
     }
 
     // Two routers sharing an AS do not form an eBGP session, so the fabric
@@ -578,6 +633,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_prefixes_are_skipped_by_automatic_allocation() {
+        // The first link names the prefix automatic allocation would otherwise
+        // hand to the second.
+        let topology = topology(
+            &[
+                ("leaf1", Role::FrrRouter),
+                ("leaf2", Role::FrrRouter),
+                ("spine1", Role::FrrRouter),
+            ],
+            &[
+                ("leaf1:eth1", "spine1:eth1", Some("10.0.0.0/31")),
+                ("leaf2:eth1", "spine1:eth2", None),
+            ],
+        );
+
+        let plan = allocate(&topology).expect("mixed explicit/automatic must allocate");
+        assert_ne!(
+            plan.links[0].subnet, plan.links[1].subnet,
+            "the derived link must not reuse the explicit link's prefix"
+        );
+        verify(&plan).expect("the plan it produces must pass its own verification");
+    }
+
+    #[test]
+    fn overlapping_prefixes_are_rejected_even_when_they_differ() {
+        // A /29 and a /31 inside it are different strings that cover the same
+        // addresses — the case a set-of-strings check misses entirely.
+        assert!(overlaps(
+            ("10.0.0.0".parse().unwrap(), 29),
+            ("10.0.0.0".parse().unwrap(), 31)
+        ));
+        assert!(!overlaps(
+            ("10.0.0.0".parse().unwrap(), 31),
+            ("10.0.0.2".parse().unwrap(), 31)
+        ));
+    }
+
+    #[test]
     fn verify_catches_a_hand_built_collision() {
         let mut plan = allocate(&clos()).unwrap();
         // Force the two links onto the same addresses.
@@ -586,7 +679,7 @@ mod tests {
 
         let mut plan = allocate(&clos()).unwrap();
         plan.links[1].subnet = plan.links[0].subnet.clone();
-        assert!(verify(&plan).unwrap_err().to_string().contains("two links"));
+        assert!(verify(&plan).unwrap_err().to_string().contains("overlaps"));
     }
 
     #[test]

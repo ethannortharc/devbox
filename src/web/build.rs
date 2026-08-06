@@ -101,6 +101,54 @@ where
     Ok(status.code().unwrap_or(-1))
 }
 
+/// The generated files a Sets apply replaces, and their previous contents.
+///
+/// `None` for a file means it did not exist — restoring then removes it, so a
+/// box that never had a selection does not end up with an empty one.
+type Generated = Vec<(&'static str, Option<String>)>;
+
+/// Files `write_set_modules` overwrites.
+const GENERATED_FILES: &[&str] = &["/etc/devbox/devbox.nix", "/etc/devbox/devbox-state.toml"];
+
+/// Read the generated files so a failed rebuild can put them back.
+async fn snapshot_generated(runtime: &dyn crate::runtime::Runtime, box_name: &str) -> Generated {
+    let mut out = Vec::new();
+    for path in GENERATED_FILES {
+        let content = runtime
+            .exec_cmd(box_name, &["cat", path], false)
+            .await
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout);
+        out.push((*path, content));
+    }
+    out
+}
+
+/// Put the generated files back. Best effort: a box that is now unreachable
+/// cannot be repaired from here, and saying so is the rebuild error's job.
+async fn restore_generated(
+    runtime: &dyn crate::runtime::Runtime,
+    box_name: &str,
+    backup: &Generated,
+) -> bool {
+    let mut restored = false;
+    for (path, content) in backup {
+        let script = match content {
+            Some(text) => {
+                format!("cat > {path} << 'DEVBOX_RESTORE_EOF'\n{text}\nDEVBOX_RESTORE_EOF")
+            }
+            None => format!("rm -f {path}"),
+        };
+        let ok = runtime
+            .exec_cmd(box_name, &["sudo", "bash", "-c", &script], false)
+            .await
+            .is_ok_and(|r| r.exit_code == 0);
+        restored |= ok;
+    }
+    restored
+}
+
 /// Apply a set selection to a box and rebuild it, streaming progress.
 ///
 /// The sequence mirrors `nix::apply_config` — write the set modules, write the
@@ -115,6 +163,19 @@ pub async fn apply_selection(
     selection.validate()?;
 
     let sandbox = manager.get_sandbox(box_name)?;
+
+    // The same guard the CLI applies. Without it the Sets tab pushes new files
+    // into the box and only then discovers there is no `nixos-rebuild` — a
+    // half-applied selection plus an opaque error, instead of the actionable
+    // message.
+    if sandbox.image != "nixos" {
+        bail!(
+            "box '{box_name}' uses the '{}' image, which has no nixos-rebuild. \
+             Use `devbox nix add <pkg>` / `devbox nix remove <pkg>` there instead.",
+            sandbox.image
+        );
+    }
+
     let runtime = manager.runtime_for_sandbox(&sandbox)?;
 
     let publish = |line: &str| {
@@ -131,6 +192,14 @@ pub async fn apply_selection(
     ));
 
     // 1. Push the set modules and the composed configuration.
+    //
+    // Snapshot what is there first. A failed rebuild leaves the active
+    // generation untouched, so the box really is unchanged — but the generated
+    // *sources* have already been replaced, and a later manual `nixos-rebuild`
+    // would then quietly apply the selection the console reported as rolled
+    // back. Worse, a source that failed to build keeps failing until someone
+    // notices why.
+    let backup = snapshot_generated(runtime.as_ref(), box_name).await;
     let base = DevboxConfig::load_or_default(&sandbox.project_dir);
     let config = selection.to_config(&base);
     crate::nix::write_set_modules(runtime.as_ref(), box_name, selection)
@@ -144,6 +213,10 @@ pub async fn apply_selection(
 
     let code = stream_command(&argv, |line| publish(line)).await?;
     if code != 0 {
+        let restored = restore_generated(runtime.as_ref(), box_name, &backup).await;
+        if restored {
+            publish("devbox: generated files restored to the last good selection");
+        }
         state.publish(ConsoleEvent::new(
             status_event(box_name),
             format!(

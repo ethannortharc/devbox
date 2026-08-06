@@ -703,3 +703,65 @@ debugging a fabric that was never asked to provision.
 
 **Revisit.** When `lab up` grows service orchestration, this function's list
 shrinks to nothing and can be deleted.
+
+## ADR-0029: `system` is the only locked set — the module must honour the rest
+
+**Status:** accepted (2026-08-06)
+
+Round 2 of review found that `nix/devbox-module.nix` unconditionally installed
+`shell`, `tools`, and `editor`, and never read `custom_packages`. The console
+would report the new selection, the rebuild would report success, and the box
+would install the old set. A toggle that is displayed but not obeyed is worse
+than no toggle, because it is believed.
+
+The module now gates all three on the state file, defaulting to `true` so boxes
+provisioned before this change are unaffected, and appends validated extra
+packages via `pkgs.${name} or null`. `LOCKED_SETS` stays `["system"]`, which is
+what §6.4 actually says.
+
+## ADR-0030: enforcement is a code path, not a printed suggestion
+
+**Status:** accepted (2026-08-06)
+
+`devbox policy set isolated` wrote the posture to `devbox.toml` and printed
+"apply it with `devbox reprovision`". No provisioning path ever generated or
+loaded a ruleset, so the box kept unrestricted egress while reporting
+`isolated`. Round 2 caught it; the honest description is that §8 was half
+implemented and the printed line covered the gap.
+
+`policy::enforce` now pushes the generated ruleset into the box and loads it,
+`policy set` applies it to a running box immediately, and `reprovision`
+re-applies the saved posture after rebuilding the network stack. `open` clears
+devbox's table rather than installing an empty one.
+
+## ADR-0031: pids and monotonic clocks are not identities
+
+**Status:** accepted (2026-08-06)
+
+Two ordering bugs with the same root: treating a value as unique when the
+kernel reuses it.
+
+`ts_mono_ns` restarts at each guest boot while the event store persists across
+boots, so sorting a summary by it put a fresh boot's events before everything
+older. Behavior summaries now sort by wall clock with the monotonic value as
+the tie-breaker — the tie-break is what keeps sub-millisecond ordering stable
+within one boot.
+
+Linux recycles pids, so `chains()` grouping on pid alone merged unrelated
+processes' commands, parents, peers, and files into one chain. Chains now break
+on a second `exec`, on `exit`, and after a 60s gap.
+
+The Go agent had the mirror image: `-no-ebpf` mode anchored `Boot` to agent
+startup, so every restart reset the clock. It now derives boot time from
+`/proc/uptime`.
+
+## ADR-0032: durability before acknowledgement in ZTP
+
+**Status:** accepted (2026-08-06)
+
+§10.3 kills `ztpd` mid-provision and asserts the fabric self-heals with
+`attempts > 1`. A 2s save ticker lost whatever landed in the last tick — which
+is exactly the window the chaos test aims at, so the test could pass while the
+guarantee it measures did not hold. `Registry.Persisting` now saves after every
+mutation, before the caller is told it happened. The cost is one small
+synchronous write per state transition; at fabric scale that is nothing.

@@ -130,6 +130,9 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     }
 
     let runtime = manager.runtime_for_sandbox(&state)?;
+    // Both the file writes and the rebuild run *inside* the guest, so a stopped
+    // box fails on the first exec. Every other live-box action starts it first.
+    crate::web::service::ensure_running(manager, &name).await?;
     crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
     crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await?;
 

@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -107,12 +108,38 @@ func chooseSource(cfg config) (capture.Source, error) {
 			"degraded proc-polling path, or -fixture to replay a recording")
 }
 
-// bootTime estimates the wall-clock time of monotonic zero.
+// bootTime is the wall-clock time of monotonic zero — the kernel's boot.
 //
-// Captured once at startup so a later NTP step cannot make events appear to
-// travel backwards relative to each other.
+// It must be the *kernel's* zero, not the agent's start: `ts_mono_ns` is
+// compared against eBPF timestamps, which come from the kernel clock, and the
+// collector orders events by it. Anchoring to agent startup made every restart
+// reset the clock to near zero, so freshly captured events sorted ahead of
+// older ones and behavior summaries came out backwards.
+//
+// Captured once, so a later NTP step cannot make events appear to travel
+// backwards relative to each other.
 func bootTime() time.Time {
-	return time.Now()
+	uptime, err := readUptime("/proc/uptime")
+	if err != nil {
+		// Not Linux, or no procfs. Ordering within this agent's lifetime is
+		// still correct; only cross-restart ordering degrades.
+		return time.Now()
+	}
+	return time.Now().Add(-uptime)
+}
+
+// readUptime parses the first field of /proc/uptime — seconds since boot.
+func readUptime(path string) (time.Duration, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	field, _, _ := strings.Cut(strings.TrimSpace(string(raw)), " ")
+	secs, err := strconv.ParseFloat(field, 64)
+	if err != nil {
+		return 0, fmt.Errorf("malformed /proc/uptime %q: %w", field, err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }
 
 // stream connects, handshakes, and pumps events until the context ends.

@@ -85,7 +85,7 @@ pub struct Flow {
 pub fn flows(events: &[Event]) -> Vec<Flow> {
     use std::collections::BTreeMap;
 
-    let mut by_key: BTreeMap<(u32, String, u16), Flow> = BTreeMap::new();
+    let mut by_key: BTreeMap<(u32, String, u16, String, u16), Flow> = BTreeMap::new();
 
     for event in events {
         let Some(net) = &event.net else { continue };
@@ -97,7 +97,18 @@ pub fn flows(events: &[Event]) -> Vec<Flow> {
             _ => continue,
         };
 
-        let key = (event.pid, net.daddr.clone(), net.dport);
+        // Keyed on the full 4-tuple plus protocol. Dropping the source port
+        // merged every sequential connection to the same destination into one
+        // row, so its timestamp, duration, and byte counts described several
+        // unrelated connections at once. TLS events are matched back to their
+        // connect by the same tuple, which is why enrichment still lands.
+        let key = (
+            event.pid,
+            net.proto.clone(),
+            net.sport,
+            net.daddr.clone(),
+            net.dport,
+        );
         let flow = by_key.entry(key).or_insert_with(|| Flow {
             peer: event.peer().unwrap_or_else(|| net.daddr.clone()),
             addr: net.daddr.clone(),

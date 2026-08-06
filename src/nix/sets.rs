@@ -210,7 +210,32 @@ pub fn generate_state_toml(
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
 ) -> String {
-    let mut toml = String::from("[sets]\n");
+    generate_state_toml_with(sets, languages, custom_packages, None, None)
+}
+
+/// Generate `devbox-state.toml`, preserving the guest identity and mount mode.
+///
+/// `devbox-module.nix` reads `[user].name` and `[sandbox].mount_mode` from this
+/// file. Regenerating it from sets alone silently resets the guest username to
+/// `dev` and the mount mode to `overlay` — which breaks a box whose guest user
+/// differs, or whose workspace is writable, on the very next rebuild.
+pub fn generate_state_toml_with(
+    sets: &HashMap<String, bool>,
+    languages: &HashMap<String, bool>,
+    custom_packages: &HashMap<String, String>,
+    username: Option<&str>,
+    mount_mode: Option<&str>,
+) -> String {
+    let mut toml = String::new();
+
+    if let Some(name) = username {
+        toml.push_str(&format!("[user]\nname = \"{name}\"\n\n"));
+    }
+    if let Some(mode) = mount_mode {
+        toml.push_str(&format!("[sandbox]\nmount_mode = \"{mode}\"\n\n"));
+    }
+
+    toml.push_str("[sets]\n");
     let set_names = [
         "system",
         "shell",
@@ -270,6 +295,29 @@ mod tests {
         let nix = generate_sets_default_nix();
         assert!(nix.contains("system = import ./system.nix"));
         assert!(nix.contains("lang_go = import ./lang-go.nix"));
+    }
+
+    #[test]
+    fn state_toml_preserves_guest_identity_and_mount_mode() {
+        // The NixOS module reads these; regenerating without them resets the
+        // guest username to `dev` and the mount mode to `overlay` on the very
+        // next rebuild.
+        let toml = generate_state_toml_with(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            Some("ethan.linux"),
+            Some("writable"),
+        );
+        assert!(toml.contains("[user]"));
+        assert!(toml.contains("name = \"ethan.linux\""));
+        assert!(toml.contains("[sandbox]"));
+        assert!(toml.contains("mount_mode = \"writable\""));
+
+        // Absent when unknown, rather than written as a wrong default.
+        let bare = generate_state_toml(&HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert!(!bare.contains("[user]"));
+        assert!(!bare.contains("[sandbox]"));
     }
 
     #[test]

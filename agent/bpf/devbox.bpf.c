@@ -20,6 +20,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
+// bpf_ntohs lives here, and the network probes below call it.
+#include <bpf/bpf_endian.h>
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -105,7 +107,11 @@ struct {
 
 static __always_inline int cgroup_is_traced(__u64 cgroup_id)
 {
-	__u32 zero = 0;
+	// __u64, matching the map's declared key width. A 4-byte stack slot made
+	// the verifier read 8 bytes from a partly uninitialized stack, which can
+	// reject the program outright — and a rejected program means no probes
+	// load at all.
+	__u64 zero = 0;
 	// An empty allowlist means no filtering. Checking a lookup against a
 	// sentinel key is cheaper than counting the map on every event.
 	__u8 *any = bpf_map_lookup_elem(&traced_cgroups, &zero);
@@ -154,9 +160,99 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	unsigned long len = arg_end - arg_start;
 	if (len > sizeof(rec->argv))
 		len = sizeof(rec->argv);
+	// The bound above is what the verifier needs; masking with
+	// `len & (sizeof - 1)` additionally turned a full-width argv into a
+	// zero-byte copy while argv_len still claimed 512, so the decoder read
+	// stale ring-buffer memory as a command line.
 	rec->argv_len = (__u32)len;
-	bpf_probe_read_user(&rec->argv, len & (sizeof(rec->argv) - 1),
-			    (void *)arg_start);
+	if (len > 0)
+		bpf_probe_read_user(&rec->argv, (__u32)len, (void *)arg_start);
+
+	bpf_ringbuf_submit(rec, 0);
+	return 0;
+}
+
+// Sockets seen at connect entry, keyed by thread, so the return probe knows
+// which socket the syscall was about.
+//
+// The socket's destination and local port are only filled in *by* the connect
+// call. Reading them at entry — which the first version did — yields zeroes or
+// the previous connection's values, so every outbound flow decoded wrong.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, __u64);
+} connecting SEC(".maps");
+
+static __always_inline int connect_enter(struct sock *sk)
+{
+	if (!cgroup_is_traced(bpf_get_current_cgroup_id()))
+		return 0;
+	__u64 tid = bpf_get_current_pid_tgid();
+	__u64 addr = (__u64)sk;
+	bpf_map_update_elem(&connecting, &tid, &addr, BPF_ANY);
+	return 0;
+}
+
+// Fill the address fields the decoder reads, for either family.
+//
+// Every byte is written, including the padding and the counters. The ring
+// buffer hands back *reused* memory, not zeroed memory, so a field left
+// untouched is whatever the previous record put there — which the Go decoder
+// then reports as real bytes transferred and a real duration.
+static __always_inline void fill_net(struct net_event *rec, struct sock *sk,
+				     __u8 direction)
+{
+	rec->proto = 6; /* IPPROTO_TCP */
+	rec->direction = direction;
+	rec->_pad = 0;
+	rec->bytes_tx = 0;
+	rec->bytes_rx = 0;
+	rec->dur_ns = 0;
+	__builtin_memset(rec->saddr, 0, sizeof(rec->saddr));
+	__builtin_memset(rec->daddr, 0, sizeof(rec->daddr));
+
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	rec->family = (__u8)family;
+
+	if (family == 10 /* AF_INET6 */) {
+		BPF_CORE_READ_INTO(&rec->saddr, sk,
+				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(&rec->daddr, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+	} else {
+		rec->family = 2; /* AF_INET */
+		__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		__builtin_memcpy(rec->saddr, &saddr, 4);
+		__builtin_memcpy(rec->daddr, &daddr, 4);
+	}
+
+	rec->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+	rec->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+}
+
+static __always_inline int connect_return(int ret)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	__u64 *addr = bpf_map_lookup_elem(&connecting, &tid);
+	if (!addr)
+		return 0;
+	struct sock *sk = (struct sock *)*addr;
+	bpf_map_delete_elem(&connecting, &tid);
+
+	// A failed connect never established anything; reporting it as a flow
+	// would put destinations in the timeline that were never reached.
+	if (ret != 0)
+		return 0;
+
+	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
+	if (!rec)
+		return 0;
+
+	FILL_COMMON(rec);
+	fill_net(rec, sk, 0 /* outbound */);
 
 	bpf_ringbuf_submit(rec, 0);
 	return 0;
@@ -165,55 +261,25 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(handle_tcp_v4_connect, struct sock *sk)
 {
-	__u64 cgroup_id = bpf_get_current_cgroup_id();
-	if (!cgroup_is_traced(cgroup_id))
-		return 0;
+	return connect_enter(sk);
+}
 
-	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
-	if (!rec)
-		return 0;
-
-	FILL_COMMON(rec);
-	rec->family = 2;  /* AF_INET */
-	rec->proto = 6;   /* IPPROTO_TCP */
-	rec->direction = 0;
-
-	__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-	__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-	__builtin_memcpy(rec->saddr, &saddr, 4);
-	__builtin_memcpy(rec->daddr, &daddr, 4);
-	rec->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
-	rec->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
-
-	bpf_ringbuf_submit(rec, 0);
-	return 0;
+SEC("kretprobe/tcp_v4_connect")
+int BPF_KRETPROBE(handle_tcp_v4_connect_ret, int ret)
+{
+	return connect_return(ret);
 }
 
 SEC("kprobe/tcp_v6_connect")
 int BPF_KPROBE(handle_tcp_v6_connect, struct sock *sk)
 {
-	__u64 cgroup_id = bpf_get_current_cgroup_id();
-	if (!cgroup_is_traced(cgroup_id))
-		return 0;
+	return connect_enter(sk);
+}
 
-	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
-	if (!rec)
-		return 0;
-
-	FILL_COMMON(rec);
-	rec->family = 10; /* AF_INET6 */
-	rec->proto = 6;
-	rec->direction = 0;
-
-	BPF_CORE_READ_INTO(&rec->saddr, sk,
-			   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
-	BPF_CORE_READ_INTO(&rec->daddr, sk,
-			   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-	rec->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
-	rec->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
-
-	bpf_ringbuf_submit(rec, 0);
-	return 0;
+SEC("kretprobe/tcp_v6_connect")
+int BPF_KRETPROBE(handle_tcp_v6_connect_ret, int ret)
+{
+	return connect_return(ret);
 }
 
 SEC("kretprobe/inet_csk_accept")
@@ -231,16 +297,10 @@ int BPF_KRETPROBE(handle_accept, struct sock *sk)
 		return 0;
 
 	FILL_COMMON(rec);
-	rec->family = 2;
-	rec->proto = 6;
-	rec->direction = 1; /* accept */
-
-	__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-	__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-	__builtin_memcpy(rec->saddr, &saddr, 4);
-	__builtin_memcpy(rec->daddr, &daddr, 4);
-	rec->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
-	rec->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+	// Family read from the socket, not assumed: `inet_csk_accept` serves
+	// IPv6 listeners too, and hardcoding AF_INET decoded every inbound IPv6
+	// connection as a bogus IPv4 flow.
+	fill_net(rec, sk, 1 /* inbound */);
 
 	bpf_ringbuf_submit(rec, 0);
 	return 0;

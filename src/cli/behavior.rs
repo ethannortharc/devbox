@@ -4,7 +4,7 @@
 //! domains it contacted, the processes it ran, the files it wrote, and — with
 //! `diff` — what it did this time that it did not do last time.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use crate::obs::behavior;
@@ -125,14 +125,20 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     };
 
-    // Without an explicit boundary the two windows would overlap — the
-    // "earlier" one running to the end of the store and the "later" one
-    // covering all of it — which produces a diff of a run against itself.
-    let boundary = Some(args.at.clone().unwrap_or_else(|| {
-        chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string()
-    }));
+    // The boundary has to fall *between* two runs. Defaulting it to "now" put
+    // every stored event in the earlier window and left the later one empty —
+    // a diff that always reports "everything disappeared". There is no honest
+    // default here, so ask for one.
+    let Some(boundary) = args.at.clone() else {
+        bail!(
+            "`devbox behavior diff` needs `--at <timestamp>`: the boundary between \
+             the run you are comparing against and the run you are judging.\n\n  \
+             Find one with `devbox behavior list` — the start of a run is a good \
+             boundary — then:\n    \
+             devbox behavior diff --at 2026-08-06T14:30:00Z"
+        );
+    };
+    let boundary = Some(boundary);
 
     let earlier = store.query(&Query {
         since: Some(args.from.clone()),

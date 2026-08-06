@@ -54,21 +54,74 @@ impl Chain {
     }
 }
 
+/// How far apart two events with the same pid must be to be different processes.
+///
+/// Linux recycles pids, so "same pid" is not "same process" over any real span
+/// of time. Splitting on an `exec` boundary catches the common case exactly;
+/// this gap catches the rest — a pid seen again after a long silence, with no
+/// exec in between, is a different process on any box that has been up a while.
+const PID_REUSE_GAP_NS: u64 = 60 * 1_000_000_000;
+
 /// Group events into per-process chains.
 ///
 /// Ordering inside a chain is by `ts_mono_ns` — the kernel's monotonic clock,
 /// which unlike the wall clock cannot step backwards under NTP. Chains
 /// themselves are ordered by when each process was first seen, so the output
 /// reads chronologically.
+///
+/// A pid is not an identity: the kernel reuses it, and on a long-running or
+/// rebooted box the same number covers several unrelated processes. Grouping
+/// on pid alone merged their commands, parents, peers, and files into one
+/// chain that never existed. So a chain is broken whenever the pid is clearly
+/// a different process — a new `exec` after the chain already had one, an
+/// `exit` (nothing that pid does afterwards belongs to it), or a long gap.
 pub fn chains(events: &[Event]) -> Vec<Chain> {
-    let mut by_pid: BTreeMap<u32, Vec<&Event>> = BTreeMap::new();
-    for event in events {
-        by_pid.entry(event.pid).or_default().push(event);
+    let mut ordered: Vec<&Event> = events.iter().collect();
+    ordered.sort_by_key(|e| (e.pid, e.ts_mono_ns));
+
+    // Keyed on (pid, incarnation) so the same pid can hold several chains.
+    let mut by_pid: BTreeMap<(u32, u32), Vec<&Event>> = BTreeMap::new();
+    let mut incarnation: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut last_ts: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut has_exec: BTreeMap<u32, bool> = BTreeMap::new();
+
+    for event in ordered {
+        let pid = event.pid;
+        let generation = incarnation.entry(pid).or_insert(0);
+
+        let gap = last_ts
+            .get(&pid)
+            .is_some_and(|prev| event.ts_mono_ns.saturating_sub(*prev) > PID_REUSE_GAP_NS);
+        let re_exec = event.kind == EventType::Exec && *has_exec.get(&pid).unwrap_or(&false);
+
+        if gap || re_exec {
+            *generation += 1;
+            has_exec.insert(pid, false);
+        }
+
+        if event.kind == EventType::Exec {
+            has_exec.insert(pid, true);
+        }
+        if event.kind == EventType::Exit {
+            // Whatever this pid does next is a different process.
+            *incarnation.entry(pid).or_insert(0) += 1;
+            has_exec.insert(pid, false);
+        }
+        last_ts.insert(pid, event.ts_mono_ns);
+
+        let key = (pid, *incarnation.get(&pid).unwrap_or(&0));
+        // Exit closes the chain it belongs to, not the one after it.
+        let key = if event.kind == EventType::Exit {
+            (pid, key.1.saturating_sub(1))
+        } else {
+            key
+        };
+        by_pid.entry(key).or_default().push(event);
     }
 
     let mut chains: Vec<Chain> = by_pid
         .into_iter()
-        .map(|(pid, mut group)| {
+        .map(|((pid, _generation), mut group)| {
             group.sort_by_key(|e| e.ts_mono_ns);
 
             let first = group[0];

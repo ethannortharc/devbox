@@ -68,7 +68,12 @@ class Interface(Model):
         if value is None:
             return None
         # Raises for anything that is not a valid interface address.
-        ipaddress.ip_interface(value)
+        interface = ipaddress.ip_interface(value)
+        # IPv4-only, for the same reason as AddressPlan: allocation reparses
+        # these as IPv4Interface, so an IPv6 value fails deep inside IPAM
+        # instead of here where the message can name the field.
+        if interface.version != 4:
+            raise ValueError(f"{value} is IPv6; interfaces address IPv4 fabrics only")
         return value
 
 
@@ -123,6 +128,8 @@ class Device(Model):
         if value is None:
             return None
         interface = ipaddress.ip_interface(value)
+        if interface.version != 4:
+            raise ValueError(f"loopback {value} is IPv6; the fabric is IPv4-only")
         if interface.network.prefixlen != 32:
             raise ValueError(f"loopback {value} should be a /32 host route")
         return value
@@ -150,7 +157,15 @@ class AddressPlan(Model):
     @field_validator("p2p_base", "loopback_base")
     @classmethod
     def _valid_prefix(cls, value: str) -> str:
-        ipaddress.ip_network(value, strict=True)
+        network = ipaddress.ip_network(value, strict=True)
+        # The allocator is IPv4-only — it reparses these as IPv4Network. An
+        # IPv6 prefix accepted here failed much later, inside allocation, with
+        # a message about the wrong thing. A declared validation boundary that
+        # lets invalid data past is not a boundary.
+        if network.version != 4:
+            raise ValueError(
+                f"{value} is IPv6; the source of truth addresses IPv4 fabrics only"
+            )
         return value
 
     @model_validator(mode="after")

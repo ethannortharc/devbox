@@ -70,7 +70,17 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
     let mut events = events.to_vec();
     let map = correlate::dns_map(&events);
     correlate::apply_dns_map(&mut events, &map);
-    events.sort_by_key(|e| e.ts_mono_ns);
+    // Wall clock first, monotonic second. `ts_mono_ns` restarts at each guest
+    // boot while the store persists across boots, so ordering by it alone put
+    // a fresh boot's events *before* everything older — the summary's start
+    // and end times came out reversed for any window spanning a reboot. The
+    // monotonic value still breaks ties, which is what gives sub-millisecond
+    // events within one boot a stable order.
+    events.sort_by(|a, b| {
+        a.ts_wall
+            .cmp(&b.ts_wall)
+            .then_with(|| a.ts_mono_ns.cmp(&b.ts_mono_ns))
+    });
 
     let mut summary = Summary {
         box_id: box_id.to_string(),

@@ -121,7 +121,7 @@ pub async fn get_box(manager: &Arc<SandboxManager>, name: &str) -> Result<BoxSum
 /// Idempotent on purpose: the console calls this both from an explicit Start
 /// button and from lazy-start when a Terminal tab is opened (§6.3), and those
 /// can race.
-pub async fn start_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
+pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
@@ -166,7 +166,7 @@ pub async fn destroy_box(manager: &Arc<SandboxManager>, name: &str, force: bool)
 }
 
 /// Start the box if needed, so a view that requires a live box can open it.
-pub async fn ensure_running(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
+pub async fn ensure_running(manager: &SandboxManager, name: &str) -> Result<()> {
     start_box(manager, name).await
 }
 

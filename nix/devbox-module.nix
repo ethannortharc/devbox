@@ -27,13 +27,15 @@ in {
   nixpkgs.config.allowUnfree = true;
 
   # ── Packages ───────────────────────────────────────
-  # Core sets (system + shell + tools + editor) are always installed.
-  # Optional sets and language sets are conditional on devbox-state.toml.
+  # Only `system` is locked (ADR-0012). Forcing shell/tools/editor on here
+  # would make unchecking them in the console a silent no-op — the box would
+  # report the new selection and install the old one. Their defaults stay
+  # `true`, so a box provisioned before this change is unaffected.
   environment.systemPackages =
     devboxSets.system
-    ++ devboxSets.shell
-    ++ devboxSets.tools
-    ++ devboxSets.editor
+    ++ (lib.optionals (sets.shell or true) devboxSets.shell)
+    ++ (lib.optionals (sets.tools or true) devboxSets.tools)
+    ++ (lib.optionals (sets.editor or true) devboxSets.editor)
     ++ (lib.optionals (sets.git or true) devboxSets.git)
     ++ (lib.optionals (sets.container or false) devboxSets.container)
     ++ (lib.optionals (sets.network or false) devboxSets.network)
@@ -44,7 +46,14 @@ in {
     ++ (lib.optionals (langs.python or false) devboxSets.lang_python)
     ++ (lib.optionals (langs.node or false) devboxSets.lang_node)
     ++ (lib.optionals (langs.java or false) devboxSets.lang_java)
-    ++ (lib.optionals (langs.ruby or false) devboxSets.lang_ruby);
+    ++ (lib.optionals (langs.ruby or false) devboxSets.lang_ruby)
+    # Ad-hoc packages from the Sets checklist's free-text field. Every name is
+    # validated host-side against a strict attribute-path pattern before it is
+    # written here, and an attribute that does not exist is skipped rather
+    # than failing the whole rebuild.
+    ++ (builtins.filter (p: p != null)
+         (map (name: pkgs.${name} or null)
+              (builtins.attrNames (devboxConfig.custom_packages or {}))));
 
   # ── Services ───────────────────────────────────────
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);

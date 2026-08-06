@@ -427,11 +427,12 @@ async fn console_drives_a_real_docker_box_end_to_end() {
     );
     let _ = socket.close(None).await;
 
-    // ── set checklist streams a real build over SSE ──
-    // busybox has no nixos-rebuild, so the rebuild is expected to fail — what
-    // this asserts is that the request is accepted, the work really starts
-    // against the box, and both its progress and its outcome reach the SSE
-    // channel. Subscribe first, exactly as the page does.
+    // ── set checklist reports the real outcome over SSE ──
+    // busybox has no nixos-rebuild. What this asserts is that the request is
+    // accepted, the work really starts against the box, and the outcome — here
+    // the actionable "this is not a NixOS box" guidance, rather than a doomed
+    // rebuild that half-applies files first — reaches the SSE channel.
+    // Subscribe first, exactly as the page does.
     let stream = http.start_stream(&format!("{base}/api/stream"));
     stream.wait_for(Duration::from_secs(5), |s| s.contains("event: tick"));
 
@@ -446,20 +447,16 @@ async fn console_drives_a_real_docker_box_end_to_end() {
         s.contains("build-status-e2e-console")
     });
     assert!(
-        seen.contains("event: build-e2e-console"),
-        "no build progress on the SSE stream; saw: {seen}"
-    );
-    assert!(
-        seen.contains("applying selection"),
-        "progress should name what is being applied; saw: {seen}"
-    );
-    assert!(
         seen.contains("build-status-e2e-console"),
         "no terminal build status; saw: {seen}"
     );
     assert!(
-        seen.contains("failed"),
-        "a busybox box cannot rebuild, so the status must say so; saw: {seen}"
+        seen.contains("nixos-rebuild"),
+        "a non-NixOS box must be told why, not handed an opaque failure; saw: {seen}"
+    );
+    assert!(
+        seen.contains("devbox nix"),
+        "the message must name the command that does work here; saw: {seen}"
     );
     drop(stream);
 

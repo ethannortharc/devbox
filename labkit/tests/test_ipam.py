@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 
 import pytest
+from pydantic import ValidationError
 
 from labkit.sot import Device, Fabric, Interface, OverlapError, allocate, verify
 from labkit.sot.models import AddressPlan
@@ -234,3 +235,44 @@ def test_verify_catches_duplicate_asns(fabric: Fabric) -> None:
 
     with pytest.raises(OverlapError, match="share AS"):
         verify(allocation)
+
+
+def test_explicit_prefix_is_not_handed_out_again() -> None:
+    """A link that names the pool's first subnet must not collide with an
+    automatic one.
+
+    Before explicit values were claimed up front, the automatic allocator
+    started at the top of the pool regardless, produced the same subnet the
+    explicit link already had, and then failed its own verification.
+    """
+    fabric = Fabric(
+        name="explicit-mix",
+        address_plan=AddressPlan(p2p_base="10.0.0.0/24", loopback_base="10.255.0.0/24"),
+        devices=[
+            Device(
+                name="a",
+                role="leaf",
+                serial="AAA",
+                interfaces=[
+                    Interface(name="eth1", peer="b:eth1", address="10.0.0.0/31"),
+                    Interface(name="eth2", peer="c:eth1"),
+                ],
+            ),
+            Device(name="b", role="spine", serial="BBB",
+                   interfaces=[Interface(name="eth1", peer="a:eth1", address="10.0.0.1/31")]),
+            Device(name="c", role="spine", serial="CCC",
+                   interfaces=[Interface(name="eth1", peer="a:eth2")]),
+        ],
+    )
+
+    allocation = allocate(fabric)
+    subnets = [link.subnet for link in allocation.links]
+    assert len(set(subnets)) == len(subnets), f"subnets collided: {subnets}"
+
+
+def test_ipv6_is_rejected_at_the_declared_boundary() -> None:
+    """IPv6 must fail validation, not survive to raise inside the allocator."""
+    with pytest.raises(ValidationError, match="IPv6"):
+        AddressPlan(p2p_base="2001:db8::/32")
+    with pytest.raises(ValidationError, match="IPv6"):
+        Interface(name="eth1", peer="b:eth1", address="2001:db8::1/64")

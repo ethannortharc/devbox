@@ -82,8 +82,19 @@ def allocate(fabric: Fabric) -> Allocation:
     a stable order (links sorted, devices in declaration order).
     """
     plan = fabric.address_plan
-    p2p_pool = _subnets(plan.p2p_base, P2P_PREFIX)
-    loopback_pool = _hosts(plan.loopback_base)
+    # Every subnet and loopback something already claims, gathered before a
+    # single automatic value is handed out. Without this an explicit link that
+    # named the pool's first candidate got that candidate handed to the next
+    # automatic link as well, and allocation failed its own verification.
+    claimed_networks = _explicit_networks(fabric)
+    claimed_loopbacks = {
+        ipaddress.IPv4Interface(device.loopback).ip
+        for device in fabric.devices
+        if device.loopback
+    }
+
+    p2p_pool = _subnets(plan.p2p_base, P2P_PREFIX, skip=claimed_networks)
+    loopback_pool = _hosts(plan.loopback_base, skip=claimed_loopbacks)
 
     allocation = Allocation()
 
@@ -189,17 +200,43 @@ def verify(allocation: Allocation) -> None:
         by_asn[asn] = device
 
 
-def _subnets(base: str, prefix: int) -> Iterator[IPv4Network]:
-    """Yield successive subnets of `prefix` length from `base`."""
+def _subnets(
+    base: str, prefix: int, skip: set[IPv4Network] | None = None
+) -> Iterator[IPv4Network]:
+    """Yield successive subnets of `prefix` length from `base`.
+
+    Subnets overlapping anything in `skip` are passed over: those are already
+    claimed by an explicit declaration, and handing one out again produces a
+    plan that fails its own verification.
+    """
     network = ipaddress.IPv4Network(base)
     if prefix < network.prefixlen:
         raise ValueError(f"cannot carve /{prefix} subnets out of {base}")
-    return network.subnets(new_prefix=prefix)
+    taken = skip or set()
+    for candidate in network.subnets(new_prefix=prefix):
+        if any(candidate.overlaps(claimed) for claimed in taken):
+            continue
+        yield candidate
 
 
-def _hosts(base: str) -> Iterator[ipaddress.IPv4Address]:
-    """Yield successive host addresses from `base`."""
-    return iter(ipaddress.IPv4Network(base).hosts())
+def _hosts(
+    base: str, skip: set[ipaddress.IPv4Address] | None = None
+) -> Iterator[ipaddress.IPv4Address]:
+    """Yield successive host addresses from `base`, minus the claimed ones."""
+    taken = skip or set()
+    for host in ipaddress.IPv4Network(base).hosts():
+        if host not in taken:
+            yield host
+
+
+def _explicit_networks(fabric: Fabric) -> set[IPv4Network]:
+    """Every subnet an interface address in the source of truth already claims."""
+    networks: set[IPv4Network] = set()
+    for device in fabric.devices:
+        for iface in device.interfaces:
+            if iface.address:
+                networks.add(ipaddress.IPv4Interface(iface.address).network)
+    return networks
 
 
 def _other_host(

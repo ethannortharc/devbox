@@ -69,9 +69,11 @@ func (p *Proc) Run(ctx context.Context, out chan<- *event.Event) error {
 	}
 
 	known := map[int]ProcInfo{}
-	// Connections already reported, keyed by their 5-tuple. Polling sees the
-	// same established socket on every sweep; without this the timeline would
-	// fill with duplicates of one connection.
+	// Connections already reported. Polling sees the same established socket on
+	// every sweep; without this the timeline would fill with duplicates of one
+	// connection. Entries are dropped once the socket is gone (see
+	// `pollConnections`), so a later connection reusing the same tuple is
+	// reported again and the map cannot grow without bound.
 	knownConns := map[string]struct{}{}
 
 	ticker := time.NewTicker(p.Interval)
@@ -124,6 +126,9 @@ func (p *Proc) pollConnections(
 	out chan<- *event.Event,
 	seen map[string]struct{},
 ) error {
+	// Every socket seen this sweep, so the ones that vanished can be expired.
+	live := make(map[string]struct{}, len(seen))
+
 	for _, family := range []struct {
 		file string
 		v6   bool
@@ -147,8 +152,8 @@ func (p *Proc) pollConnections(
 			if conn.State != TCPEstablished {
 				continue
 			}
-			key := fmt.Sprintf("%s:%d>%s:%d",
-				conn.LocalAddr, conn.LocalPort, conn.RemoteAddr, conn.RemotePort)
+			key := connKey(conn)
+			live[key] = struct{}{}
 			if _, dup := seen[key]; dup {
 				continue
 			}
@@ -159,7 +164,28 @@ func (p *Proc) pollConnections(
 			}
 		}
 	}
+
+	// Forget sockets that are no longer established. Keeping them forever
+	// suppressed every later connection that happened to reuse the tuple —
+	// which is normal, since the kernel recycles ephemeral ports — and grew
+	// the map for the agent's whole lifetime.
+	for key := range seen {
+		if _, alive := live[key]; !alive {
+			delete(seen, key)
+		}
+	}
 	return nil
+}
+
+// connKey identifies one socket for deduplication.
+//
+// The inode is included because it is the kernel's own identity for the socket:
+// two different connections that reuse the same 4-tuple get different inodes,
+// so a recycled ephemeral port is not mistaken for the connection that used it
+// before.
+func connKey(conn Conn) string {
+	return fmt.Sprintf("%s:%d>%s:%d/%d",
+		conn.LocalAddr, conn.LocalPort, conn.RemoteAddr, conn.RemotePort, conn.Inode)
 }
 
 // connectEvent builds a `connect` event from a /proc/net/tcp row.

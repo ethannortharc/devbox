@@ -83,21 +83,14 @@ func run(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	server := api.New(registry, catalog, cfg.bootURL())
-
 	// §10.3 kills this process mid-provision and expects the fabric to
-	// self-heal. Persisting on a short interval means a returning node is
-	// recognised as a retry rather than a first attempt, which is what makes
-	// the whole-ordeal SLO and the `attempts > 1` assertion mean anything.
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := registry.Save(statePath); err != nil {
-				fmt.Fprintf(os.Stderr, "devbox-ztpd: could not persist state: %v\n", err)
-			}
-		}
-	}()
+	// self-heal, so a mutation is durable *before* the node is told it
+	// happened. A 2s ticker lost whatever landed in the last tick — which is
+	// exactly the window the chaos test aims at.
+	registry.Persisting(statePath, func(err error) {
+		fmt.Fprintf(os.Stderr, "devbox-ztpd: could not persist state: %v\n", err)
+	})
+	server := api.New(registry, catalog, cfg.bootURL())
 	fmt.Fprintf(out, "%s listening on %s (%d device(s) known)\n",
 		buildinfo.String(buildinfo.Ztpd), cfg.listen, len(catalog.Serials))
 	fmt.Fprintf(out, "  DHCP option 67 should point at %s/bootstrap.sh\n", cfg.bootURL())

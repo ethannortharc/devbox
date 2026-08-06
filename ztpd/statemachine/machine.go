@@ -117,6 +117,39 @@ type Registry struct {
 	nodes map[string]*Node
 	// now is injectable so tests do not have to sleep.
 	now func() time.Time
+	// persist, when set, is called after every mutation, before the caller is
+	// told the mutation happened. See Persisting.
+	persist func()
+}
+
+// Persisting makes every mutation durable before it is acknowledged.
+//
+// §10.3 kills `ztpd` at an arbitrary moment. With a periodic save, a node that
+// identified and reported `pushing` in the second before the kill came back to
+// a registry that had never heard of it — `Attempts` reset to 1, and both the
+// retry assertion and the whole-ordeal SLO became fiction precisely in the
+// scenario they exist to measure.
+//
+// The cost is a small synchronous write per state transition. At fabric scale
+// (tens of nodes, a handful of transitions each) that is nothing, and it buys
+// the guarantee the chaos test is actually asserting.
+func (r *Registry) Persisting(path string, onError func(error)) *Registry {
+	r.persist = func() {
+		if err := r.Save(path); err != nil && onError != nil {
+			onError(err)
+		}
+	}
+	return r
+}
+
+// saved runs the persist hook, if one is installed.
+//
+// Called after the mutating lock is released — Save takes the read lock, and
+// taking it while the write lock is held would deadlock.
+func (r *Registry) saved() {
+	if r.persist != nil {
+		r.persist()
+	}
 }
 
 // Snapshot is the registry's persistent form.
@@ -209,6 +242,14 @@ func (r *Registry) Discover(serial string) (*Node, bool, error) {
 		return nil, false, fmt.Errorf("a node must present a serial")
 	}
 
+	// LIFO: the unlock runs first, then the save — Save takes the read lock,
+	// and taking it under the write lock would deadlock.
+	mutated := false
+	defer func() {
+		if mutated {
+			r.saved()
+		}
+	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -223,6 +264,7 @@ func (r *Registry) Discover(serial string) (*Node, bool, error) {
 			Attempts:  1,
 		}
 		r.nodes[serial] = node
+		mutated = true
 		return node, false, nil
 	}
 
@@ -233,11 +275,18 @@ func (r *Registry) Discover(serial string) (*Node, bool, error) {
 	node.UpdatedAt = now
 	node.Attempts++
 	node.Reason = ""
+	mutated = true
 	return node, true, nil
 }
 
 // Advance moves a node to a new state.
 func (r *Registry) Advance(serial string, to State, reason string) (*Node, error) {
+	mutated := false
+	defer func() {
+		if mutated {
+			r.saved()
+		}
+	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -253,6 +302,7 @@ func (r *Registry) Advance(serial string, to State, reason string) (*Node, error
 	node.State = to
 	node.UpdatedAt = r.now()
 	node.Reason = reason
+	mutated = true
 	return node, nil
 }
 
@@ -273,11 +323,18 @@ func (r *Registry) Identify(serial, name, role string) (*Node, error) {
 	if !ok {
 		return nil, fmt.Errorf("node %q has not been discovered", serial)
 	}
+	// Advance persists, which covers the name and role written just above.
 	return r.Advance(serial, Identified, "")
 }
 
 // RecordPush stores the hash of the config pushed to a node.
 func (r *Registry) RecordPush(serial, hash string) error {
+	mutated := false
+	defer func() {
+		if mutated {
+			r.saved()
+		}
+	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -287,6 +344,7 @@ func (r *Registry) RecordPush(serial, hash string) error {
 	}
 	node.ConfigHash = hash
 	node.UpdatedAt = r.now()
+	mutated = true
 	return nil
 }
 

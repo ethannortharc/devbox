@@ -62,6 +62,17 @@ pub async fn write_set_modules(
     sandbox_name: &str,
     selection: &compose::Selection,
 ) -> Result<()> {
+    // Read back what the box already declares, so regenerating the state file
+    // does not reset the guest username or the mount mode (both of which the
+    // NixOS module reads from it).
+    let existing = read_state_toml(runtime, sandbox_name).await;
+    let username = existing
+        .as_ref()
+        .and_then(|t| toml_string(t, "user", "name"));
+    let mount_mode = existing
+        .as_ref()
+        .and_then(|t| toml_string(t, "sandbox", "mount_mode"));
+
     // The set index and every set module are pushed regardless of selection:
     // they are small text files, and having them all present means toggling a
     // set on later needs no extra round trip. What the selection controls is
@@ -97,14 +108,39 @@ pub async fn write_set_modules(
     // the first would let `sets apply` report success while the installed
     // closure never changed — so both are written, from the same selection.
     let config = selection.to_config(&DevboxConfig::default());
-    let state_toml = generate_state_toml(&sets_map(&config), &languages_map(&config), &{
-        let mut extra = HashMap::new();
-        for pkg in &selection.packages {
-            extra.insert(pkg.clone(), "nixpkgs".to_string());
-        }
-        extra
-    });
+    let mut extra = HashMap::new();
+    for pkg in &selection.packages {
+        extra.insert(pkg.clone(), "nixpkgs".to_string());
+    }
+    let state_toml = crate::nix::sets::generate_state_toml_with(
+        &sets_map(&config),
+        &languages_map(&config),
+        &extra,
+        username.as_deref(),
+        mount_mode.as_deref(),
+    );
     write_state_toml(runtime, sandbox_name, &state_toml).await
+}
+
+/// Read the box's current `devbox-state.toml`, if it has one.
+async fn read_state_toml(runtime: &dyn Runtime, sandbox_name: &str) -> Option<toml::Value> {
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["cat", "/etc/devbox/devbox-state.toml"],
+            false,
+        )
+        .await
+        .ok()?;
+    if result.exit_code != 0 {
+        return None;
+    }
+    toml::from_str(&result.stdout).ok()
+}
+
+/// Pull `table.key` out of a parsed TOML document.
+fn toml_string(doc: &toml::Value, table: &str, key: &str) -> Option<String> {
+    doc.get(table)?.get(key)?.as_str().map(str::to_string)
 }
 
 /// Toggle additional sets/languages on a running sandbox, then rebuild.

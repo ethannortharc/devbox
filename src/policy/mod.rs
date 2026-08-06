@@ -8,6 +8,7 @@
 //! The split matters: a policy decision that can only be tested by making a
 //! real connection through a real firewall is a policy decision nobody tests.
 
+pub mod enforce;
 pub mod mirrors;
 pub mod nftables;
 

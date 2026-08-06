@@ -79,7 +79,7 @@ pub struct TestArgs {
 pub async fn run(args: PolicyArgs, manager: &SandboxManager) -> Result<()> {
     match args.command {
         PolicyCommand::Show(a) => show(a, manager),
-        PolicyCommand::Set(a) => set(a, manager),
+        PolicyCommand::Set(a) => set(a, manager).await,
         PolicyCommand::Allow(a) => allow(a, manager),
         PolicyCommand::Test(a) => test(a, manager),
         PolicyCommand::Rules(a) => rules(a, manager),
@@ -142,7 +142,7 @@ fn show(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
     Ok(())
 }
 
-fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
+async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
     let posture: Posture = args.posture.parse()?;
     let (name, mut config, path) = load(manager, args.name.as_deref())?;
 
@@ -160,7 +160,24 @@ fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
              Add entries with `devbox policy allow <domain>`."
         );
     }
-    println!("\n  Apply it with `devbox reprovision` (or the Policy tab in the console).");
+    // Apply it now. The old text told the user to run `devbox reprovision`,
+    // which never generated or loaded a ruleset — so an `isolated` box kept
+    // full egress while reporting otherwise.
+    match manager.get_sandbox(&name) {
+        Ok(state) => {
+            let runtime = manager.runtime_for_sandbox(&state)?;
+            match runtime.status(&name).await? {
+                crate::runtime::SandboxStatus::Running => {
+                    crate::policy::enforce::apply(runtime.as_ref(), &name, &config.policy).await?;
+                    println!("\n  Applied to the running box.");
+                }
+                _ => {
+                    println!("\n  Box is not running; the posture will be applied when it starts.")
+                }
+            }
+        }
+        Err(_) => println!("\n  No box yet; the posture will be applied when one is created."),
+    }
     Ok(())
 }
 

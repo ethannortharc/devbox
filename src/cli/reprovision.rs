@@ -73,6 +73,16 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     updated_state.sets = sets;
     updated_state.save(&manager.state_dir)?;
 
+    // Re-apply the saved egress posture. Provisioning rebuilds the box's
+    // network stack, so a policy applied before this point is gone; without
+    // this the box comes back open no matter what `devbox.toml` says.
+    let config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    if config.policy.egress != crate::policy::Posture::Open {
+        let runtime = manager.runtime_for_sandbox(&updated_state)?;
+        crate::policy::enforce::apply(runtime.as_ref(), &name, &config.policy).await?;
+        println!("Egress posture '{}' re-applied.", config.policy.egress);
+    }
+
     println!("Re-provisioning complete. Run `devbox shell --name {name}` to attach.");
     Ok(())
 }
