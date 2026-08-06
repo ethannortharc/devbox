@@ -26,16 +26,31 @@ pub fn netns(lab: &str, node: &str) -> String {
 
 /// Host-side name for one end of a veth pair.
 ///
-/// Linux caps interface names at 15 characters, so the visible half keeps the
-/// readable name and the host half is a hash-free truncation — collisions are
-/// prevented by the topology validator, which already rejects duplicate
-/// node names and reused interfaces.
-pub fn veth_name(node: &str, iface: &str) -> String {
-    let raw = format!("{node}-{iface}");
-    if raw.len() <= 15 {
-        raw
-    } else {
-        raw[..15].to_string()
+/// Linux caps interface names at 15 characters, and both ends of every pair
+/// exist in the root namespace at once — so a truncated `node-iface` would
+/// collide the moment two long node names shared a prefix, and `ip link add`
+/// would fail (or worse, silently attach to the wrong pair).
+///
+/// These names are transient: each end is renamed to its topology interface
+/// name as soon as it is inside its namespace. So they are indexed rather than
+/// descriptive, which makes them unique by construction.
+pub fn veth_name(link_index: usize, end: VethEnd) -> String {
+    format!("dvb{link_index}{}", end.suffix())
+}
+
+/// Which half of a veth pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VethEnd {
+    A,
+    B,
+}
+
+impl VethEnd {
+    fn suffix(self) -> &'static str {
+        match self {
+            VethEnd::A => "a",
+            VethEnd::B => "b",
+        }
     }
 }
 
@@ -72,9 +87,9 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
     }
 
     // 2 + 3. veth pairs, then moved into place
-    for link in &topology.links {
+    for (index, link) in topology.links.iter().enumerate() {
         let (a, b) = link.parse_endpoints()?;
-        let (va, vb) = (veth_name(&a.node, &a.iface), veth_name(&b.node, &b.iface));
+        let (va, vb) = (veth_name(index, VethEnd::A), veth_name(index, VethEnd::B));
 
         cmds.push(vec![
             "ip".into(),
@@ -278,10 +293,73 @@ mod tests {
     }
 
     #[test]
-    fn veth_names_fit_the_kernel_limit() {
-        assert_eq!(veth_name("leaf1", "eth1"), "leaf1-eth1");
-        let long = veth_name("a-very-long-node-name", "eth1");
-        assert!(long.len() <= 15, "Linux caps interface names at 15: {long}");
+    fn veth_names_are_short_and_unique_by_construction() {
+        // Both ends of every pair exist in the root namespace at once, so a
+        // truncated `node-iface` would collide as soon as two long node names
+        // shared a prefix.
+        assert_eq!(veth_name(0, VethEnd::A), "dvb0a");
+        assert_eq!(veth_name(0, VethEnd::B), "dvb0b");
+        assert_ne!(veth_name(0, VethEnd::A), veth_name(1, VethEnd::A));
+
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..500 {
+            for end in [VethEnd::A, VethEnd::B] {
+                let name = veth_name(index, end);
+                assert!(name.len() <= 15, "Linux caps names at 15: {name}");
+                assert!(seen.insert(name.clone()), "{name} collided");
+            }
+        }
+    }
+
+    #[test]
+    fn long_node_names_do_not_collide() {
+        let long = |n: usize| -> Topology {
+            Topology {
+                lab: LabSection {
+                    name: "long".into(),
+                    substrate: "auto".into(),
+                    base: "10.0.0.0/16".into(),
+                    asn_base: 65000,
+                },
+                nodes: (0..n)
+                    .map(|i| Node {
+                        name: format!("a-very-long-node-name-{i}"),
+                        role: Role::Host,
+                        sets: vec![],
+                        asn: None,
+                    })
+                    .collect(),
+                links: (0..n - 1)
+                    .map(|i| Link {
+                        endpoints: vec![
+                            format!("a-very-long-node-name-{i}:eth1"),
+                            format!("a-very-long-node-name-{}:eth2", i + 1),
+                        ],
+                        subnet: None,
+                    })
+                    .collect(),
+                services: Services::default(),
+            }
+        };
+
+        let t = long(4);
+        t.validate().expect("the topology is valid");
+        let plan = ipam::allocate(&t).unwrap();
+        let cmds = up_commands(&t, &plan).unwrap();
+
+        // Every `ip link add ... type veth peer name ...` must name two
+        // interfaces nothing else in the root namespace is using.
+        let mut created = std::collections::BTreeSet::new();
+        for cmd in &cmds {
+            if cmd.get(1).map(String::as_str) == Some("link")
+                && cmd.get(2).map(String::as_str) == Some("add")
+            {
+                assert!(created.insert(cmd[3].clone()), "{} collided", cmd[3]);
+                let peer = cmd.last().expect("peer name");
+                assert!(created.insert(peer.clone()), "{peer} collided");
+            }
+        }
+        assert_eq!(created.len(), 6, "three links, six ends");
     }
 
     #[test]
@@ -340,7 +418,7 @@ mod tests {
         let cmds = commands();
         assert!(
             cmds.iter()
-                .any(|c| c.contains("ip link set leaf1-eth1 name eth1")),
+                .any(|c| c.contains("ip link set dvb0a name eth1")),
             "the veth end takes the topology's interface name:\n{cmds:#?}"
         );
     }

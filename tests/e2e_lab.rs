@@ -15,7 +15,8 @@
 
 use std::process::Command;
 
-use devbox::lab::{Lab, wiring};
+use devbox::lab::fault::{Direction, Impairment};
+use devbox::lab::{Lab, fault, wiring};
 
 const CONTAINER: &str = "devbox-e2e-lab";
 const IMAGE: &str = "devbox-e2e-lab:latest";
@@ -229,6 +230,52 @@ fn a_real_lab_wires_up_and_directly_connected_nodes_reach_each_other() {
         code, 0,
         "leaf1 reached leaf2 without routing — the namespaces are not isolated"
     );
+
+    // ── partition, observe the loss, then heal ───────────
+    //
+    // Phase 7's acceptance criterion, on a real link.
+    let link = fault::find_link(&lab.topology, "leaf1-spine1").expect("the link resolves");
+    let (a, b) = (&lab.plan.links[0].a, &lab.plan.links[0].b);
+
+    for cmd in fault::partition(lab.name(), &link).expect("partition commands") {
+        let (code, output) = exec(&cmd);
+        assert_eq!(code, 0, "`{}` failed: {output}", wiring::render(&cmd));
+    }
+
+    let (code, output) = exec(&wiring::ping(lab.name(), &a.node, &b.addr));
+    assert_ne!(
+        code, 0,
+        "a partitioned link should not carry traffic:\n{output}"
+    );
+
+    for cmd in fault::heal(lab.name(), &link, Direction::Both) {
+        let (code, output) = exec(&cmd);
+        assert_eq!(code, 0, "`{}` failed: {output}", wiring::render(&cmd));
+    }
+
+    let (code, output) = exec(&wiring::ping(lab.name(), &a.node, &b.addr));
+    assert_eq!(code, 0, "healing should restore the link:\n{output}");
+
+    // ── a one-way impairment stays one-way ───────────────
+    //
+    // A symmetric fault would hide exactly the asymmetries worth debugging.
+    let one_way = Impairment {
+        loss_pct: Some(100.0),
+        ..Default::default()
+    };
+    for cmd in fault::apply(lab.name(), &link, Direction::A, &one_way).expect("apply") {
+        let (code, output) = exec(&cmd);
+        assert_eq!(code, 0, "{output}");
+    }
+
+    let (from_a, _) = exec(&wiring::ping(lab.name(), &a.node, &b.addr));
+    assert_ne!(from_a, 0, "the impaired end should not get packets out");
+
+    for cmd in fault::heal(lab.name(), &link, Direction::Both) {
+        let _ = exec(&cmd);
+    }
+    let (code, _) = exec(&wiring::ping(lab.name(), &a.node, &b.addr));
+    assert_eq!(code, 0, "healing is idempotent and complete");
 
     // ── teardown removes everything ──────────────────────
     for cmd in lab.down_commands() {

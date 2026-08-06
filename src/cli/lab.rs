@@ -8,7 +8,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
-use crate::lab::{Lab, scenarios, wiring};
+use crate::lab::fault::{Direction, Impairment};
+use crate::lab::{Lab, fault, scenarios, wiring};
 use crate::runtime::{Runtime, SandboxStatus};
 use crate::sandbox::SandboxManager;
 
@@ -34,6 +35,78 @@ pub enum LabCommand {
 
     /// Print a router's generated FRR configuration
     Config(ConfigArgs),
+
+    /// Impair a link: delay, jitter, loss, rate, or a full partition
+    Fault(FaultArgs),
+
+    /// Clear every impairment on a link
+    Heal(HealArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct FaultArgs {
+    /// Scenario name, or a path to a lab.toml
+    pub target: String,
+
+    /// Link, as `nodeA-nodeB` or `node:iface`
+    pub link: String,
+
+    /// One-way delay, in milliseconds
+    #[arg(long)]
+    pub delay: Option<u32>,
+
+    /// Delay variation, in milliseconds (needs --delay)
+    #[arg(long)]
+    pub jitter: Option<u32>,
+
+    /// Packet loss, as a percentage
+    #[arg(long)]
+    pub loss: Option<f64>,
+
+    /// Packet reordering, as a percentage (needs --delay)
+    #[arg(long)]
+    pub reorder: Option<f64>,
+
+    /// Packet duplication, as a percentage
+    #[arg(long)]
+    pub duplicate: Option<f64>,
+
+    /// Egress rate limit, in kbit/s
+    #[arg(long)]
+    pub rate: Option<u32>,
+
+    /// Black-hole the link entirely (100% loss, both directions)
+    #[arg(long)]
+    pub partition: bool,
+
+    /// Which end to impair: a, b, or both
+    #[arg(long, default_value = "both")]
+    pub direction: String,
+
+    /// Box to use as the Linux substrate
+    #[arg(long)]
+    pub substrate: Option<String>,
+
+    /// Print the commands instead of running them
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HealArgs {
+    /// Scenario name, or a path to a lab.toml
+    pub target: String,
+
+    /// Link, as `nodeA-nodeB` or `node:iface`
+    pub link: String,
+
+    /// Box to use as the Linux substrate
+    #[arg(long)]
+    pub substrate: Option<String>,
+
+    /// Print the commands instead of running them
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +163,8 @@ pub async fn run(args: LabArgs, manager: &SandboxManager) -> Result<()> {
         LabCommand::Down(a) => down(a, manager).await,
         LabCommand::Status(a) => status(a),
         LabCommand::Config(a) => config(a),
+        LabCommand::Fault(a) => inject(a, manager).await,
+        LabCommand::Heal(a) => heal(a, manager).await,
     }
 }
 
@@ -250,6 +325,106 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
         lab.name(),
         commands.len()
     );
+    Ok(())
+}
+
+/// Parse the `--direction` flag.
+fn parse_direction(text: &str) -> Result<Direction> {
+    match text {
+        "a" => Ok(Direction::A),
+        "b" => Ok(Direction::B),
+        "both" => Ok(Direction::Both),
+        other => bail!("--direction must be a, b, or both, got '{other}'"),
+    }
+}
+
+async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
+    let lab = Lab::resolve(&args.target)?;
+    let link = fault::find_link(&lab.topology, &args.link)?;
+    let direction = parse_direction(&args.direction)?;
+
+    let (commands, description) = if args.partition {
+        (
+            fault::partition(lab.name(), &link)?,
+            "partitioned (100% loss, both directions)".to_string(),
+        )
+    } else {
+        let impairment = Impairment {
+            delay_ms: args.delay,
+            jitter_ms: args.jitter,
+            loss_pct: args.loss,
+            duplicate_pct: args.duplicate,
+            reorder_pct: args.reorder,
+            rate_kbit: args.rate,
+        };
+        let description = impairment.describe();
+        (
+            fault::apply(lab.name(), &link, direction, &impairment)?,
+            description,
+        )
+    };
+
+    println!("{} ↔ {}: {description}", link.0, link.1);
+
+    if args.dry_run {
+        print_commands(&commands);
+        return Ok(());
+    }
+
+    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+    run_all(runtime.as_ref(), &substrate, &commands).await?;
+    println!(
+        "Applied. Clear it with `devbox lab heal {} {}`.",
+        args.target, args.link
+    );
+    Ok(())
+}
+
+async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
+    let lab = Lab::resolve(&args.target)?;
+    let link = fault::find_link(&lab.topology, &args.link)?;
+    let commands = fault::heal(lab.name(), &link, Direction::Both);
+
+    if args.dry_run {
+        print_commands(&commands);
+        return Ok(());
+    }
+
+    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+
+    // Healing a link that was never impaired is a no-op, not an error.
+    let mut cleared = 0;
+    for cmd in &commands {
+        let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        if let Ok(result) = runtime.exec_cmd(&substrate, &argv, false).await
+            && result.exit_code == 0
+        {
+            cleared += 1;
+        }
+    }
+    println!(
+        "{} ↔ {}: healed ({cleared} end(s) cleared).",
+        link.0, link.1
+    );
+    Ok(())
+}
+
+/// Run a command sequence inside the substrate, stopping at the first failure.
+async fn run_all(runtime: &dyn Runtime, substrate: &str, commands: &[Vec<String>]) -> Result<()> {
+    for cmd in commands {
+        let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let result = runtime
+            .exec_cmd(substrate, &argv, false)
+            .await
+            .with_context(|| format!("failed to run: {}", wiring::render(cmd)))?;
+        if result.exit_code != 0 {
+            bail!(
+                "`{}` failed:\n{}",
+                wiring::render(cmd),
+                result.stderr.trim()
+            );
+        }
+    }
     Ok(())
 }
 

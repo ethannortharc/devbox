@@ -228,8 +228,19 @@ impl Topology {
     /// Strict on purpose: a topology that half-comes-up wastes an hour of
     /// debugging a network that was never going to work.
     pub fn validate(&self) -> Result<()> {
+        // The lab name becomes a network-namespace name and a path component
+        // in the substrate, so it is held to the same rule as a node name.
+        // Without this, a hostile `lab.toml` could put a quote or a shell
+        // metacharacter somewhere it would be interpreted.
         if self.lab.name.trim().is_empty() {
             bail!("the lab needs a name");
+        }
+        if !is_valid_name(&self.lab.name) {
+            bail!(
+                "lab name '{}' must be lowercase letters, digits, or '-'; it \
+                 becomes a namespace name and a path component",
+                self.lab.name
+            );
         }
         if self.nodes.is_empty() {
             bail!("a lab with no nodes has nothing to bring up");
@@ -543,6 +554,19 @@ ntp = true
     fn a_lab_with_no_nodes_is_rejected() {
         let t = topology(&[], &[]);
         assert!(t.validate().unwrap_err().to_string().contains("no nodes"));
+    }
+
+    #[test]
+    fn the_lab_name_is_held_to_the_same_rule_as_a_node_name() {
+        // It becomes a namespace name and a path component in the substrate.
+        for bad in ["Lab One", "lab'; rm -rf /; '", "lab/../etc", "", "-lab"] {
+            let mut t = topology(
+                &[("a", Role::Host), ("b", Role::Host)],
+                &[("a:eth1", "b:eth1")],
+            );
+            t.lab.name = bad.into();
+            assert!(t.validate().is_err(), "lab name {bad:?} should be rejected");
+        }
     }
 
     #[test]

@@ -562,3 +562,58 @@ grouped by ecosystem, and why telemetry endpoints are excluded).
 
 **Revisit.** If the list grows past a few hundred entries, or gains structure
 beyond "host string", generate the Go side from the Rust one.
+
+---
+
+## ADR-0023 — The lab name is validated like a node name
+
+**Date:** 2026-08-06
+
+**Context.** A commit-time security review flagged `src/cli/lab.rs`'s
+`push_file`, which builds a shell script to write a generated FRR config into
+the substrate. The path contains the lab name, and the lab name came straight
+from `lab.toml` with only an is-it-empty check.
+
+**Decision.** `Topology::validate` now holds the lab name to the same rule as a
+node name: lowercase letters, digits, and `-`. A `lab.toml` naming itself
+`x'; rm -rf /; '` is rejected before anything runs.
+
+**Rationale.** The lab name is not merely a label — it becomes a network
+namespace name and a path component inside the substrate. Both of those want
+the same character set a node name wants, and the validator was already
+enforcing it one level down. This is the fix at the boundary rather than
+escaping at each use site, which is the kind of thing that gets forgotten at
+the fourth use site.
+
+**Note on the rest of that path.** The wiring and fault commands are argv
+vectors executed directly — never through a shell — and a test asserts no shell
+metacharacter appears in any of them. `push_file` is the one place a shell is
+involved, because writing a file into a box through `exec` needs one; the
+content is base64-encoded for exactly that reason, and now the path is
+constrained too.
+
+**Revisit.** If `push_file` grows more callers, give it a non-shell
+implementation (a runtime `copy_into` method) and delete the question.
+
+---
+
+## ADR-0024 — veth names are indexed, not derived from node names
+
+**Date:** 2026-08-06
+
+**Context.** The first wiring implementation named each veth end
+`{node}-{iface}`, truncated to Linux's 15-character interface limit.
+
+**Decision.** Name them `dvb{link_index}{a|b}`.
+
+**Rationale.** Both ends of every pair exist in the **root** namespace at the
+moment they are created, so their names must be unique there. Truncation makes
+that false: two node names sharing a 15-character prefix produce the same veth
+name, and `ip link add` either fails or — worse — the second pair attaches
+where the first one was. The names are transient anyway; each end is renamed to
+its topology interface name the instant it is inside its namespace, so nothing
+is lost by making them opaque and everything is gained by making them unique by
+construction. A test walks 500 links and asserts no collision.
+
+**Revisit.** Not expected to; if a lab ever exceeds ~10⁹ links the format
+string is the least of the problems.

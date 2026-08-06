@@ -15,9 +15,11 @@
 //!                                     run inside the substrate
 //! ```
 
+pub mod fault;
 pub mod frr;
 pub mod ipam;
 pub mod scenarios;
+pub mod straggler;
 pub mod topology;
 pub mod wiring;
 
