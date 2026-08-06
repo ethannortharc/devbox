@@ -51,11 +51,11 @@ devbox sets apply --set system --set git --set lang-rust --dry-run
 # what the box did
 devbox watch --type dns --tree
 devbox behavior summary
-devbox behavior diff --from 2026-08-06T22:00:00Z
+devbox behavior diff --from 2026-08-06T20:00:00Z --at 2026-08-06T22:00:00Z
 
 # what the box may reach
 devbox policy show
-devbox policy set mirror-only
+devbox policy set mirror-only     # applied to the running box immediately
 devbox policy test pypi.org        # exits non-zero if denied
 
 # the lab

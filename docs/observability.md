@@ -52,8 +52,14 @@ The behavioural analogue of `devbox diff`:
 
 ```bash
 devbox behavior summary
-devbox behavior diff --from 2026-08-06T22:00:00Z
+devbox behavior diff --from 2026-08-06T20:00:00Z --at 2026-08-06T22:00:00Z
 ```
+
+`--at` is the boundary between the two runs being compared: everything from
+`--from` up to it is the baseline, everything after it is what is being judged.
+It is required, because there is no honest default — a boundary of "now" leaves
+the second window empty and reports that all behaviour disappeared. Take one
+from `devbox behavior list`; the start of a run is a good boundary.
 
 A summary is a comparable value, not a formatted string: domains contacted,
 processes run, files written, traffic, policy posture, violations, API calls.
@@ -90,6 +96,12 @@ devbox policy allow api.anthropic.com
 devbox policy test telemetry.example.com   # non-zero exit when denied
 devbox policy rules                        # the nftables ruleset it generates
 ```
+
+`policy set` and `policy allow` apply the ruleset to a running box straight
+away; on a stopped box the posture is saved and applied at start. `reprovision`
+re-applies it too, since rebuilding the box rebuilds its network stack. Nothing
+enforces `open` — it clears devbox's table rather than leaving an empty one
+behind that looks like it is doing something.
 
 Enforcement is nftables inside the box, with the allow set kept in sync from
 the DNS the agent is already capturing — so the firewall learns the address
