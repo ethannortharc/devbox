@@ -327,6 +327,10 @@ mod tests {
 /// service manager inside one to hand this to, which is exactly the assumption
 /// that left `lab up` reporting success with BGP never started.
 pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
+    // The namespace wiring created, not the bare node name. `ip netns exec
+    // leaf1` fails with "namespace not found" and aborts before zebra starts —
+    // which is every routed lab.
+    let ns = super::wiring::netns(lab, node);
     let dir = format!("/etc/devbox/lab/{lab}/{node}");
     let run = format!("/run/devbox/lab/{lab}/{node}");
 
@@ -336,7 +340,7 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             "ip".to_string(),
             "netns".to_string(),
             "exec".to_string(),
-            node.to_string(),
+            ns.clone(),
             name.to_string(),
             "-d".to_string(),
             "-f".to_string(),
@@ -348,6 +352,11 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             // whichever started first.
             "-z".to_string(),
             format!("{run}/zserv.api"),
+            // Its own VTY pathspace: `vtysh` finds a daemon by its socket
+            // directory, so without this every router's vtysh would reach
+            // whichever zebra registered first.
+            "-N".to_string(),
+            ns.clone(),
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
         argv
@@ -381,9 +390,16 @@ mod start_tests {
             "bgpd has nowhere to install routes without zebra"
         );
 
+        // The namespace name wiring generates, not the bare node name.
+        let ns = crate::lab::wiring::netns("clos", "leaf1");
         assert!(
             flat.iter()
-                .all(|c| !c.contains("zebra") || c.contains("ip netns exec leaf1"))
+                .all(|c| !c.contains("zebra") || c.contains(&format!("ip netns exec {ns}"))),
+            "FRR must run in the namespace that exists: {flat:?}"
+        );
+        assert!(
+            flat.iter().any(|c| c.contains(&format!("-N {ns}"))),
+            "each router needs its own VTY pathspace: {flat:?}"
         );
         // Per-namespace sockets and pidfiles, or every router talks to the
         // first zebra that started.

@@ -899,3 +899,36 @@ The guard now reads the agent's command line and requires a DNS-capturing
 source. The general form: when a guard exists to establish that something *can
 be done*, checking that the thing which would do it is *present* is a different
 question, and the gap between them is where this class of bug lives.
+
+## ADR-0040: privilege is decided in the guest
+
+**Status:** accepted (2026-08-06)
+
+Every command `policy::enforce` runs was prefixed with `sudo`. That is wrong in
+both directions: a container exec is already root and may have no `sudo`
+installed at all, while a VM's user needs it. Once clearing ran on *every*
+start of an `open` box — which round 6 required, so a box that was `isolated`
+and is now `open` does not keep its old rules — the container case became a
+box that refused to start.
+
+Scripts are now wrapped in `if [ "$(id -u)" -eq 0 ]; then sh -c …; else sudo sh
+-c …; fi`. The guest is the only place that knows. `sh` rather than `bash` for
+the same reason: nothing here uses a bashism, and not every image ships bash.
+
+Clearing also exits 0 when `nft` is absent, because a box with no firewall
+provably has no devbox rules to remove — refusing to start it would be
+punishing the user for a cleanup that had nothing to clean.
+
+## ADR-0041: report saving and enforcing separately
+
+**Status:** accepted (2026-08-06)
+
+The Policy tab saved the file, said "run a reprovision to apply it", and
+reprovision never applied it either. Making it apply raised the question of
+what to do when the save succeeds and the apply does not — and the first
+answer, a 500, was wrong: the policy really is saved, and a user told only
+"error" does not know whether to re-enter it.
+
+The tab now reports both outcomes in one message, naming the posture and the
+entry count in either case, and styles the failure as an error. The CLI does
+the same thing with its exit status (ADR-0037). Two facts, two reports.

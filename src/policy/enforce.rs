@@ -77,7 +77,7 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     let write_policy = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "bash", "-c", &policy_command(&spec)],
+            &["sh", "-c", &elevated(&policy_command(&spec))],
             false,
         )
         .await?;
@@ -91,7 +91,7 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     let write = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "bash", "-c", &write_command(&ruleset)],
+            &["sh", "-c", &elevated(&write_command(&ruleset))],
             false,
         )
         .await?;
@@ -105,7 +105,7 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     let load = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "bash", "-c", &load_command()],
+            &["sh", "-c", &elevated(&load_command())],
             false,
         )
         .await?;
@@ -132,7 +132,7 @@ pub async fn clear(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     let result = runtime
         .exec_cmd(
             sandbox_name,
-            &["sudo", "bash", "-c", &clear_command()],
+            &["sh", "-c", &elevated(&clear_command())],
             false,
         )
         .await?;
@@ -143,6 +143,24 @@ pub async fn clear(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Wrap a script so it runs with privilege wherever privilege is needed.
+///
+/// `sudo` unconditionally is wrong in both directions: a container exec is
+/// already root and may not have sudo installed at all, while a VM's user
+/// needs it. Deciding inside the guest is the only place that knows.
+fn elevated(script: &str) -> String {
+    format!(
+        "if [ \"$(id -u)\" -eq 0 ]; then sh -c '{}'; else sudo sh -c '{}'; fi",
+        shell_quote(script),
+        shell_quote(script)
+    )
+}
+
+/// Escape a script for embedding in a single-quoted shell string.
+fn shell_quote(script: &str) -> String {
+    script.replace('\'', "'\\''")
 }
 
 /// The shell that writes the ruleset into the guest.
@@ -158,7 +176,14 @@ fn write_command(ruleset: &str) -> String {
 /// The shell that removes devbox's table and its generated files.
 fn clear_command() -> String {
     format!(
-        "nft destroy table inet {} 2>/dev/null || true; rm -f {RULESET_PATH} {POLICY_PATH}",
+        // No nft means no devbox table, so there is nothing to clear and this
+        // is not a failure. Clearing runs on every start of an `open` box,
+        // including boxes that have never had a policy and images that ship no
+        // firewall at all — erroring there would refuse to start them.
+        "command -v nft >/dev/null 2>&1 && \
+         nft destroy table inet {} 2>/dev/null; \
+         rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; \
+         exit 0",
         super::nftables::TABLE
     )
 }
@@ -292,10 +317,14 @@ pub async fn apply_saved(
             });
         }
     };
-    if config.policy.egress == Posture::Open {
-        return Ok(());
-    }
     let runtime = manager.runtime_for_sandbox(state)?;
+    if config.policy.egress == Posture::Open {
+        // Not a no-op. A box that was `isolated` and is now `open` still has
+        // devbox's table in whatever state the guest kept across the restart;
+        // returning early left those rules in force while every surface
+        // reported the box unrestricted.
+        return clear(runtime.as_ref(), name).await;
+    }
     apply(runtime.as_ref(), name, &config.policy)
         .await
         .with_context(|| {
@@ -407,7 +436,15 @@ mod tests {
         // `destroy` and the `|| true` are both load-bearing: `delete` on a
         // missing table is an error, and this runs on every `policy set open`.
         assert!(cmd.contains("destroy table inet devbox"));
-        assert!(cmd.contains("|| true"));
+        // Exits 0 whatever it finds: this runs on every start of an open box,
+        // including images with no firewall at all.
+        assert!(cmd.contains("command -v nft"));
+        // Privilege is decided in the guest: a container exec is already root
+        // and may have no sudo at all, while a VM's user needs it.
+        let wrapped = elevated(&cmd);
+        assert!(wrapped.contains("id -u"));
+        assert!(wrapped.contains("sudo sh -c"));
+        assert!(cmd.trim_end().ends_with("exit 0"));
         assert!(cmd.contains(RULESET_PATH));
     }
 }

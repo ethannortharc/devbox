@@ -81,6 +81,13 @@ func CanTransition(from, to State) bool {
 		// already allows.
 		return false
 	}
+	// A repeat of the state the node is already in is a retry, not a
+	// regression. The bootstrap resends when a response is lost, and after the
+	// first request landed the identical retry would otherwise get 409 —
+	// forever, until the node gave up on a transition that had succeeded.
+	if from == to {
+		return true
+	}
 	return index(to) > index(from)
 }
 

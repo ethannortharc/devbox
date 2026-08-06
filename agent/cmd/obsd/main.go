@@ -189,7 +189,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	// Without this the generated ruleset is not merely incomplete — it is
 	// default-deny with an empty allow set, so `allowlist` and `mirror-only`
 	// block everything they promise to permit.
-	enforcer, err := loadEnforcer(cfg)
+	enforcer, err := loadEnforcer(cfg, true)
 	if err != nil {
 		return err
 	}
@@ -213,8 +213,13 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 			// the old list and leave the newly allowed domain blocked until
 			// someone restarted the service.
 			if cfg.policy != "" {
-				if reloaded, changed := reloadEnforcer(cfg, policyStamp, out); changed {
-					enforcer, policyStamp = reloaded.enforcer, reloaded.stamp
+				if reloaded, changed := reloadEnforcer(cfg, policyStamp, out); reloaded.stamp != "" {
+					// The stamp advances either way: a file that cannot be
+					// parsed must not be re-read on every subsequent event.
+					policyStamp = reloaded.stamp
+					if changed {
+						enforcer = reloaded.enforcer
+					}
 				}
 			}
 			if enforcer != nil && e.Type == event.TypeDNS {
@@ -284,7 +289,7 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 //
 // Returns nil when no policy is configured, which is the `open` posture and
 // the fixture/replay paths: nothing to enforce, and no root needed.
-func loadEnforcer(cfg config) (*policy.Enforcer, error) {
+func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 	if cfg.policy == "" {
 		return nil, nil
 	}
@@ -305,10 +310,13 @@ func loadEnforcer(cfg config) (*policy.Enforcer, error) {
 	}
 
 	enforcer := policy.New(policy.NFT{}, spec.Allow, spec.Egress == "mirror-only")
-	if spec.Ruleset != "" {
-		// The control plane generated the ruleset; loading it here rather than
-		// host-side means the agent owns the table it is about to keep in step,
-		// and a restart re-establishes it.
+	if loadRuleset && spec.Ruleset != "" {
+		// Only at startup. `Load` destroys and rebuilds the table, so doing it
+		// on every reload would discard every address the previous enforcer had
+		// resolved into the allow sets — briefly denying traffic that was
+		// already permitted, each time the user edits the policy. On a reload
+		// the control plane has just installed the table itself; the agent only
+		// needs the new domain list.
 		if err := enforcer.Load(context.Background(), spec.Ruleset); err != nil {
 			return nil, fmt.Errorf("load the egress ruleset: %w", err)
 		}
@@ -333,12 +341,14 @@ func reloadEnforcer(cfg config, stamp string, out io.Writer) (reloadState, bool)
 	if current == stamp {
 		return reloadState{}, false
 	}
-	enforcer, err := loadEnforcer(cfg)
+	enforcer, err := loadEnforcer(cfg, false)
 	if err != nil {
 		fmt.Fprintf(out, "devbox-obsd: policy reload failed, keeping the old one: %v\n", err)
-		// Stamp anyway, so a persistently broken file is not retried on every
-		// single event.
-		return reloadState{enforcer: nil, stamp: current}, false
+		// Stamped, so a persistently broken file is not retried on every event
+		// — but reported as *not* changed, so the caller keeps the enforcer it
+		// has. Returning a nil enforcer with `changed` would have been read as
+		// "policy reloaded to nothing" and silently stopped enforcement.
+		return reloadState{stamp: current}, false
 	}
 	fmt.Fprintf(out, "devbox-obsd: policy reloaded from %s\n", cfg.policy)
 	return reloadState{enforcer: enforcer, stamp: current}, true

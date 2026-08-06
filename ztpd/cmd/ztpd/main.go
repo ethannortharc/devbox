@@ -106,8 +106,16 @@ func run(args []string, out io.Writer) error {
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// Bound synchronously, before startup is declared a success. A detached
+	// ListenAndServe that fails to bind leaves the process running and the
+	// banner claiming metrics are available, so monitoring sees a permanently
+	// missing endpoint from a server that started cleanly.
+	metricsLn, err := net.Listen("tcp", cfg.metrics)
+	if err != nil {
+		return fmt.Errorf("metrics listener on %s: %w", cfg.metrics, err)
+	}
 	go func() {
-		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := metricsSrv.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(os.Stderr, "devbox-ztpd: metrics listener: %v\n", err)
 		}
 	}()

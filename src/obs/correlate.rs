@@ -76,8 +76,17 @@ const PID_REUSE_GAP_NS: u64 = 60 * 1_000_000_000;
 /// a different process — a new `exec` after the chain already had one, an
 /// `exit` (nothing that pid does afterwards belongs to it), or a long gap.
 pub fn chains(events: &[Event]) -> Vec<Chain> {
+    // Wall clock first, monotonic second — the same reason `behavior::summarize`
+    // does: `ts_mono_ns` restarts at each guest boot while the store persists
+    // across boots, so ordering by it alone interleaves two boots' events and
+    // the gap heuristic below then splits chains in the wrong places.
     let mut ordered: Vec<&Event> = events.iter().collect();
-    ordered.sort_by_key(|e| (e.pid, e.ts_mono_ns));
+    ordered.sort_by(|a, b| {
+        a.pid
+            .cmp(&b.pid)
+            .then_with(|| a.ts_wall.cmp(&b.ts_wall))
+            .then_with(|| a.ts_mono_ns.cmp(&b.ts_mono_ns))
+    });
 
     // Keyed on (pid, incarnation) so the same pid can hold several chains.
     let mut by_pid: BTreeMap<(u32, u32), Vec<&Event>> = BTreeMap::new();

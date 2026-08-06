@@ -491,23 +491,47 @@ async fn put_policy(
 
     let posture = updated.egress;
     let entries = updated.allow.len();
+    let policy = updated.clone();
     if let Err(e) = service::save_policy(&state.manager, &name, updated) {
         return server_error("failed to save the policy", &e);
     }
 
-    let note = if posture.enforces() {
-        format!(
-            "Saved: <strong>{posture}</strong> with {entries} allowlist entr{}. \
-             Run a reprovision to apply it inside the box.",
+    // And apply it. The tab used to save the file and report the posture set,
+    // then tell the user to reprovision — which never applied it either. The
+    // console said one thing and the firewall did another.
+    //
+    // Saving and applying are reported separately because they fail
+    // separately: the policy really is saved, and a user who is told only
+    // "error" would not know whether to re-enter it.
+    let applied = service::apply_policy_now(&state.manager, &name, &policy).await;
+
+    let note = match (&applied, posture.enforces()) {
+        // The count appears in both branches: what was saved is a fact either
+        // way, and the user needs to know their entries are recorded even when
+        // the box could not be reached.
+        (Err(e), _) => format!(
+            "<span class=\"term-err\">Saved <strong>{posture}</strong> with {entries} \
+             allowlist entr{}, but it is not active on the box: {}</span>",
+            if entries == 1 { "y" } else { "ies" },
+            build::escape_html(&e.to_string())
+        ),
+        (Ok(()), true) => format!(
+            "Saved and applied: <strong>{posture}</strong> with {entries} allowlist entr{}.",
             if entries == 1 { "y" } else { "ies" }
-        )
-    } else {
-        format!("Saved: <strong>{posture}</strong>. Nothing is blocked in this posture.")
+        ),
+        (Ok(()), false) => {
+            format!("Saved: <strong>{posture}</strong>. Nothing is blocked in this posture.")
+        }
     };
 
+    let class = if applied.is_err() {
+        "notice error"
+    } else {
+        "notice"
+    };
     (
         StatusCode::OK,
-        Html(format!("<div class=\"notice\">{note}</div>")),
+        Html(format!("<div class=\"{class}\">{note}</div>")),
     )
         .into_response()
 }

@@ -126,7 +126,10 @@ pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
     let runtime = manager.runtime_for_sandbox(&state)?;
 
     match runtime.status(name).await? {
-        SandboxStatus::Running => Ok(()),
+        // Running too, for the same reason as `attach`: a box that is already
+        // up may have been started outside this path, or created moments ago,
+        // and never had its posture installed. Applying is idempotent.
+        SandboxStatus::Running => crate::policy::enforce::apply_saved(manager, &state, name).await,
         SandboxStatus::Stopped => {
             runtime
                 .start(name)
@@ -352,10 +355,42 @@ pub fn policy_view(policy: &crate::policy::Policy) -> PolicyView {
 /// Read a box's policy from its project config.
 pub fn load_policy(manager: &Arc<SandboxManager>, name: &str) -> Result<crate::policy::Policy> {
     let state = manager.get_sandbox(name)?;
-    Ok(crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir).policy)
+    // Fallibly. `load_or_default` would render a malformed devbox.toml as the
+    // default `open` posture, so the tab would show "Open" for a box whose
+    // firewall is still restrictive — telling the user the opposite of the
+    // truth instead of that its source of truth is unreadable.
+    Ok(
+        crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
+            .with_context(|| {
+                format!("box '{name}' has an unreadable devbox.toml, so its posture is unknown")
+            })?
+            .policy,
+    )
 }
 
 /// Write a box's policy back to its project config.
+/// Apply a saved policy to the box, if it is running.
+///
+/// The console's counterpart to `cli::policy::reapply`. A stopped box picks it
+/// up at start; an unreachable one is an error, because the tab has just told
+/// the user the posture is set.
+pub async fn apply_policy_now(
+    manager: &Arc<SandboxManager>,
+    name: &str,
+    policy: &crate::policy::Policy,
+) -> Result<()> {
+    let state = manager.get_sandbox(name)?;
+    let runtime = manager.runtime_for_sandbox(&state)?;
+    match runtime.status(name).await? {
+        SandboxStatus::Running => {
+            crate::policy::enforce::apply(runtime.as_ref(), name, policy).await
+        }
+        // Nothing to do: `start_box` applies it, and saying "not applied" for a
+        // box that is off would be noise.
+        _ => Ok(()),
+    }
+}
+
 pub fn save_policy(
     manager: &Arc<SandboxManager>,
     name: &str,

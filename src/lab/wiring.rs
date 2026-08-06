@@ -153,6 +153,36 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
         }
     }
 
+    // A host's default route.
+    //
+    // A fresh namespace has only the /31 it was just given, so a host in a
+    // routed scenario (`wan-lossy`, `client-proxy-server`) can reach its
+    // directly attached router and nothing beyond it — the far site stays
+    // unreachable however well BGP converges. Routers do not get one: they
+    // learn everything from BGP, and a default would mask a fabric that has
+    // not converged behind a route that always resolves.
+    for link in &plan.links {
+        for (end, peer) in [(&link.a, &link.b), (&link.b, &link.a)] {
+            if topology.node(&end.node).is_none_or(|n| n.role.routes()) {
+                continue;
+            }
+            cmds.push(privileged(vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                netns(lab, &end.node),
+                "ip".into(),
+                "route".into(),
+                "replace".into(),
+                "default".into(),
+                "via".into(),
+                peer.addr.to_string(),
+                "dev".into(),
+                end.iface.clone(),
+            ]));
+        }
+    }
+
     // Router loopbacks, which BGP uses as its router-id.
     for (node, addr) in &plan.loopbacks {
         cmds.push(privileged(vec![

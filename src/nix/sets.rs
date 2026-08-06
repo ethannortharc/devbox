@@ -107,6 +107,11 @@ pub static NIX_SETS: &[NixSet] = &[
     NixSet {
         name: "network",
         packages: &[
+            // The routing stack a `devbox lab` substrate needs: without it
+            // `lab up` starts zebra and gets command-not-found for every
+            // routed topology.
+            "frr",
+            "conntrack-tools",
             "tailscale",
             "mosh",
             "nmap",
