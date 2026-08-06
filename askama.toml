@@ -1,0 +1,5 @@
+# Askama looks for templates in `templates/` at the crate root by default.
+# The v4 project layout (§14 of the design doc) keeps web templates next to the
+# web code instead, so point Askama at that directory.
+[general]
+dirs = ["src/web/templates"]

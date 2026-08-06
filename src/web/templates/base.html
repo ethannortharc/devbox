@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>{% block title %}devbox{% endblock %}</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/css/app.css" />
+    {% block head %}{% endblock %}
+    <script src="/assets/js/htmx.min.js" defer></script>
+    <script src="/assets/js/sse.js" defer></script>
+  </head>
+  <body hx-ext="sse" sse-connect="/api/stream">
+    <header class="topbar">
+      <a class="brand" href="/">devbox <span class="v">v{{ version }}</span></a>
+      <nav class="nav">
+        <a href="/" {% if nav == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+      </nav>
+      <span class="spacer"></span>
+      <span class="pulse" id="pulse">
+        <span class="dot"></span>
+        <span sse-swap="tick">connecting…</span>
+      </span>
+    </header>
+
+    <main>{% block content %}{% endblock %}</main>
+
+    <footer>© 2026 Ethan H.B. Zhou</footer>
+
+    <script>
+      // The heartbeat drives the "live" indicator: green while ticks arrive,
+      // grey if the stream goes quiet for more than two intervals.
+      (function () {
+        var pulse = document.getElementById("pulse");
+        var timer = null;
+        document.body.addEventListener("htmx:sseMessage", function (e) {
+          if (e.detail.type !== "tick") return;
+          pulse.classList.add("live");
+          clearTimeout(timer);
+          timer = setTimeout(function () {
+            pulse.classList.remove("live");
+          }, 5000);
+        });
+        document.body.addEventListener("htmx:sseError", function () {
+          pulse.classList.remove("live");
+        });
+      })();
+    </script>
+  </body>
+</html>

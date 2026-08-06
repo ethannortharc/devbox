@@ -1,0 +1,44 @@
+{#- Shared fragments. Imported with `{% import "_macros.html" as m %}` so the
+    same markup renders inside a full page and as a standalone htmx/SSE
+    partial — one definition, no drift between the two. -#}
+
+{% macro status_badge(status) %}
+<span class="status status-{{ status }}">{{ status }}</span>
+{% endmacro %}
+
+{% macro box_card(b) %}
+<article class="card" id="box-{{ b.name }}">
+  <div class="card-head">
+    <h2><a href="/boxes/{{ b.name }}">{{ b.name }}</a></h2>
+    <span class="spacer"></span>
+    {% call status_badge(b.status) %}{% endcall %}
+  </div>
+
+  <dl class="meta">
+    <dt>runtime</dt>
+    <dd>{{ b.runtime }}</dd>
+    <dt>project</dt>
+    <dd>{{ b.project_dir }}</dd>
+    <dt>mount</dt>
+    <dd>{{ b.mount_mode }}</dd>
+  </dl>
+
+  {% if !b.sets.is_empty() %}
+  <div class="chips">
+    {% for s in b.sets %}<span class="chip">{{ s }}</span>{% endfor %}
+  </div>
+  {% endif %}
+</article>
+{% endmacro %}
+
+{% macro box_grid(boxes) %}
+{% if boxes.is_empty() %}
+<div class="empty">
+  <h2>No boxes yet</h2>
+  <p>Create one from a project directory:</p>
+  <pre>cd ~/code/myapp &amp;&amp; devbox create</pre>
+</div>
+{% else %}
+{% for b in boxes %}{% call box_card(b) %}{% endcall %}{% endfor %}
+{% endif %}
+{% endmacro %}

@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use clap::Args;
 
-use crate::runtime::cmd::run_cmd;
 use crate::runtime::SandboxStatus;
+use crate::runtime::cmd::run_cmd;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay;
 
@@ -56,18 +56,9 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 /// Lima: extract SSH config and configure ~/.ssh/config, then launch editor.
-async fn open_via_lima(
-    ssh_host: &str,
-    vm_name: &str,
-    editor: &str,
-    path: &str,
-) -> Result<()> {
+async fn open_via_lima(ssh_host: &str, vm_name: &str, editor: &str, path: &str) -> Result<()> {
     // Get SSH config from Lima
-    let result = run_cmd(
-        "limactl",
-        &["show-ssh", "--format", "config", vm_name],
-    )
-    .await?;
+    let result = run_cmd("limactl", &["show-ssh", "--format", "config", vm_name]).await?;
 
     if result.exit_code != 0 {
         bail!(
@@ -85,18 +76,9 @@ async fn open_via_lima(
 }
 
 /// Incus: get VM IP address, configure SSH, then launch editor.
-async fn open_via_incus(
-    ssh_host: &str,
-    vm_name: &str,
-    editor: &str,
-    path: &str,
-) -> Result<()> {
+async fn open_via_incus(ssh_host: &str, vm_name: &str, editor: &str, path: &str) -> Result<()> {
     // Get IP from incus list
-    let result = run_cmd(
-        "incus",
-        &["list", vm_name, "--format", "json"],
-    )
-    .await?;
+    let result = run_cmd("incus", &["list", vm_name, "--format", "json"]).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to query Incus VM: {}", result.stderr.trim());
@@ -119,27 +101,22 @@ fn extract_incus_ip(json_output: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to parse Incus JSON: {e}"))?;
 
     for vm in &arr {
-        if let Some(state) = vm.get("state") {
-            if let Some(network) = state.get("network") {
-                if let Some(obj) = network.as_object() {
-                    for (iface, data) in obj {
-                        if iface == "lo" {
-                            continue;
-                        }
-                        if let Some(addrs) = data.get("addresses") {
-                            if let Some(addrs_arr) = addrs.as_array() {
-                                for addr in addrs_arr {
-                                    if addr.get("family").and_then(|f| f.as_str())
-                                        == Some("inet")
-                                    {
-                                        if let Some(ip) =
-                                            addr.get("address").and_then(|a| a.as_str())
-                                        {
-                                            return Ok(ip.to_string());
-                                        }
-                                    }
-                                }
-                            }
+        if let Some(state) = vm.get("state")
+            && let Some(network) = state.get("network")
+            && let Some(obj) = network.as_object()
+        {
+            for (iface, data) in obj {
+                if iface == "lo" {
+                    continue;
+                }
+                if let Some(addrs) = data.get("addresses")
+                    && let Some(addrs_arr) = addrs.as_array()
+                {
+                    for addr in addrs_arr {
+                        if addr.get("family").and_then(|f| f.as_str()) == Some("inet")
+                            && let Some(ip) = addr.get("address").and_then(|a| a.as_str())
+                        {
+                            return Ok(ip.to_string());
                         }
                     }
                 }
@@ -167,7 +144,8 @@ fn rewrite_ssh_host(desired_host: &str, config: &str) -> String {
 
 /// Write or update an SSH config block in ~/.ssh/config for the devbox host.
 fn write_ssh_config(host: &str, config_block: &str) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let ssh_dir = home.join(".ssh");
     std::fs::create_dir_all(&ssh_dir)?;
 

@@ -9,3 +9,25 @@ id_rsa*
 findings.md
 progress.md
 task_plan.md
+
+# `core.ignorecase=true` (macOS) makes `progress.md` above also match
+# `PROGRESS.md`, which v4 tracks as the build log. Re-include it explicitly.
+!/PROGRESS.md
+
+# macOS
+.DS_Store
+
+# Go
+/agent/bin/
+/ztpd/bin/
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+/labkit/dist/
+/labkit/*.egg-info/

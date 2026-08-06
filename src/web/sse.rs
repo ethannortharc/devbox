@@ -1,0 +1,84 @@
+//! Server-Sent Events — the console's live channel.
+//!
+//! One SSE connection per open page carries every live signal: the heartbeat
+//! that drives the "live" indicator, box status changes, build progress, and
+//! (from Phase 3) the observability event feed. WebSockets are reserved for
+//! the interactive terminal, which is the only genuinely bidirectional view.
+
+use std::convert::Infallible;
+use std::time::Duration;
+
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::stream::{Stream, StreamExt};
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
+
+use super::state::AppState;
+
+/// Heartbeat interval. Fast enough that a dead server is obvious within a few
+/// seconds, slow enough to be invisible in CPU terms.
+pub const HEARTBEAT: Duration = Duration::from_secs(2);
+
+/// Render the heartbeat payload — the small fragment htmx swaps into the
+/// status pill in the header.
+pub fn tick_payload(now: chrono::DateTime<chrono::Local>) -> String {
+    format!("live · {}", now.format("%H:%M:%S"))
+}
+
+/// `GET /api/stream` — the console's live event stream.
+pub async fn stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let ticks = IntervalStream::new(tokio::time::interval(HEARTBEAT)).map(|_| {
+        Ok(Event::default()
+            .event("tick")
+            .data(tick_payload(chrono::Local::now())))
+    });
+
+    let events = BroadcastStream::new(state.events.subscribe()).filter_map(|item| async move {
+        match item {
+            Ok(ev) => Some(Ok(Event::default().event(ev.kind).data(ev.data))),
+            // A lagging browser drops events rather than stalling the server.
+            // Surface it instead of hiding it: the page can show a "reconnect
+            // to catch up" hint, and the count is a real signal.
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(dropped = n, "console SSE subscriber lagged");
+                Some(Ok(Event::default().event("lagged").data(n.to_string())))
+            }
+        }
+    });
+
+    Sse::new(futures::stream::select(ticks, events)).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::web::state::ConsoleEvent;
+    use chrono::TimeZone;
+
+    #[test]
+    fn tick_payload_is_a_wall_clock_time() {
+        let t = chrono::Local
+            .with_ymd_and_hms(2026, 8, 6, 22, 14, 7)
+            .unwrap();
+        assert_eq!(tick_payload(t), "live · 22:14:07");
+    }
+
+    #[test]
+    fn heartbeat_is_a_couple_of_seconds() {
+        // Guards against a fat-fingered unit change making the console spin.
+        assert!(HEARTBEAT >= Duration::from_secs(1));
+        assert!(HEARTBEAT <= Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn broadcast_events_reach_a_subscriber_stream() {
+        let (tx, _) = tokio::sync::broadcast::channel::<ConsoleEvent>(8);
+        let mut s = BroadcastStream::new(tx.subscribe());
+        tx.send(ConsoleEvent::new("box-status", "<span>running</span>"))
+            .unwrap();
+        let got = s.next().await.unwrap().unwrap();
+        assert_eq!(got.kind, "box-status");
+    }
+}

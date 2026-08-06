@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="devbox">
+  <title>devbox</title>
+  <rect width="32" height="32" rx="7" fill="#0d1117"/>
+  <!-- the box: a sealed container with one glass face -->
+  <path d="M16 4.5 27 10v12L16 27.5 5 22V10z" fill="none" stroke="#4493f8" stroke-width="2"
+        stroke-linejoin="round"/>
+  <path d="M5 10l11 5.5L27 10" fill="none" stroke="#4493f8" stroke-width="2"
+        stroke-linejoin="round" opacity=".55"/>
+  <path d="M16 15.5v12" stroke="#4493f8" stroke-width="2" opacity=".55"/>
+  <circle cx="16" cy="15.5" r="2.2" fill="#3fb950"/>
+</svg>

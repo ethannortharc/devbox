@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}devbox — dashboard{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Boxes</h1>
+  <span class="sub" id="box-subtitle" sse-swap="box-subtitle">{{ subtitle }}</span>
+</div>
+
+{#- The grid is an SSE swap target: the server re-renders it whenever a box's
+    status changes, so the dashboard stays live without polling from the page. -#}
+<div class="grid" id="box-grid" sse-swap="boxes">
+  {% call m::box_grid(boxes) %}{% endcall %}
+</div>
+{% endblock %}

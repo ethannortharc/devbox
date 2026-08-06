@@ -23,6 +23,7 @@ pub mod status;
 pub mod stop;
 pub mod upgrade;
 pub mod use_cmd;
+pub mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -141,6 +142,9 @@ pub enum Command {
     /// Switch sandbox to use current directory
     #[command(name = "use")]
     Use(use_cmd::UseArgs),
+
+    /// Start the local web console
+    Web(web::WebArgs),
 }
 
 impl Command {
@@ -171,6 +175,7 @@ impl Command {
             Command::Layer(args) => layer::run(args, manager).await,
             Command::Code(args) => code::run(args, manager).await,
             Command::Use(args) => use_cmd::run(args, manager).await,
+            Command::Web(args) => web::run(args, manager).await,
         }
     }
 }

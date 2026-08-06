@@ -1,0 +1,37 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errorlint
+    - misspell
+    - revive
+    - unconvert
+
+  settings:
+    revive:
+      rules:
+        # The Go services are the guest-side half of a documented protocol;
+        # exported identifiers need doc comments so the Rust side can be read
+        # against them.
+        - name: exported
+        - name: error-strings
+        - name: context-as-argument
+
+  exclusions:
+    rules:
+      # Tests may assert on values without consuming every return.
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt

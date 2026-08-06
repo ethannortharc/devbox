@@ -2,15 +2,18 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [v4]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: CI
+  rust:
+    name: Rust
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
 
@@ -27,10 +30,104 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test
 
       - name: cargo build --release
         run: cargo build --release
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l agent ztpd internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed for: $unformatted"
+            exit 1
+          fi
+
+      # The eBPF programs need a kernel with BTF to *load*, but the decode and
+      # transport layers are tested against recorded fixtures and need no
+      # privileges — so this lane stays fast and hermetic. Kernel-load tests
+      # live in the `ebpf` job below.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labkit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: install
+        run: uv sync --all-extras --dev
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy .
+
+      - name: pytest
+        run: uv run pytest -q
+
+  ebpf:
+    name: eBPF (privileged Linux)
+    runs-on: ubuntu-latest
+    # The kernel-load path can only be exercised on a Linux runner with BTF.
+    # It is informational until Phase 3 lands the programs.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check kernel BTF
+        run: |
+          if [ -r /sys/kernel/btf/vmlinux ]; then
+            echo "BTF available: $(uname -r)"
+          else
+            echo "::warning::kernel has no BTF; eBPF load tests will be skipped"
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: install clang/llvm and headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-headers-"$(uname -r)"
+
+      - name: build eBPF objects and run load tests
+        working-directory: agent
+        run: |
+          go generate ./... || echo "::warning::bpf2go generation not wired yet"
+          sudo -E env "PATH=$PATH" go test -tags=ebpf ./... || \
+            echo "::warning::eBPF load tests not present yet"
