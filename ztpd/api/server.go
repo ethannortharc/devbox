@@ -1,0 +1,312 @@
+// Package api is devbox-ztpd's HTTP surface — §10.1, §10.2.
+//
+// The flow a blank node walks:
+//
+//	GET  /bootstrap.sh          the script DHCP option 67 points at
+//	POST /identify              "here is my serial — who am I?"
+//	GET  /config/{name}          the rendered config for that device
+//	POST /status                 "I applied it / I failed"
+//	GET  /status                 what the operator and the test SDK read
+//	GET  /metrics                Prometheus
+//
+// Every handler is small and the interesting logic lives in
+// `statemachine`, so the provisioning rules are tested without a socket.
+package api
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/ethannortharc/devbox/ztpd/statemachine"
+)
+
+// Catalog answers "who is this serial, and what config should it have?".
+//
+// An interface rather than a concrete type because the answer comes from the
+// Python source of truth, which reaches the server as rendered files — and
+// because a test needs to answer it without either.
+type Catalog interface {
+	// Lookup maps a hardware serial to a device name and role.
+	Lookup(serial string) (name, role string, ok bool)
+	// Config returns the rendered configuration for a device.
+	Config(name string) (string, bool)
+}
+
+// MapCatalog is a Catalog backed by plain maps.
+type MapCatalog struct {
+	Serials map[string]DeviceIdentity
+	Configs map[string]string
+}
+
+// DeviceIdentity is what a serial resolves to.
+type DeviceIdentity struct {
+	Name string
+	Role string
+}
+
+// Lookup implements Catalog.
+func (c *MapCatalog) Lookup(serial string) (string, string, bool) {
+	identity, ok := c.Serials[serial]
+	return identity.Name, identity.Role, ok
+}
+
+// Config implements Catalog.
+func (c *MapCatalog) Config(name string) (string, bool) {
+	config, ok := c.Configs[name]
+	return config, ok
+}
+
+// Server is the ZTP HTTP service.
+type Server struct {
+	registry *statemachine.Registry
+	catalog  Catalog
+	// bootURL is what the bootstrap script points back at.
+	bootURL string
+}
+
+// New builds a server.
+func New(registry *statemachine.Registry, catalog Catalog, bootURL string) *Server {
+	return &Server{registry: registry, catalog: catalog, bootURL: bootURL}
+}
+
+// Handler returns the routed HTTP handler.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /bootstrap.sh", s.bootstrap)
+	mux.HandleFunc("POST /identify", s.identify)
+	mux.HandleFunc("GET /config/{name}", s.config)
+	mux.HandleFunc("POST /status", s.report)
+	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+	return mux
+}
+
+// IdentifyRequest is what a blank node posts to learn who it is.
+type IdentifyRequest struct {
+	Serial string `json:"serial"`
+}
+
+// IdentifyResponse tells it.
+type IdentifyResponse struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+	// ConfigURL is where to fetch the rendered config.
+	ConfigURL string `json:"config_url"`
+}
+
+// StatusRequest is a node reporting progress.
+type StatusRequest struct {
+	Serial string `json:"serial"`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
+	// A shell script, because that is what a blank node can run: no
+	// interpreter to install, no package to fetch first.
+	w.Header().Set("Content-Type", "text/x-shellscript")
+	fmt.Fprintf(w, `#!/bin/sh
+# devbox ZTP bootstrap — fetched via DHCP option 67.
+set -eu
+
+ZTP="%s"
+SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || cat /etc/machine-id)"
+
+report() {
+  wget -q -O- --post-data="{\"serial\":\"$SERIAL\",\"state\":\"$1\",\"reason\":\"${2:-}\"}" \
+    --header='Content-Type: application/json' "$ZTP/status" >/dev/null || true
+}
+
+# Who am I?
+IDENTITY="$(wget -q -O- --post-data="{\"serial\":\"$SERIAL\"}" \
+  --header='Content-Type: application/json' "$ZTP/identify")" || {
+  report failed "identify failed"; exit 1; }
+
+NAME="$(echo "$IDENTITY" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')"
+[ -n "$NAME" ] || { report failed "no name for serial $SERIAL"; exit 1; }
+
+report rendering
+
+# Fetch and apply.
+mkdir -p /etc/frr
+wget -q -O /etc/frr/frr.conf "$ZTP/config/$NAME" || {
+  report failed "config fetch failed"; exit 1; }
+
+report pushing
+hostname "$NAME"
+/etc/init.d/frr restart >/dev/null 2>&1 || service frr restart >/dev/null 2>&1 || true
+
+# Self-check, then phone home.
+report verifying
+if vtysh -c 'show bgp summary' >/dev/null 2>&1; then
+  report healthy
+else
+  report failed "bgp did not come up"
+fi
+`, s.bootURL)
+}
+
+func (s *Server) identify(w http.ResponseWriter, r *http.Request) {
+	var req IdentifyRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "malformed identify request: %v", err)
+		return
+	}
+
+	node, restarted, err := s.registry.Discover(req.Serial)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	_ = restarted
+
+	name, role, ok := s.catalog.Lookup(req.Serial)
+	if !ok {
+		// An unknown serial is a real condition, not an error to hide: it
+		// means a device is on the network that the source of truth does not
+		// know about, which an operator wants to see.
+		if _, err := s.registry.Advance(req.Serial, statemachine.Failed,
+			"serial is not in the source of truth"); err != nil {
+			httpError(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		httpError(w, http.StatusNotFound,
+			"serial %q is not in the source of truth", req.Serial)
+		return
+	}
+
+	if _, err := s.registry.Identify(node.Serial, name, role); err != nil {
+		httpError(w, http.StatusConflict, "%v", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, IdentifyResponse{
+		Name:      name,
+		Role:      role,
+		ConfigURL: fmt.Sprintf("%s/config/%s", s.bootURL, name),
+	})
+}
+
+func (s *Server) config(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	config, ok := s.catalog.Config(name)
+	if !ok {
+		httpError(w, http.StatusNotFound, "no rendered config for %q", name)
+		return
+	}
+
+	// The hash lets a node (and the registry) tell "same config" from
+	// "changed config" without diffing, which is what keeps re-provisioning
+	// idempotent.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Devbox-Config-Hash", Hash(config))
+	fmt.Fprint(w, config)
+}
+
+func (s *Server) report(w http.ResponseWriter, r *http.Request) {
+	var req StatusRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "malformed status report: %v", err)
+		return
+	}
+
+	state := statemachine.State(strings.TrimSpace(req.State))
+	if !statemachine.Valid(state) {
+		httpError(w, http.StatusBadRequest, "unknown state %q", req.State)
+		return
+	}
+
+	node, err := s.registry.Advance(req.Serial, state, req.Reason)
+	if err != nil {
+		// A refused transition is the node and the server disagreeing about
+		// where provisioning is, which is worth a distinct status.
+		httpError(w, http.StatusConflict, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
+}
+
+func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
+	summary := s.registry.Summarize()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodes":     s.registry.List(),
+		"total":     summary.Total,
+		"healthy":   summary.Healthy,
+		"failed":    summary.Failed,
+		"converged": summary.Converged,
+		"p95_secs":  summary.P95().Seconds(),
+	})
+}
+
+func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+	summary := s.registry.Summarize()
+
+	var b strings.Builder
+	b.WriteString("# HELP ztp_nodes_total Nodes the server has seen.\n")
+	b.WriteString("# TYPE ztp_nodes_total gauge\n")
+	fmt.Fprintf(&b, "ztp_nodes_total %d\n", summary.Total)
+
+	b.WriteString("# HELP ztp_nodes_by_state Nodes in each provisioning state.\n")
+	b.WriteString("# TYPE ztp_nodes_by_state gauge\n")
+	// Every state is emitted, at zero if need be: a series that only appears
+	// once it is non-zero cannot be alerted on.
+	states := append(append([]statemachine.State{}, statemachine.Order...), statemachine.Failed)
+	for _, state := range states {
+		fmt.Fprintf(&b, "ztp_nodes_by_state{state=%q} %d\n", state, summary.ByState[state])
+	}
+
+	b.WriteString("# HELP ztp_fabric_converged 1 when every node is healthy.\n")
+	b.WriteString("# TYPE ztp_fabric_converged gauge\n")
+	converged := 0
+	if summary.Converged {
+		converged = 1
+	}
+	fmt.Fprintf(&b, "ztp_fabric_converged %d\n", converged)
+
+	b.WriteString("# HELP node_provision_seconds Provisioning time, 95th percentile.\n")
+	b.WriteString("# TYPE node_provision_seconds gauge\n")
+	fmt.Fprintf(&b, "node_provision_seconds{quantile=\"0.95\"} %.3f\n", summary.P95().Seconds())
+
+	b.WriteString("# HELP ztp_node_attempts Provisioning attempts per node.\n")
+	b.WriteString("# TYPE ztp_node_attempts gauge\n")
+	nodes := s.registry.List()
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Serial < nodes[j].Serial })
+	for _, node := range nodes {
+		name := node.Name
+		if name == "" {
+			name = node.Serial
+		}
+		fmt.Fprintf(&b, "ztp_node_attempts{node=%q} %d\n", name, node.Attempts)
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprint(w, b.String())
+}
+
+// Hash identifies a rendered config.
+func Hash(config string) string {
+	sum := sha256.Sum256([]byte(config))
+	return hex.EncodeToString(sum[:8])
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		// The status line is already sent, so there is nothing useful left to
+		// say to the client.
+		return
+	}
+}
+
+func httpError(w http.ResponseWriter, status int, format string, args ...any) {
+	http.Error(w, fmt.Sprintf(format, args...), status)
+}

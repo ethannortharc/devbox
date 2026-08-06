@@ -10,13 +10,21 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/ethannortharc/devbox/internal/buildinfo"
+	"github.com/ethannortharc/devbox/ztpd/api"
+	"github.com/ethannortharc/devbox/ztpd/statemachine"
 )
 
 // config is the server's runtime configuration, parsed from flags.
@@ -25,6 +33,23 @@ type config struct {
 	listen      string
 	metrics     string
 	sotPath     string
+	advertise   string
+}
+
+// bootURL is what the bootstrap script and the config URLs point back at.
+//
+// A node fetches these over the network, so the address has to be one it can
+// reach — not `0.0.0.0` and not `localhost`.
+func (c config) bootURL() string {
+	host := c.advertise
+	if host == "" {
+		host = "10.0.0.1"
+	}
+	_, port, err := net.SplitHostPort(c.listen)
+	if err != nil || port == "" {
+		port = "8080"
+	}
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, port))
 }
 
 func main() {
@@ -48,7 +73,64 @@ func run(args []string, out io.Writer) error {
 		return err
 	}
 
-	return errors.New("provisioning server lands in Phase 8")
+	catalog, err := loadCatalog(cfg.sotPath)
+	if err != nil {
+		return err
+	}
+
+	server := api.New(statemachine.NewRegistry(), catalog, cfg.bootURL())
+	fmt.Fprintf(out, "%s listening on %s (%d device(s) known)\n",
+		buildinfo.String(buildinfo.Ztpd), cfg.listen, len(catalog.Serials))
+	fmt.Fprintf(out, "  DHCP option 67 should point at %s/bootstrap.sh\n", cfg.bootURL())
+
+	srv := &http.Server{
+		Addr:              cfg.listen,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return srv.ListenAndServe()
+}
+
+// loadCatalog reads the rendered artifacts the Python side produced.
+//
+// The source-of-truth directory holds `serials.json` (serial → device) and one
+// `<device>.conf` per device. Rendering happens in `labkit`; ztpd only serves
+// what is there, which keeps the Go side free of templating and the Python
+// side free of HTTP.
+func loadCatalog(dir string) (*api.MapCatalog, error) {
+	catalog := &api.MapCatalog{
+		Serials: map[string]api.DeviceIdentity{},
+		Configs: map[string]string{},
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "serials.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read the serial map: %w", err)
+	}
+	if err := json.Unmarshal(raw, &catalog.Serials); err != nil {
+		return nil, fmt.Errorf("parse the serial map: %w", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	for _, entry := range entries {
+		name, ok := strings.CutSuffix(entry.Name(), ".conf")
+		if !ok {
+			continue
+		}
+		config, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+		}
+		catalog.Configs[name] = string(config)
+	}
+
+	if len(catalog.Serials) == 0 {
+		return nil, fmt.Errorf("%s knows no serials; nothing could ever provision", dir)
+	}
+	return catalog, nil
 }
 
 func parseFlags(args []string, out io.Writer) (config, error) {
@@ -61,8 +143,10 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		"address to serve bootstrap scripts and configs on")
 	fs.StringVar(&cfg.metrics, "metrics", ":9090",
 		"address to serve Prometheus metrics on")
-	fs.StringVar(&cfg.sotPath, "sot", "/etc/devbox/lab/sot.yaml",
-		"path to the source-of-truth the rendered configs derive from")
+	fs.StringVar(&cfg.sotPath, "sot", "/etc/devbox/ztp",
+		"directory holding serials.json and the rendered <device>.conf files")
+	fs.StringVar(&cfg.advertise, "advertise", "",
+		"address nodes should reach this server at (defaults to 10.0.0.1)")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err

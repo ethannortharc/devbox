@@ -20,8 +20,8 @@ ordered work list, §17 the quality bar).
 | 5 | Egress & activity control | **DONE** |
 | 6 | Box lab: substrate & topology | **DONE** |
 | 7 | Fault injection & scenario library | **DONE** |
-| 8 | ZTP fabric + SoT + config-gen | in progress |
-| 9 | Polish, docs, examples | not started |
+| 8 | ZTP fabric + SoT + config-gen | **DONE** |
+| 9 | Polish, docs, examples | in progress |
 
 ## Environment notes
 
@@ -425,3 +425,57 @@ commit:
 
 Worth recording plainly: the Phase 7 commit was pushed before clippy finished,
 so it briefly violated the "never land red" rule. The amended commit is green.
+
+---
+
+## 2026-08-06T10:20Z — Phase 8 DONE
+
+**Landed** — the flagship, in the two languages the design assigns it to.
+
+**Python `labkit`** (58 tests, ruff + mypy --strict clean):
+- **Source of truth** (`labkit.sot.models`): pydantic models with
+  `extra="forbid"`, so a typo'd YAML key is an error at load time rather than a
+  silently ignored field. Validation refuses everything downstream cannot
+  trust: duplicate serials (ZTP would provision one device as another),
+  one-sided links, links to devices that do not exist, non-private ASNs, and
+  loopbacks that are not /32.
+- **IPAM** (`labkit.sot.ipam`): deterministic, total, /31 links, separate pools
+  for links and loopbacks, invariants *verified* after every allocation rather
+  than assumed.
+- **Config generation** (`labkit.gen`): Jinja with `StrictUndefined`, so a
+  typo'd variable is a loud error instead of a config shipping with a blank
+  where a router-id belonged. **Golden-file tested** (`UPDATE_GOLDEN=1` to
+  rewrite) and **idempotent**: applying twice produces no second change, and
+  comment or whitespace churn is not counted as one — a diff that always shows
+  changes trains people to stop reading diffs.
+- **Test SDK** (`labkit.sdk`): the §10.4 assertions as pure functions —
+  `all_nodes_healthy`, `provision_p95`, `bgp_fully_converged`,
+  `no_egress_outside`. Each returns a verdict *and* an explanation, so a
+  failure names the node. Several tests exist specifically to pin behaviour
+  that could otherwise pass vacuously: zero nodes is not "all healthy", an
+  empty allowlist is not "everything permitted", and an unparseable
+  destination is a violation rather than a skip.
+
+**Go `ztpd`**:
+- **State machine**: `discovered → identified → rendering → pushing →
+  verifying → healthy|failed`, with the two properties §10.3 actually needs. A
+  restart to `discovered` is legal **from every state** — that is what
+  idempotent recovery looks like under chaos — while any other backwards move
+  is refused rather than logged. Re-discovery keeps `FirstSeen`, so the
+  provisioning SLO measures the whole ordeal rather than the last attempt.
+- **HTTP API**: `/bootstrap.sh` (plain `sh`, because a blank node has nothing
+  else), `/identify`, `/config/{name}` with a content hash so a re-push of
+  identical config can be skipped, `POST /status`, `GET /status`, `/metrics`.
+- **Metrics**: `ztp_fabric_converged`, `node_provision_seconds{quantile=0.95}`,
+  and per-state gauges emitted **at zero** so they can be alerted on before
+  they first fire.
+- An unknown serial is recorded as `failed` with a reason, not silently
+  dropped: a device on the network the source of truth does not know about is
+  exactly what an operator wants to see.
+
+**Chaos coverage** — a test walks a node to `pushing`, fails it, and provisions
+it again cleanly, asserting `attempts == 2` and that the fabric converges.
+
+**Gate** — 421 Rust, 10 Go packages, 58 Python; every lane green.
+
+**Next step** — Phase 9: docs, README, and the draft PR.
