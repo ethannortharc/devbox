@@ -12,9 +12,12 @@
 //! - [`sandbox`] — box lifecycle, state, config, OverlayFS diff/commit.
 //! - [`nix`] — Nix set composition and rebuilds inside a box.
 //! - [`runtime`] — the Incus/Lima/Multipass/Docker abstraction.
+//! - [`obs`] — the observability plane: schema, store, collector, correlation.
+//! - [`metrics`] — the Prometheus exporter.
 //! - [`tools`] — language/tool detection and the tool registry.
 
 pub mod cli;
+pub mod metrics;
 pub mod nix;
 pub mod obs;
 pub mod runtime;

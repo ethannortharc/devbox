@@ -18,6 +18,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use devbox::obs::behavior;
 use devbox::obs::collector::{Collector, socket_path};
 use devbox::obs::correlate;
 use devbox::obs::event::EventType;
@@ -217,6 +218,39 @@ async fn go_agent_streams_into_the_rust_collector() {
     let (tx, rx) = pip.bytes();
     assert_eq!(tx, 4102);
     assert_eq!(rx, 831_720);
+
+    // ── the behaviour summary matches the run (§7.6) ─────
+    let summary = behavior::summarize("myapp", &all);
+    assert!(
+        summary.domains.contains("pypi.org"),
+        "domains: {:?}",
+        summary.domains
+    );
+    assert!(
+        summary.processes.contains("python3.12"),
+        "the basename, not the /nix/store path: {:?}",
+        summary.processes
+    );
+    assert!(summary.dns_queries.contains("pypi.org"));
+    assert_eq!(summary.egress_mode.as_deref(), Some("allowlist"));
+    assert_eq!(summary.violations.len(), 1);
+    assert_eq!(summary.violations[0].target, "telemetry.example.com");
+    assert_eq!(summary.api_calls.len(), 1);
+    assert_eq!(summary.api_calls[0].host, "api.anthropic.com");
+    assert_eq!(summary.api_calls[0].tokens, 142_000);
+
+    let md = behavior::render_markdown(&summary);
+    assert!(md.contains("Behavior summary"));
+    assert!(md.contains("telemetry.example.com"));
+
+    // Diffing a run against itself finds nothing; against an empty window it
+    // finds everything that left, but no *new* behaviour.
+    let self_diff = behavior::diff(&summary, &summary);
+    assert!(self_diff.is_empty());
+
+    let from_nothing = behavior::diff(&behavior::Summary::default(), &summary);
+    assert!(from_nothing.has_new_behavior());
+    assert!(from_nothing.new_domains.contains(&"pypi.org".to_string()));
 
     // ── the live stream saw them too ─────────────────────
     let mut live_seen = 0;

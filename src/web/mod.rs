@@ -6,6 +6,7 @@
 //! embedded in the binary (see [`assets`]), so the console needs no network
 //! and no build step.
 
+pub mod activity;
 pub mod assets;
 pub mod auth;
 pub mod build;

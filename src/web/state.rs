@@ -42,6 +42,12 @@ pub struct AppState {
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
     pub version: &'static str,
+    /// Collector counters, surfaced by `/metrics` (§7.7).
+    ///
+    /// Shared with the collector task when one is running; a console started
+    /// without a collector simply reports zeroes, which is honest — no agent
+    /// has connected.
+    pub collector_stats: Arc<crate::obs::collector::Stats>,
 }
 
 impl AppState {
@@ -52,6 +58,7 @@ impl AppState {
             token: token.into(),
             events,
             version: env!("CARGO_PKG_VERSION"),
+            collector_stats: Arc::new(crate::obs::collector::Stats::default()),
         }
     }
 

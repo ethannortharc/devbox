@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
 
+use super::activity::{self, Activity, Flow, Lookup, StreamRow, TreeRow};
 use super::help::{self, Topic};
 use super::service::{self, BoxSummary, FileChange, SetGroup};
 use super::state::AppState;
@@ -36,9 +37,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/boxes/{name}/sets", post(apply_sets))
         .route("/api/boxes/{name}/files", get(box_files))
         .route("/api/boxes/{name}/term", get(box_terminal))
+        .route("/api/boxes/{name}/activity", get(box_activity))
+        .route("/api/boxes/{name}/behavior", get(box_behavior))
         .route("/api/stream", get(sse::stream))
         // static
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/assets/{*path}", get(assets::handler))
         // Browsers request /favicon.ico unprompted; serve the embedded icon
         // rather than logging a 404 on every page load.
@@ -97,6 +101,12 @@ struct BoxDetailTemplate {
     boxinfo: BoxSummary,
     groups: Vec<SetGroup>,
     extra_packages: String,
+    stream: Vec<StreamRow>,
+    flows: Vec<Flow>,
+    lookups: Vec<Lookup>,
+    tree: Vec<TreeRow>,
+    behavior: String,
+    has_store: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +120,7 @@ pub struct TabQuery {
 /// land on the box, not on an error page.
 pub fn resolve_tab(requested: Option<&str>) -> &'static str {
     match requested {
+        Some("activity") => "activity",
         Some("sets") => "sets",
         Some("files") => "files",
         Some("terminal") => "terminal",
@@ -145,6 +156,16 @@ async fn box_detail(
         std::iter::empty(),
     );
 
+    // Only the Activity tab pays for reading the event store.
+    let act = if tab == "activity" {
+        activity::load(&state.manager, &name, activity::INITIAL_EVENTS).unwrap_or_else(|e| {
+            tracing::warn!(box_id = %name, error = %e, "could not load activity");
+            empty_activity()
+        })
+    } else {
+        empty_activity()
+    };
+
     render(BoxDetailTemplate {
         version: state.version,
         nav: "dashboard",
@@ -152,7 +173,147 @@ async fn box_detail(
         groups: service::set_groups(&selection),
         extra_packages: String::new(),
         boxinfo,
+        behavior: crate::obs::behavior::render_markdown(&act.summary),
+        stream: act.stream,
+        flows: act.flows,
+        lookups: act.lookups,
+        tree: act.tree,
+        has_store: act.has_store,
     })
+}
+
+fn empty_activity() -> Activity {
+    Activity {
+        events: vec![],
+        stream: vec![],
+        flows: vec![],
+        lookups: vec![],
+        tree: vec![],
+        summary: Default::default(),
+        has_store: false,
+    }
+}
+
+// ── activity ─────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "_activity_stream.html")]
+struct ActivityStreamFragment {
+    stream: Vec<StreamRow>,
+}
+
+/// `GET /api/boxes/{name}/activity` — the live stream fragment, refreshed by
+/// htmx while the tab is open.
+async fn box_activity(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match activity::load(&state.manager, &name, activity::INITIAL_EVENTS) {
+        Ok(act) => render(ActivityStreamFragment { stream: act.stream }),
+        Err(e) => server_error("failed to read the event store", &e),
+    }
+}
+
+/// `GET /api/boxes/{name}/behavior` — the run summary (§7.6).
+///
+/// `?format=json|markdown|jsonl` selects the export; the default is JSON so
+/// the endpoint is useful to a script without a flag.
+#[derive(Debug, Deserialize)]
+pub struct BehaviorQuery {
+    format: Option<String>,
+    since: Option<String>,
+}
+
+async fn box_behavior(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<BehaviorQuery>,
+) -> Response {
+    let store = match activity::open_store(&state.manager, &name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no events recorded for box '{name}' yet"),
+            )
+                .into_response();
+        }
+        Err(e) => return server_error("failed to open the event store", &e),
+    };
+
+    let events = match store.query(&crate::obs::store::Query {
+        since: q.since.clone(),
+        limit: Some(crate::obs::store::Query::MAX_LIMIT),
+        ..Default::default()
+    }) {
+        Ok(e) => e,
+        Err(e) => return server_error("failed to query events", &e),
+    };
+
+    let summary = crate::obs::behavior::summarize(&name, &events);
+
+    match q.format.as_deref() {
+        Some("markdown") => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8",
+            )],
+            crate::obs::behavior::render_markdown(&summary),
+        )
+            .into_response(),
+        Some("jsonl") => match crate::obs::behavior::render_jsonl(&events) {
+            Ok(body) => (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-ndjson; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response(),
+            Err(e) => server_error("failed to export events", &anyhow::Error::from(e)),
+        },
+        _ => Json(summary).into_response(),
+    }
+}
+
+// ── metrics ──────────────────────────────────────────────
+
+/// `GET /metrics` — Prometheus exposition (§7.7).
+async fn metrics(State(state): State<AppState>) -> Response {
+    let boxes = service::list_boxes(&state.manager)
+        .await
+        .unwrap_or_default();
+
+    let mut by_status: std::collections::BTreeMap<String, u64> = Default::default();
+    for b in &boxes {
+        *by_status.entry(b.status.clone()).or_default() += 1;
+    }
+
+    // Sum stored events across every box that has a store, so one scrape
+    // describes the whole host rather than a single box.
+    let mut by_type: std::collections::BTreeMap<crate::obs::EventType, u64> = Default::default();
+    for b in &boxes {
+        if let Ok(Some(store)) = activity::open_store(&state.manager, &b.name)
+            && let Ok(counts) = store.count_by_type()
+        {
+            for (kind, n) in counts {
+                *by_type.entry(kind).or_default() += n;
+            }
+        }
+    }
+
+    let body = crate::metrics::render(&crate::metrics::Snapshot {
+        collector: state.collector_stats.snapshot(),
+        events_by_type: by_type.into_iter().collect(),
+        boxes_by_status: by_status.into_iter().collect(),
+        version: state.version.to_string(),
+    });
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 // ── lifecycle ────────────────────────────────────────────
@@ -461,7 +622,8 @@ mod tests {
         assert_eq!(resolve_tab(Some("overview")), "overview");
         assert_eq!(resolve_tab(Some("files")), "files");
         assert_eq!(resolve_tab(Some("terminal")), "terminal");
-        assert_eq!(resolve_tab(Some("activity")), "overview");
+        assert_eq!(resolve_tab(Some("activity")), "activity");
+        assert_eq!(resolve_tab(Some("nonsense")), "overview");
         assert_eq!(resolve_tab(Some("../../etc/passwd")), "overview");
     }
 
@@ -550,7 +712,52 @@ mod tests {
             groups: service::set_groups(&selection),
             extra_packages: String::new(),
             boxinfo: summary("alpha", "running"),
+            stream: vec![],
+            flows: vec![],
+            lookups: vec![],
+            tree: vec![],
+            behavior: String::new(),
+            has_store: false,
         }
+    }
+
+    /// A detail page whose Activity tab has data to show.
+    fn detail_with_activity() -> BoxDetailTemplate {
+        let mut page = detail("activity");
+        page.has_store = true;
+        page.stream = vec![StreamRow {
+            ts: "22:14:07.412".into(),
+            kind: "connect".into(),
+            domain: "network",
+            pid: 812,
+            comm: "pip".into(),
+            summary: "connect pypi.org:443".into(),
+        }];
+        page.flows = vec![Flow {
+            peer: "pypi.org".into(),
+            addr: "151.101.0.223".into(),
+            port: 443,
+            proto: "tcp".into(),
+            sni: "pypi.org".into(),
+            alpn: "h2".into(),
+            bytes_tx: 4102,
+            bytes_rx: 831_720,
+            dur_ms: 690,
+            pid: 812,
+            comm: "pip".into(),
+            ts: "2026-08-06T22:14:07.412Z".into(),
+            direction: "out",
+        }];
+        page.lookups = vec![Lookup {
+            ts: "22:14:07.400".into(),
+            name: "pypi.org".into(),
+            qtype: "A".into(),
+            answers: vec!["151.101.0.223".into()],
+            pid: 812,
+            comm: "pip".into(),
+        }];
+        page.behavior = "# Behavior summary".into();
+        page
     }
 
     #[test]
@@ -583,6 +790,57 @@ mod tests {
         // The live build log is wired to this box's SSE stream.
         assert!(html.contains("sse-swap=\"build-alpha\""));
         assert!(html.contains("hx-swap=\"beforeend scroll:bottom\""));
+    }
+
+    #[test]
+    fn activity_tab_shows_an_empty_state_before_any_capture() {
+        let html = detail("activity").render().unwrap();
+        assert!(html.contains("No observability data yet"));
+        assert!(html.contains("devbox-obsd"));
+    }
+
+    #[test]
+    fn activity_tab_renders_every_view() {
+        let html = detail_with_activity().render().unwrap();
+
+        // Live stream is refreshed by htmx, scoped to this box.
+        assert!(html.contains("hx-get=\"/api/boxes/alpha/activity\""));
+        // Flow table.
+        assert!(html.contains("pypi.org"));
+        assert!(html.contains("831720"));
+        // DNS log.
+        assert!(html.contains("151.101.0.223"));
+        // Behaviour summary with its exports.
+        assert!(html.contains("Behavior summary"));
+        assert!(html.contains("behavior?format=markdown"));
+        assert!(html.contains("behavior?format=jsonl"));
+    }
+
+    #[test]
+    fn activity_stream_fragment_colour_codes_by_domain() {
+        let html = ActivityStreamFragment {
+            stream: vec![StreamRow {
+                ts: "22:14:07.412".into(),
+                kind: "dns".into(),
+                domain: "network",
+                pid: 812,
+                comm: "pip".into(),
+                summary: "dns pypi.org".into(),
+            }],
+        }
+        .render()
+        .unwrap();
+
+        assert!(html.contains("ev-network"));
+        assert!(html.contains("22:14:07.412"));
+        assert!(html.contains("dns pypi.org"));
+        assert!(!html.contains("<html"), "a fragment carries no page chrome");
+    }
+
+    #[test]
+    fn activity_stream_fragment_has_an_empty_state() {
+        let html = ActivityStreamFragment { stream: vec![] }.render().unwrap();
+        assert!(html.contains("No activity recorded yet"));
     }
 
     #[test]

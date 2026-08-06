@@ -18,6 +18,8 @@
     <nav class="tabs">
       <a href="/boxes/{{ boxinfo.name }}?tab=overview"
          {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
+      <a href="/boxes/{{ boxinfo.name }}?tab=activity"
+         {% if tab == "activity" %}aria-current="page"{% endif %}>Activity</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=sets"
          {% if tab == "sets" %}aria-current="page"{% endif %}>Sets</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=files"
@@ -46,6 +48,127 @@
         <dt>languages</dt>
         <dd>{% if boxinfo.languages.is_empty() %}—{% else %}{{ boxinfo.languages|join(", ") }}{% endif %}</dd>
       </dl>
+
+      {% elif tab == "activity" %}
+      {% if !has_store %}
+      <div class="empty">
+        <h2>No observability data yet</h2>
+        <p>
+          Nothing has been captured for this box. The agent
+          (<code>devbox-obsd</code>) streams into
+          <code>~/.devbox/boxes/{{ boxinfo.name }}/events.db</code> once the box
+          is provisioned with observability enabled.
+        </p>
+      </div>
+      {% else %}
+
+      <div class="actsplit">
+        <section>
+          <h3 class="acthead">Live stream</h3>
+          {#- Refreshed by htmx while the tab is open; the SSE channel carries
+              the heartbeat, this carries the events. -#}
+          {#- Server-rendered for the first paint, then refreshed by htmx.
+              The SSE channel carries the heartbeat; this carries events. -#}
+          <div class="stream"
+               id="activity-stream"
+               hx-get="/api/boxes/{{ boxinfo.name }}/activity"
+               hx-trigger="every 2s"
+               hx-swap="innerHTML">
+            {% for r in stream %}
+            <div class="ev ev-{{ r.domain }}">
+              <span class="ev-ts">{{ r.ts }}</span>
+              <span class="ev-kind">{{ r.kind }}</span>
+              <span class="ev-proc">{{ r.comm }}<span class="ev-pid">·{{ r.pid }}</span></span>
+              <span class="ev-summary">{{ r.summary }}</span>
+            </div>
+            {% endfor %}
+            {% if stream.is_empty() %}
+            <p class="muted">No activity recorded yet.</p>
+            {% endif %}
+          </div>
+        </section>
+
+        <section>
+          <h3 class="acthead">Flows</h3>
+          {% if flows.is_empty() %}
+          <p class="muted">No connections recorded.</p>
+          {% else %}
+          <div class="tablewrap">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>peer</th><th>port</th><th>proto</th><th>alpn</th>
+                  <th>↑</th><th>↓</th><th>process</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for f in flows %}
+                <tr>
+                  <td title="{{ f.addr }}">{{ f.peer }}</td>
+                  <td>{{ f.port }}</td>
+                  <td>{{ f.proto }}</td>
+                  <td>{{ f.alpn }}</td>
+                  <td>{{ f.bytes_tx }}</td>
+                  <td>{{ f.bytes_rx }}</td>
+                  <td>{{ f.comm }}·{{ f.pid }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endif %}
+
+          <h3 class="acthead">DNS</h3>
+          {% if lookups.is_empty() %}
+          <p class="muted">No lookups recorded.</p>
+          {% else %}
+          <div class="tablewrap">
+            <table class="data">
+              <thead><tr><th>time</th><th>name</th><th>type</th><th>answers</th></tr></thead>
+              <tbody>
+                {% for l in lookups %}
+                <tr>
+                  <td>{{ l.ts }}</td>
+                  <td>{{ l.name }}</td>
+                  <td>{{ l.qtype }}</td>
+                  <td>{{ l.answers|join(", ") }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endif %}
+
+          <h3 class="acthead">Processes</h3>
+          {% if tree.is_empty() %}
+          <p class="muted">No processes recorded.</p>
+          {% else %}
+          <ul class="ptree">
+            {% for row in tree %}
+            <li style="padding-left: {{ row.depth }}rem">
+              <span class="ev-proc">{{ row.chain.comm }}<span class="ev-pid">·{{ row.chain.pid }}</span></span>
+              {% if let Some(cmd) = row.chain.command %}<code>{{ cmd }}</code>{% endif %}
+              {% if !row.chain.peers.is_empty() %}
+              <span class="muted">→ {{ row.chain.peers|join(", ") }}</span>
+              {% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </section>
+      </div>
+
+      <details class="behavior">
+        <summary>Behavior summary — what this box has done</summary>
+        <pre>{{ behavior }}</pre>
+        <p class="muted">
+          Export:
+          <a href="/api/boxes/{{ boxinfo.name }}/behavior?format=markdown">Markdown</a> ·
+          <a href="/api/boxes/{{ boxinfo.name }}/behavior?format=jsonl">JSONL</a> ·
+          <a href="/api/boxes/{{ boxinfo.name }}/behavior">JSON</a>
+        </p>
+      </details>
+      {% endif %}
 
       {% elif tab == "sets" %}
       <p class="muted">

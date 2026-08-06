@@ -595,6 +595,181 @@ input.text:focus {
   color: var(--err);
 }
 
+/* ── activity ─────────────────────────────────────────── */
+
+.actsplit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .actsplit {
+    grid-template-columns: 1fr;
+  }
+}
+
+.acthead {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.acthead:not(:first-child) {
+  margin-top: 22px;
+}
+
+.stream {
+  max-height: 480px;
+  overflow-y: auto;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.ev {
+  display: grid;
+  grid-template-columns: 6.5rem 4.5rem minmax(6rem, auto) 1fr;
+  gap: 10px;
+  padding: 2px 12px;
+  border-left: 2px solid transparent;
+  overflow-wrap: anywhere;
+}
+.ev:hover {
+  background: var(--bg-raised);
+}
+.ev-ts {
+  color: var(--fg-faint);
+}
+.ev-kind {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  align-self: center;
+}
+.ev-proc {
+  color: var(--fg);
+}
+.ev-pid {
+  color: var(--fg-faint);
+}
+.ev-summary {
+  color: var(--fg-muted);
+}
+
+/* Colour by domain — the same grouping EventType::domain() reports. */
+.ev-process {
+  border-left-color: var(--accent);
+}
+.ev-process .ev-kind {
+  color: var(--accent);
+}
+.ev-network {
+  border-left-color: var(--mag);
+}
+.ev-network .ev-kind {
+  color: var(--mag);
+}
+.ev-file {
+  border-left-color: var(--ok);
+}
+.ev-file .ev-kind {
+  color: var(--ok);
+}
+.ev-policy {
+  border-left-color: var(--err);
+}
+.ev-policy .ev-kind {
+  color: var(--err);
+}
+.ev-api {
+  border-left-color: var(--warn);
+}
+.ev-api .ev-kind {
+  color: var(--warn);
+}
+.ev-syscall .ev-kind {
+  color: var(--fg-faint);
+}
+
+.tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+table.data th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  background: var(--bg-inset);
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+table.data td {
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+table.data tr:hover td {
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+
+.ptree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.ptree li {
+  padding: 3px 0;
+  overflow-wrap: anywhere;
+}
+.ptree code {
+  color: var(--fg-muted);
+}
+
+.behavior {
+  margin-top: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.behavior summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--fg);
+}
+.behavior pre {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+}
+
 /* ── help ─────────────────────────────────────────────── */
 
 .help-layout {

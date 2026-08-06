@@ -418,6 +418,62 @@ async fn applying_a_selection_to_an_unknown_box_is_404() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
+// ── activity, behaviour, metrics ─────────────────────────
+
+#[tokio::test]
+async fn activity_tab_renders_before_any_capture() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_authed("/boxes/alpha?tab=activity"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let html = body_string(res).await;
+    assert!(html.contains("No observability data yet"));
+    assert!(html.contains("devbox-obsd"));
+}
+
+#[tokio::test]
+async fn behavior_endpoint_is_404_before_any_capture() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_authed("/api/boxes/alpha/behavior"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn metrics_are_scrapeable_without_a_token() {
+    let (_dir, app) = console_with_boxes(&["alpha", "beta"]);
+
+    // Prometheus scrapes with no cookie; /metrics exposes counts and
+    // statuses, never box contents.
+    let req = Request::builder()
+        .uri("/metrics")
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+
+    let body = body_string(res).await;
+    assert!(body.contains("# TYPE devbox_events_dropped_total counter"));
+    assert!(body.contains("devbox_events_dropped_total 0"));
+    assert!(body.contains("devbox_build_info{version="));
+    // Two boxes, both with an unresolvable runtime, so both report unknown.
+    assert!(
+        body.contains("devbox_boxes{status=\"unknown\"} 2"),
+        "got: {body}"
+    );
+}
+
 // ── help ─────────────────────────────────────────────────
 
 #[tokio::test]

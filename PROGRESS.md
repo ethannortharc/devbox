@@ -15,9 +15,9 @@ ordered work list, §17 the quality bar).
 | 0 | Foundations | **DONE** |
 | 1 | Web console: box management (retire TUI) | **DONE** |
 | 2 | On-demand build / selective sets | **DONE** |
-| 3 | Observability capture (Go agent + eBPF) | in progress |
-| 4 | Observability presentation + behavior diff | not started |
-| 5 | Egress & activity control | not started |
+| 3 | Observability capture (Go agent + eBPF) | **DONE** |
+| 4 | Observability presentation + behavior diff | **DONE** |
+| 5 | Egress & activity control | in progress |
 | 6 | Box lab: substrate & topology | not started |
 | 7 | Fault injection & scenario library | not started |
 | 8 | ZTP fabric + SoT + config-gen | not started |
@@ -191,3 +191,84 @@ event schema from §11.1 in Go (`agent/event`), with JSON round-trip and decoder
 tests against recorded fixtures; then the Rust collector + SQLite store in
 `src/obs/`; then wire the transport. eBPF *loading* cannot be tested on macOS —
 that lives in the privileged Linux CI lane.
+
+---
+
+## 2026-08-06T08:05Z — Phase 3 DONE
+
+**Landed**
+
+- **One event schema, two languages.** `agent/event` (Go) and `src/obs/event.rs`
+  (Rust) both decode `agent/event/testdata/events.jsonl`, which covers all ten
+  §11.1 types. A field rename on either side now fails a test rather than
+  silently rendering blanks.
+- **Agent** (`agent/`): versioned length-prefixed transport (ADR-0015);
+  fixed-layout ring-buffer decoders with byte-size assertions against the C
+  structs; hand-rolled DNS and TLS ClientHello parsers (ADR-0016) covering
+  compression pointers, pointer loops, and truncation; three capture sources by
+  fidelity — eBPF, proc-polling, fixture replay (ADR-0017). The Go module has
+  **no third-party dependencies**.
+- **eBPF** (`agent/bpf`): CO-RE programs for exec, connect (v4/v6), accept, and
+  openat, filtering on cgroup id *in the kernel*. Behind a build tag so a plain
+  `go build` works on macOS; loading is the privileged Linux CI lane's job.
+- **Collector** (`src/obs/`): unix-socket listener with the handshake, a bounded
+  queue that drops **and counts**, batched SQLite writes, lifted+indexed filter
+  columns with the raw event alongside, and correlation (per-process chains,
+  the DNS reverse map, a depth-bounded process tree).
+- NixOS module supervising the agent with `CAP_BPF` only, `ProtectSystem=strict`,
+  and a CPU quota.
+- CLI: `devbox watch [--type --pid --peer --path --since --tree --json]`.
+
+**e2e evidence** — `tests/obs_pipeline.rs` builds the real agent, runs it as a
+real process against the real collector, and asserts the exec→dns→connect→file
+chain arrives, is queryable by every filter, and correlates — including that
+the DNS answer explains the address that was connected to. A second test
+asserts a box-id mismatch is refused and stores nothing.
+
+**Known gap** — eBPF *loading* is untested locally (macOS host). The decode and
+transport layers are fully covered by fixtures; kernel attach lives in the
+`ebpf` CI job.
+
+---
+
+## 2026-08-06T08:20Z — Phase 4 DONE
+
+**Landed**
+
+- **Activity tab**: live stream (server-rendered first paint, htmx-refreshed,
+  colour-coded by event domain), flow table (a connection and its TLS handshake
+  collapse into one row, sorted by traffic), DNS log, and process tree.
+- **Behaviour diff** (`src/obs/behavior.rs`): a run summary that is a
+  *comparable value*, not a formatted string — domains, processes, files
+  written, DNS lookups, traffic, policy posture, violations, API calls. `diff`
+  distinguishes "did something new" from "did less", because only the first is
+  worth warning about.
+- Exports: Markdown, JSON, and JSONL, from both the API and the CLI.
+- CLI: `devbox behavior summary [--since --json --jsonl]` and
+  `devbox behavior diff --from <ts> [--at <ts>]`.
+- **`/metrics`** (`src/metrics.rs`): Prometheus text format, hand-rolled — the
+  exposition format is a dozen lines and the alternative is a dependency plus a
+  global registry. Every family is declared before use, label values are
+  escaped, and event types are emitted **at zero** so a series can be alerted
+  on before it first fires. Scrapeable without a token (loopback + Host check
+  still apply); it exposes counts and statuses, never box contents.
+- Grafana dashboard in `docs/grafana/`, with the dropped-event panel red at the
+  first drop — §7.3 promises drops are never *silent*, and this is where that
+  promise is made visible.
+
+**Gate** — all green:
+
+```
+cargo fmt --check / clippy --all-targets -D warnings    ok
+cargo test          215 unit + 15 cli + 29 console + 2 obs + 1 docker = 262
+go vet / go test / gofmt                                 ok
+```
+
+**Deferred, deliberately** — pcap export per flow (§7.5) needs the tap capture
+that lands with the eBPF path; writing a pcap file with no packets to put in it
+would be fabricating data. Tracked for Phase 5's tap work.
+
+**Next step** — Phase 5: the policy engine. `src/policy/` with the four
+postures, DNS-driven allowlist resolution, and an nftables driver the agent
+applies; violations become `policy` events, which the behaviour summary already
+knows how to read.

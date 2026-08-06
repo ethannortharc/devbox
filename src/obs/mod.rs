@@ -5,9 +5,11 @@
 //!
 //! - [`event`] — the canonical schema (§11.1), mirrored in `agent/event`.
 //! - [`store`] — the per-box SQLite store and its query API (§7.4).
+//! - [`behavior`] — the run summary and behaviour diff (§7.6).
 //! - [`collector`] — the socket listener and the agent handshake (§11.3).
 //! - [`correlate`] — the join that turns a wall of events into a story (§7.2).
 
+pub mod behavior;
 pub mod collector;
 pub mod correlate;
 pub mod event;

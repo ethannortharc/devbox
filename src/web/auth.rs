@@ -90,7 +90,13 @@ pub fn strip_token(uri: &Uri) -> String {
 /// browser's unprompted favicon request, and the liveness probe (used by tests
 /// and by `devbox doctor`). None of these expose box state.
 pub fn is_public(path: &str) -> bool {
-    path.starts_with("/assets/") || path == "/healthz" || path == "/favicon.ico"
+    path.starts_with("/assets/")
+        || path == "/healthz"
+        || path == "/favicon.ico"
+        // Prometheus scrapes without a cookie. `/metrics` exposes counts and
+        // statuses — never box contents — and the loopback bind plus the Host
+        // check are still in force.
+        || path == "/metrics"
 }
 
 /// Whether a `Host` header names this machine's loopback interface.
@@ -247,6 +253,7 @@ mod tests {
         assert!(is_public("/assets/js/htmx.min.js"));
         assert!(is_public("/healthz"));
         assert!(is_public("/favicon.ico"));
+        assert!(is_public("/metrics"));
         assert!(!is_public("/"));
         assert!(!is_public("/api/boxes"));
         // A path that merely mentions assets must not slip through.

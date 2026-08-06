@@ -435,3 +435,49 @@ falling back to `proc`. A quiet timeline reads as "the box did nothing", which
 is the worst possible failure mode for an observability tool.
 
 **Revisit.** Not expected to; a replay source is useful for demos regardless.
+
+---
+
+## ADR-0018 — Hand-render Prometheus text; no client library
+
+**Date:** 2026-08-06
+
+**Context.** §7.7 requires a `/metrics` endpoint in Prometheus text format.
+The obvious move is `prometheus` or `metrics-exporter-prometheus`.
+
+**Decision.** Render the exposition format directly in `src/metrics.rs`.
+
+**Rationale.** The format is a dozen lines of text. A client library brings a
+global registry, a metric lifecycle, and a registration order to get wrong — in
+exchange for formatting we can do in fifty lines with tests that assert the
+things that actually break: every family declared before use, label values
+escaped (a box name is user-chosen), and **every event type emitted at zero**
+so a series can be alerted on before it first fires. Counters live where they
+are produced (`collector::Stats`), which is where they belong anyway.
+
+**Revisit.** If devbox ever needs histograms — `node_provision_seconds` p95 in
+Phase 8 is a real candidate — bucket rendering is where hand-rolling stops
+paying.
+
+---
+
+## ADR-0019 — `/metrics` needs no console token
+
+**Date:** 2026-08-06
+
+**Context.** Prometheus scrapes with no cookie and no way to obtain a
+per-launch token. Requiring one would make the endpoint unusable for its only
+purpose.
+
+**Decision.** `/metrics` joins the public paths, alongside assets and
+`/healthz`.
+
+**Rationale.** It exposes counts and statuses — how many events, how many
+boxes, in what state — and never box contents, file paths, domains, or command
+lines. The loopback bind and the `Host` check (ADR-0010) still apply, so
+reaching it already means being a local user on this machine, who could read
+`~/.devbox` directly.
+
+**Revisit.** If a metric ever carries a box-derived label beyond `status`
+— a domain, a path, a command — that label leaks and this decision has to
+change with it.
