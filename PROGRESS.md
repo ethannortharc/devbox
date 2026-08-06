@@ -851,3 +851,49 @@ re-enter their allowlist.
 
 **Gate** — 384 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T23:40Z — Codex review round 7: 11 findings, all addressed
+
+Series: **23, 23, 14, 27, 9, 14, 11.**
+
+Two findings were the shape that has dominated this whole review: something
+reporting success while the thing it claims is not true.
+
+**DNS-derived allow entries never expired.** Every address an allowlisted
+domain ever resolved to stayed permitted for the life of the box, so a CDN
+address later reassigned to someone else remained reachable — a default-deny
+posture quietly widening the longer it ran (ADR-0042). Stated CIDRs still never
+expire, and that asymmetry is deliberate: an address the user wrote down is a
+decision, an address the agent inferred from a DNS answer is an observation,
+and observations should not outlive their evidence.
+
+**ZTP declared convergence over the nodes it had seen.** A node that never
+boots is invisible to `Summarize()`, so nineteen healthy out of an expected
+twenty read as `converged: true` — the one answer a convergence signal must
+never get wrong, since a test and an operator both key off it. One level down,
+a node counted as healthy whenever `show bgp summary` exited zero, which it
+does whenever bgpd is answering even with every neighbour Idle (ADR-0043).
+
+Four more were mine from earlier rounds, all follow-ups to fixes that stopped
+one layer short: `correlate` ordered chains by uptime after being careful to
+*group* by wall clock; it resolved parents by pid alone after deliberately
+splitting reused pids into incarnations; `reprovision` re-added `ai-code` and
+persisted it, so disabling the set could not be made to stick; and
+`EDITOR=nvim` was exported on boxes where the editor set was unchecked.
+
+I hit the pattern live while fixing the `-once` flag. The obvious wiring —
+`Loop: !once` — made fixture replay loop forever by default and hung the test
+suite: I changed the default for every existing caller in order to give effect
+to a flag nobody had wired. Backed out; `-once` now means what its help text
+already said. Worth recording that I caught it because tests hung, not because
+I reasoned it through.
+
+**Added unprompted:** a Go test that parses `ALLOW_TTL_SECS` out of
+`nftables.rs` and fails if the agent's window and the kernel's timeout drift
+apart. Verified by breaking it deliberately. If the agent's window were the
+longer of the two, a domain in continuous use would be blocked for the gap —
+failing closed on traffic already allowed, an hour into a run. Same technique
+as the mirror-list guard (ADR-0022), same reason: one home for the constant.
+
+**Gate** — 384 Rust unit + 52 integration/e2e across all 8 suites, 10 Go
+packages, 65 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.

@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethannortharc/devbox/agent/event"
 )
@@ -299,5 +301,39 @@ func TestMirrorHostsMatchTheRustList(t *testing.T) {
 		if rust[i] != goList[i] {
 			t.Errorf("mirror lists differ at %d: Rust %q, Go %q", i, rust[i], goList[i])
 		}
+	}
+}
+
+// TestAllowTTLMatchesTheRuleset pins the two halves of an expiry together.
+//
+// The kernel expires an allow-set element on the timeout the *Rust* ruleset
+// writes; this agent decides when it is willing to add the address again. If
+// the agent's window were longer, a domain in continuous use would be blocked
+// for the gap between them — a default-deny posture failing closed on traffic
+// it had already allowed, and only after an hour of running, which is the
+// worst possible time to discover it.
+//
+// Parsed from the source rather than duplicated in a shared config, for the
+// same reason as the mirror list (ADR-0022): the constant has exactly one
+// home, and this fails loudly if it moves.
+func TestAllowTTLMatchesTheRuleset(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "src", "policy", "nftables.rs"))
+	if err != nil {
+		t.Fatalf("read nftables.rs: %v", err)
+	}
+
+	match := regexp.MustCompile(`ALLOW_TTL_SECS: u64 = (\d+)`).FindSubmatch(source)
+	if match == nil {
+		t.Fatal("could not find ALLOW_TTL_SECS in nftables.rs; the parser needs updating")
+	}
+	secs, err := strconv.Atoi(string(match[1]))
+	if err != nil {
+		t.Fatalf("ALLOW_TTL_SECS is not a number: %v", err)
+	}
+
+	if want := time.Duration(secs) * time.Second; AllowTTL != want {
+		t.Fatalf("AllowTTL is %v but the ruleset expires elements after %v; "+
+			"an agent window longer than the kernel's blocks allowlisted traffic",
+			AllowTTL, want)
 	}
 }
