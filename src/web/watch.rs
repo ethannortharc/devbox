@@ -122,6 +122,7 @@ mod tests {
             sets: vec!["system".into()],
             languages: vec![],
             image: "nixos".into(),
+            packages: vec![],
             created_at: String::new(),
         }
     }

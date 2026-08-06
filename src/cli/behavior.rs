@@ -94,6 +94,17 @@ fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
         })
         .context("failed to query the event store")?;
 
+    // A summary that silently covers only part of a window is worse than one
+    // that says so: it reports "no violations" for a run that had them.
+    if events.len() >= Query::MAX_LIMIT {
+        eprintln!(
+            "warning: this window has at least {} events, which is the query ceiling. \
+             The summary below covers the oldest {} only — narrow it with --since.",
+            Query::MAX_LIMIT,
+            Query::MAX_LIMIT
+        );
+    }
+
     if args.jsonl {
         print!("{}", behavior::render_jsonl(&events)?);
         return Ok(());
@@ -114,7 +125,14 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     };
 
-    let boundary = args.at.clone();
+    // Without an explicit boundary the two windows would overlap — the
+    // "earlier" one running to the end of the store and the "later" one
+    // covering all of it — which produces a diff of a run against itself.
+    let boundary = Some(args.at.clone().unwrap_or_else(|| {
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }));
 
     let earlier = store.query(&Query {
         since: Some(args.from.clone()),

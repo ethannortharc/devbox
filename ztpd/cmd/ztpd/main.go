@@ -78,10 +78,47 @@ func run(args []string, out io.Writer) error {
 		return err
 	}
 
-	server := api.New(statemachine.NewRegistry(), catalog, cfg.bootURL())
+	statePath := filepath.Join(cfg.sotPath, "ztpd-state.json")
+	registry, err := statemachine.Load(statePath)
+	if err != nil {
+		return err
+	}
+	server := api.New(registry, catalog, cfg.bootURL())
+
+	// §10.3 kills this process mid-provision and expects the fabric to
+	// self-heal. Persisting on a short interval means a returning node is
+	// recognised as a retry rather than a first attempt, which is what makes
+	// the whole-ordeal SLO and the `attempts > 1` assertion mean anything.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := registry.Save(statePath); err != nil {
+				fmt.Fprintf(os.Stderr, "devbox-ztpd: could not persist state: %v\n", err)
+			}
+		}
+	}()
 	fmt.Fprintf(out, "%s listening on %s (%d device(s) known)\n",
 		buildinfo.String(buildinfo.Ztpd), cfg.listen, len(catalog.Serials))
 	fmt.Fprintf(out, "  DHCP option 67 should point at %s/bootstrap.sh\n", cfg.bootURL())
+
+	// Metrics get their own listener, as the flag advertises. A node fetching
+	// its config should not be able to reach the metrics surface by accident,
+	// and a scrape target of `:9090` that refuses connections is worse than
+	// no flag at all.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", server.Handler())
+	metricsSrv := &http.Server{
+		Addr:              cfg.metrics,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "devbox-ztpd: metrics listener: %v\n", err)
+		}
+	}()
+	fmt.Fprintf(out, "  metrics on %s\n", cfg.metrics)
 
 	srv := &http.Server{
 		Addr:              cfg.listen,

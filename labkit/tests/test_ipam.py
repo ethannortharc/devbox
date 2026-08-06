@@ -148,3 +148,89 @@ def test_asns_are_handed_out_in_order_skipping_explicit_ones(fabric: Fabric) -> 
 
     assert assigned == list(range(65000, 65000 + len(fabric.routers)))
     assert len(set(assigned)) == len(assigned)
+
+
+def test_an_explicit_address_stays_at_the_end_that_declared_it() -> None:
+    # "Explicit values win" has to mean the address lands where it was
+    # declared, not merely that its subnet was used.
+    fabric = Fabric(
+        name="explicit",
+        devices=[
+            Device(
+                name="a",
+                role="leaf",
+                serial="S1",
+                interfaces=[Interface(name="eth1", peer="b:eth1", address="10.9.0.2/31")],
+            ),
+            Device(
+                name="b",
+                role="spine",
+                serial="S2",
+                interfaces=[Interface(name="eth1", peer="a:eth1")],
+            ),
+        ],
+    )
+    allocation = allocate(fabric)
+
+    assert allocation.address_of("a:eth1") == "10.9.0.2/31"
+    assert allocation.address_of("b:eth1") == "10.9.0.3/31"
+
+
+def test_both_ends_declaring_different_subnets_is_rejected() -> None:
+    fabric = Fabric(
+        name="conflict",
+        devices=[
+            Device(
+                name="a",
+                role="leaf",
+                serial="S1",
+                interfaces=[Interface(name="eth1", peer="b:eth1", address="10.9.0.0/31")],
+            ),
+            Device(
+                name="b",
+                role="spine",
+                serial="S2",
+                interfaces=[Interface(name="eth1", peer="a:eth1", address="10.9.4.0/31")],
+            ),
+        ],
+    )
+    with pytest.raises(OverlapError, match="same subnet"):
+        allocate(fabric)
+
+
+def test_a_derived_asn_never_lands_on_an_explicit_one() -> None:
+    # Two intended eBGP peers sharing an AS do not peer at all, so the fabric
+    # comes up and never converges.
+    fabric = Fabric(
+        name="asn",
+        devices=[
+            Device(
+                name="a",
+                role="leaf",
+                serial="S1",
+                asn=65000,
+                interfaces=[Interface(name="eth1", peer="b:eth1")],
+            ),
+            Device(
+                name="b",
+                role="spine",
+                serial="S2",
+                interfaces=[Interface(name="eth1", peer="a:eth1")],
+            ),
+        ],
+    )
+    allocation = allocate(fabric)
+
+    assert allocation.asns["a"] == 65000
+    assert allocation.asns["b"] != 65000
+    assert len(set(allocation.asns.values())) == len(allocation.asns)
+
+
+def test_verify_catches_duplicate_asns(fabric: Fabric) -> None:
+    allocation = allocate(fabric)
+    first = next(iter(allocation.asns))
+    second = next(d for d in allocation.asns if d != first)
+    allocation.asns[second] = allocation.asns[first]
+
+    with pytest.raises(OverlapError, match="share AS"):
+        verify(allocation)

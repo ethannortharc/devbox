@@ -2,13 +2,28 @@ use anyhow::{Result, bail};
 
 use crate::runtime::Runtime;
 
+/// The shell command that rebuilds a NixOS box.
+///
+/// NixOS Lima images ship a flake-based `NIX_PATH` with no `nixos-config`
+/// entry, so a bare `nixos-rebuild switch` fails before it evaluates anything.
+/// Provisioning has always exported the path; every other rebuild caller has to
+/// do the same, which is why it lives here rather than being repeated.
+pub const REBUILD_SHELL: &str = "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && \
+     nixos-rebuild switch";
+
+/// Argv that rebuilds a NixOS box, for callers that spawn the process
+/// themselves (the streamed console rebuild).
+pub fn rebuild_argv() -> [&'static str; 4] {
+    ["sudo", "bash", "-lc", REBUILD_SHELL]
+}
+
 /// Execute `nixos-rebuild switch` inside a sandbox VM.
 /// Returns Ok(()) on success, Err with rollback attempt on failure.
 pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     println!("Running nixos-rebuild switch...");
 
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "nixos-rebuild", "switch"], false)
+        .exec_cmd(sandbox_name, &rebuild_argv(), false)
         .await?;
 
     if result.exit_code != 0 {

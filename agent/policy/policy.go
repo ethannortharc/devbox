@@ -157,23 +157,26 @@ func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error)
 			continue
 		}
 
-		e.mu.Lock()
-		if _, dup := e.seen[answer]; dup {
-			e.mu.Unlock()
+		e.mu.RLock()
+		_, dup := e.seen[answer]
+		e.mu.RUnlock()
+		if dup {
 			continue
 		}
-		e.seen[answer] = struct{}{}
-		e.mu.Unlock()
 
 		set := SetV4
 		if addr.Is6() && !addr.Is4In6() {
 			set = SetV6
 		}
+		// Marked seen only *after* nft accepts it. Recording it first would
+		// mean a transient failure permanently skipped the address, leaving an
+		// allowlisted domain blocked until the whole policy is reloaded.
 		if err := e.applier.AddElement(ctx, set, addr.String()); err != nil {
 			return added, fmt.Errorf("allow %s (%s): %w", ev.Net.QName, answer, err)
 		}
 
 		e.mu.Lock()
+		e.seen[answer] = struct{}{}
 		e.added++
 		e.mu.Unlock()
 		added = append(added, answer)

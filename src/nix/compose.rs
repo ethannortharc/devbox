@@ -67,7 +67,10 @@ impl Selection {
     /// with a `lang-` prefix, so they are folded together here.
     pub fn from_state(state: &SandboxState) -> Self {
         let langs = state.languages.iter().map(|l| format!("lang-{l}"));
-        Self::new(state.sets.iter().cloned().chain(langs), std::iter::empty())
+        Self::new(
+            state.sets.iter().cloned().chain(langs),
+            state.packages.iter().cloned(),
+        )
     }
 
     /// Reject anything that would produce a `configuration.nix` Nix cannot
@@ -411,6 +414,7 @@ mod tests {
             sets: vec!["system".into(), "git".into(), "lang-go".into()],
             languages: vec!["go".into()],
             image: "nixos".into(),
+            packages: vec![],
         };
         let s = Selection::from_state(&state);
         assert!(s.sets.contains("git"));

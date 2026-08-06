@@ -168,7 +168,29 @@ impl DevboxConfig {
         Ok(())
     }
 
+    /// Load an existing `devbox.toml`, or the default when there is none.
+    ///
+    /// Unlike [`Self::load_or_default`], a file that exists but does not parse
+    /// is an **error**. Any path that goes on to *write* the config must use
+    /// this: falling back to defaults and then saving would silently erase the
+    /// user's mounts, resources, environment, and set selections.
+    pub fn load_for_edit(dir: &Path) -> Result<Self> {
+        let path = dir.join("devbox.toml");
+        if path.exists() {
+            Self::load(&path).with_context(|| {
+                format!(
+                    "{} exists but could not be parsed; refusing to overwrite it",
+                    path.display()
+                )
+            })
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     /// Try to load from the current directory, or return default.
+    ///
+    /// Read-only callers only: see [`Self::load_for_edit`].
     pub fn load_or_default(dir: &Path) -> Self {
         let path = dir.join("devbox.toml");
         if path.exists() {
@@ -211,14 +233,19 @@ impl DevboxConfig {
 
     /// Return a list of all active set names.
     pub fn active_sets(&self) -> Vec<String> {
-        // Locked sets (always on)
-        let mut sets = vec![
-            "system".to_string(),
-            "shell".to_string(),
-            "tools".to_string(),
-            "editor".to_string(),
-        ];
-        // Toggleable sets
+        // Only `system` is locked (ADR-0012). Forcing shell/tools/editor on
+        // here would silently re-enable sets the user unchecked, and the next
+        // reprovision would reinstall them.
+        let mut sets = vec!["system".to_string()];
+        if self.sets.shell {
+            sets.push("shell".to_string());
+        }
+        if self.sets.tools {
+            sets.push("tools".to_string());
+        }
+        if self.sets.editor {
+            sets.push("editor".to_string());
+        }
         if self.sets.git {
             sets.push("git".to_string());
         }

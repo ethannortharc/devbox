@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
 use crate::nix::compose::{LOCKED_SETS, Selection, describe_change};
@@ -119,16 +119,27 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
+    // A NixOS-only path: an Ubuntu box has no `nixos-rebuild`, and running it
+    // would fail with a much less helpful message than this one.
+    if state.image != "nixos" {
+        bail!(
+            "box '{name}' uses the '{}' image, which has no nixos-rebuild. \
+             Use `devbox nix add <pkg>` / `devbox nix remove <pkg>` there instead.",
+            state.image
+        );
+    }
+
     let runtime = manager.runtime_for_sandbox(&state)?;
     crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
     crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await?;
 
-    let config = after.to_config(&crate::sandbox::config::DevboxConfig::load_or_default(
+    let config = after.to_config(&crate::sandbox::config::DevboxConfig::load_for_edit(
         &state.project_dir,
-    ));
+    )?);
     let mut state = state;
     state.sets = config.active_sets();
     state.languages = config.active_languages();
+    state.packages = after.packages.iter().cloned().collect();
     state.save(&manager.state_dir)?;
 
     println!("Box '{name}' rebuilt with the new selection.");

@@ -39,6 +39,7 @@ fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
             sets: vec!["system".into(), "git".into()],
             languages: vec!["rust".into()],
             image: "nixos".to_string(),
+            packages: vec![],
         }
         .save(dir.path())
         .expect("seed sandbox state");

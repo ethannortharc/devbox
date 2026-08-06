@@ -36,6 +36,8 @@ pub struct BoxSummary {
     pub sets: Vec<String>,
     pub languages: Vec<String>,
     pub image: String,
+    /// Ad-hoc packages outside the set catalogue.
+    pub packages: Vec<String>,
     pub created_at: String,
 }
 
@@ -66,6 +68,7 @@ pub fn summarize(state: &SandboxState, status: Option<&SandboxStatus>) -> BoxSum
         sets: state.sets.clone(),
         languages: state.languages.clone(),
         image: state.image.clone(),
+        packages: state.packages.clone(),
         created_at: state.created_at.clone(),
     }
 }
@@ -356,7 +359,8 @@ pub fn save_policy(
     policy: crate::policy::Policy,
 ) -> Result<()> {
     let state = manager.get_sandbox(name)?;
-    let mut config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    // See `DevboxConfig::load_for_edit`: this path writes the file back.
+    let mut config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
     config.policy = policy;
     config
         .save(&state.project_dir.join("devbox.toml"))
@@ -484,6 +488,7 @@ mod tests {
             sets: vec!["system".into(), "git".into()],
             languages: vec!["rust".into()],
             image: "nixos".into(),
+            packages: vec![],
         }
     }
 

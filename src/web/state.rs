@@ -42,6 +42,13 @@ pub struct AppState {
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
     pub version: &'static str,
+    /// Boxes with a rebuild in flight.
+    ///
+    /// Two submissions from a double-click or two tabs would otherwise both
+    /// overwrite the same `/etc/devbox/devbox.nix`, rebuild, and then each
+    /// persist *its own* selection — leaving the recorded state describing a
+    /// generation that was never built.
+    pub rebuilding: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     /// Collector counters, surfaced by `/metrics` (§7.7).
     ///
     /// Shared with the collector task when one is running; a console started
@@ -58,8 +65,24 @@ impl AppState {
             token: token.into(),
             events,
             version: env!("CARGO_PKG_VERSION"),
+            rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
             collector_stats: Arc::new(crate::obs::collector::Stats::default()),
         }
+    }
+
+    /// Claim the rebuild slot for a box, if it is free.
+    ///
+    /// Returns `None` when a rebuild is already running; the guard releases the
+    /// slot when dropped, including on a panic.
+    pub fn claim_rebuild(&self, box_name: &str) -> Option<RebuildGuard> {
+        let mut in_flight = self.rebuilding.lock().ok()?;
+        if !in_flight.insert(box_name.to_string()) {
+            return None;
+        }
+        Some(RebuildGuard {
+            slots: self.rebuilding.clone(),
+            box_name: box_name.to_string(),
+        })
     }
 
     /// Publish an event to every connected console.
@@ -68,6 +91,20 @@ impl AppState {
     /// no browser is open — so this never errors.
     pub fn publish(&self, event: ConsoleEvent) -> usize {
         self.events.send(event).unwrap_or(0)
+    }
+}
+
+/// Holds a box's rebuild slot until dropped.
+pub struct RebuildGuard {
+    slots: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    box_name: String,
+}
+
+impl Drop for RebuildGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.remove(&self.box_name);
+        }
     }
 }
 

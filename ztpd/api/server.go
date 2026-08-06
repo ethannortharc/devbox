@@ -135,17 +135,25 @@ NAME="$(echo "$IDENTITY" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')"
 
 report rendering
 
-# Fetch and apply.
+# Fetch. Compare against what is already installed before touching anything:
+# re-pushing identical config would restart routing for no reason, which is
+# exactly what makes a reconciliation loop unsafe.
 mkdir -p /etc/frr
-wget -q -O /etc/frr/frr.conf "$ZTP/config/$NAME" || {
+wget -q -O /tmp/frr.conf.new "$ZTP/config/$NAME" || {
   report failed "config fetch failed"; exit 1; }
 
-report pushing
-hostname "$NAME"
-/etc/init.d/frr restart >/dev/null 2>&1 || service frr restart >/dev/null 2>&1 || true
+if [ -f /etc/frr/frr.conf ] && cmp -s /tmp/frr.conf.new /etc/frr/frr.conf; then
+  rm -f /tmp/frr.conf.new
+  report verifying
+else
+  report pushing
+  mv /tmp/frr.conf.new /etc/frr/frr.conf
+  hostname "$NAME"
+  /etc/init.d/frr restart >/dev/null 2>&1 || service frr restart >/dev/null 2>&1 || true
+  report verifying
+fi
 
 # Self-check, then phone home.
-report verifying
 if vtysh -c 'show bgp summary' >/dev/null 2>&1; then
   report healthy
 else

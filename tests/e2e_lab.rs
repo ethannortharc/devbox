@@ -50,7 +50,13 @@ fn ensure_image() -> bool {
     let dockerfile = dir.path().join("Dockerfile");
     if std::fs::write(
         &dockerfile,
-        "FROM alpine:3\nRUN apk add --no-cache iproute2 iputils\nCMD [\"sleep\", \"infinity\"]\n",
+        // `sudo` because the generated wiring commands are prefixed with it —
+        // a real Lima or Multipass substrate runs exec as a non-root user, and
+        // the test image should exercise the same path rather than a
+        // root-only shortcut.
+        "FROM alpine:3\n\
+         RUN apk add --no-cache iproute2 iputils sudo\n\
+         CMD [\"sleep\", \"infinity\"]\n",
     )
     .is_err()
     {

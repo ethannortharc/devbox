@@ -70,10 +70,15 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
     // 1. namespaces
     for node in &topology.nodes {
         let ns = netns(lab, &node.name);
-        cmds.push(vec!["ip".into(), "netns".into(), "add".into(), ns.clone()]);
+        cmds.push(privileged(vec![
+            "ip".into(),
+            "netns".into(),
+            "add".into(),
+            ns.clone(),
+        ]));
         // Loopback inside a fresh namespace starts down, which breaks
         // everything that binds to 127.0.0.1 in surprising ways.
-        cmds.push(vec![
+        cmds.push(privileged(vec![
             "ip".into(),
             "netns".into(),
             "exec".into(),
@@ -83,7 +88,7 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
             "set".into(),
             "lo".into(),
             "up".into(),
-        ]);
+        ]));
     }
 
     // 2 + 3. veth pairs, then moved into place
@@ -91,7 +96,7 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
         let (a, b) = link.parse_endpoints()?;
         let (va, vb) = (veth_name(index, VethEnd::A), veth_name(index, VethEnd::B));
 
-        cmds.push(vec![
+        cmds.push(privileged(vec![
             "ip".into(),
             "link".into(),
             "add".into(),
@@ -101,21 +106,21 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
             "peer".into(),
             "name".into(),
             vb.clone(),
-        ]);
+        ]));
 
         for (veth, end) in [(&va, &a), (&vb, &b)] {
             let ns = netns(lab, &end.node);
-            cmds.push(vec![
+            cmds.push(privileged(vec![
                 "ip".into(),
                 "link".into(),
                 "set".into(),
                 veth.clone(),
                 "netns".into(),
                 ns.clone(),
-            ]);
+            ]));
             // Rename to the topology's interface name once it is inside the
             // namespace, where it cannot collide with anything.
-            cmds.push(vec![
+            cmds.push(privileged(vec![
                 "ip".into(),
                 "netns".into(),
                 "exec".into(),
@@ -126,14 +131,14 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
                 veth.clone(),
                 "name".into(),
                 end.iface.clone(),
-            ]);
+            ]));
         }
     }
 
     // 4. addresses
     for link in &plan.links {
         for end in [&link.a, &link.b] {
-            cmds.push(vec![
+            cmds.push(privileged(vec![
                 "ip".into(),
                 "netns".into(),
                 "exec".into(),
@@ -144,13 +149,13 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
                 end.cidr(),
                 "dev".into(),
                 end.iface.clone(),
-            ]);
+            ]));
         }
     }
 
     // Router loopbacks, which BGP uses as its router-id.
     for (node, addr) in &plan.loopbacks {
-        cmds.push(vec![
+        cmds.push(privileged(vec![
             "ip".into(),
             "netns".into(),
             "exec".into(),
@@ -161,13 +166,13 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
             format!("{addr}/32"),
             "dev".into(),
             "lo".into(),
-        ]);
+        ]));
     }
 
     // 5. interfaces up, last
     for link in &plan.links {
         for end in [&link.a, &link.b] {
-            cmds.push(vec![
+            cmds.push(privileged(vec![
                 "ip".into(),
                 "netns".into(),
                 "exec".into(),
@@ -177,13 +182,13 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
                 "set".into(),
                 end.iface.clone(),
                 "up".into(),
-            ]);
+            ]));
         }
     }
 
     // Routers must forward, or a correct topology still cannot route.
     for node in topology.routers() {
-        cmds.push(vec![
+        cmds.push(privileged(vec![
             "ip".into(),
             "netns".into(),
             "exec".into(),
@@ -191,7 +196,7 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
             "sysctl".into(),
             "-w".into(),
             "net.ipv4.ip_forward=1".into(),
-        ]);
+        ]));
     }
 
     Ok(cmds)
@@ -207,19 +212,34 @@ pub fn down_commands(topology: &Topology) -> Vec<Vec<String>> {
         .nodes
         .iter()
         .map(|node| {
-            vec![
+            privileged(vec![
                 "ip".into(),
                 "netns".into(),
                 "del".into(),
                 netns(&topology.lab.name, &node.name),
-            ]
+            ])
         })
         .collect()
+}
+
+/// Every wiring command needs `CAP_NET_ADMIN`.
+///
+/// Runtime `exec` runs as the ordinary VM user on Lima and Multipass, so a
+/// bare `ip netns add` fails on the very first command. Prefixing here rather
+/// than at each call site means no generator can forget.
+pub const PRIVILEGED: &str = "sudo";
+
+/// Prefix a command with the privilege escalation the substrate needs.
+pub fn privileged(argv: Vec<String>) -> Vec<String> {
+    let mut cmd = vec![PRIVILEGED.to_string()];
+    cmd.extend(argv);
+    cmd
 }
 
 /// A command that runs inside a node's namespace.
 pub fn in_node(lab: &str, node: &str, argv: &[&str]) -> Vec<String> {
     let mut cmd = vec![
+        PRIVILEGED.to_string(),
         "ip".to_string(),
         "netns".to_string(),
         "exec".to_string(),
@@ -351,10 +371,10 @@ mod tests {
         // interfaces nothing else in the root namespace is using.
         let mut created = std::collections::BTreeSet::new();
         for cmd in &cmds {
-            if cmd.get(1).map(String::as_str) == Some("link")
-                && cmd.get(2).map(String::as_str) == Some("add")
+            if cmd.get(2).map(String::as_str) == Some("link")
+                && cmd.get(3).map(String::as_str) == Some("add")
             {
-                assert!(created.insert(cmd[3].clone()), "{} collided", cmd[3]);
+                assert!(created.insert(cmd[4].clone()), "{} collided", cmd[4]);
                 let peer = cmd.last().expect("peer name");
                 assert!(created.insert(peer.clone()), "{peer} collided");
             }
@@ -367,7 +387,7 @@ mod tests {
         let cmds = commands();
         let add_ns = cmds
             .iter()
-            .position(|c| c == "ip netns add devbox-clos-leaf1")
+            .position(|c| c == "sudo ip netns add devbox-clos-leaf1")
             .expect("leaf1's namespace is created");
         let move_in = cmds
             .iter()
@@ -400,7 +420,8 @@ mod tests {
         for node in ["leaf1", "leaf2", "spine1"] {
             assert!(
                 cmds.iter()
-                    .any(|c| c == &format!("ip netns exec devbox-clos-{node} ip link set lo up")),
+                    .any(|c| c
+                        == &format!("sudo ip netns exec devbox-clos-{node} ip link set lo up")),
                 "{node} must bring lo up"
             );
         }
@@ -447,7 +468,7 @@ mod tests {
 
         assert_eq!(cmds.len(), 3);
         for node in ["leaf1", "leaf2", "spine1"] {
-            assert!(cmds.contains(&format!("ip netns del devbox-clos-{node}")));
+            assert!(cmds.contains(&format!("sudo ip netns del devbox-clos-{node}")));
         }
     }
 
@@ -456,7 +477,7 @@ mod tests {
         let cmd = in_node("clos", "leaf1", &["vtysh", "-c", "show bgp summary"]);
         assert_eq!(
             render(&cmd),
-            "ip netns exec devbox-clos-leaf1 vtysh -c show bgp summary"
+            "sudo ip netns exec devbox-clos-leaf1 vtysh -c show bgp summary"
         );
     }
 
@@ -467,6 +488,20 @@ mod tests {
         assert!(text.contains("-c 1"), "one packet");
         assert!(text.contains("-W 2"), "and a timeout: {text}");
         assert!(text.ends_with("10.0.0.3"));
+    }
+
+    #[test]
+    fn every_command_is_privileged() {
+        // Runtime exec runs as the ordinary VM user on Lima and Multipass, so
+        // an unprivileged `ip netns add` fails on the very first command.
+        let t = clos();
+        let plan = ipam::allocate(&t).unwrap();
+        for cmd in up_commands(&t, &plan).unwrap() {
+            assert_eq!(cmd[0], PRIVILEGED, "unprivileged: {}", render(&cmd));
+        }
+        for cmd in down_commands(&t) {
+            assert_eq!(cmd[0], PRIVILEGED, "unprivileged: {}", render(&cmd));
+        }
     }
 
     #[test]

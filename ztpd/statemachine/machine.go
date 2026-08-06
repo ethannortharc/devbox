@@ -17,7 +17,11 @@
 package statemachine
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -113,6 +117,74 @@ type Registry struct {
 	nodes map[string]*Node
 	// now is injectable so tests do not have to sleep.
 	now func() time.Time
+}
+
+// Snapshot is the registry's persistent form.
+//
+// §10.3 kills `ztpd` mid-provision and expects the fabric to self-heal. An
+// in-memory-only registry loses first-seen times, attempt counts, and config
+// hashes on that restart — so returning nodes look like first attempts and
+// both the whole-ordeal SLO and the `attempts > 1` assertion become fiction.
+type Snapshot struct {
+	Nodes []Node `json:"nodes"`
+}
+
+// Save writes the registry to a file, atomically.
+func (r *Registry) Save(path string) error {
+	r.mu.RLock()
+	snapshot := Snapshot{Nodes: make([]Node, 0, len(r.nodes))}
+	for _, node := range r.nodes {
+		snapshot.Nodes = append(snapshot.Nodes, *node)
+	}
+	r.mu.RUnlock()
+
+	sort.Slice(snapshot.Nodes, func(i, j int) bool {
+		return snapshot.Nodes[i].Serial < snapshot.Nodes[j].Serial
+	})
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("encode the registry: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+	}
+
+	// Write-then-rename: a crash mid-write must not leave a truncated file
+	// that the next start refuses to load.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// Load restores a registry from a file.
+//
+// A missing file is an empty registry, not an error: the first start of a
+// fabric has nothing to restore.
+func Load(path string) (*Registry, error) {
+	registry := NewRegistry()
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return registry, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var snapshot Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	for i := range snapshot.Nodes {
+		node := snapshot.Nodes[i]
+		registry.nodes[node.Serial] = &node
+	}
+	return registry, nil
 }
 
 // NewRegistry builds an empty registry.

@@ -88,7 +88,21 @@ def allocate(fabric: Fabric) -> Allocation:
     allocation = Allocation()
 
     for near, far in fabric.links():
-        explicit = _explicit_address(fabric, near) or _explicit_address(fabric, far)
+        near_explicit = _explicit_address(fabric, near)
+        far_explicit = _explicit_address(fabric, far)
+
+        if near_explicit is not None and far_explicit is not None:
+            near_iface = ipaddress.IPv4Interface(near_explicit)
+            far_iface = ipaddress.IPv4Interface(far_explicit)
+            if near_iface.network != far_iface.network:
+                raise OverlapError(
+                    f"{near} declares {near_explicit} and {far} declares {far_explicit}; "
+                    "the two ends of a link must be in the same subnet"
+                )
+            if near_iface.ip == far_iface.ip:
+                raise OverlapError(f"{near} and {far} both declare {near_explicit}")
+
+        explicit = near_explicit or far_explicit
         if explicit is not None:
             network = ipaddress.IPv4Interface(explicit).network
         else:
@@ -101,17 +115,29 @@ def allocate(fabric: Fabric) -> Allocation:
         if len(hosts) < 2:
             raise OverlapError(f"subnet {network} cannot address two ends")
 
+        # A declared address is honoured *at the end that declared it*, not
+        # merely used to pick a subnet — otherwise the API's promise that
+        # explicit values win is a half-truth that silently moves addresses.
+        if near_explicit is not None:
+            near_addr = near_explicit
+            far_addr = far_explicit or _other_host(hosts, near_explicit, network)
+        elif far_explicit is not None:
+            far_addr = far_explicit
+            near_addr = _other_host(hosts, far_explicit, network)
+        else:
+            near_addr = f"{hosts[0]}/{network.prefixlen}"
+            far_addr = f"{hosts[1]}/{network.prefixlen}"
+
         allocation.links.append(
-            LinkAddresses(
-                subnet=str(network),
-                ends={
-                    near: f"{hosts[0]}/{network.prefixlen}",
-                    far: f"{hosts[1]}/{network.prefixlen}",
-                },
-            )
+            LinkAddresses(subnet=str(network), ends={near: near_addr, far: far_addr})
         )
 
+    # Explicit ASNs are claimed up front, so a derived one never lands on top
+    # of one the fabric already asked for: two intended eBGP peers sharing an
+    # AS do not peer at all.
+    claimed = {d.asn for d in fabric.devices if d.routes and d.asn is not None}
     next_asn = plan.asn_base
+
     for device in fabric.devices:
         if not device.routes:
             continue
@@ -124,8 +150,12 @@ def allocate(fabric: Fabric) -> Allocation:
                 raise OverlapError(f"{plan.loopback_base} has no room left for {device.name}")
             allocation.loopbacks[device.name] = f"{address}/32"
 
-        allocation.asns[device.name] = device.asn if device.asn is not None else next_asn
-        if device.asn is None:
+        if device.asn is not None:
+            allocation.asns[device.name] = device.asn
+        else:
+            while next_asn in claimed:
+                next_asn += 1
+            allocation.asns[device.name] = next_asn
             next_asn += 1
 
     verify(allocation)
@@ -150,6 +180,14 @@ def verify(allocation: Allocation) -> None:
             if left.overlaps(right):
                 raise OverlapError(f"subnets {left} and {right} overlap")
 
+    # Two routers sharing an AS do not form an eBGP session, so the fabric
+    # comes up and never converges.
+    by_asn: dict[int, str] = {}
+    for device, asn in allocation.asns.items():
+        if asn in by_asn:
+            raise OverlapError(f"devices {by_asn[asn]!r} and {device!r} share AS {asn}")
+        by_asn[asn] = device
+
 
 def _subnets(base: str, prefix: int) -> Iterator[IPv4Network]:
     """Yield successive subnets of `prefix` length from `base`."""
@@ -162,6 +200,17 @@ def _subnets(base: str, prefix: int) -> Iterator[IPv4Network]:
 def _hosts(base: str) -> Iterator[ipaddress.IPv4Address]:
     """Yield successive host addresses from `base`."""
     return iter(ipaddress.IPv4Network(base).hosts())
+
+
+def _other_host(
+    hosts: list[ipaddress.IPv4Address], taken: str, network: ipaddress.IPv4Network
+) -> str:
+    """The host address in `network` that is not `taken`."""
+    taken_ip = ipaddress.IPv4Interface(taken).ip
+    for host in hosts:
+        if host != taken_ip:
+            return f"{host}/{network.prefixlen}"
+    raise OverlapError(f"{network} has no second address beside {taken}")
 
 
 def _explicit_address(fabric: Fabric, endpoint: str) -> str | None:

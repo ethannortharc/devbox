@@ -90,7 +90,21 @@ pub async fn write_set_modules(
         sandbox_name,
         &compose::compose_configuration_nix(selection),
     )
-    .await
+    .await?;
+
+    // `devbox.nix` is the readable record of the selection, but the NixOS
+    // module the box already imports reads `devbox-state.toml`. Writing only
+    // the first would let `sets apply` report success while the installed
+    // closure never changed — so both are written, from the same selection.
+    let config = selection.to_config(&DevboxConfig::default());
+    let state_toml = generate_state_toml(&sets_map(&config), &languages_map(&config), &{
+        let mut extra = HashMap::new();
+        for pkg in &selection.packages {
+            extra.insert(pkg.clone(), "nixpkgs".to_string());
+        }
+        extra
+    });
+    write_state_toml(runtime, sandbox_name, &state_toml).await
 }
 
 /// Toggle additional sets/languages on a running sandbox, then rebuild.

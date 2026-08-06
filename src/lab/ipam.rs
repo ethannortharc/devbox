@@ -133,8 +133,25 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
         let (a, b) = link.parse_endpoints()?;
 
         let (network, prefix_len) = match &link.subnet {
-            Some(explicit) => parse_v4_cidr(explicit)
-                .with_context(|| format!("link {index} has an invalid subnet '{explicit}'"))?,
+            Some(explicit) => {
+                let (addr, len) = parse_v4_cidr(explicit)
+                    .with_context(|| format!("link {index} has an invalid subnet '{explicit}'"))?;
+                if len > P2P_PREFIX {
+                    bail!("link {index} declares '{explicit}': a /{len} cannot address two ends");
+                }
+                // Canonicalize: `192.0.2.1/31` names a host, not a network, and
+                // deriving both ends from it would put them in different
+                // subnets.
+                let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+                let canonical = Ipv4Addr::from(u32::from(addr) & mask);
+                if canonical != addr {
+                    bail!(
+                        "link {index} declares '{explicit}', which is a host inside \
+                         {canonical}/{len}, not the network itself"
+                    );
+                }
+                (canonical, len)
+            }
             None => {
                 // Each derived link takes the next /31 inside the base.
                 // Links live in the lower half of the base prefix.
@@ -179,7 +196,18 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
     }
 
     // Loopbacks and ASNs for routers, in topology order so they are stable.
+    // Explicit ASNs are claimed first, so a derived one never lands on top of
+    // one the topology already asked for — two eBGP peers sharing an AS do not
+    // peer at all.
+    let claimed: std::collections::BTreeSet<u32> = topology
+        .nodes
+        .iter()
+        .filter(|n| n.role.routes())
+        .filter_map(|n| n.asn)
+        .collect();
+
     let mut next_router: u32 = 0;
+    let mut next_asn = topology.lab.asn_base;
     for node in &topology.nodes {
         if !node.role.routes() {
             continue;
@@ -188,10 +216,19 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
             node.name.clone(),
             offset_addr(loopback_base(base, base_len), next_router),
         );
-        plan.asns.insert(
-            node.name.clone(),
-            node.asn.unwrap_or(topology.lab.asn_base + next_router),
-        );
+
+        let asn = match node.asn {
+            Some(explicit) => explicit,
+            None => {
+                while claimed.contains(&next_asn) {
+                    next_asn += 1;
+                }
+                let derived = next_asn;
+                next_asn += 1;
+                derived
+            }
+        };
+        plan.asns.insert(node.name.clone(), asn);
         next_router += 1;
     }
 
@@ -215,6 +252,15 @@ pub fn verify(plan: &Plan) -> Result<()> {
     for link in &plan.links {
         if !seen.insert(link.subnet.clone()) {
             bail!("subnet {} is assigned to two links", link.subnet);
+        }
+    }
+
+    // Two routers sharing an AS do not form an eBGP session, so the fabric
+    // comes up and never converges.
+    let mut asns = std::collections::BTreeMap::new();
+    for (node, asn) in &plan.asns {
+        if let Some(other) = asns.insert(*asn, node.clone()) {
+            bail!("routers '{other}' and '{node}' share AS {asn}");
         }
     }
     Ok(())
@@ -403,7 +449,55 @@ mod tests {
 
         let plan = allocate(&t).unwrap();
         assert_eq!(plan.asns["r1"], 64512);
-        assert_eq!(plan.asns["r2"], 65001, "derived ASNs keep their position");
+        assert_eq!(plan.asns["r2"], 65000, "derivation starts at asn_base");
+    }
+
+    #[test]
+    fn a_derived_asn_never_lands_on_an_explicit_one() {
+        // Two eBGP peers sharing an AS do not peer at all, so the fabric comes
+        // up and never converges — the worst kind of lab bug.
+        let mut t = topology(
+            &[
+                ("r1", Role::FrrRouter),
+                ("r2", Role::FrrRouter),
+                ("r3", Role::FrrRouter),
+            ],
+            &[("r1:eth1", "r2:eth1", None), ("r2:eth2", "r3:eth1", None)],
+        );
+        t.nodes[0].asn = Some(65000); // exactly what derivation would pick
+
+        let plan = allocate(&t).unwrap();
+        assert_eq!(plan.asns["r1"], 65000);
+        assert_ne!(plan.asns["r2"], 65000);
+        assert_ne!(plan.asns["r3"], 65000);
+        assert_ne!(plan.asns["r2"], plan.asns["r3"]);
+    }
+
+    #[test]
+    fn verify_catches_duplicate_asns() {
+        let mut plan = allocate(&clos()).unwrap();
+        let first = plan.asns["leaf1"];
+        plan.asns.insert("leaf2".into(), first);
+        assert!(verify(&plan).unwrap_err().to_string().contains("share AS"));
+    }
+
+    #[test]
+    fn an_explicit_subnet_must_be_a_network_that_fits_two_ends() {
+        // `192.0.2.1/31` names a host, and deriving both ends from it would
+        // put them in different subnets.
+        for bad in ["192.0.2.1/31", "10.0.0.5/32", "10.0.0.1/24"] {
+            let t = topology(
+                &[("a", Role::Host), ("b", Role::Host)],
+                &[("a:eth1", "b:eth1", Some(bad))],
+            );
+            assert!(allocate(&t).is_err(), "{bad} should be rejected");
+        }
+        // The canonical form is fine.
+        let t = topology(
+            &[("a", Role::Host), ("b", Role::Host)],
+            &[("a:eth1", "b:eth1", Some("192.0.2.0/31"))],
+        );
+        assert!(allocate(&t).is_ok());
     }
 
     #[test]

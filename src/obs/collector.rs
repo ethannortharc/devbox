@@ -307,6 +307,7 @@ impl Collector {
             "agent connected"
         );
 
+        let box_id = hello.box_id.clone();
         while let Some(frame) = read_frame(&mut stream).await? {
             if frame.is_empty() {
                 continue; // keepalive
@@ -323,6 +324,18 @@ impl Collector {
             };
             if event.validate().is_err() {
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // The handshake decided which box this connection speaks for.
+            // Accepting an event that names a different one would let a
+            // compromised agent write into another box's timeline.
+            if event.box_id != box_id {
+                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    expected = %box_id,
+                    claimed = %event.box_id,
+                    "agent sent an event for another box"
+                );
                 continue;
             }
 

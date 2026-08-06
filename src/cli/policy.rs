@@ -94,7 +94,9 @@ fn load(
     let name = manager.resolve_name(name)?;
     let state = manager.get_sandbox(&name)?;
     let path = state.project_dir.join("devbox.toml");
-    let config = DevboxConfig::load_or_default(&state.project_dir);
+    // `load_for_edit`, not `load_or_default`: every caller here may go on to
+    // write the file, and falling back to defaults would erase the rest of it.
+    let config = DevboxConfig::load_for_edit(&state.project_dir)?;
     Ok((name, config, path))
 }
 
@@ -207,8 +209,10 @@ fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
         println!("  ({ecosystem} package host)");
     }
 
-    // Non-zero exit for a denial, so this is usable in a script.
-    if decision.verdict != crate::policy::Verdict::Allow {
+    // Non-zero exit for a *denial*, so this is usable in a script. A `flag`
+    // verdict is permitted traffic that is merely recorded, so it must not
+    // read as a denial.
+    if decision.verdict == crate::policy::Verdict::Block {
         bail!("{} is not permitted by the current policy", args.domain);
     }
     Ok(())

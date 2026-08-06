@@ -337,6 +337,7 @@ async fn console_drives_a_real_docker_box_end_to_end() {
         sets: vec!["system".to_string()],
         languages: vec![],
         image: "busybox".to_string(),
+        packages: vec![],
     }
     .save(state_dir.path())
     .expect("box is registered");

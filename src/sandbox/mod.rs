@@ -165,6 +165,7 @@ impl SandboxManager {
             sets: config.active_sets(),
             languages: config.active_languages(),
             image: config.sandbox.image.clone(),
+            packages: config.custom_packages.keys().cloned().collect(),
         };
         state.save(&self.state_dir)?;
 

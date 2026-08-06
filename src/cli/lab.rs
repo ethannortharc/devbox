@@ -293,6 +293,13 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
         "Router configs written for {} node(s).",
         lab.topology.routers().len()
     );
+
+    // Service orchestration — dnsmasq, chrony, and `devbox-ztpd` — is not
+    // wired yet. Saying so is the whole point: a topology that asks for those
+    // and gets a silent success is a lab the user will debug for an hour
+    // before discovering nothing was ever started.
+    report_unstarted_services(&lab);
+
     println!("\nCheck it with `devbox lab status {}`.", args.target);
     Ok(())
 }
@@ -326,6 +333,62 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
         commands.len()
     );
     Ok(())
+}
+
+/// Name the parts of a topology this bring-up did not start.
+///
+/// The wiring, addressing, and routing configs are real. Everything a
+/// `service` or `ztp-blank` node needs — dnsmasq with options 66/67, chrony,
+/// `devbox-ztpd`, and the bootstrap run itself — is not orchestrated yet, and
+/// reporting success without saying so would send someone hunting a fabric
+/// that was never asked to provision.
+fn report_unstarted_services(lab: &Lab) {
+    use crate::lab::topology::Role;
+
+    let mut pending: Vec<String> = Vec::new();
+    if lab.topology.services.dns {
+        pending.push("dnsmasq (DNS)".into());
+    }
+    if lab.topology.services.dhcp {
+        pending.push("dnsmasq DHCP with options 66/67".into());
+    }
+    if lab.topology.services.ntp {
+        pending.push("chrony (NTP)".into());
+    }
+
+    let blank = lab
+        .topology
+        .nodes
+        .iter()
+        .filter(|n| n.role == Role::ZtpBlank)
+        .count();
+    if blank > 0 {
+        pending.push(format!(
+            "devbox-ztpd, and the bootstrap on {blank} blank node(s)"
+        ));
+    }
+    let services = lab
+        .topology
+        .nodes
+        .iter()
+        .filter(|n| n.role == Role::Service)
+        .count();
+    if services > 0 {
+        pending.push(format!("the workload on {services} service node(s)"));
+    }
+
+    if pending.is_empty() {
+        return;
+    }
+
+    println!("\nNot started by this bring-up (service orchestration is not wired yet):");
+    for item in &pending {
+        println!("  - {item}");
+    }
+    println!(
+        "  The wiring, addressing, and routing configs above are real; \n  \
+         these have to be started inside the substrate by hand for now."
+    );
 }
 
 /// Parse the `--direction` flag.

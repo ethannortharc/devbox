@@ -617,3 +617,89 @@ construction. A test walks 500 links and asserts no collision.
 
 **Revisit.** Not expected to; if a lab ever exceeds ~10⁹ links the format
 string is the least of the problems.
+
+---
+
+## ADR-0025 — The selection drives `devbox-state.toml`, not just `devbox.nix`
+
+**Date:** 2026-08-06
+
+**Context.** A code review found that `sets apply` wrote the composed selection
+to `/etc/devbox/devbox.nix` — a file nothing in the box imports. The NixOS
+module a provisioned box actually loads reads `/etc/devbox/devbox-state.toml`.
+So the command reported success, persisted the new selection, and left the
+installed closure exactly as it was.
+
+**Decision.** `write_set_modules` writes **both**: `devbox.nix` as the readable
+record of what was composed, and `devbox-state.toml` — derived from the same
+`Selection` — as the file the module reads.
+
+**Rationale.** The alternative (change the module to import `devbox.nix`) would
+break every box provisioned before this change, because the module is baked in
+at provision time. Writing both keeps existing boxes working and makes the
+command truthful today. Also fixed alongside: `active_sets()` no longer forces
+`shell`/`tools`/`editor` on, which had made unchecking them a no-op that
+contradicted ADR-0012.
+
+**Revisit.** When the module itself can be updated in place, `devbox.nix`
+becomes the single source and the TOML can go.
+
+---
+
+## ADR-0026 — Config writes never fall back to defaults
+
+**Date:** 2026-08-06
+
+**Context.** `DevboxConfig::load_or_default` silently substitutes a default
+config for one that fails to parse. Read paths do not care. Write paths do:
+`devbox policy set` on a project whose `devbox.toml` has a syntax error would
+load defaults, apply the policy, and save — erasing mounts, resources,
+environment, and set selections.
+
+**Decision.** Add `load_for_edit`, which errors on a file that exists but does
+not parse, and use it on every path that writes the config back.
+
+**Rationale.** The failure is silent, total, and hits exactly the file a user
+hand-edited. Two functions with names that say which is which beats one
+function everyone has to remember not to misuse.
+
+---
+
+## ADR-0027 — Lab commands are privileged; the substrate provides `sudo`
+
+**Date:** 2026-08-06
+
+**Context.** `ip netns add`, veth creation, `sysctl`, and `tc` all need
+`CAP_NET_ADMIN`. Runtime `exec` runs as the ordinary VM user on Lima and
+Multipass, so `devbox lab up` failed on its very first command.
+
+**Decision.** Every generated wiring and fault command is prefixed with `sudo`
+in `wiring::privileged` / `wiring::in_node`, and a test asserts no generated
+command is missing it. The e2e substrate image installs `sudo` rather than
+running as root, so the test exercises the same path a real substrate does.
+
+**Rationale.** Prefixing at the generator means no future command can forget.
+Testing against a root container would have made the whole class of bug
+invisible.
+
+---
+
+## ADR-0028 — `lab up` reports what it did not start
+
+**Date:** 2026-08-06
+
+**Context.** `devbox lab up ztp-fabric` wired namespaces and wrote router
+configs, then exited zero — having started no dnsmasq, no chrony, no `ztpd`,
+and no bootstrap. The documented flagship scenario looked like it worked.
+
+**Decision.** `lab up` ends by listing every service the topology asks for that
+this bring-up did not start, and says the wiring and configs above are real.
+
+**Rationale.** Service orchestration is genuinely not built. The choice was
+between removing the scenario, silently succeeding, or saying so — and only the
+last leaves the topology, address plan, and generated configs useful while
+being honest about the gap. A silent success would cost someone an hour of
+debugging a fabric that was never asked to provision.
+
+**Revisit.** When `lab up` grows service orchestration, this function's list
+shrinks to nothing and can be deleted.

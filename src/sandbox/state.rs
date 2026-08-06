@@ -16,6 +16,13 @@ pub struct SandboxState {
     /// Base image type: "nixos" or "ubuntu"
     #[serde(default = "default_image")]
     pub image: String,
+    /// Ad-hoc nixpkgs attribute paths outside the set catalogue.
+    ///
+    /// Stored alongside the sets because they are part of the same selection:
+    /// without this, an extra package vanishes from the Sets form and is
+    /// removed by the next rebuild.
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 fn default_image() -> String {
@@ -92,6 +99,7 @@ mod tests {
             sets: vec!["system".into(), "shell".into(), "tools".into()],
             languages: vec!["go".into()],
             image: "nixos".to_string(),
+            packages: vec![],
         }
     }
 

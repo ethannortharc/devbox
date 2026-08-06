@@ -139,7 +139,7 @@ pub async fn apply_selection(
     publish("devbox: set modules written to /etc/devbox/sets/");
 
     // 2. Rebuild, streamed.
-    let argv = runtime.argv(box_name, &["sudo", "nixos-rebuild", "switch"], false);
+    let argv = runtime.argv(box_name, &crate::nix::rebuild::rebuild_argv(), false);
     publish(&format!("devbox: {}", argv.join(" ")));
 
     let code = stream_command(&argv, |line| publish(line)).await?;
@@ -157,6 +157,7 @@ pub async fn apply_selection(
     let mut sandbox = sandbox;
     sandbox.sets = config.active_sets();
     sandbox.languages = config.active_languages();
+    sandbox.packages = selection.packages.iter().cloned().collect();
     sandbox.save(&manager.state_dir)?;
 
     state.publish(ConsoleEvent::new(

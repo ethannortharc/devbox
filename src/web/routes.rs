@@ -150,14 +150,13 @@ async fn box_detail(
         Err(e) => return not_found(&name, &e),
     };
 
-    let selection = Selection::new(
-        boxinfo
-            .sets
-            .iter()
-            .cloned()
-            .chain(boxinfo.languages.iter().map(|l| format!("lang-{l}"))),
-        std::iter::empty(),
-    );
+    // Rebuild the selection from persisted state, packages included — the
+    // form posts the *whole* selection back, so anything missing here is
+    // silently dropped on the next apply.
+    let selection = match state.manager.get_sandbox(&name) {
+        Ok(s) => Selection::from_state(&s),
+        Err(_) => Selection::default(),
+    };
 
     // Only the Activity tab pays for reading the event store.
     let act = if tab == "activity" {
@@ -174,7 +173,12 @@ async fn box_detail(
         nav: "dashboard",
         tab,
         groups: service::set_groups(&selection),
-        extra_packages: String::new(),
+        extra_packages: selection
+            .packages
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
         policy: service::policy_view(
             &service::load_policy(&state.manager, &name).unwrap_or_default(),
         ),
@@ -410,9 +414,24 @@ async fn apply_sets(
         selection.packages.len()
     );
 
+    // One rebuild per box at a time: two concurrent ones would overwrite the
+    // same generated config and then each persist its own selection.
+    let Some(guard) = state.claim_rebuild(&name) else {
+        return (
+            StatusCode::CONFLICT,
+            Html(
+                "<div class=\"notice error\">A rebuild is already running for this box. \
+                 Wait for it to finish.</div>"
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    };
+
     let bg = state.clone();
     let box_name = name.clone();
     tokio::spawn(async move {
+        let _guard = guard;
         let manager = bg.manager.clone();
         if let Err(e) = build::apply_selection(&manager, &bg, &box_name, &selection).await {
             tracing::warn!(box_id = %box_name, error = ?e, "rebuild failed");
@@ -661,6 +680,7 @@ mod tests {
             sets: vec![],
             languages: vec![],
             image: "nixos".into(),
+            packages: vec![],
             created_at: String::new(),
         }
     }

@@ -574,3 +574,66 @@ Four of those Rust tests are end-to-end against real infrastructure:
   than from a re-resolution timer.
 - **ADR-0024** — why veth names are indexed rather than derived from node
   names.
+
+---
+
+## 2026-08-06T11:30Z — Codex review round 1: 23 findings, all addressed
+
+Ran `codex review --base main` with `gpt-5.6-sol` at `xhigh`. It found 8 P1 and
+15 P2 issues. Several were things the test suite could not have caught, because
+they were about how the pieces meet rather than how each behaves:
+
+**Paths that reported success without working**
+
+| Finding | Fix |
+|---|---|
+| `sets apply` wrote a file nothing imports | Write `devbox-state.toml` from the same selection (ADR-0025) |
+| Streamed rebuild missing the `NIX_PATH` workaround | `rebuild_argv()`, shared by both callers |
+| `sets apply` ran `nixos-rebuild` on Ubuntu boxes | Explicit guard naming `devbox nix add` instead |
+| `lab up` failed on its first command (no privileges) | Every generated command is `sudo`-prefixed, with a test (ADR-0027) |
+| `lab up ztp-fabric` started nothing and exited zero | Reports every service it did not start (ADR-0028) |
+| Unchecking `shell`/`tools`/`editor` was a no-op | `active_sets()` respects them, per ADR-0012 |
+| Extra packages vanished on the next rebuild | Persisted in `SandboxState.packages` |
+
+**Data loss and correctness**
+
+- `devbox policy set` on a project with a broken `devbox.toml` loaded defaults
+  and saved them over the file — erasing mounts, resources, and env (ADR-0026).
+- `behavior diff` without `--at` compared overlapping windows.
+- `behavior summary` silently truncated at 50k events; now warns.
+- `policy test` exited non-zero for a `flag` verdict, which is permitted
+  traffic.
+- Derived ASNs could collide with explicit ones, in **both** the Rust lab and
+  the Python labkit — two eBGP peers sharing an AS never peer, so the fabric
+  comes up and never converges. Both now claim explicit values first, and both
+  `verify` functions check.
+- An explicit link subnet like `192.0.2.1/31` was accepted as a network,
+  putting the two ends in different subnets.
+- Python IPAM moved an explicitly declared address to whichever end came first;
+  it now stays where it was declared, and conflicting declarations are refused.
+- Two concurrent Sets submissions each overwrote the other's config and then
+  persisted their own selection; one rebuild per box at a time now.
+
+**Security**
+
+- The collector accepted events naming a **different** box than the one that
+  handshook, letting a compromised agent write into another box's timeline.
+
+**Go**
+
+- The DNS→nftables enforcer marked an answer "seen" before nft accepted it, so
+  a transient failure blocked an allowlisted domain permanently.
+- `ztpd -metrics` was parsed, documented, and never listened on.
+- The ZTP registry was in-memory only, so the documented chaos case lost
+  attempt counts and first-seen times — making the SLO it advertises fiction.
+  Now persisted atomically, with a test.
+- The bootstrap script rewrote and restarted FRR on every rediscovery instead
+  of comparing first, which is what made "idempotent" untrue in practice.
+
+**Not fixed, deliberately** — `proc` capture still advertises `connect`
+coverage it does not deliver (the `/proc/net/tcp` parser exists and is tested,
+but the poll loop does not use it). It is recorded here rather than papered
+over; the honest interim is that `-no-ebpf` sees processes only.
+
+**Gate after the fixes** — 373 Rust unit + 52 integration/e2e, 10 Go packages,
+62 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.

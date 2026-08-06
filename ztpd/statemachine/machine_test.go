@@ -2,6 +2,8 @@ package statemachine
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -386,5 +388,78 @@ func TestTransitionsInvolvingUnknownStatesAreRefused(t *testing.T) {
 
 	if CanTransition("nonsense", Healthy) || CanTransition(Discovered, "nonsense") {
 		t.Error("an unknown state must not participate in a transition")
+	}
+}
+
+func TestARegistrySurvivesARestart(t *testing.T) {
+	t.Parallel()
+
+	// §10.3 kills ztpd mid-provision. Losing the registry would make every
+	// returning node look like a first attempt, and both the whole-ordeal SLO
+	// and the `attempts > 1` assertion fiction.
+	path := filepath.Join(t.TempDir(), "state", "ztpd-state.json")
+
+	first := NewRegistry()
+	if _, _, err := first.Discover("SN-001"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Advance("SN-001", Failed, "ztpd went away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.RecordPush("SN-001", "hash-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	second, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	node, ok := second.Get("SN-001")
+	if !ok {
+		t.Fatal("the node should have survived")
+	}
+	if node.State != Failed || node.Reason != "ztpd went away" {
+		t.Errorf("node = %+v", node)
+	}
+	if node.ConfigHash != "hash-abc" {
+		t.Error("the config hash must survive, or an identical re-push is not skipped")
+	}
+
+	// And a rediscovery is correctly counted as a retry.
+	if _, restarted, err := second.Discover("SN-001"); err != nil || !restarted {
+		t.Errorf("restarted=%v err=%v", restarted, err)
+	}
+	node, _ = second.Get("SN-001")
+	if node.Attempts != 2 {
+		t.Errorf("attempts = %d, want 2", node.Attempts)
+	}
+}
+
+func TestLoadingAMissingFileIsAnEmptyRegistryNotAnError(t *testing.T) {
+	t.Parallel()
+
+	// The first start of a fabric has nothing to restore.
+	registry, err := Load(filepath.Join(t.TempDir(), "nope.json"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if registry.Summarize().Total != 0 {
+		t.Error("a missing file should load as empty")
+	}
+}
+
+func TestLoadingACorruptFileIsAnError(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte("{not json}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Error("a corrupt state file should be reported, not silently discarded")
 	}
 }
