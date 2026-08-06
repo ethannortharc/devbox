@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::activity::{self, Activity, Flow, Lookup, StreamRow, TreeRow};
 use super::help::{self, Topic};
-use super::service::{self, BoxSummary, FileChange, SetGroup};
+use super::service::{self, BoxSummary, FileChange, PolicyView, SetGroup};
 use super::state::AppState;
 use super::{assets, auth, build, sse, term};
 use crate::nix::compose::Selection;
@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/boxes/{name}/stop", post(stop_box))
         .route("/api/boxes/{name}/destroy", post(destroy_box))
         .route("/api/boxes/{name}/sets", post(apply_sets))
+        .route("/api/boxes/{name}/policy", get(get_policy).put(put_policy))
         .route("/api/boxes/{name}/files", get(box_files))
         .route("/api/boxes/{name}/term", get(box_terminal))
         .route("/api/boxes/{name}/activity", get(box_activity))
@@ -101,6 +102,7 @@ struct BoxDetailTemplate {
     boxinfo: BoxSummary,
     groups: Vec<SetGroup>,
     extra_packages: String,
+    policy: PolicyView,
     stream: Vec<StreamRow>,
     flows: Vec<Flow>,
     lookups: Vec<Lookup>,
@@ -122,6 +124,7 @@ pub fn resolve_tab(requested: Option<&str>) -> &'static str {
     match requested {
         Some("activity") => "activity",
         Some("sets") => "sets",
+        Some("policy") => "policy",
         Some("files") => "files",
         Some("terminal") => "terminal",
         _ => "overview",
@@ -172,6 +175,9 @@ async fn box_detail(
         tab,
         groups: service::set_groups(&selection),
         extra_packages: String::new(),
+        policy: service::policy_view(
+            &service::load_policy(&state.manager, &name).unwrap_or_default(),
+        ),
         boxinfo,
         behavior: crate::obs::behavior::render_markdown(&act.summary),
         stream: act.stream,
@@ -423,6 +429,66 @@ async fn apply_sets(
     (
         StatusCode::ACCEPTED,
         render(BuildPanelFragment { name, summary }),
+    )
+        .into_response()
+}
+
+// ── policy ───────────────────────────────────────────────
+
+/// `GET /api/boxes/{name}/policy` — the policy as JSON.
+async fn get_policy(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match service::load_policy(&state.manager, &name) {
+        Ok(policy) => Json(policy).into_response(),
+        Err(e) => not_found(&name, &e),
+    }
+}
+
+/// `PUT /api/boxes/{name}/policy` — edit the policy live (§8).
+///
+/// The form posts the *whole* allowlist, so an edit is a replacement; a merge
+/// would make removing an entry in the UI do nothing.
+async fn put_policy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
+    let current = match service::load_policy(&state.manager, &name) {
+        Ok(p) => p,
+        Err(e) => return not_found(&name, &e),
+    };
+
+    let updated = match service::parse_policy_form(&body, &current) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<div class=\"notice error\">Invalid policy: {e}</div>"
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let posture = updated.egress;
+    let entries = updated.allow.len();
+    if let Err(e) = service::save_policy(&state.manager, &name, updated) {
+        return server_error("failed to save the policy", &e);
+    }
+
+    let note = if posture.enforces() {
+        format!(
+            "Saved: <strong>{posture}</strong> with {entries} allowlist entr{}. \
+             Run a reprovision to apply it inside the box.",
+            if entries == 1 { "y" } else { "ies" }
+        )
+    } else {
+        format!("Saved: <strong>{posture}</strong>. Nothing is blocked in this posture.")
+    };
+
+    (
+        StatusCode::OK,
+        Html(format!("<div class=\"notice\">{note}</div>")),
     )
         .into_response()
 }
@@ -711,6 +777,7 @@ mod tests {
             tab,
             groups: service::set_groups(&selection),
             extra_packages: String::new(),
+            policy: service::policy_view(&crate::policy::Policy::default()),
             boxinfo: summary("alpha", "running"),
             stream: vec![],
             flows: vec![],
@@ -765,6 +832,7 @@ mod tests {
         for (tab, needle) in [
             ("overview", "mount mode"),
             ("sets", "hx-post=\"/api/boxes/alpha/sets\""),
+            ("policy", "hx-put=\"/api/boxes/alpha/policy\""),
             ("files", "hx-get=\"/api/boxes/alpha/files\""),
             ("terminal", "data-endpoint=\"/api/boxes/alpha/term\""),
         ] {

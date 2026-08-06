@@ -14,12 +14,14 @@
 //! - [`runtime`] — the Incus/Lima/Multipass/Docker abstraction.
 //! - [`obs`] — the observability plane: schema, store, collector, correlation.
 //! - [`metrics`] — the Prometheus exporter.
+//! - [`policy`] — egress postures, the allowlist, and the nftables driver.
 //! - [`tools`] — language/tool detection and the tool registry.
 
 pub mod cli;
 pub mod metrics;
 pub mod nix;
 pub mod obs;
+pub mod policy;
 pub mod runtime;
 pub mod sandbox;
 pub mod tools;

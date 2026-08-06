@@ -1,0 +1,303 @@
+package policy
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/ethannortharc/devbox/agent/event"
+)
+
+// fakeApplier records what would have been run.
+type fakeApplier struct {
+	mu       sync.Mutex
+	rulesets []string
+	elements [][2]string // (set, addr)
+	failOn   string
+}
+
+func (f *fakeApplier) Apply(_ context.Context, ruleset string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rulesets = append(f.rulesets, ruleset)
+	return nil
+}
+
+func (f *fakeApplier) AddElement(_ context.Context, set, addr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failOn != "" && addr == f.failOn {
+		return errors.New("nft refused")
+	}
+	f.elements = append(f.elements, [2]string{set, addr})
+	return nil
+}
+
+func dnsEvent(name string, answers ...string) *event.Event {
+	return &event.Event{
+		TSWall: "2026-08-06T22:00:00.000Z", BoxID: "myapp", PID: 812,
+		Type: event.TypeDNS,
+		Net:  &event.Net{QName: name, QType: "A", Answers: answers},
+	}
+}
+
+func TestPermitsMatchesOnLabelBoundaries(t *testing.T) {
+	t.Parallel()
+
+	e := New(&fakeApplier{}, []string{"github.com", "*.githubusercontent.com"}, false)
+
+	for _, name := range []string{
+		"github.com", "codeload.github.com", "GitHub.com", "github.com.",
+		"raw.githubusercontent.com", "githubusercontent.com",
+	} {
+		if !e.Permits(name) {
+			t.Errorf("%q should be permitted", name)
+		}
+	}
+	for _, name := range []string{
+		"evilgithub.com", "github.com.evil.example", "example.com", "", "   ",
+	} {
+		if e.Permits(name) {
+			t.Errorf("%q must not be permitted", name)
+		}
+	}
+}
+
+func TestMirrorOnlyAddsTheCuratedHosts(t *testing.T) {
+	t.Parallel()
+
+	strict := New(&fakeApplier{}, nil, false)
+	if strict.Permits("pypi.org") {
+		t.Error("pypi.org should not be permitted without mirror-only")
+	}
+
+	mirror := New(&fakeApplier{}, nil, true)
+	for _, host := range []string{"pypi.org", "files.pythonhosted.org", "crates.io"} {
+		if !mirror.Permits(host) {
+			t.Errorf("%q should be permitted under mirror-only", host)
+		}
+	}
+	if mirror.Permits("telemetry.example.com") {
+		t.Error("mirror-only must not permit arbitrary hosts")
+	}
+}
+
+func TestOnDNSAddsPermittedAnswers(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	added, err := e.OnDNS(context.Background(),
+		dnsEvent("pypi.org", "151.101.0.223", "2606:4700::1"))
+	if err != nil {
+		t.Fatalf("OnDNS: %v", err)
+	}
+	if len(added) != 2 {
+		t.Fatalf("added = %v, want both answers", added)
+	}
+	if len(applier.elements) != 2 {
+		t.Fatalf("elements = %v", applier.elements)
+	}
+	if applier.elements[0][0] != SetV4 || applier.elements[1][0] != SetV6 {
+		t.Errorf("answers went to the wrong sets: %v", applier.elements)
+	}
+	if e.Added() != 2 {
+		t.Errorf("Added() = %d, want 2", e.Added())
+	}
+}
+
+func TestOnDNSIgnoresLookupsOutsideThePolicy(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	added, err := e.OnDNS(context.Background(), dnsEvent("telemetry.example", "1.2.3.4"))
+	if err != nil {
+		t.Fatalf("OnDNS: %v", err)
+	}
+	if len(added) != 0 || len(applier.elements) != 0 {
+		t.Errorf("a disallowed name must not open the firewall: %v", applier.elements)
+	}
+}
+
+func TestOnDNSDeduplicates(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	for i := 0; i < 3; i++ {
+		if _, err := e.OnDNS(context.Background(), dnsEvent("pypi.org", "151.101.0.223")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(applier.elements) != 1 {
+		t.Errorf("the same address should be added once, got %v", applier.elements)
+	}
+}
+
+func TestOnDNSRejectsMalformedAnswers(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	// These would otherwise become arguments to a command running as root.
+	added, err := e.OnDNS(context.Background(), dnsEvent("pypi.org",
+		"1.2.3.4; nft flush ruleset",
+		"$(reboot)",
+		"}; add rule inet devbox output accept; #",
+		"151.101.0.223",
+	))
+	if err != nil {
+		t.Fatalf("OnDNS: %v", err)
+	}
+	if len(added) != 1 || added[0] != "151.101.0.223" {
+		t.Errorf("only the real address should be added, got %v", added)
+	}
+}
+
+func TestOnDNSIgnoresNonDNSEvents(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	for _, ev := range []*event.Event{
+		nil,
+		{Type: event.TypeConnect, Net: &event.Net{QName: "pypi.org"}},
+		{Type: event.TypeDNS}, // no net sub-object
+	} {
+		if _, err := e.OnDNS(context.Background(), ev); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if len(applier.elements) != 0 {
+		t.Errorf("nothing should have been added: %v", applier.elements)
+	}
+}
+
+func TestOnDNSSurfacesAnApplierFailure(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{failOn: "151.101.0.223"}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	_, err := e.OnDNS(context.Background(), dnsEvent("pypi.org", "151.101.0.223"))
+	if err == nil {
+		t.Fatal("a failed insertion must be reported, not swallowed")
+	}
+	if !strings.Contains(err.Error(), "pypi.org") {
+		t.Errorf("the error should name the domain: %v", err)
+	}
+}
+
+func TestLoadForgetsPreviouslyAddedAddresses(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	e := New(applier, []string{"pypi.org"}, false)
+
+	if _, err := e.OnDNS(context.Background(), dnsEvent("pypi.org", "151.101.0.223")); err != nil {
+		t.Fatal(err)
+	}
+	// A reload destroys and rebuilds the table, so the set is empty again.
+	if err := e.Load(context.Background(), "table inet devbox {}"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.OnDNS(context.Background(), dnsEvent("pypi.org", "151.101.0.223")); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(applier.elements) != 2 {
+		t.Errorf("the address must be re-added after a reload, got %v", applier.elements)
+	}
+	if len(applier.rulesets) != 1 {
+		t.Errorf("rulesets = %d, want 1", len(applier.rulesets))
+	}
+}
+
+func TestViolationCarriesTheProcessIdentity(t *testing.T) {
+	t.Parallel()
+
+	base := &event.Event{
+		TSWall: "2026-08-06T22:00:00.000Z", TSMonoNS: 42,
+		PID: 812, TID: 812, PPID: 640, Comm: "pip", UID: 1000, CgroupID: 7,
+	}
+	ev := Violation("myapp", "allowlist", "telemetry.example", "not in the allowlist", base)
+
+	if err := ev.Validate(); err != nil {
+		t.Fatalf("a violation must be a valid event: %v", err)
+	}
+	if ev.Policy.Verdict != "block" || ev.Policy.Mode != "allowlist" {
+		t.Errorf("policy = %+v", ev.Policy)
+	}
+	// Without the pid, a violation cannot be attributed to a process, which
+	// is the only thing that makes it actionable.
+	if ev.PID != 812 || ev.Comm != "pip" || ev.CgroupID != 7 {
+		t.Errorf("identity was lost: %+v", ev)
+	}
+}
+
+func TestViolationWithoutABaseEventStillValidates(t *testing.T) {
+	t.Parallel()
+
+	ev := Violation("myapp", "isolated", "example.com", "no egress", nil)
+	ev.TSWall = "2026-08-06T22:00:00.000Z"
+	ev.PID = 1
+	if err := ev.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+// The curated list exists in both languages. They must agree, or `mirror-only`
+// means one thing to the policy engine and another to the firewall.
+func TestMirrorHostsMatchTheRustList(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "src", "policy", "mirrors.rs"))
+	if err != nil {
+		t.Skipf("cannot read the Rust list: %v", err)
+	}
+
+	// Hosts are the quoted strings inside the `hosts:` arrays.
+	blocks := regexp.MustCompile(`(?s)hosts:\s*&\[(.*?)\]`).FindAllSubmatch(source, -1)
+	if len(blocks) == 0 {
+		t.Fatal("found no host lists in mirrors.rs; the parser needs updating")
+	}
+
+	quoted := regexp.MustCompile(`"([^"]+)"`)
+	seen := map[string]bool{}
+	var rust []string
+	for _, block := range blocks {
+		for _, m := range quoted.FindAllSubmatch(block[1], -1) {
+			host := string(m[1])
+			if !seen[host] {
+				seen[host] = true
+				rust = append(rust, host)
+			}
+		}
+	}
+	sort.Strings(rust)
+
+	goList := append([]string(nil), MirrorHosts...)
+	sort.Strings(goList)
+
+	if len(rust) != len(goList) {
+		t.Fatalf("mirror lists differ in length: Rust has %d, Go has %d\nRust: %v\nGo:   %v",
+			len(rust), len(goList), rust, goList)
+	}
+	for i := range rust {
+		if rust[i] != goList[i] {
+			t.Errorf("mirror lists differ at %d: Rust %q, Go %q", i, rust[i], goList[i])
+		}
+	}
+}

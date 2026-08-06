@@ -17,8 +17,8 @@ ordered work list, §17 the quality bar).
 | 2 | On-demand build / selective sets | **DONE** |
 | 3 | Observability capture (Go agent + eBPF) | **DONE** |
 | 4 | Observability presentation + behavior diff | **DONE** |
-| 5 | Egress & activity control | in progress |
-| 6 | Box lab: substrate & topology | not started |
+| 5 | Egress & activity control | **DONE** |
+| 6 | Box lab: substrate & topology | in progress |
 | 7 | Fault injection & scenario library | not started |
 | 8 | ZTP fabric + SoT + config-gen | not started |
 | 9 | Polish, docs, examples | not started |
@@ -272,3 +272,49 @@ would be fabricating data. Tracked for Phase 5's tap work.
 postures, DNS-driven allowlist resolution, and an nftables driver the agent
 applies; violations become `policy` events, which the behaviour summary already
 knows how to read.
+
+---
+
+## 2026-08-06T08:50Z — Phase 5 DONE
+
+**Landed**
+
+- **Policy engine** (`src/policy/`), pure and 43 tests deep. Four postures with
+  the semantics §8 specifies, and the details that matter:
+  - A bare `github.com` covers `codeload.github.com` but **not**
+    `evilgithub.com` — label-boundary matching, shared by the Rust and Go
+    implementations.
+  - `open` + an allowlist **flags without blocking**: the useful first step
+    before enforcing.
+  - `isolated` blocks even explicitly allowlisted hosts. A posture that quietly
+    makes exceptions is a lie.
+  - Loopback is never egress under **any** posture, so no posture can break the
+    box's own services.
+- **`mirror-only` curated list** (`src/policy/mirrors.rs`): ten ecosystems,
+  download hosts rather than web UIs, telemetry endpoints deliberately excluded.
+  The acceptance criterion — pip/npm/cargo/nix work, arbitrary hosts do not —
+  is a test.
+- **nftables generation** (`src/policy/nftables.rs`): idempotent (destroy then
+  rebuild), devbox's own table so a flush never touches the box's own rules,
+  conntrack before the set lookup, DNS permitted in every posture except
+  `isolated` (blocking it would make the allowlist *unenforceable*, not
+  stricter), and `log prefix "devbox-blocked "` — which is what turns a dropped
+  packet into a `policy` event.
+- **Agent enforcement** (`agent/policy/`): applies the ruleset, then keeps the
+  named sets in sync from the DNS it is already capturing. The firewall learns
+  the address from the same resolution the application is about to use, so a
+  CDN rotation needs no re-resolution timer. Malformed answers are dropped
+  before they can reach a command running as root — tested with the injection
+  strings.
+- **Cross-language list test**: the Go mirror list is parsed out of
+  `mirrors.rs` and compared, so the two cannot drift.
+- **Policy tab** in the console: radio postures with their own explanations, a
+  paste-anything allowlist textarea, live save to `devbox.toml`, and validation
+  that rejects without partially applying.
+- **CLI**: `devbox policy show|set|allow|test|rules`. `test` exits non-zero on a
+  denial so it is usable in a script.
+
+**Gate** — all green: 315 Rust tests, Go vet/test/gofmt, Python ruff/pytest.
+
+**Next step** — Phase 6: the lab. `src/lab/` with the topology schema, IPAM
+address assignment, and veth/bridge wiring inside one Linux substrate.

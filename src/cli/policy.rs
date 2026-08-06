@@ -1,0 +1,298 @@
+//! `devbox policy` — read and change a box's egress posture (§8, §6.4).
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Subcommand};
+
+use crate::policy::{Policy, Posture, Target, mirrors};
+use crate::sandbox::SandboxManager;
+use crate::sandbox::config::DevboxConfig;
+
+#[derive(Args, Debug)]
+pub struct PolicyArgs {
+    #[command(subcommand)]
+    pub command: PolicyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PolicyCommand {
+    /// Show a box's current posture and allowlist
+    Show(ShowArgs),
+
+    /// Change the posture
+    Set(SetArgs),
+
+    /// Add entries to the allowlist
+    Allow(AllowArgs),
+
+    /// Ask what the policy would do about a target, without connecting
+    Test(TestArgs),
+
+    /// Print the nftables ruleset the posture generates
+    Rules(ShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// Sandbox name (default: current directory's sandbox)
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SetArgs {
+    /// One of: open, allowlist, mirror-only, isolated
+    pub posture: String,
+
+    /// Sandbox name (default: current directory's sandbox)
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AllowArgs {
+    /// Domains or CIDRs to permit
+    #[arg(required = true)]
+    pub entries: Vec<String>,
+
+    /// Sandbox name (default: current directory's sandbox)
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TestArgs {
+    /// Domain to test, e.g. `pypi.org`
+    pub domain: String,
+
+    /// Address it resolves to
+    #[arg(long, default_value = "203.0.113.1")]
+    pub addr: String,
+
+    /// Destination port
+    #[arg(long, default_value_t = 443)]
+    pub port: u16,
+
+    /// Sandbox name (default: current directory's sandbox)
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+pub async fn run(args: PolicyArgs, manager: &SandboxManager) -> Result<()> {
+    match args.command {
+        PolicyCommand::Show(a) => show(a, manager),
+        PolicyCommand::Set(a) => set(a, manager),
+        PolicyCommand::Allow(a) => allow(a, manager),
+        PolicyCommand::Test(a) => test(a, manager),
+        PolicyCommand::Rules(a) => rules(a, manager),
+    }
+}
+
+/// Load a box's project config, which is where the policy lives (§12.1).
+fn load(
+    manager: &SandboxManager,
+    name: Option<&str>,
+) -> Result<(String, DevboxConfig, std::path::PathBuf)> {
+    let name = manager.resolve_name(name)?;
+    let state = manager.get_sandbox(&name)?;
+    let path = state.project_dir.join("devbox.toml");
+    let config = DevboxConfig::load_or_default(&state.project_dir);
+    Ok((name, config, path))
+}
+
+fn save(config: &DevboxConfig, path: &std::path::Path) -> Result<()> {
+    config
+        .save(path)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn show(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
+    let (name, config, _) = load(manager, args.name.as_deref())?;
+    let policy = &config.policy;
+
+    println!("Egress policy for '{name}':\n");
+    println!("  posture: {}", policy.egress);
+    println!("  {}", policy.egress.describe());
+    println!(
+        "  alert on violation: {}",
+        if policy.alert_on_violation {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    if policy.allow.is_empty() {
+        println!("  allowlist: (empty)");
+    } else {
+        println!("  allowlist:");
+        for entry in &policy.allow {
+            println!("    - {entry}");
+        }
+    }
+
+    if policy.egress == Posture::MirrorOnly {
+        println!(
+            "\n  mirror-only additionally permits {} package and source hosts.",
+            mirrors::all_hosts().len()
+        );
+        println!("  Run `devbox policy test <domain>` to check a specific one.");
+    }
+
+    Ok(())
+}
+
+fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
+    let posture: Posture = args.posture.parse()?;
+    let (name, mut config, path) = load(manager, args.name.as_deref())?;
+
+    let previous = config.policy.egress;
+    config.policy.egress = posture;
+    config.policy.validate()?;
+    save(&config, &path)?;
+
+    println!("Box '{name}': egress posture {previous} → {posture}");
+    println!("  {}", posture.describe());
+
+    if posture == Posture::Allowlist && config.policy.allow.is_empty() {
+        println!(
+            "\n  Warning: the allowlist is empty, so nothing can be reached.\n  \
+             Add entries with `devbox policy allow <domain>`."
+        );
+    }
+    println!("\n  Apply it with `devbox reprovision` (or the Policy tab in the console).");
+    Ok(())
+}
+
+fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
+    let (name, mut config, path) = load(manager, args.name.as_deref())?;
+
+    let mut added = Vec::new();
+    for entry in &args.entries {
+        let entry = entry.trim().to_string();
+        if config.policy.allow.contains(&entry) {
+            continue;
+        }
+        config.policy.allow.push(entry.clone());
+        added.push(entry);
+    }
+
+    // Validate after adding so a bad entry is reported by name rather than
+    // silently written and rejected at apply time.
+    config.policy.validate()?;
+    save(&config, &path)?;
+
+    if added.is_empty() {
+        println!("Box '{name}': nothing new to allow.");
+    } else {
+        println!("Box '{name}': allowed {}", added.join(", "));
+    }
+    Ok(())
+}
+
+fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
+    let (name, config, _) = load(manager, args.name.as_deref())?;
+
+    let target = Target {
+        domain: args.domain.clone(),
+        addr: args.addr.clone(),
+        port: args.port,
+    };
+    let decision = config.policy.evaluate(&target);
+
+    println!(
+        "Box '{name}' ({}): {} → {}",
+        config.policy.egress, args.domain, decision.verdict
+    );
+    println!("  {}", decision.reason);
+    if let Some(ecosystem) = mirrors::ecosystem_of(&args.domain) {
+        println!("  ({ecosystem} package host)");
+    }
+
+    // Non-zero exit for a denial, so this is usable in a script.
+    if decision.verdict != crate::policy::Verdict::Allow {
+        bail!("{} is not permitted by the current policy", args.domain);
+    }
+    Ok(())
+}
+
+fn rules(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
+    let (_, config, _) = load(manager, args.name.as_deref())?;
+    print!("{}", crate::policy::nftables::ruleset(&config.policy));
+    Ok(())
+}
+
+/// Merge new allowlist entries into a policy, rejecting invalid ones.
+///
+/// Shared with the console's policy editor so both paths validate identically.
+pub fn apply_edit(policy: &mut Policy, posture: Posture, allow: Vec<String>) -> Result<()> {
+    let candidate = Policy {
+        egress: posture,
+        allow: allow
+            .into_iter()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect(),
+        alert_on_violation: policy.alert_on_violation,
+    };
+    candidate.validate()?;
+    *policy = candidate;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_edit_replaces_the_whole_allowlist() {
+        // The console posts the full list, so an edit is a replacement, not a
+        // merge — otherwise removing an entry in the UI would do nothing.
+        let mut policy = Policy {
+            egress: Posture::Open,
+            allow: vec!["old.example".into()],
+            alert_on_violation: true,
+        };
+
+        apply_edit(
+            &mut policy,
+            Posture::Allowlist,
+            vec!["github.com".into(), "10.0.0.0/8".into()],
+        )
+        .unwrap();
+
+        assert_eq!(policy.egress, Posture::Allowlist);
+        assert_eq!(policy.allow, vec!["github.com", "10.0.0.0/8"]);
+        assert!(
+            policy.alert_on_violation,
+            "unrelated settings are preserved"
+        );
+    }
+
+    #[test]
+    fn an_edit_drops_blank_entries() {
+        let mut policy = Policy::default();
+        apply_edit(
+            &mut policy,
+            Posture::Allowlist,
+            vec!["  ".into(), "github.com".into(), String::new()],
+        )
+        .unwrap();
+        assert_eq!(policy.allow, vec!["github.com"]);
+    }
+
+    #[test]
+    fn an_invalid_edit_leaves_the_policy_untouched() {
+        let mut policy = Policy {
+            egress: Posture::Allowlist,
+            allow: vec!["github.com".into()],
+            alert_on_violation: true,
+        };
+
+        let err = apply_edit(&mut policy, Posture::Allowlist, vec!["no-dot".into()]).unwrap_err();
+        assert!(err.to_string().contains("no-dot"));
+        assert_eq!(
+            policy.allow,
+            vec!["github.com"],
+            "a rejected edit must not partially apply"
+        );
+    }
+}

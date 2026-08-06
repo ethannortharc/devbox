@@ -13,6 +13,7 @@ pub mod init;
 pub mod layer;
 pub mod list;
 pub mod nix_cmd;
+pub mod policy;
 pub mod prune;
 pub mod reprovision;
 pub mod self_update;
@@ -147,6 +148,9 @@ pub enum Command {
     /// Summarize or diff a box's behaviour
     Behavior(behavior::BehaviorArgs),
 
+    /// Read or change a box's egress policy
+    Policy(policy::PolicyArgs),
+
     /// Start the local web console
     Web(web::WebArgs),
 }
@@ -180,6 +184,7 @@ impl Command {
             Command::Sets(args) => sets::run(args, manager).await,
             Command::Watch(args) => watch::run(args, manager).await,
             Command::Behavior(args) => behavior::run(args, manager).await,
+            Command::Policy(args) => policy::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
         }
     }

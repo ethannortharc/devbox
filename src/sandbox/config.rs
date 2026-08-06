@@ -27,6 +27,10 @@ pub struct DevboxConfig {
 
     #[serde(default)]
     pub custom_packages: HashMap<String, String>,
+
+    /// Egress and activity control (§8, §12.1).
+    #[serde(default)]
+    pub policy: crate::policy::Policy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +145,7 @@ impl Default for DevboxConfig {
             resources: ResourcesSection::default(),
             env: HashMap::new(),
             custom_packages: HashMap::new(),
+            policy: crate::policy::Policy::default(),
         }
     }
 }
@@ -156,7 +161,6 @@ impl DevboxConfig {
     }
 
     /// Save to devbox.toml.
-    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         std::fs::write(path, content)

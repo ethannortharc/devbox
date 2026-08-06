@@ -116,6 +116,59 @@
 </form>
 {% endmacro %}
 
+{#- The egress posture editor. Postures are radio buttons because they are
+    mutually exclusive, and each carries its own one-line explanation so the
+    choice does not need a manual. -#}
+{% macro policy_editor(name, view) %}
+<form hx-put="/api/boxes/{{ name }}/policy"
+      hx-target="#policy-result"
+      hx-swap="innerHTML">
+  <fieldset class="setgroup">
+    <legend>Egress posture</legend>
+    {% for p in view.postures %}
+    <label class="postopt">
+      <input type="radio" name="posture" value="{{ p.name }}"
+             {% if p.selected %}checked{% endif %} />
+      <span class="postname">{{ p.name }}</span>
+      {% if p.enforces %}<span class="chip">blocks</span>{% endif %}
+      <span class="postdesc">{{ p.description }}</span>
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <fieldset class="setgroup">
+    <legend>Allowlist</legend>
+    <p class="muted">
+      Domains and CIDRs, one per line. A bare domain covers its subdomains, and
+      <code>*.example.com</code> matches subdomains only.
+      <code>mirror-only</code> additionally permits {{ view.mirror_hosts }}
+      package and source hosts.
+    </p>
+    <textarea class="text" name="allow" rows="6" spellcheck="false"
+              placeholder="github.com&#10;api.anthropic.com&#10;10.0.0.0/8">{{ view.allow }}</textarea>
+  </fieldset>
+
+  <fieldset class="setgroup">
+    <legend>Violations</legend>
+    <label class="setopt">
+      <input type="checkbox" name="alert"
+             {% if view.alert_on_violation %}checked{% endif %} />
+      <span class="setname">alert on violation</span>
+    </label>
+    <p class="muted">
+      Under <code>open</code> this flags connections outside the allowlist
+      without blocking them — the useful first step before enforcing.
+    </p>
+  </fieldset>
+
+  <div class="actions">
+    <button class="btn btn-primary" type="submit">Save policy</button>
+  </div>
+</form>
+
+<div id="policy-result"></div>
+{% endmacro %}
+
 {% macro file_changes(changes) %}
 {% if changes.is_empty() %}
 <p class="muted">No uncommitted changes in the overlay.</p>

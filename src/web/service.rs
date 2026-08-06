@@ -303,6 +303,103 @@ pub fn parse_selection_form(body: &str) -> compose::Selection {
     compose::Selection::new(sets, packages)
 }
 
+// ── policy (the Policy tab) ──────────────────────────────
+
+/// One posture option in the editor.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PostureOption {
+    pub name: String,
+    pub description: &'static str,
+    pub selected: bool,
+    /// True for postures that actually block traffic.
+    pub enforces: bool,
+}
+
+/// The Policy tab's view model.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PolicyView {
+    pub postures: Vec<PostureOption>,
+    pub allow: String,
+    pub alert_on_violation: bool,
+    /// Number of package hosts `mirror-only` permits, for the explanation.
+    pub mirror_hosts: usize,
+}
+
+/// Build the Policy tab view model.
+pub fn policy_view(policy: &crate::policy::Policy) -> PolicyView {
+    PolicyView {
+        postures: crate::policy::Posture::ALL
+            .iter()
+            .map(|p| PostureOption {
+                name: p.as_str().to_string(),
+                description: p.describe(),
+                selected: *p == policy.egress,
+                enforces: p.enforces(),
+            })
+            .collect(),
+        allow: policy.allow.join("\n"),
+        alert_on_violation: policy.alert_on_violation,
+        mirror_hosts: crate::policy::mirrors::all_hosts().len(),
+    }
+}
+
+/// Read a box's policy from its project config.
+pub fn load_policy(manager: &Arc<SandboxManager>, name: &str) -> Result<crate::policy::Policy> {
+    let state = manager.get_sandbox(name)?;
+    Ok(crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir).policy)
+}
+
+/// Write a box's policy back to its project config.
+pub fn save_policy(
+    manager: &Arc<SandboxManager>,
+    name: &str,
+    policy: crate::policy::Policy,
+) -> Result<()> {
+    let state = manager.get_sandbox(name)?;
+    let mut config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    config.policy = policy;
+    config
+        .save(&state.project_dir.join("devbox.toml"))
+        .with_context(|| format!("failed to write the policy for box '{name}'"))
+}
+
+/// Parse the Policy tab's form.
+///
+/// The allowlist is a textarea, so entries are split on any whitespace or
+/// comma — people paste lists in every shape.
+pub fn parse_policy_form(
+    body: &str,
+    current: &crate::policy::Policy,
+) -> Result<crate::policy::Policy> {
+    let mut posture = current.egress;
+    let mut allow: Vec<String> = Vec::new();
+    // An unchecked checkbox sends nothing, so absence means false.
+    let mut alert = false;
+
+    for (key, value) in form_urlencoded::parse(body.as_bytes()) {
+        match key.as_ref() {
+            "posture" => posture = value.parse()?,
+            "allow" => allow.extend(
+                value
+                    .split([' ', ',', '\t', '\n', '\r'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            ),
+            "alert" => alert = true,
+            _ => {}
+        }
+    }
+
+    let candidate = crate::policy::Policy {
+        egress: posture,
+        allow,
+        alert_on_violation: alert,
+    };
+    candidate.validate()?;
+    Ok(candidate)
+}
+
 // ── overlay (the Files tab) ──────────────────────────────
 
 /// One overlay change, as the console presents it.
@@ -480,6 +577,61 @@ mod tests {
         let sel = parse_selection_form("set=git&csrf=whatever&nonsense=1");
         assert!(sel.sets.contains("git"));
         assert_eq!(sel.sets.len(), 2, "git plus the locked system set");
+    }
+
+    #[test]
+    fn policy_view_marks_the_current_posture() {
+        let policy = crate::policy::Policy {
+            egress: crate::policy::Posture::MirrorOnly,
+            allow: vec!["github.com".into(), "10.0.0.0/8".into()],
+            alert_on_violation: true,
+        };
+        let view = policy_view(&policy);
+
+        assert_eq!(view.postures.len(), crate::policy::Posture::ALL.len());
+        let selected: Vec<&PostureOption> = view.postures.iter().filter(|p| p.selected).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "mirror-only");
+        assert!(selected[0].enforces);
+        assert!(!view.postures[0].enforces, "open blocks nothing");
+        assert_eq!(view.allow, "github.com\n10.0.0.0/8");
+        assert!(view.mirror_hosts > 10);
+    }
+
+    #[test]
+    fn policy_form_parses_a_pasted_allowlist_in_any_shape() {
+        let current = crate::policy::Policy::default();
+        let policy = parse_policy_form(
+            "posture=allowlist&allow=github.com%0Aapi.anthropic.com%2C+10.0.0.0%2F8&alert=on",
+            &current,
+        )
+        .unwrap();
+
+        assert_eq!(policy.egress, crate::policy::Posture::Allowlist);
+        assert_eq!(
+            policy.allow,
+            vec!["github.com", "api.anthropic.com", "10.0.0.0/8"]
+        );
+        assert!(policy.alert_on_violation);
+    }
+
+    #[test]
+    fn an_unchecked_alert_box_turns_alerting_off() {
+        // An unchecked checkbox sends nothing at all, so absence must mean
+        // false rather than "leave it as it was".
+        let current = crate::policy::Policy {
+            alert_on_violation: true,
+            ..Default::default()
+        };
+        let policy = parse_policy_form("posture=open", &current).unwrap();
+        assert!(!policy.alert_on_violation);
+    }
+
+    #[test]
+    fn a_bad_posture_or_allowlist_entry_is_rejected() {
+        let current = crate::policy::Policy::default();
+        assert!(parse_policy_form("posture=nonsense", &current).is_err());
+        assert!(parse_policy_form("posture=allowlist&allow=no-dot", &current).is_err());
     }
 
     #[test]

@@ -507,6 +507,47 @@ input.text:focus {
   outline-offset: -1px;
 }
 
+/* ── policy editor ────────────────────────────────────── */
+
+.postopt {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.postopt:hover {
+  background: var(--bg-inset);
+}
+.postname {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--fg);
+}
+.postdesc {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+textarea.text {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  width: 100%;
+  color: var(--fg);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  resize: vertical;
+}
+textarea.text:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
 /* ── build log ────────────────────────────────────────── */
 
 .buildlog {

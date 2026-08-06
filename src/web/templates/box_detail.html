@@ -22,6 +22,8 @@
          {% if tab == "activity" %}aria-current="page"{% endif %}>Activity</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=sets"
          {% if tab == "sets" %}aria-current="page"{% endif %}>Sets</a>
+      <a href="/boxes/{{ boxinfo.name }}?tab=policy"
+         {% if tab == "policy" %}aria-current="page"{% endif %}>Policy</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=files"
          {% if tab == "files" %}aria-current="page"{% endif %}>Files</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=terminal"
@@ -185,6 +187,14 @@
              hx-swap="beforeend scroll:bottom"></div>
         <p class="muted" sse-swap="build-status-{{ boxinfo.name }}"></p>
       </div>
+
+      {% elif tab == "policy" %}
+      <p class="muted">
+        What this box is allowed to reach. Changes are saved to
+        <code>devbox.toml</code>; the agent applies them on the next
+        provision or reprovision.
+      </p>
+      {% call m::policy_editor(boxinfo.name, policy) %}{% endcall %}
 
       {% elif tab == "files" %}
       <p class="muted">

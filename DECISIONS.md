@@ -481,3 +481,84 @@ reaching it already means being a local user on this machine, who could read
 **Revisit.** If a metric ever carries a box-derived label beyond `status`
 — a domain, a path, a command — that label leaks and this decision has to
 change with it.
+
+---
+
+## ADR-0020 — DNS must survive every posture except `isolated`
+
+**Date:** 2026-08-06
+
+**Context.** An obvious reading of "default-deny egress" blocks port 53 along
+with everything else.
+
+**Decision.** `allowlist` and `mirror-only` explicitly permit UDP and TCP 53.
+Only `isolated` blocks it.
+
+**Rationale.** The allowlist names *domains*, and the firewall enforces on
+*addresses*. The bridge between them is the agent watching DNS answers and
+adding them to the nftables set. Block resolution and that bridge collapses:
+nothing ever gets added, so the allowlist permits nothing and the posture is
+not "strict", it is "broken". `isolated` is the exception because it has no
+allowlist to resolve.
+
+**Cost.** DNS is an exfiltration channel, and this leaves it open in the
+enforcing postures. Mitigated by the fact that every query is *captured* —
+`devbox watch --type dns` shows exactly what was asked for — but a determined
+tunnel would work. Closing it properly means a resolver inside the box that
+only answers for allowlisted names, which is real work for a later phase.
+
+**Revisit.** When the lab gains its own dnsmasq (§9), it is the natural place
+to put an allowlist-only resolver.
+
+---
+
+## ADR-0021 — Enforce from observed DNS, not from periodic re-resolution
+
+**Date:** 2026-08-06
+
+**Context.** An allowlist of domains has to become a set of addresses. The
+usual approach is to resolve each name on a timer and refresh the set.
+
+**Decision.** The agent adds addresses to the nftables set as it *observes*
+DNS answers for allowlisted names, using the same capture pipeline that feeds
+the timeline.
+
+**Rationale.** Periodic re-resolution races the application: a CDN answers a
+different address to the box than it answered to the refresher, and the
+connection is blocked despite the name being allowed. Watching the actual
+answer means the firewall learns the exact address the application is about to
+use, in the right order, with no timer to tune. It also costs nothing extra —
+the DNS events are already being captured.
+
+**Cost.** A process that resolves by some other path (DoH, a hard-coded
+address, `/etc/hosts`) is not seen, so its connection is blocked even to an
+allowlisted name. That is arguably the correct outcome — an application
+bypassing the resolver is exactly what a glass box should not silently permit
+— but it will surprise someone, so the reason lands in a `policy` event.
+
+**Revisit.** If DoH becomes common inside boxes, the SSL uprobe (§7.1) sees
+those requests and can feed the same path.
+
+---
+
+## ADR-0022 — The `mirror-only` list is duplicated in Go, and a test keeps it honest
+
+**Date:** 2026-08-06
+
+**Context.** `mirror-only` needs the curated host list in two places: the Rust
+policy engine, which decides, and the Go agent, which resolves those names into
+the firewall. Sharing it would mean generating one from the other, or a data
+file both read at runtime.
+
+**Decision.** Duplicate the list, and add a Go test that parses
+`src/policy/mirrors.rs` and asserts the two agree exactly.
+
+**Rationale.** Codegen for a 38-entry list of strings is more machinery than
+the problem deserves, and a runtime data file would have to be pushed into the
+box and version-matched — a third thing that can drift. A test that fails the
+build when the lists disagree gets the same guarantee for twenty lines. The
+Rust side stays the source of truth: it carries the reasoning (which hosts,
+grouped by ecosystem, and why telemetry endpoints are excluded).
+
+**Revisit.** If the list grows past a few hundred entries, or gains structure
+beyond "host string", generate the Go side from the Rust one.

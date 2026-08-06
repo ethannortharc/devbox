@@ -7,7 +7,6 @@
 //! The fixture boxes use a runtime name no runtime claims, so status probes
 //! fail fast and the tests never shell out to `docker`/`limactl`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -26,10 +25,15 @@ const TOKEN: &str = "test-token-0123456789";
 fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().expect("temp dir");
     for name in names {
+        // A real project directory: the policy editor writes devbox.toml there,
+        // so a fake path would make that path untestable.
+        let project = dir.path().join("projects").join(name);
+        std::fs::create_dir_all(&project).expect("project dir");
+
         SandboxState {
             name: (*name).to_string(),
             runtime: "test-null".to_string(),
-            project_dir: PathBuf::from(format!("/tmp/projects/{name}")),
+            project_dir: project,
             created_at: "2026-08-06T00:00:00Z".to_string(),
             mount_mode: "overlay".to_string(),
             sets: vec!["system".into(), "git".into()],
@@ -416,6 +420,112 @@ async fn applying_a_selection_to_an_unknown_box_is_404() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+// ── policy ───────────────────────────────────────────────
+
+fn put_form(uri: &str, form: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn policy_tab_renders_every_posture() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_authed("/boxes/alpha?tab=policy"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let html = body_string(res).await;
+    for posture in ["open", "allowlist", "mirror-only", "isolated"] {
+        assert!(
+            html.contains(&format!("value=\"{posture}\"")),
+            "{posture} is missing from the editor"
+        );
+    }
+    assert!(html.contains("hx-put=\"/api/boxes/alpha/policy\""));
+    // Open is the default and must be the one checked.
+    let open = html.split("value=\"open\"").nth(1).unwrap();
+    assert!(open.split("/>").next().unwrap().contains("checked"));
+}
+
+#[tokio::test]
+async fn policy_is_editable_live_and_persists() {
+    let (dir, app) = console_with_boxes(&["alpha"]);
+
+    let res = app
+        .clone()
+        .oneshot(put_form(
+            "/api/boxes/alpha/policy",
+            "posture=allowlist&allow=github.com%0A10.0.0.0%2F8&alert=on",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("allowlist"), "got: {body}");
+    assert!(body.contains("2 allowlist entries"), "got: {body}");
+
+    // Read it back through the JSON endpoint.
+    let res = app
+        .oneshot(get_authed("/api/boxes/alpha/policy"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+    assert_eq!(json["egress"], "allowlist");
+    assert_eq!(json["allow"][0], "github.com");
+    assert_eq!(json["alert_on_violation"], true);
+
+    // And it really landed in the project's devbox.toml, not just in memory.
+    let toml = std::fs::read_to_string(dir.path().join("projects/alpha/devbox.toml"))
+        .expect("devbox.toml was written");
+    assert!(toml.contains("allowlist"), "devbox.toml: {toml}");
+    assert!(toml.contains("github.com"), "devbox.toml: {toml}");
+}
+
+#[tokio::test]
+async fn an_invalid_policy_is_rejected_without_saving() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for form in [
+        "posture=nonsense",
+        "posture=allowlist&allow=no-dot",
+        "posture=allowlist&allow=10.0.0.0%2F99",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(put_form("/api/boxes/alpha/policy", form))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "{form} should be rejected"
+        );
+        assert!(body_string(res).await.contains("Invalid policy"));
+    }
+}
+
+#[tokio::test]
+async fn policy_editing_requires_a_token() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/boxes/alpha/policy")
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::from("posture=isolated"))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── activity, behaviour, metrics ─────────────────────────
