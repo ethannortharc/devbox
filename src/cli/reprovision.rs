@@ -58,13 +58,14 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Re-run full provisioning with the (migrated) sets/languages
     // Pass mount_mode so NixOS module sets up overlay declaratively
     let image = state.image.as_str();
-    provision::provision_vm_with_mode(
+    provision::provision_vm_full(
         runtime.as_ref(),
         &name,
         &sets,
         &state.languages,
         image,
         &state.mount_mode,
+        &state.packages,
     )
     .await?;
 

@@ -21,6 +21,25 @@ let
   sandbox = devboxConfig.sandbox or {};
   mountMode = sandbox.mount_mode or "overlay";
   isOverlay = mountMode == "overlay";
+
+  # Ad-hoc packages from the Sets checklist's free-text field.
+  #
+  # `python312Packages.ipython` is a *path*, and a bare dotted TOML key is a
+  # nested table — so `attrNames` yields `python312Packages` and the lookup
+  # returns a whole package set rather than the leaf derivation. Walking the
+  # table recursively recovers the full path, and `attrByPath` resolves it.
+  #
+  # An attribute that does not exist is skipped rather than failing the whole
+  # rebuild: one stale name in the free-text field should not brick the box.
+  flattenPaths = prefix: attrs:
+    lib.concatLists (lib.mapAttrsToList (name: value:
+      let path = prefix ++ [ name ];
+      in if builtins.isAttrs value then flattenPaths path value else [ path ]
+    ) attrs);
+
+  customPaths = flattenPaths [ ] (devboxConfig.custom_packages or { });
+  customPackages = builtins.filter (p: p != null)
+    (map (path: lib.attrByPath path null pkgs) customPaths);
 in {
   # ── Nixpkgs config ──────────────────────────────────
   # Allow unfree packages (claude-code, codex, etc.)
@@ -51,9 +70,7 @@ in {
     # validated host-side against a strict attribute-path pattern before it is
     # written here, and an attribute that does not exist is skipped rather
     # than failing the whole rebuild.
-    ++ (builtins.filter (p: p != null)
-         (map (name: pkgs.${name} or null)
-              (builtins.attrNames (devboxConfig.custom_packages or {}))));
+    ++ customPackages;
 
   # ── Services ───────────────────────────────────────
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);

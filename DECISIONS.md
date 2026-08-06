@@ -765,3 +765,54 @@ is exactly the window the chaos test aims at, so the test could pass while the
 guarantee it measures did not hold. `Registry.Persisting` now saves after every
 mutation, before the caller is told it happened. The cost is one small
 synchronous write per state transition; at fabric scale that is nothing.
+
+## ADR-0033: the agent owns the allow set, because DNS is where names become addresses
+
+**Status:** accepted (2026-08-06)
+
+Turning on enforcement in ADR-0030 exposed the half that was missing. An
+allowlist names *domains*; nftables matches *addresses*. The generated ruleset
+is default-deny with `allow_v4`/`allow_v6` seeded only from literal CIDRs, and
+the only code that could add resolved answers — Go `Enforcer.OnDNS` — was never
+instantiated. So `allowlist` and `mirror-only` did not merely under-enforce
+once enforcement was live: they blocked exactly the traffic they promise to
+permit.
+
+`devbox-obsd -policy /etc/devbox/policy.json` now builds the enforcer, loads
+the ruleset, and adds every answer for an allowlisted name as it captures it.
+The control plane writes that file next to the ruleset. The agent is the right
+owner: it is already watching DNS, so the firewall learns an address from the
+same resolution the application is about to use — no polling, no TTL guessing.
+
+`nftables` moved into the `system` set at the same time. Enforcement that
+depends on the user having ticked an optional checkbox is not enforcement.
+
+## ADR-0034: policy is applied in the start lifecycle, not at the point of decision
+
+**Status:** accepted (2026-08-06)
+
+A firewall does not survive a box restart. Applying a posture only when it is
+*set* meant enforcement lasted until the first reboot and then vanished, while
+`devbox.toml` and the console kept reporting it — the same "displayed but not
+enforced" failure ADR-0030 was written to end, one layer down.
+
+`service::start_box` now applies the saved posture on every start, and
+`policy allow` reapplies on a running box. Failure is reported, not fatal:
+refusing to start a box because its firewall could not be installed would
+strand the user with no way in to fix it.
+
+## ADR-0035: generated modules must not overwrite guarded ones
+
+**Status:** accepted (2026-08-06)
+
+`write_set_modules` regenerated every set as a flat package list, including
+`ai-code.nix` and `ai-infra.nix` — which are checked in precisely because they
+wrap each optional tool in `tryEval`, since some are absent or broken on a
+given nixpkgs channel. One unavailable optional tool then failed the entire
+rebuild, for a set that is on by default. Those two are now embedded with
+`include_str!` and pushed verbatim.
+
+Related, same root cause of "a flat list loses structure": a bare dotted TOML
+key like `python312Packages.ipython` is a *nested table*, so `attrNames` gave
+`python312Packages` and the module handed an entire package set to
+`systemPackages`. Keys are quoted on write and resolved with `attrByPath`.

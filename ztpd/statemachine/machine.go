@@ -120,6 +120,9 @@ type Registry struct {
 	// persist, when set, is called after every mutation, before the caller is
 	// told the mutation happened. See Persisting.
 	persist func()
+	// saveMu serializes writes to the state file. Separate from mu because a
+	// save holds it across file I/O and must not block reads.
+	saveMu sync.Mutex
 }
 
 // Persisting makes every mutation durable before it is acknowledged.
@@ -185,13 +188,30 @@ func (r *Registry) Save(path string) error {
 		}
 	}
 
+	// One writer at a time. Saving per-mutation means concurrent nodes
+	// reporting transitions save concurrently, and a shared temp path lets an
+	// older snapshot rename over a newer one — or one writer's rename remove
+	// the file the other is still writing. Both lose acknowledged transitions,
+	// which is the exact guarantee per-mutation saving exists to provide.
+	//
+	// The snapshot above is taken under the read lock; this serializes only
+	// the write, so a save never blocks a mutation for longer than a file
+	// write takes.
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+
 	// Write-then-rename: a crash mid-write must not leave a truncated file
-	// that the next start refuses to load.
-	tmp := path + ".tmp"
+	// that the next start refuses to load. The pid keeps two *processes*
+	// sharing a state file from colliding on the temp path as well.
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Load restores a registry from a file.

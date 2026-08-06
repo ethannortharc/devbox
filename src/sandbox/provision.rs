@@ -217,21 +217,42 @@ pub async fn provision_vm_with_mode(
     image: &str,
     mount_mode: &str,
 ) -> Result<()> {
+    provision_vm_full(runtime, name, sets, languages, image, mount_mode, &[]).await
+}
+
+/// Provision, carrying the box's ad-hoc packages through.
+///
+/// The three-argument form drops them, so creating a box with
+/// `custom_packages` — or reprovisioning one that gained a package through the
+/// Sets tab — wrote a guest state file without them while the host state kept
+/// reporting them as selected. The two then disagreed until the next Sets
+/// apply, with the console showing the host's version.
+pub async fn provision_vm_full(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    image: &str,
+    mount_mode: &str,
+    packages: &[String],
+) -> Result<()> {
     match image {
         "ubuntu" => provision_ubuntu(runtime, name, sets, languages).await,
-        _ => provision_nixos(runtime, name, sets, languages, mount_mode).await,
+        _ => provision_nixos(runtime, name, sets, languages, mount_mode, packages).await,
     }
 }
 
 // ── NixOS Provisioning ─────────────────────────────────────
 
 /// Provision a NixOS VM: push nix config files + nixos-rebuild switch.
+#[allow(clippy::too_many_arguments)]
 async fn provision_nixos(
     runtime: &dyn Runtime,
     name: &str,
     sets: &[String],
     languages: &[String],
     mount_mode: &str,
+    packages: &[String],
 ) -> Result<()> {
     let username = whoami();
 
@@ -257,7 +278,7 @@ async fn provision_nixos(
     ensure_nixos_config(runtime, name).await?;
 
     // 3. Push devbox-state.toml (includes mount_mode for overlay setup)
-    let state_toml = generate_state_toml(sets, languages, &username, mount_mode);
+    let state_toml = generate_state_toml(sets, languages, &username, mount_mode, packages);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     // 4. Push devbox-module.nix
@@ -622,6 +643,7 @@ fn generate_state_toml(
     languages: &[String],
     username: &str,
     mount_mode: &str,
+    packages: &[String],
 ) -> String {
     let set_names = [
         "system",
@@ -658,6 +680,16 @@ fn generate_state_toml(
 
     toml.push_str("\n[sandbox]\n");
     toml.push_str(&format!("mount_mode = \"{mount_mode}\"\n"));
+
+    // Ad-hoc packages. Quoted, because an attribute path like
+    // `python312Packages.ipython` is otherwise read as a nested table and the
+    // module resolves the wrong thing.
+    if !packages.is_empty() {
+        toml.push_str("\n[custom_packages]\n");
+        for pkg in packages {
+            toml.push_str(&format!("\"{pkg}\" = \"nixpkgs\"\n"));
+        }
+    }
 
     toml
 }
@@ -1230,7 +1262,7 @@ mod tests {
             "container".to_string(),
         ];
         let langs = vec!["go".to_string()];
-        let toml = generate_state_toml(&sets, &langs, "testuser", "overlay");
+        let toml = generate_state_toml(&sets, &langs, "testuser", "overlay", &[]);
 
         assert!(toml.contains("name = \"testuser\""));
         assert!(toml.contains("system = true"));
@@ -1252,7 +1284,7 @@ mod tests {
             "lang-rust".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", "overlay");
+        let toml = generate_state_toml(&sets, &langs, "dev", "overlay", &[]);
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
@@ -1268,7 +1300,7 @@ mod tests {
             "ai-code".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", "overlay");
+        let toml = generate_state_toml(&sets, &langs, "dev", "overlay", &[]);
 
         assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("ai_infra = false"));
@@ -1278,7 +1310,7 @@ mod tests {
     fn generate_state_toml_bare() {
         let sets = vec![];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "user", "overlay");
+        let toml = generate_state_toml(&sets, &langs, "user", "overlay", &[]);
 
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));

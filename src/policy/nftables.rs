@@ -76,10 +76,15 @@ pub fn ruleset(policy: &Policy) -> String {
     // a lookup on every packet.
     let _ = writeln!(nft, "    ct state established,related accept");
 
-    // Loopback is never egress. Blocking it breaks the box's own services.
+    // Loopback and link-local are never egress. Blocking them breaks the box's
+    // own services and its neighbour discovery — and `Policy::evaluate` already
+    // treats both as local, so omitting them here made `devbox policy test`
+    // report "allowed" for an address the box would then drop.
     let _ = writeln!(nft, "    oifname \"lo\" accept");
     let _ = writeln!(nft, "    ip daddr 127.0.0.0/8 accept");
     let _ = writeln!(nft, "    ip6 daddr ::1 accept");
+    let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
+    let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
 
     // DNS must survive every posture except `isolated`: the allowlist is
     // resolved by name, so blocking resolution would make the allowlist

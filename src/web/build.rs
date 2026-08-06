@@ -177,6 +177,10 @@ pub async fn apply_selection(
     }
 
     let runtime = manager.runtime_for_sandbox(&sandbox)?;
+    // Everything below runs *inside* the guest — the snapshot, the writes, the
+    // rebuild — so a stopped box fails on the first exec. The CLI path already
+    // did this; the background path did not, and simply never rebuilt.
+    crate::web::service::ensure_running(manager, box_name).await?;
 
     let publish = |line: &str| {
         state.publish(ConsoleEvent::new(

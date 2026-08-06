@@ -80,7 +80,7 @@ pub async fn run(args: PolicyArgs, manager: &SandboxManager) -> Result<()> {
     match args.command {
         PolicyCommand::Show(a) => show(a, manager),
         PolicyCommand::Set(a) => set(a, manager).await,
-        PolicyCommand::Allow(a) => allow(a, manager),
+        PolicyCommand::Allow(a) => allow(a, manager).await,
         PolicyCommand::Test(a) => test(a, manager),
         PolicyCommand::Rules(a) => rules(a, manager),
     }
@@ -163,25 +163,12 @@ async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
     // Apply it now. The old text told the user to run `devbox reprovision`,
     // which never generated or loaded a ruleset — so an `isolated` box kept
     // full egress while reporting otherwise.
-    match manager.get_sandbox(&name) {
-        Ok(state) => {
-            let runtime = manager.runtime_for_sandbox(&state)?;
-            match runtime.status(&name).await? {
-                crate::runtime::SandboxStatus::Running => {
-                    crate::policy::enforce::apply(runtime.as_ref(), &name, &config.policy).await?;
-                    println!("\n  Applied to the running box.");
-                }
-                _ => {
-                    println!("\n  Box is not running; the posture will be applied when it starts.")
-                }
-            }
-        }
-        Err(_) => println!("\n  No box yet; the posture will be applied when one is created."),
-    }
+    println!();
+    reapply(manager, &name, &config.policy).await;
     Ok(())
 }
 
-fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
+async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
     let (name, mut config, path) = load(manager, args.name.as_deref())?;
 
     let mut added = Vec::new();
@@ -201,10 +188,40 @@ fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
 
     if added.is_empty() {
         println!("Box '{name}': nothing new to allow.");
-    } else {
-        println!("Box '{name}': allowed {}", added.join(", "));
+        return Ok(());
+    }
+    println!("Box '{name}': allowed {}", added.join(", "));
+
+    // Reapply. A new entry that only lands in `devbox.toml` stays blocked on
+    // the running box until something else happens to rebuild the ruleset —
+    // which reads as the allowlist simply not working.
+    if config.policy.egress != Posture::Open {
+        reapply(manager, &name, &config.policy).await;
     }
     Ok(())
+}
+
+/// Push a policy to the box, if the box is running.
+///
+/// Shared by `set` and `allow`. A stopped box picks it up at start
+/// (`service::start_box`), so nothing is silently dropped either way.
+async fn reapply(manager: &SandboxManager, name: &str, policy: &crate::policy::Policy) {
+    let Ok(state) = manager.get_sandbox(name) else {
+        println!("  No box yet; the posture applies when one is created.");
+        return;
+    };
+    let Ok(runtime) = manager.runtime_for_sandbox(&state) else {
+        return;
+    };
+    match runtime.status(name).await {
+        Ok(crate::runtime::SandboxStatus::Running) => {
+            match crate::policy::enforce::apply(runtime.as_ref(), name, policy).await {
+                Ok(()) => println!("  Applied to the running box."),
+                Err(e) => println!("  Could not apply it to the running box: {e}"),
+            }
+        }
+        _ => println!("  Box is not running; the posture applies when it starts."),
+    }
 }
 
 fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {

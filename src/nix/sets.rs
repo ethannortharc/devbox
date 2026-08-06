@@ -23,6 +23,11 @@ pub static NIX_SETS: &[NixSet] = &[
             "xz",
             "bzip2",
             "file",
+            // nftables, because every enforcing egress posture loads a ruleset
+            // with it. Pointing a user at some optional set to get their
+            // firewall would make enforcement conditional on a checkbox they
+            // have no reason to connect to it.
+            "nftables",
             "which",
             "tree",
             "less",

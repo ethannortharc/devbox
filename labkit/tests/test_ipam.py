@@ -258,10 +258,18 @@ def test_explicit_prefix_is_not_handed_out_again() -> None:
                     Interface(name="eth2", peer="c:eth1"),
                 ],
             ),
-            Device(name="b", role="spine", serial="BBB",
-                   interfaces=[Interface(name="eth1", peer="a:eth1", address="10.0.0.1/31")]),
-            Device(name="c", role="spine", serial="CCC",
-                   interfaces=[Interface(name="eth1", peer="a:eth2")]),
+            Device(
+                name="b",
+                role="spine",
+                serial="BBB",
+                interfaces=[Interface(name="eth1", peer="a:eth1", address="10.0.0.1/31")],
+            ),
+            Device(
+                name="c",
+                role="spine",
+                serial="CCC",
+                interfaces=[Interface(name="eth1", peer="a:eth2")],
+            ),
         ],
     )
 

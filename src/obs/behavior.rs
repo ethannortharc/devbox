@@ -195,6 +195,12 @@ impl Diff {
             && self.gone_processes.is_empty()
             && self.new_files.is_empty()
             && self.new_violations == 0
+            // Two runs can touch identical domains and processes while moving
+            // very different amounts of data. Leaving these out made the diff
+            // report "no behavioural change" and then never render the traffic
+            // delta it had already computed.
+            && self.bytes_tx_delta == 0
+            && self.bytes_rx_delta == 0
     }
 
     /// Whether anything appeared that was not there before.
@@ -217,11 +223,27 @@ pub fn diff(before: &Summary, after: &Summary) -> Diff {
         new_files: difference(&after.files_written, &before.files_written),
         bytes_tx_delta: after.bytes_tx as i64 - before.bytes_tx as i64,
         bytes_rx_delta: after.bytes_rx as i64 - before.bytes_rx as i64,
-        new_violations: after
-            .violations
-            .len()
-            .saturating_sub(before.violations.len()),
+        // Compared by identity, not by count. One violation against A
+        // followed by one against B is the same length, and subtracting gave
+        // zero — so a run that started hitting a different blocked target
+        // reported nothing new, which is precisely the alarm this exists for.
+        new_violations: {
+            let seen: BTreeSet<_> = before.violations.iter().map(violation_key).collect();
+            after
+                .violations
+                .iter()
+                .filter(|v| !seen.contains(&violation_key(v)))
+                .count()
+        },
     }
+}
+
+/// What makes two violations the same violation.
+///
+/// The timestamp is deliberately excluded: the same target blocked twice for
+/// the same reason is one recurring problem, not two.
+fn violation_key(v: &Violation) -> (&str, &str, &str) {
+    (v.target.as_str(), v.verdict.as_str(), v.reason.as_str())
 }
 
 fn difference(a: &BTreeSet<String>, b: &BTreeSet<String>) -> Vec<String> {

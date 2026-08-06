@@ -142,13 +142,14 @@ impl SandboxManager {
         let image = config.sandbox.image.as_str();
         // Provision tools — pass mount_mode so NixOS module sets up overlay
         let mount_mode = &config.sandbox.mount_mode;
-        if let Err(e) = provision::provision_vm_with_mode(
+        if let Err(e) = provision::provision_vm_full(
             runtime,
             name,
             &active_sets,
             &active_langs,
             image,
             mount_mode,
+            &config.custom_packages.keys().cloned().collect::<Vec<_>>(),
         )
         .await
         {

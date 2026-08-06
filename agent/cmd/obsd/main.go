@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/ethannortharc/devbox/agent/capture"
 	"github.com/ethannortharc/devbox/agent/event"
+	"github.com/ethannortharc/devbox/agent/policy"
 	"github.com/ethannortharc/devbox/agent/transport"
 	"github.com/ethannortharc/devbox/internal/buildinfo"
 )
@@ -44,6 +46,9 @@ type config struct {
 	once bool
 	// queue bounds the in-agent buffer between capture and transport.
 	queue int
+	// policy is the path to the generated egress policy. When set, the agent
+	// keeps the firewall's allow sets in step with the DNS it captures.
+	policy string
 }
 
 // defaultQueue bounds the buffer between capture and transport.
@@ -176,6 +181,22 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		close(events)
 	}()
 
+	// An allowlist names *domains*, and a firewall matches addresses. The
+	// bridge is the DNS this agent is already capturing: every answer for an
+	// allowlisted name is added to the allow set before the application that
+	// asked for it connects.
+	//
+	// Without this the generated ruleset is not merely incomplete — it is
+	// default-deny with an empty allow set, so `allowlist` and `mirror-only`
+	// block everything they promise to permit.
+	enforcer, err := loadEnforcer(cfg)
+	if err != nil {
+		return err
+	}
+	if enforcer != nil {
+		fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
+	}
+
 	sent := 0
 	for {
 		select {
@@ -184,6 +205,14 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				// Source finished and the channel drained.
 				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
 				return <-srcDone
+			}
+			if enforcer != nil && e.Type == event.TypeDNS {
+				if added, err := enforcer.OnDNS(ctx, e); err != nil {
+					// A failed insertion means one domain stays blocked, not
+					// that capture should stop. It is worth saying out loud,
+					// because the symptom otherwise looks like a network fault.
+					fmt.Fprintf(out, "devbox-obsd: could not allow %v: %v\n", added, err)
+				}
 			}
 			payload, err := e.Encode()
 			if err != nil {
@@ -225,6 +254,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		"exit when the source finishes instead of waiting for a signal")
 	fs.IntVar(&cfg.queue, "queue", defaultQueue,
 		"in-agent event buffer depth")
+	fs.StringVar(&cfg.policy, "policy", "",
+		"egress policy JSON; keeps the nftables allow sets in step with DNS")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -236,4 +267,40 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		return config{}, errors.New("vsock transport lands with the VM runtimes; use a unix socket")
 	}
 	return cfg, nil
+}
+
+// loadEnforcer builds the DNS→nftables bridge, if a policy was given.
+//
+// Returns nil when no policy is configured, which is the `open` posture and
+// the fixture/replay paths: nothing to enforce, and no root needed.
+func loadEnforcer(cfg config) (*policy.Enforcer, error) {
+	if cfg.policy == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(cfg.policy)
+	if err != nil {
+		return nil, fmt.Errorf("read the policy at %s: %w", cfg.policy, err)
+	}
+	var spec struct {
+		Egress  string   `json:"egress"`
+		Allow   []string `json:"allow"`
+		Ruleset string   `json:"ruleset"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return nil, fmt.Errorf("parse the policy at %s: %w", cfg.policy, err)
+	}
+	if spec.Egress == "open" {
+		return nil, nil
+	}
+
+	enforcer := policy.New(policy.NFT{}, spec.Allow, spec.Egress == "mirror-only")
+	if spec.Ruleset != "" {
+		// The control plane generated the ruleset; loading it here rather than
+		// host-side means the agent owns the table it is about to keep in step,
+		// and a restart re-establishes it.
+		if err := enforcer.Load(context.Background(), spec.Ruleset); err != nil {
+			return nil, fmt.Errorf("load the egress ruleset: %w", err)
+		}
+	}
+	return enforcer, nil
 }

@@ -166,23 +166,32 @@ pub fn find_link(topology: &Topology, spec: &str) -> Result<(Endpoint, Endpoint)
         bail!("no link uses {spec}");
     }
 
-    // A node pair.
-    let (left, right) = spec
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("write a link as nodeA-nodeB or node:iface"))?;
-
+    // A node pair. Node names may themselves contain hyphens — `edge-a` and
+    // `edge-b` are valid names — so splitting on the *first* hyphen turns
+    // `edge-a-edge-b` into `edge` and `a-edge-b` and finds nothing. Match
+    // against the topology's actual adjacencies instead of guessing where the
+    // separator is: the names that exist decide, not the punctuation.
     let matches: Vec<(Endpoint, Endpoint)> = topology
         .links
         .iter()
         .filter_map(|l| l.parse_endpoints().ok())
-        .filter(|(a, b)| (a.node == left && b.node == right) || (a.node == right && b.node == left))
+        .filter(|(a, b)| {
+            spec == format!("{}-{}", a.node, b.node) || spec == format!("{}-{}", b.node, a.node)
+        })
         .collect();
 
+    if matches.is_empty() && !spec.contains('-') {
+        bail!("write a link as nodeA-nodeB or node:iface");
+    }
+
     match matches.len() {
-        0 => bail!("no link connects '{left}' and '{right}'"),
+        0 => bail!(
+            "no link matches '{spec}'; write it as nodeA-nodeB using names from \
+             the topology, or as node:iface"
+        ),
         1 => Ok(matches.into_iter().next().expect("checked len")),
         n => bail!(
-            "'{left}' and '{right}' are connected by {n} links; name one end \
+            "'{spec}' matches {n} links; name one end \
              explicitly, e.g. {}",
             matches[0].0
         ),
@@ -561,6 +570,42 @@ mod tests {
             for meta in [';', '|', '&', '`', '$'] {
                 assert!(!text.contains(meta), "{text} contains {meta}");
             }
+        }
+    }
+    #[test]
+    fn hyphenated_node_names_resolve_as_a_pair() {
+        // `edge-a-edge-b` split on the first hyphen gives `edge` and
+        // `a-edge-b`, which matches nothing — even though both nodes exist.
+        let topology = Topology {
+            lab: crate::lab::topology::LabSection {
+                name: "hyphens".into(),
+                substrate: "auto".into(),
+                base: "10.0.0.0/16".into(),
+                asn_base: 65000,
+            },
+            nodes: vec![node("edge-a"), node("edge-b")],
+            links: vec![crate::lab::topology::Link {
+                endpoints: vec!["edge-a:eth1".into(), "edge-b:eth1".into()],
+                subnet: None,
+            }],
+            services: Default::default(),
+        };
+
+        let (a, b) = find_link(&topology, "edge-a-edge-b").expect("the pair must resolve");
+        assert_eq!(a.node, "edge-a");
+        assert_eq!(b.node, "edge-b");
+
+        // And the reverse order names the same link.
+        let (a, b) = find_link(&topology, "edge-b-edge-a").expect("either order resolves");
+        assert_eq!((a.node.as_str(), b.node.as_str()), ("edge-a", "edge-b"));
+    }
+
+    fn node(name: &str) -> crate::lab::topology::Node {
+        crate::lab::topology::Node {
+            name: name.into(),
+            role: crate::lab::topology::Role::FrrRouter,
+            sets: vec![],
+            asn: None,
         }
     }
 }

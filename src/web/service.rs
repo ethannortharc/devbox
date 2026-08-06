@@ -127,10 +127,14 @@ pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
 
     match runtime.status(name).await? {
         SandboxStatus::Running => Ok(()),
-        SandboxStatus::Stopped => runtime
-            .start(name)
-            .await
-            .with_context(|| format!("failed to start box '{name}'")),
+        SandboxStatus::Stopped => {
+            runtime
+                .start(name)
+                .await
+                .with_context(|| format!("failed to start box '{name}'"))?;
+            apply_saved_policy(manager, &state, name).await;
+            Ok(())
+        }
         SandboxStatus::NotFound => bail!(
             "box '{name}' is registered but runtime '{}' does not have it; \
              run `devbox destroy {name}` to clean up the stale entry",
@@ -163,6 +167,38 @@ pub async fn stop_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
 /// the CLI would have protected.
 pub async fn destroy_box(manager: &Arc<SandboxManager>, name: &str, force: bool) -> Result<()> {
     manager.destroy_sandbox(name, force).await
+}
+
+/// Load the box's saved egress posture, if it has one.
+///
+/// A firewall does not survive a box restart, so a posture that is only applied
+/// when it is *set* is enforced until the first reboot and then silently gone —
+/// while `devbox.toml` and the console both keep reporting it. This is the
+/// shared start path, so every route into a running box goes through it.
+///
+/// Failure is reported, not fatal: refusing to start a box because its
+/// firewall could not be installed would strand the user with no way in to fix
+/// it. The console shows the posture's real state either way.
+async fn apply_saved_policy(
+    manager: &SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+) {
+    let config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    if config.policy.egress == crate::policy::Posture::Open {
+        return;
+    }
+    let Ok(runtime) = manager.runtime_for_sandbox(state) else {
+        return;
+    };
+    if let Err(e) = crate::policy::enforce::apply(runtime.as_ref(), name, &config.policy).await {
+        tracing::warn!(
+            box_id = %name,
+            posture = %config.policy.egress,
+            error = ?e,
+            "could not apply the saved egress posture on start"
+        );
+    }
 }
 
 /// Start the box if needed, so a view that requires a live box can open it.

@@ -52,6 +52,24 @@ pub async fn apply_config(
     Ok(())
 }
 
+/// Sets whose module is checked in rather than generated.
+///
+/// Their packages are optional by nature, so the module guards each one with
+/// `tryEval`. A generated flat list has no such guard.
+const GUARDED_SETS: &[&str] = &["ai-code", "ai-infra"];
+
+/// The checked-in module source for a guarded set.
+///
+/// Embedded at compile time so the binary carries it: these are pushed into a
+/// box that has no copy of the repository.
+fn embedded_set_nix(name: &str) -> Option<&'static str> {
+    match name {
+        "ai-code" => Some(include_str!("../../nix/sets/ai-code.nix")),
+        "ai-infra" => Some(include_str!("../../nix/sets/ai-infra.nix")),
+        _ => None,
+    }
+}
+
 /// Push the Nix set modules and the composed `configuration.nix` for a
 /// selection, without rebuilding.
 ///
@@ -87,6 +105,21 @@ pub async fn write_set_modules(
     .await?;
 
     for set in NIX_SETS {
+        // The AI sets ship as checked-in modules that wrap each optional tool
+        // in `tryEval`, because some of them are absent or broken on a given
+        // nixpkgs channel. Regenerating them as flat package lists throws that
+        // away, so one unavailable optional tool fails the entire rebuild —
+        // for the set that is on by default.
+        if GUARDED_SETS.contains(&set.name) {
+            write_nix_file(
+                runtime,
+                sandbox_name,
+                &format!("{}.nix", set.name),
+                embedded_set_nix(set.name).unwrap_or(&generate_set_nix(set)),
+            )
+            .await?;
+            continue;
+        }
         write_nix_file(
             runtime,
             sandbox_name,
