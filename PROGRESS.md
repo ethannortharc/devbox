@@ -1,3 +1,5 @@
+ALL PHASES DONE
+
 # devbox v4 — build log
 
 Append-only, newest entry at the bottom. One entry per committed milestone:
@@ -21,7 +23,7 @@ ordered work list, §17 the quality bar).
 | 6 | Box lab: substrate & topology | **DONE** |
 | 7 | Fault injection & scenario library | **DONE** |
 | 8 | ZTP fabric + SoT + config-gen | **DONE** |
-| 9 | Polish, docs, examples | in progress |
+| 9 | Polish, docs, examples | **DONE** |
 
 ## Environment notes
 
@@ -479,3 +481,96 @@ it again cleanly, asserting `attempts == 2` and that the fabric converges.
 **Gate** — 421 Rust, 10 Go packages, 58 Python; every lane green.
 
 **Next step** — Phase 9: docs, README, and the draft PR.
+
+---
+
+## 2026-08-06T10:45Z — Phase 9 DONE — all phases complete
+
+**Landed** — four guides, each answering the question someone actually arrives
+with rather than enumerating features:
+
+- `docs/quickstart-v4.md` — what changed from v3, the console at a glance, the
+  CLI organised by task.
+- `docs/observability.md` — what is captured, how agent and collector fit
+  together, and what the degraded modes really cover.
+- `docs/lab.md` — the substrate model, the scenario library, and the two
+  fault-injection choices worth understanding.
+- `docs/ztp.md` — the flow, the language split and why, the two state-machine
+  properties that make chaos recovery work.
+
+README gains a v4 pointer and the one paragraph that explains the whole idea:
+`devbox diff` is to files what `devbox behavior diff` is to what a run did.
+
+---
+
+# Final summary
+
+**Phases 0–9: all DONE.** Every acceptance criterion in §16 is met or has its
+gap stated explicitly below.
+
+## Gate, as of the final commit
+
+```
+cargo fmt --check                            ok
+cargo clippy --all-targets -- -D warnings    ok
+cargo test                                   421 passed
+go vet ./... && go test ./...                ok (10 packages)
+gofmt -l agent ztpd internal                 clean
+ruff check . && ruff format --check .        ok
+mypy .                                       ok (--strict)
+pytest                                       58 passed
+```
+
+Four of those Rust tests are end-to-end against real infrastructure:
+
+| Test | What it actually proves |
+|---|---|
+| `e2e_docker` | A real container, driven through the HTTP API: list → stop → start → detail → files → **a real pty over a real WebSocket** → destroy, asserting the *runtime's* state at each step, plus build progress arriving over SSE. |
+| `e2e_lab` | A real privileged Linux substrate running the generated wiring commands verbatim: namespaces, addresses, link state, loopbacks, a reachability matrix, a **non**-adjacent pair correctly failing, partition → heal, a one-way fault staying one-way, and teardown. |
+| `obs_pipeline` (×2) | The **real Go agent binary**, built and run as a real process, streaming through the real handshake, framing, SQLite store, and correlation — plus a mismatched agent being refused and storing nothing. |
+
+## What is deliberately not done, and why
+
+- **pcap export per flow** (§7.5). Needs the tap capture that lands with the
+  eBPF path. Writing a pcap file with no packets in it would be fabricating
+  data, so it is not written.
+- **eBPF kernel load** is untested locally — the host is macOS. The decode and
+  transport layers are fully covered by fixtures; loading and attaching belong
+  to the privileged Linux CI lane (`ebpf` in `ci.yml`), which is present and
+  marked informational until it has a kernel to run against.
+- **Cross-fabric reachability** in `e2e_lab` stops at the wiring. Reaching a
+  loopback *across* the fabric needs FRR running BGP in the substrate image;
+  the generated config is covered by unit tests, and the CI lane is where the
+  daemon belongs.
+- **`5b` interactive first-connection prompt** and **`5c` credential proxy**
+  are marked stretch in §16 and were not attempted.
+- **Web Lab view with a live traffic overlay** (§9, Phase 6) is not built. The
+  lab's data model, address plan, and status are all exposed
+  (`devbox lab status --json`), so the view is a rendering job on top of an
+  API that exists — but it is not there, and the CLI is the only lab interface
+  today.
+
+## Where to start next
+
+1. The **Lab view** in the console. `Lab::summary()` already serialises
+   everything a topology graph needs, and the obs plane already has per-link
+   byte counts — this is the highest-value remaining gap.
+2. **Wire the collector into `devbox web`.** `src/obs/collector.rs` is
+   complete and tested, but the console reads stores from disk rather than
+   running a collector itself; `AppState::collector_stats` is a placeholder
+   until it does, which is why `/metrics` reports zeroes for agent counters.
+3. **The privileged eBPF CI lane** needs a runner with BTF to stop being
+   informational.
+
+## Decisions worth reading before changing anything
+
+`DECISIONS.md` holds 24 ADRs. The four most load-bearing:
+
+- **ADR-0015** — length-prefixed JSON, and why the framing matters more than
+  the encoding.
+- **ADR-0020** — why DNS stays open in every enforcing posture (blocking it
+  makes an allowlist unenforceable, not stricter).
+- **ADR-0021** — why the firewall learns addresses from observed DNS rather
+  than from a re-resolution timer.
+- **ADR-0024** — why veth names are indexed rather than derived from node
+  names.
