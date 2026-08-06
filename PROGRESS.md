@@ -769,3 +769,45 @@ counter items listed below, and every P2 except three.
 
 **Gate** — 382 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T19:05Z — Codex review round 5: 9 findings, all addressed
+
+Nine (6 P1, 3 P2), down from twenty-seven. The series now reads **23, 23, 14,
+27, 9**, which corrects what I wrote after round 4: the spike was the reviewer
+reaching new territory once, not evidence that the loop cannot converge. Round
+5 stayed inside areas earlier rounds had already touched, which is what
+convergence looks like.
+
+Two findings mattered more than their line count.
+
+**`lab up` reported success while BGP never started.** Every `frr.conf` was
+written under a comment claiming "the routing daemon is started by the node's
+own service manager, which the substrate provisioning installs." Neither half
+was true — a network namespace has no init, and nothing installed one. A routed
+lab therefore came up with adjacent nodes able to ping and non-adjacent
+loopbacks never converging; the only symptom was a scenario quietly failing its
+assertions (ADR-0038). The comment is the lesson: it described an architecture
+nobody had built, and read plausibly enough to survive four review rounds.
+
+**The agent guard I added in round 4 checked the wrong thing.** It verified
+`devbox-obsd` was running, but the degraded proc source captures no DNS, so an
+agent started with `-no-ebpf` passed while being unable to fill a single
+allow-set entry — recreating the exact default-deny-with-empty-allowlist the
+guard exists to prevent (ADR-0039).
+
+Four more were mine from round 4, all the same shape — a lifecycle case I did
+not cover. A newly created box is already `Running`, so gating enforcement on
+the `Stopped` arm left it unrestricted until its first restart. `reprovision`
+read a malformed `devbox.toml` as posture `open` immediately after rebuilding
+away the firewall. A *failed* status probe was treated as "stopped", exiting 0
+with the posture saved and the running firewall untouched. And the duplicate
+`package` option I added made the obsd module fail to evaluate at all.
+
+The remaining one was not mine but is the sharpest ZTP finding yet: the
+bootstrap script discarded status reports with `|| true`. Losing the final
+`healthy` left the registry and `ztp_fabric_converged` stale permanently,
+because nothing schedules reconciliation — in precisely the chaos case §10.3
+exists to exercise. It now retries across a restart window.
+
+**Gate** — 383 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
