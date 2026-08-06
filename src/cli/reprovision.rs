@@ -29,6 +29,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         SandboxStatus::Stopped => {
             println!("Starting sandbox '{name}'...");
             runtime.start(&name).await?;
+            crate::policy::enforce::apply_saved(manager, &state, &name).await?;
         }
         SandboxStatus::NotFound => {
             anyhow::bail!(

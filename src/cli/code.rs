@@ -32,6 +32,7 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
         SandboxStatus::Stopped => {
             println!("Starting sandbox '{name}'...");
             runtime.start(&name).await?;
+            crate::policy::enforce::apply_saved(manager, &state, &name).await?;
         }
         SandboxStatus::NotFound => bail!("Sandbox '{name}' not found."),
         SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),

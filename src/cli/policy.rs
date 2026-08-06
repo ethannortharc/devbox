@@ -164,8 +164,7 @@ async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
     // which never generated or loaded a ruleset — so an `isolated` box kept
     // full egress while reporting otherwise.
     println!();
-    reapply(manager, &name, &config.policy).await;
-    Ok(())
+    reapply(manager, &name, &config.policy).await
 }
 
 async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
@@ -196,7 +195,7 @@ async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
     // the running box until something else happens to rebuild the ruleset —
     // which reads as the allowlist simply not working.
     if config.policy.egress != Posture::Open {
-        reapply(manager, &name, &config.policy).await;
+        reapply(manager, &name, &config.policy).await?;
     }
     Ok(())
 }
@@ -205,23 +204,36 @@ async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
 ///
 /// Shared by `set` and `allow`. A stopped box picks it up at start
 /// (`service::start_box`), so nothing is silently dropped either way.
-async fn reapply(manager: &SandboxManager, name: &str, policy: &crate::policy::Policy) {
+async fn reapply(
+    manager: &SandboxManager,
+    name: &str,
+    policy: &crate::policy::Policy,
+) -> Result<()> {
     let Ok(state) = manager.get_sandbox(name) else {
         println!("  No box yet; the posture applies when one is created.");
-        return;
+        return Ok(());
     };
-    let Ok(runtime) = manager.runtime_for_sandbox(&state) else {
-        return;
-    };
+    let runtime = manager.runtime_for_sandbox(&state)?;
     match runtime.status(name).await {
         Ok(crate::runtime::SandboxStatus::Running) => {
-            match crate::policy::enforce::apply(runtime.as_ref(), name, policy).await {
-                Ok(()) => println!("  Applied to the running box."),
-                Err(e) => println!("  Could not apply it to the running box: {e}"),
-            }
+            // The error is returned, not printed. A script that runs
+            // `devbox policy set isolated` and gets exit 0 is entitled to
+            // believe the box is isolated; saving the file is not the same
+            // thing as enforcing it, and only the exit status can say which
+            // happened.
+            crate::policy::enforce::apply(runtime.as_ref(), name, policy)
+                .await
+                .with_context(|| {
+                    format!(
+                        "posture saved to devbox.toml, but not applied to running box \
+                         '{name}' — it is still using its previous egress"
+                    )
+                })?;
+            println!("  Applied to the running box.");
         }
         _ => println!("  Box is not running; the posture applies when it starts."),
     }
+    Ok(())
 }
 
 fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {

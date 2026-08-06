@@ -195,6 +195,7 @@ impl SandboxManager {
             SandboxStatus::Stopped => {
                 println!("Starting sandbox '{name}'...");
                 runtime.start(name).await?;
+                crate::policy::enforce::apply_saved(self, &state, name).await?;
             }
             SandboxStatus::NotFound => {
                 bail!(
@@ -427,6 +428,7 @@ impl SandboxManager {
         let status = runtime.status(name).await?;
         if status == SandboxStatus::Stopped {
             runtime.start(name).await?;
+            crate::policy::enforce::apply_saved(self, &state, name).await?;
         } else if status == SandboxStatus::NotFound {
             bail!("Sandbox '{}' not found in runtime", name);
         }

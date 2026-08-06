@@ -31,9 +31,12 @@ let
   #
   # An attribute that does not exist is skipped rather than failing the whole
   # rebuild: one stale name in the free-text field should not brick the box.
+  # A key may arrive either way: `python312Packages.ipython` unquoted is a
+  # nested table, quoted it is one literal key containing a dot. Both mean the
+  # same attribute path, so both are split into one.
   flattenPaths = prefix: attrs:
     lib.concatLists (lib.mapAttrsToList (name: value:
-      let path = prefix ++ [ name ];
+      let path = prefix ++ (lib.splitString "." name);
       in if builtins.isAttrs value then flattenPaths path value else [ path ]
     ) attrs);
 

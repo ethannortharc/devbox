@@ -816,3 +816,49 @@ Related, same root cause of "a flat list loses structure": a bare dotted TOML
 key like `python312Packages.ipython` is a *nested table*, so `attrNames` gave
 `python312Packages` and the module handed an entire package set to
 `systemPackages`. Keys are quoted on write and resolved with `attrByPath`.
+
+## ADR-0036: refuse a posture that cannot be enforced
+
+**Status:** accepted (2026-08-06)
+
+Round 4 found the hole under ADR-0033: the agent that fills the allow set is
+not part of provisioning. Nothing pushes `devbox-obsd` into a box, imports its
+module, or enables the service. So wiring `-policy` into the agent made the
+*agent* correct while leaving the deployed system unable to run it.
+
+The failure mode is the dangerous direction of wrong. `allowlist` loads a
+default-deny ruleset whose allow set only the agent can populate, so an
+allowlisted domain is **blocked**. The user asks for less egress and gets none,
+while the console reports the posture applied.
+
+`enforce::apply` now probes for a running agent and refuses a domain-based
+posture without one, naming what would have been blocked. CIDR allowlists,
+`isolated`, and `open` need no agent and still apply. The obsd module says
+plainly at the top that provisioning does not yet install it.
+
+This is deliberately not a "make it work anyway" fix. Shipping the agent into
+every box is real work — a binary to embed, a module to import, a service to
+supervise, a version pin to honour — and doing it badly under review pressure
+would be worse than an honest refusal that names the gap.
+
+## ADR-0037: durability and enforcement failures are errors, not log lines
+
+**Status:** accepted (2026-08-06)
+
+Three round-4 findings, one mistake: I reported failures where the caller could
+not act on them.
+
+- `Registry.saved()` logged a failed write and let the mutation return success,
+  so a node was acknowledged before its state was durable — the exact guarantee
+  per-mutation saving exists to provide. It now fails the mutation.
+- `Registry.Save` took its lock *after* snapshotting, so an older snapshot
+  could still overwrite a newer one. The lock now covers both.
+- `policy set`/`policy allow` printed enforcement errors and exited 0. A script
+  that gets exit 0 from `devbox policy set isolated` is entitled to believe the
+  box is isolated. Saving a file is not enforcing it, and only the exit status
+  can distinguish them.
+
+And the same shape in `apply_saved`: it used `load_or_default`, so a malformed
+`devbox.toml` became the *default* config — posture `open`. Corruption silently
+unfirewalled a box that had been isolated. It loads fallibly now. Corruption is
+not consent.

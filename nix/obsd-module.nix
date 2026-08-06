@@ -1,9 +1,22 @@
 # NixOS module for devbox-obsd, the in-guest observability agent (§7.3).
 #
-# The agent binary is embedded in the devbox host binary and pushed into the
-# box on provision; this module supervises it. It is version-pinned to the host
-# binary — the collector refuses a mismatched agent rather than decoding events
-# with the wrong layout.
+# This module supervises the agent. It is version-pinned to the host binary —
+# the collector refuses a mismatched agent rather than decoding events with the
+# wrong layout.
+#
+# **Not yet wired into provisioning.** Nothing pushes the `devbox-obsd` binary
+# into a box, imports this module, or sets `services.devbox-obsd.enable`, so no
+# box built by `devbox create` runs the agent today. Two things depend on that
+# and do not work until it lands:
+#
+#   * activity capture — the console's timeline stays empty on a real box;
+#   * domain allowlists — `allowlist` and `mirror-only` are enforced by
+#     nftables whose allow set only the agent can populate from DNS, so an
+#     allowlisted domain is *blocked*, not permitted.
+#
+# `devbox policy set` refuses domain-based postures for exactly that reason
+# (see `policy::enforce`). CIDR-only allowlists, `isolated`, and `open` are
+# fully enforced without the agent.
 { config, lib, pkgs, ... }:
 
 let
@@ -37,9 +50,22 @@ in
       '';
     };
 
+    package = lib.mkOption {
+      type = lib.types.path;
+      description = ''
+        The `devbox-obsd` binary. No default: this module cannot conjure the
+        agent, and a default pointing at a path that does not exist would give
+        a restart loop instead of an evaluation error naming the problem.
+      '';
+    };
+
     enableEbpf = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      # The shipped agent has no eBPF source linked in — `chooseSource` errors
+      # out when neither a fixture nor `-no-ebpf` is given, so defaulting this
+      # on would restart-loop the service. Flip it when the privileged build
+      # lands; until then the degraded path is the one that runs.
+      default = false;
       description = ''
         Attach eBPF programs. Turning this off selects the degraded
         proc-polling path (§13), which sees processes and sockets but not

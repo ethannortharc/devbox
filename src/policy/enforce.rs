@@ -11,7 +11,7 @@
 //! `isolated` and still reach the whole internet. A posture that is displayed
 //! but not enforced is worse than no posture at all, because it is believed.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::{Policy, Posture};
 use crate::runtime::Runtime;
@@ -36,6 +36,35 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     // suggesting something is being enforced.
     if policy.egress == Posture::Open {
         return clear(runtime, sandbox_name).await;
+    }
+
+    // A domain-based allowlist is enforced by nftables against a set that only
+    // the agent can fill, from the DNS it captures. No agent means the deny
+    // half applies and the allow half never does — the box ends up *more*
+    // restricted than the posture says, silently.
+    //
+    // Refusing is the honest move. Loading a ruleset that blocks what the user
+    // just allowlisted, and reporting success, is worse than not applying it.
+    let domains: Vec<&str> = policy
+        .allow
+        .iter()
+        .filter(|entry| super::parse_cidr(entry).is_none())
+        .map(String::as_str)
+        .collect();
+    let needs_agent = !domains.is_empty() || policy.egress == Posture::MirrorOnly;
+    if needs_agent && !agent_present(runtime, sandbox_name).await {
+        bail!(
+            "box '{sandbox_name}' has no running devbox-obsd, so a domain-based \
+             posture cannot be enforced: nftables matches addresses, and only the \
+             agent turns the allowlisted names into addresses as they resolve. \
+             Applying it anyway would block {}.\n\n  \
+             Use CIDRs instead, or `isolated`, both of which need no agent.",
+            if domains.is_empty() {
+                "the package mirrors".to_string()
+            } else {
+                domains.join(", ")
+            }
+        );
     }
 
     let ruleset = super::nftables::ruleset(policy);
@@ -129,6 +158,18 @@ fn clear_command() -> String {
     )
 }
 
+/// Is the observability agent running in this box?
+///
+/// Probed rather than assumed: the agent is not yet part of provisioning, so
+/// on most boxes the answer is no, and the caller needs to know before it
+/// installs a ruleset that depends on it.
+async fn agent_present(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
+    runtime
+        .exec_cmd(sandbox_name, &["pgrep", "-x", "devbox-obsd"], false)
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
 /// The shell that writes the agent's policy file.
 fn policy_command(spec: &str) -> String {
     format!(
@@ -174,6 +215,59 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Load the box's saved egress posture, if it has one.
+///
+/// A firewall does not survive a box restart, so a posture that is only applied
+/// when it is *set* is enforced until the first reboot and then silently gone —
+/// while `devbox.toml` and the console both keep reporting it. This is the
+/// shared start path, so every route into a running box goes through it.
+///
+/// Failure is an error, not a warning. A box that starts with a restrictive
+/// posture saved and no firewall installed is exactly the situation the
+/// posture exists to prevent, and reporting it quietly in a log leaves the user
+/// believing the opposite of what is true. Callers that must start the box
+/// regardless can catch it — but they have to decide that explicitly.
+pub async fn apply_saved(
+    manager: &crate::sandbox::SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+) -> Result<()> {
+    // Loaded fallibly. `load_or_default` turns a malformed `devbox.toml` into
+    // the *default* config, whose posture is `open` — so a corrupted file would
+    // silently unfirewall a box that had been isolated, and report nothing.
+    // Corruption is not consent.
+    let config = match crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(
+                box_id = %name,
+                error = ?e,
+                "devbox.toml could not be read; refusing to guess at the egress posture"
+            );
+            return Err(e).with_context(|| {
+                format!(
+                    "box '{name}' has an unreadable devbox.toml, so its egress posture is \
+                     unknown. Fix the file, or set a posture explicitly with \
+                     `devbox policy set <posture>`."
+                )
+            });
+        }
+    };
+    if config.policy.egress == Posture::Open {
+        return Ok(());
+    }
+    let runtime = manager.runtime_for_sandbox(state)?;
+    apply(runtime.as_ref(), name, &config.policy)
+        .await
+        .with_context(|| {
+            format!(
+                "box '{name}' started, but its '{}' egress posture could not be applied — \
+                 the box is running with whatever egress it had",
+                config.policy.egress
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +309,37 @@ mod tests {
         assert!(!spec.contains("10.0.0.0/8"), "CIDRs need no DNS: {spec}");
         // The ruleset is embedded as a JSON scalar, so its newlines are escaped.
         assert!(spec.contains("\"ruleset\":\"table inet devbox {}\""));
+    }
+
+    #[test]
+    fn cidrs_and_isolated_need_no_agent() {
+        // The distinction the guard rests on: what nftables can match on its
+        // own versus what needs DNS to become an address.
+        let cidr_only = Policy {
+            egress: Posture::Allowlist,
+            allow: vec!["10.0.0.0/8".into(), "192.168.1.1/32".into()],
+            ..Default::default()
+        };
+        assert!(
+            cidr_only
+                .allow
+                .iter()
+                .all(|e| crate::policy::parse_cidr(e).is_some()),
+            "a CIDR allowlist is enforceable without the agent"
+        );
+
+        let with_domain = Policy {
+            egress: Posture::Allowlist,
+            allow: vec!["10.0.0.0/8".into(), "github.com".into()],
+            ..Default::default()
+        };
+        assert!(
+            with_domain
+                .allow
+                .iter()
+                .any(|e| crate::policy::parse_cidr(e).is_none()),
+            "one domain is enough to need the agent"
+        );
     }
 
     #[test]

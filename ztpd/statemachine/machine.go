@@ -119,7 +119,7 @@ type Registry struct {
 	now func() time.Time
 	// persist, when set, is called after every mutation, before the caller is
 	// told the mutation happened. See Persisting.
-	persist func()
+	persist func() error
 	// saveMu serializes writes to the state file. Separate from mu because a
 	// save holds it across file I/O and must not block reads.
 	saveMu sync.Mutex
@@ -137,10 +137,12 @@ type Registry struct {
 // (tens of nodes, a handful of transitions each) that is nothing, and it buys
 // the guarantee the chaos test is actually asserting.
 func (r *Registry) Persisting(path string, onError func(error)) *Registry {
-	r.persist = func() {
-		if err := r.Save(path); err != nil && onError != nil {
+	r.persist = func() error {
+		err := r.Save(path)
+		if err != nil && onError != nil {
 			onError(err)
 		}
+		return err
 	}
 	return r
 }
@@ -149,10 +151,11 @@ func (r *Registry) Persisting(path string, onError func(error)) *Registry {
 //
 // Called after the mutating lock is released — Save takes the read lock, and
 // taking it while the write lock is held would deadlock.
-func (r *Registry) saved() {
-	if r.persist != nil {
-		r.persist()
+func (r *Registry) saved() error {
+	if r.persist == nil {
+		return nil
 	}
+	return r.persist()
 }
 
 // Snapshot is the registry's persistent form.
@@ -167,6 +170,13 @@ type Snapshot struct {
 
 // Save writes the registry to a file, atomically.
 func (r *Registry) Save(path string) error {
+	// Before the snapshot, not just before the write. Serializing only the
+	// write let an older save snapshot, pause, and then overwrite a newer one
+	// that had already landed — losing an acknowledged transition, which is
+	// the single thing per-mutation saving exists to prevent.
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+
 	r.mu.RLock()
 	snapshot := Snapshot{Nodes: make([]Node, 0, len(r.nodes))}
 	for _, node := range r.nodes {
@@ -187,18 +197,6 @@ func (r *Registry) Save(path string) error {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
-
-	// One writer at a time. Saving per-mutation means concurrent nodes
-	// reporting transitions save concurrently, and a shared temp path lets an
-	// older snapshot rename over a newer one — or one writer's rename remove
-	// the file the other is still writing. Both lose acknowledged transitions,
-	// which is the exact guarantee per-mutation saving exists to provide.
-	//
-	// The snapshot above is taken under the read lock; this serializes only
-	// the write, so a save never blocks a mutation for longer than a file
-	// write takes.
-	r.saveMu.Lock()
-	defer r.saveMu.Unlock()
 
 	// Write-then-rename: a crash mid-write must not leave a truncated file
 	// that the next start refuses to load. The pid keeps two *processes*
@@ -257,17 +255,22 @@ func (r *Registry) WithClock(now func() time.Time) *Registry {
 // Discover records a node presenting itself, starting or restarting it.
 //
 // Returns the node and whether this was a restart.
-func (r *Registry) Discover(serial string) (*Node, bool, error) {
+func (r *Registry) Discover(serial string) (node *Node, restarted bool, err error) {
 	if serial == "" {
 		return nil, false, fmt.Errorf("a node must present a serial")
 	}
 
 	// LIFO: the unlock runs first, then the save — Save takes the read lock,
 	// and taking it under the write lock would deadlock.
+	// A mutation is not real until it is durable: acknowledging one that was
+	// never written is the failure the chaos test exists to catch. LIFO — the
+	// unlock runs first, then the save, because Save takes the read lock.
 	mutated := false
 	defer func() {
 		if mutated {
-			r.saved()
+			if saveErr := r.saved(); saveErr != nil && err == nil {
+				err = saveErr
+			}
 		}
 	}()
 	r.mu.Lock()
@@ -300,11 +303,16 @@ func (r *Registry) Discover(serial string) (*Node, bool, error) {
 }
 
 // Advance moves a node to a new state.
-func (r *Registry) Advance(serial string, to State, reason string) (*Node, error) {
+func (r *Registry) Advance(serial string, to State, reason string) (node *Node, err error) {
+	// A mutation is not real until it is durable: acknowledging one that was
+	// never written is the failure the chaos test exists to catch. LIFO — the
+	// unlock runs first, then the save, because Save takes the read lock.
 	mutated := false
 	defer func() {
 		if mutated {
-			r.saved()
+			if saveErr := r.saved(); saveErr != nil && err == nil {
+				err = saveErr
+			}
 		}
 	}()
 	r.mu.Lock()
@@ -348,11 +356,16 @@ func (r *Registry) Identify(serial, name, role string) (*Node, error) {
 }
 
 // RecordPush stores the hash of the config pushed to a node.
-func (r *Registry) RecordPush(serial, hash string) error {
+func (r *Registry) RecordPush(serial, hash string) (err error) {
+	// A mutation is not real until it is durable: acknowledging one that was
+	// never written is the failure the chaos test exists to catch. LIFO — the
+	// unlock runs first, then the save, because Save takes the read lock.
 	mutated := false
 	defer func() {
 		if mutated {
-			r.saved()
+			if saveErr := r.saved(); saveErr != nil && err == nil {
+				err = saveErr
+			}
 		}
 	}()
 	r.mu.Lock()
