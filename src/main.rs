@@ -26,6 +26,16 @@ async fn main() -> Result<()> {
 /// nothing is lost for headless use.
 async fn open_console_for_cwd(manager: &SandboxManager, tools: Option<&[String]>) -> Result<()> {
     let name = manager.ensure_box_for_cwd(tools).await?;
+
+    // Enforce before serving. `ensure_box_for_cwd` hands back a box that may
+    // have been created moments ago or started outside devbox, and this path
+    // does not otherwise touch the start lifecycle — so a project with a
+    // restrictive posture would sit unrestricted behind a console reporting
+    // it, until the user happened to open a terminal.
+    if let Ok(state) = manager.get_sandbox(&name) {
+        devbox::policy::enforce::apply_saved(manager, &state, &name).await?;
+    }
+
     let manager = Arc::new(SandboxManager {
         state_dir: manager.state_dir.clone(),
     });

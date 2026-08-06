@@ -170,10 +170,14 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
         })
         .collect();
 
+    // Wall clock first, as the grouping above already does. Ordering the
+    // output by uptime alone would put a newer boot's chains before older
+    // ones, undoing the cross-boot correctness the grouping was careful about.
     chains.sort_by(|a, b| {
         a.events[0]
-            .ts_mono_ns
-            .cmp(&b.events[0].ts_mono_ns)
+            .ts_wall
+            .cmp(&b.events[0].ts_wall)
+            .then_with(|| a.events[0].ts_mono_ns.cmp(&b.events[0].ts_mono_ns))
             .then(a.pid.cmp(&b.pid))
     });
     chains
@@ -246,28 +250,45 @@ pub fn apply_dns_map(events: &mut [Event], map: &BTreeMap<String, String>) -> us
 pub fn tree(chains: &[Chain]) -> Vec<(usize, usize)> {
     const MAX_DEPTH: usize = 32;
 
-    let index: BTreeMap<u32, usize> = chains.iter().enumerate().map(|(i, c)| (c.pid, i)).collect();
+    // Every chain for a pid, in start order — not one. `chains()` splits a
+    // reused pid into several incarnations on purpose, and a map keyed on pid
+    // alone kept whichever came last, so an earlier child would be filed under
+    // the *newer* process's parent and appear in the wrong tree.
+    let mut by_pid: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, chain) in chains.iter().enumerate() {
+        by_pid.entry(chain.pid).or_default().push(i);
+    }
 
-    let depth_of = |mut pid: u32| -> usize {
+    // The incarnation of `pid` that was alive when `at` happened: the last one
+    // that had already started. A parent always starts before its child.
+    let contemporaneous = |pid: u32, at: &Chain| -> Option<usize> {
+        let candidates = by_pid.get(&pid)?;
+        candidates
+            .iter()
+            .rev()
+            .find(|&&i| chains[i].events[0].ts_wall <= at.events[0].ts_wall)
+            .or_else(|| candidates.first())
+            .copied()
+    };
+
+    let depth_of = |start: usize| -> usize {
         let mut depth = 0;
         let mut seen = std::collections::HashSet::new();
-        while depth < MAX_DEPTH && seen.insert(pid) {
-            let Some(&i) = index.get(&pid) else { break };
-            let parent = chains[i].ppid;
-            if parent == 0 || parent == pid || !index.contains_key(&parent) {
+        let mut current = start;
+        while depth < MAX_DEPTH && seen.insert(current) {
+            let Some(i) = contemporaneous(chains[current].ppid, &chains[current]) else {
                 break;
+            };
+            if i == current {
+                break; // its own parent, which nothing real produces
             }
-            pid = parent;
+            current = i;
             depth += 1;
         }
         depth
     };
 
-    chains
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, depth_of(c.pid)))
-        .collect()
+    (0..chains.len()).map(|i| (i, depth_of(i))).collect()
 }
 
 #[cfg(test)]

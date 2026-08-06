@@ -168,10 +168,31 @@ else
 fi
 
 # Self-check, then phone home.
-if vtysh -c 'show bgp summary' >/dev/null 2>&1; then
+#
+# "show bgp summary" exits 0 whenever bgpd is answering, even with every
+# neighbour Idle — so the old check reported healthy for a router with no
+# routing at all, and the fabric declared convergence on it. What matters is
+# that peers reach Established, and that takes a moment after a restart.
+_ok=0
+_try=0
+while [ "$_try" -lt 30 ]; do
+  _summary="$(vtysh -c 'show bgp summary' 2>/dev/null || true)"
+  if [ -n "$_summary" ]; then
+    # A neighbour still coming up shows Idle/Active/Connect in the state
+    # column; none of those present means every session is established.
+    if ! echo "$_summary" | grep -qE '(Idle|Active|Connect)'; then
+      _ok=1
+      break
+    fi
+  fi
+  _try=$((_try + 1))
+  sleep 2
+done
+
+if [ "$_ok" -eq 1 ]; then
   report healthy
 else
-  report failed "bgp did not come up"
+  report failed "bgp did not establish within 60s"
 fi
 `, s.bootURL)
 }
@@ -258,14 +279,53 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	summary := s.registry.Summarize()
+	missing := s.missingSerials()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":     s.registry.List(),
-		"total":     summary.Total,
-		"healthy":   summary.Healthy,
-		"failed":    summary.Failed,
-		"converged": summary.Converged,
+		"nodes":   s.registry.List(),
+		"total":   summary.Total,
+		"healthy": summary.Healthy,
+		"failed":  summary.Failed,
+		// Expected, not observed. `Summarize` can only see nodes that have
+		// identified, so a node that never boots is invisible to it — and 19
+		// healthy out of an expected 20 reported `converged: true`, which is
+		// the one answer a fabric-convergence signal must never get wrong.
+		"expected":  len(s.catalogSerials()),
+		"missing":   missing,
+		"converged": summary.Converged && len(missing) == 0,
 		"p95_secs":  summary.P95().Seconds(),
 	})
+}
+
+// catalogSerials is every serial the source of truth expects to see.
+func (s *Server) catalogSerials() []string {
+	catalog, ok := s.catalog.(*MapCatalog)
+	if !ok {
+		// A catalog that cannot enumerate itself cannot contribute an expected
+		// count; convergence then means what it meant before.
+		return nil
+	}
+	serials := make([]string, 0, len(catalog.Serials))
+	for serial := range catalog.Serials {
+		serials = append(serials, serial)
+	}
+	sort.Strings(serials)
+	return serials
+}
+
+// missingSerials is every expected device that has not reported at all.
+func (s *Server) missingSerials() []string {
+	seen := map[string]struct{}{}
+	for _, node := range s.registry.List() {
+		seen[node.Serial] = struct{}{}
+	}
+	var missing []string
+	for _, serial := range s.catalogSerials() {
+		if _, ok := seen[serial]; !ok {
+			missing = append(missing, serial)
+		}
+	}
+	return missing
 }
 
 func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
@@ -285,10 +345,19 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&b, "ztp_nodes_by_state{state=%q} %d\n", state, summary.ByState[state])
 	}
 
-	b.WriteString("# HELP ztp_fabric_converged 1 when every node is healthy.\n")
+	b.WriteString("# HELP ztp_nodes_expected Devices the source of truth expects.\n")
+	b.WriteString("# TYPE ztp_nodes_expected gauge\n")
+	fmt.Fprintf(&b, "ztp_nodes_expected %d\n", len(s.catalogSerials()))
+
+	b.WriteString("# HELP ztp_nodes_missing Expected devices that have never reported.\n")
+	b.WriteString("# TYPE ztp_nodes_missing gauge\n")
+	missing := s.missingSerials()
+	fmt.Fprintf(&b, "ztp_nodes_missing %d\n", len(missing))
+
+	b.WriteString("# HELP ztp_fabric_converged 1 when every expected node is healthy.\n")
 	b.WriteString("# TYPE ztp_fabric_converged gauge\n")
 	converged := 0
-	if summary.Converged {
+	if summary.Converged && len(missing) == 0 {
 		converged = 1
 	}
 	fmt.Fprintf(&b, "ztp_fabric_converged %d\n", converged)

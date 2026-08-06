@@ -21,6 +21,7 @@ let
   sandbox = devboxConfig.sandbox or {};
   mountMode = sandbox.mount_mode or "overlay";
   isOverlay = mountMode == "overlay";
+  hasEditor = sets.editor or true;
 
   # Ad-hoc packages from the Sets checklist's free-text field.
   #
@@ -90,8 +91,11 @@ in {
 
   # ── Environment ──────────────────────────────────
   environment.variables = {
-    EDITOR = "nvim";
-    VISUAL = "nvim";
+    # Only when the editor set is actually installed. Exporting EDITOR=nvim on
+    # a box where the user unchecked `editor` makes `git commit` fail with a
+    # missing editor rather than falling back to something that exists.
+    EDITOR = if hasEditor then "nvim" else "vi";
+    VISUAL = if hasEditor then "nvim" else "vi";
   };
 
   # ── User configuration ────────────────────────────

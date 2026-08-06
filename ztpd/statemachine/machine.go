@@ -76,9 +76,12 @@ func CanTransition(from, to State) bool {
 	if to == Discovered || to == Failed {
 		return true
 	}
-	if from == Healthy {
-		// A healthy node only changes by restarting, which the case above
-		// already allows.
+	if from == Healthy || from == Failed {
+		// Both are terminal: the only way out is a restart through
+		// `discovered`, which the case above already allows. Without this,
+		// `index(Failed)` is -1 and every forward state compares greater — so
+		// a stale status update could revive a failed node straight into
+		// `healthy` and manufacture convergence.
 		return false
 	}
 	// A repeat of the state the node is already in is a retry, not a

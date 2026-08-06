@@ -932,3 +932,39 @@ answer, a 500, was wrong: the policy really is saved, and a user told only
 The tab now reports both outcomes in one message, naming the posture and the
 entry count in either case, and styles the failure as an error. The CLI does
 the same thing with its exit status (ADR-0037). Two facts, two reports.
+
+## ADR-0042: DNS-derived allow entries expire; stated ones do not
+
+**Status:** accepted (2026-08-06)
+
+`OnDNS` recorded every resolved address permanently, in both nftables and its
+own `seen` map. An allowlisted domain that rotates addresses therefore left the
+old ones reachable for the life of the box — and a CDN address later reassigned
+to someone else stayed permitted, silently widening a default-deny posture the
+longer it ran.
+
+The allow sets now carry `flags interval,timeout` with a one-hour default, and
+`seen` records *when* an address was added so an expired entry can be added
+again. A domain in steady use never lapses, because every fresh resolution
+refreshes it.
+
+CIDRs written into `elements` carry no timeout and never expire. The
+distinction is the point: an address the user stated is a decision, an address
+the agent inferred from a DNS answer is an observation, and observations should
+not outlive their evidence.
+
+## ADR-0043: convergence counts what was expected, not what showed up
+
+**Status:** accepted (2026-08-06)
+
+`Summarize()` can only see nodes that have identified themselves, so a node
+that never boots is invisible to it. Nineteen healthy out of an expected twenty
+reported `converged: true` — the one answer a fabric-convergence signal must
+never get wrong, because it is what a test and an operator both key off.
+
+`/status` and `/metrics` now count the catalog's serials, report `missing`, and
+require it to be empty. The same reasoning applies one level down: the
+bootstrap called a node healthy when `show bgp summary` exited zero, which it
+does whenever bgpd is answering even with every neighbour Idle. It now waits
+for sessions to leave Idle/Active/Connect, bounded, and reports `failed` if
+they do not.

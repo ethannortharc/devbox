@@ -205,7 +205,17 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 			if !ok {
 				// Source finished and the channel drained.
 				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
-				return <-srcDone
+				err := <-srcDone
+				if err != nil || cfg.once {
+					return err
+				}
+				// `-once` is what makes a finished source end the process; its
+				// own help text says so, and without this the flag had no
+				// effect at all. A fixture replay that finishes without it
+				// stays connected and waits for a signal, so the collector
+				// keeps a live agent rather than seeing it hang up.
+				<-ctx.Done()
+				return ctx.Err()
 			}
 			// Reload when the control plane rewrites the policy. `devbox
 			// policy allow` recreates the nftables sets empty and writes a

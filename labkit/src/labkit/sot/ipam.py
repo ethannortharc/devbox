@@ -13,6 +13,7 @@ produces a fabric that comes up and then behaves inexplicably.
 from __future__ import annotations
 
 import ipaddress
+import itertools
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -122,7 +123,13 @@ def allocate(fabric: Fabric) -> Allocation:
                 raise OverlapError(f"{plan.p2p_base} has no room left for link {near} ↔ {far}")
             network = candidate
 
-        hosts = list(network.hosts()) or list(network)
+        # Only the first few, taken lazily. A valid-but-broad explicit prefix
+        # like `10.0.0.1/8` has sixteen million hosts, and materializing them
+        # to choose two exhausts memory for no reason.
+        hosts = list(itertools.islice(network.hosts(), 2))
+        if not hosts:
+            # A /31 or /32 has no "hosts"; its addresses are the network itself.
+            hosts = list(itertools.islice(iter(network), 2))
         if len(hosts) < 2:
             raise OverlapError(f"subnet {network} cannot address two ends")
 

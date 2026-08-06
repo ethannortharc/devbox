@@ -84,6 +84,9 @@ async fn go_agent_streams_into_the_rust_collector() {
         .arg(&sock)
         .arg("-fixture")
         .arg(&fixture)
+        // The test waits for the process, so it wants the flag whose help
+        // text says "exit when the source finishes".
+        .arg("-once")
         .output()
         .await
         .expect("agent runs");
@@ -293,6 +296,7 @@ async fn the_collector_rejects_an_agent_claiming_another_box() {
         .arg(&sock)
         .arg("-fixture")
         .arg(repo_root().join("agent/event/testdata/events.jsonl"))
+        .arg("-once")
         .output()
         .await
         .expect("agent runs");

@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethannortharc/devbox/agent/event"
 )
@@ -68,6 +69,16 @@ func (NFT) AddElement(ctx context.Context, set, addr string) error {
 	return nil
 }
 
+// AllowTTL is how long a DNS-derived allow-set entry is trusted.
+//
+// Must match the `timeout` the generated ruleset puts on the sets
+// (`policy::nftables::ALLOW_TTL_SECS`): the kernel expires the element, and
+// this decides when the agent is willing to add it again.
+const AllowTTL = time.Hour
+
+// now is injectable so the expiry logic is testable without sleeping.
+var now = time.Now
+
 // Enforcer keeps the firewall in step with DNS.
 type Enforcer struct {
 	applier Applier
@@ -75,8 +86,10 @@ type Enforcer struct {
 	mu sync.RWMutex
 	// allow holds the domains the policy names, lower-cased.
 	allow map[string]struct{}
-	// seen deduplicates addresses already added to a set.
-	seen map[string]struct{}
+	// seen records when each address was last added, so an entry that has
+	// aged out of the kernel set is added again rather than suppressed
+	// forever. See AllowTTL.
+	seen map[string]time.Time
 	// mirrorOnly permits the curated package hosts in addition to `allow`.
 	mirrorOnly bool
 	// added counts successful set insertions, for the metrics surface.
@@ -95,7 +108,7 @@ func New(applier Applier, domains []string, mirrorOnly bool) *Enforcer {
 	return &Enforcer{
 		applier:    applier,
 		allow:      allow,
-		seen:       map[string]struct{}{},
+		seen:       map[string]time.Time{},
 		mirrorOnly: mirrorOnly,
 	}
 }
@@ -106,7 +119,7 @@ func (e *Enforcer) Load(ctx context.Context, ruleset string) error {
 	// enforcer previously added is gone. Forgetting them is what makes a
 	// reload re-add them as DNS answers come in again.
 	e.mu.Lock()
-	e.seen = map[string]struct{}{}
+	e.seen = map[string]time.Time{}
 	e.mu.Unlock()
 
 	return e.applier.Apply(ctx, ruleset)
@@ -157,10 +170,14 @@ func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error)
 			continue
 		}
 
+		// "Seen recently", not "seen ever". The nftables entry carries a
+		// timeout, so an address that has aged out of the set must be
+		// re-addable — otherwise a domain in continuous use would be allowed
+		// for the first hour and silently blocked thereafter.
 		e.mu.RLock()
-		_, dup := e.seen[answer]
+		at, dup := e.seen[answer]
 		e.mu.RUnlock()
-		if dup {
+		if dup && now().Sub(at) < AllowTTL {
 			continue
 		}
 
@@ -176,7 +193,7 @@ func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error)
 		}
 
 		e.mu.Lock()
-		e.seen[answer] = struct{}{}
+		e.seen[answer] = now()
 		e.added++
 		e.mu.Unlock()
 		added = append(added, answer)

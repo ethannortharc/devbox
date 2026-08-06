@@ -49,12 +49,15 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     println!("This will push all config files and rebuild the system.");
 
     // Migrate old set names (e.g., "ai" → "ai-code" + "ai-infra")
-    let mut sets = migrate_sets(&state.sets);
+    let sets = migrate_sets(&state.sets);
 
-    // Ensure ai-code is always present (default on)
-    if !sets.iter().any(|s| s == "ai-code") {
-        sets.push("ai-code".to_string());
-    }
+    // Deliberately no "ensure ai-code is present" fallback here.
+    //
+    // It predates the set being optional, and it silently reinstated a set the
+    // user had unchecked — on every reprovision, persisted afterwards, so the
+    // choice could not be made to stick. `migrate_sets` still maps the legacy
+    // `ai` name onto `ai-code`, which is the only case that genuinely needs
+    // filling in; an absent `ai-code` in a modern state means absent.
 
     // Re-run full provisioning with the (migrated) sets/languages
     // Pass mount_mode so NixOS module sets up overlay declaratively

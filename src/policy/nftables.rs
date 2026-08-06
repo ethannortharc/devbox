@@ -24,6 +24,14 @@ pub const TABLE: &str = "devbox";
 pub const SET_V4: &str = "allow_v4";
 pub const SET_V6: &str = "allow_v6";
 
+/// How long a DNS-derived allow-set entry lives.
+///
+/// Long enough that an active session is not interrupted by an expiry between
+/// two requests, short enough that a reassigned address stops being reachable
+/// within an hour. Every fresh resolution refreshes it, so a domain in steady
+/// use never lapses.
+pub const ALLOW_TTL_SECS: u64 = 3600;
+
 /// Generate the full ruleset for a policy.
 ///
 /// The output is idempotent: it deletes the devbox table first, so applying it
@@ -46,7 +54,14 @@ pub fn ruleset(policy: &Policy) -> String {
     // caring which posture is in force.
     let _ = writeln!(nft, "  set {SET_V4} {{");
     let _ = writeln!(nft, "    type ipv4_addr");
-    let _ = writeln!(nft, "    flags interval");
+    // `timeout` as well as `interval`: entries the agent derives from DNS must
+    // age out. Without it, an address an allowlisted domain used once stays
+    // reachable for the life of the box — and a CDN address that gets
+    // reassigned elsewhere silently widens a default-deny posture over time.
+    // CIDRs written into `elements` below carry no timeout and so never
+    // expire, which is right: they were stated, not inferred.
+    let _ = writeln!(nft, "    flags interval,timeout");
+    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
     if !cidrs_v4(policy).is_empty() {
         let _ = writeln!(nft, "    elements = {{ {} }}", cidrs_v4(policy).join(", "));
     }
@@ -54,7 +69,8 @@ pub fn ruleset(policy: &Policy) -> String {
 
     let _ = writeln!(nft, "  set {SET_V6} {{");
     let _ = writeln!(nft, "    type ipv6_addr");
-    let _ = writeln!(nft, "    flags interval");
+    let _ = writeln!(nft, "    flags interval,timeout");
+    let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
     if !cidrs_v6(policy).is_empty() {
         let _ = writeln!(nft, "    elements = {{ {} }}", cidrs_v6(policy).join(", "));
     }
