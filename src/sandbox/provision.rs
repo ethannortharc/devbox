@@ -245,7 +245,7 @@ pub async fn provision_vm_full(
     packages: &[String],
 ) -> Result<()> {
     match image {
-        "ubuntu" => provision_ubuntu(runtime, name, sets, languages).await,
+        "ubuntu" => provision_ubuntu(runtime, name, sets, languages, packages).await,
         _ => provision_nixos(runtime, name, sets, languages, mount_mode, packages).await,
     }
 }
@@ -355,6 +355,7 @@ async fn provision_ubuntu(
     name: &str,
     sets: &[String],
     languages: &[String],
+    extra: &[String],
 ) -> Result<()> {
     // 1. Install the Nix package manager
     println!("Installing Nix package manager on Ubuntu...");
@@ -381,6 +382,11 @@ fi"#;
         let set_name = format!("lang-{lang}");
         packages.extend(nix_packages_for_set(&set_name));
     }
+    // The box's ad-hoc packages too. They were accepted, persisted in sandbox
+    // state, and reported as selected — and never installed, because only the
+    // NixOS path read them.
+    let mut packages: Vec<String> = packages.into_iter().map(str::to_string).collect();
+    packages.extend(extra.iter().cloned());
     packages.sort();
     packages.dedup();
 

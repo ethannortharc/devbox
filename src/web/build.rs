@@ -224,6 +224,26 @@ pub async fn restore_generated(
     restored
 }
 
+/// Which system generation the box is currently running.
+///
+/// `readlink /run/current-system` is the cheapest honest answer: it points at
+/// the store path of the active generation and changes exactly when a switch
+/// activates one. `None` means the question could not be answered, and callers
+/// treat that as "assume it may have changed" — the conservative direction,
+/// since an unnecessary rollback is recoverable and a skipped one is not.
+async fn current_generation(
+    runtime: &dyn crate::runtime::Runtime,
+    box_name: &str,
+) -> Option<String> {
+    runtime
+        .exec_cmd(box_name, &["readlink", "-f", "/run/current-system"], false)
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| r.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Write the modules and rebuild, with everything after the snapshot fallible.
 ///
 /// Split out so a single `?` covers each step: the caller restores on any
@@ -240,11 +260,29 @@ async fn apply_after_snapshot(
         .context("failed to push Nix set modules into the box")?;
     publish("devbox: set modules written to /etc/devbox/sets/");
 
+    // Which generation is current *before* the rebuild. `switch --rollback`
+    // activates the generation before the current one — so running it after an
+    // evaluation or build failure, where the profile never moved, would undo
+    // the user's last *successful* configuration. Only a switch that actually
+    // changed the profile should be reversed.
+    let before = current_generation(runtime, box_name).await;
+
     let argv = runtime.argv(box_name, &crate::nix::rebuild::rebuild_argv(), false);
     publish(&format!("devbox: {}", argv.join(" ")));
 
     let code = stream_command(&argv, |line| publish(line)).await?;
     if code != 0 {
+        let after = current_generation(runtime, box_name).await;
+        if before.is_some() && before == after {
+            // Nothing was activated: evaluation or build failed, and the box
+            // is genuinely untouched. Rolling back here would be the bug.
+            publish("devbox: rebuild failed before activation — the box is unchanged");
+            bail!(
+                "nixos-rebuild switch failed with exit code {code} before activation; \
+                 the box is unchanged"
+            );
+        }
+
         // `nixos-rebuild switch` can fail *during activation*, after the new
         // generation has been made current — only evaluation and build
         // failures leave the box genuinely untouched. Restoring the sources

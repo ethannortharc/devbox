@@ -1025,3 +1025,48 @@ asserting the two chains carry identical rules. Factoring it out is the point �
 a rule added to one chain and forgotten in the other is a hole shaped exactly
 like this bug, and a shared emitter makes that impossible rather than merely
 unlikely.
+
+## ADR-0046: a blanket exemption in a default-deny firewall is a hole
+
+**Status:** accepted (2026-08-07). Reverses the round-4 deferral.
+
+Two exemptions were written as blanket rules because the generator had no way
+to know the specifics, and I deferred them in round 4 as "hardening beyond what
+§8 specifies, deserving a design decision rather than a reflex fix." The
+reviewer raised them again in rounds 5, 9, and 11. It was right and I was
+wrong: these are not hardening, they are bypasses.
+
+- **DNS.** `udp dport 53 accept` with no destination meant a process reached
+  any endpoint on the internet by speaking to port 53 — the allowlist was
+  advisory for anything willing to use one port number. Scoped now to the
+  resolvers in the box's own `/etc/resolv.conf`, parsed and validated as
+  addresses because the result is loaded as root. No resolver found means no
+  exemption: name resolution then visibly fails, which is safer than a policy
+  that quietly does not enforce, and the command says so on stderr.
+- **`isolated`.** All of RFC 1918 and ULA were permitted so lab traffic would
+  work. On a box with a route to a home or corporate network — which is most
+  boxes — that reached the LAN router while the posture promised lab-internal
+  traffic only. Scoped now to the prefixes of a lab actually running on the
+  box; with no lab, `isolated` means loopback.
+
+What I got wrong was the framing, not the caution. I treated "changes what a
+posture means" as a reason to defer, when the posture already did not mean what
+it said. Deferring a security fix because its semantics deserve thought is only
+correct if the current semantics are defensible, and I never checked whether
+they were.
+
+## ADR-0047: only reverse a switch that happened
+
+**Status:** accepted (2026-08-07)
+
+Round 9 added `nixos-rebuild switch --rollback` on any non-zero exit. But
+`--rollback` activates the generation *before* the current one, and an
+evaluation or build failure never moves the profile — so a failed Sets apply
+would undo the user's last *successful* configuration. The fix for "a failed
+activation is not rolled back" created "a failed evaluation rolls back
+something unrelated."
+
+`/run/current-system` is read before and after. Same path means nothing was
+activated and the box is genuinely untouched; different (or unreadable) means
+the switch may have happened and is reversed. Unreadable counts as changed
+because an unnecessary rollback is recoverable and a skipped one is not.

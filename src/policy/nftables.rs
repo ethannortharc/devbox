@@ -25,7 +25,7 @@ pub const TABLE: &str = "devbox";
 /// Shared by `output` and `forward` so the two can never drift: a rule added
 /// to one and forgotten in the other is a hole shaped exactly like the
 /// container-egress bypass this was factored out to fix.
-fn emit_policy_rules(nft: &mut String, policy: &Policy) {
+fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     // Established traffic first: a reply to a connection we already allowed
     // must not be re-evaluated, and putting this rule anywhere but first costs
     // a lookup on every packet.
@@ -44,9 +44,24 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy) {
     // DNS must survive every posture except `isolated`: the allowlist is
     // resolved by name, so blocking resolution would make the allowlist
     // unenforceable rather than strict.
+    //
+    // Scoped to the resolvers the box actually uses. Accepting port 53 to any
+    // destination made the port itself a bypass: a process could reach an
+    // unlisted endpoint by speaking anything at all to :53. With no resolver
+    // discovered, nothing is exempted — a policy that cannot resolve is
+    // visibly broken, which is safer than one that quietly is not enforced.
     if policy.egress != Posture::Isolated {
-        let _ = writeln!(nft, "    udp dport 53 accept");
-        let _ = writeln!(nft, "    tcp dport 53 accept");
+        for resolver in &ctx.resolvers {
+            let family = if resolver.contains(':') { "ip6" } else { "ip" };
+            let _ = writeln!(nft, "    {family} daddr {resolver} udp dport 53 accept");
+            let _ = writeln!(nft, "    {family} daddr {resolver} tcp dport 53 accept");
+        }
+        if ctx.resolvers.is_empty() {
+            let _ = writeln!(
+                nft,
+                "    # no resolver found in /etc/resolv.conf; DNS is not exempted"
+            );
+        }
     }
 
     match policy.egress {
@@ -54,13 +69,17 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy) {
             let _ = writeln!(nft, "    # posture is open: nothing is blocked");
         }
         Posture::Isolated => {
-            // Lab subnets stay reachable: the posture means "no egress", not
-            // "no networking".
-            let _ = writeln!(
-                nft,
-                "    ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} accept"
-            );
-            let _ = writeln!(nft, "    ip6 daddr fc00::/7 accept");
+            // This lab's subnets stay reachable: the posture means "no
+            // egress", not "no networking". *This lab's* — the previous
+            // blanket RFC 1918 exemption let an isolated box reach the home or
+            // corporate LAN behind it, which is egress by any reading.
+            for prefix in &ctx.lab_prefixes {
+                let family = if prefix.contains(':') { "ip6" } else { "ip" };
+                let _ = writeln!(nft, "    {family} daddr {prefix} accept");
+            }
+            if ctx.lab_prefixes.is_empty() {
+                let _ = writeln!(nft, "    # no lab on this box: loopback only");
+            }
             let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
         }
         Posture::Allowlist | Posture::MirrorOnly => {
@@ -95,7 +114,34 @@ pub const ALLOW_TTL_SECS: u64 = 3600;
 ///
 /// The output is idempotent: it deletes the devbox table first, so applying it
 /// twice leaves the same state as applying it once.
+/// What the ruleset needs to know about the box it is being generated for.
+///
+/// Two exemptions used to be written as blanket rules because the generator
+/// had no way to know the specifics — and a blanket exemption in a
+/// default-deny firewall is a hole, not a convenience:
+///
+/// * DNS was accepted to *any* destination on port 53, so a process reached
+///   an unlisted endpoint simply by using that port.
+/// * `isolated` accepted all of RFC 1918 and ULA, so a box with a route to a
+///   home or corporate LAN could reach the LAN router while the posture
+///   promised lab-internal traffic only.
+///
+/// Both are now derived from the box. Empty means "none of these exist", which
+/// is the strict reading and the right default.
+#[derive(Debug, Default, Clone)]
+pub struct Context {
+    /// The resolvers this box is configured to use, from `/etc/resolv.conf`.
+    pub resolvers: Vec<String>,
+    /// Prefixes belonging to a lab running on this box.
+    pub lab_prefixes: Vec<String>,
+}
+
 pub fn ruleset(policy: &Policy) -> String {
+    ruleset_with(policy, &Context::default())
+}
+
+/// Generate the ruleset for a policy against a known box.
+pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
     let mut nft = String::new();
 
     let _ = writeln!(
@@ -168,7 +214,7 @@ pub fn ruleset(policy: &Policy) -> String {
             nft,
             "    type filter hook {hook} priority filter; policy {verdict};"
         );
-        emit_policy_rules(&mut nft, policy);
+        emit_policy_rules(&mut nft, policy, ctx);
         let _ = writeln!(nft, "  }}");
     }
 
@@ -287,11 +333,21 @@ mod tests {
 
     #[test]
     fn dns_survives_every_posture_except_isolated() {
+        let ctx = Context {
+            resolvers: vec!["192.0.2.53".into()],
+            ..Default::default()
+        };
         for posture in [Posture::Open, Posture::Allowlist, Posture::MirrorOnly] {
-            let nft = ruleset(&policy(posture, &[]));
+            let nft = ruleset_with(&policy(posture, &[]), &ctx);
             assert!(
-                nft.contains("udp dport 53 accept"),
+                nft.contains("ip daddr 192.0.2.53 udp dport 53 accept"),
                 "{posture} resolves the allowlist by name, so DNS must work"
+            );
+            // To the resolver, not to the port. Accepting :53 anywhere made
+            // the port itself an exit.
+            assert!(
+                !nft.contains("    udp dport 53 accept"),
+                "{posture} must not exempt port 53 to arbitrary destinations"
             );
         }
         let nft = ruleset(&policy(Posture::Isolated, &[]));
@@ -355,11 +411,32 @@ mod tests {
     }
 
     #[test]
-    fn isolated_still_permits_lab_subnets() {
+    fn isolated_permits_this_labs_subnets_and_no_others() {
+        let ctx = Context {
+            lab_prefixes: vec!["10.99.0.0/16".into()],
+            ..Default::default()
+        };
+        let nft = ruleset_with(&policy(Posture::Isolated, &[]), &ctx);
+        assert!(nft.contains("ip daddr 10.99.0.0/16 accept"));
+
+        // Not all of RFC 1918. A box with a route to a home or corporate LAN
+        // could otherwise reach its router while the posture promised
+        // lab-internal traffic only — which is egress by any reading.
+        assert!(!nft.contains("172.16.0.0/12"));
+        assert!(!nft.contains("192.168.0.0/16"));
+        assert!(!nft.contains("fc00::/7"));
+    }
+
+    #[test]
+    fn isolated_without_a_lab_permits_nothing_beyond_loopback() {
         let nft = ruleset(&policy(Posture::Isolated, &[]));
-        assert!(nft.contains("10.0.0.0/8"));
-        assert!(nft.contains("192.168.0.0/16"));
-        assert!(nft.contains("fc00::/7"));
+        let chain = nft.split("chain output {").nth(1).unwrap();
+        assert!(
+            chain.contains("127.0.0.0/8 accept"),
+            "loopback is not egress"
+        );
+        assert!(chain.contains("no lab on this box"));
+        assert!(!chain.contains("10.0.0.0/8"));
     }
 
     #[test]

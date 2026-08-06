@@ -265,6 +265,25 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     .await?;
     println!("Substrate: '{substrate}' ({})\n", runtime.name());
 
+    // Preflight, before a single namespace exists. Discovering that FRR is
+    // missing *after* wiring left the user with a half-built lab and a
+    // suggested re-run that then failed at `ip netns add`, because the
+    // namespaces were already there. Nothing is worse to hand someone than a
+    // fix that cannot be applied.
+    if !lab.topology.routers().is_empty() {
+        let probe = runtime
+            .exec_cmd(&substrate, &["sh", "-c", "command -v zebra"], false)
+            .await;
+        if !probe.is_ok_and(|r| r.exit_code == 0) {
+            bail!(
+                "this topology has {} router(s), but substrate '{substrate}' has no FRR.\n  \
+                 Enable the `network` set (`devbox sets enable network --name {substrate}`) \
+                 and rebuild, then re-run `devbox lab up`.",
+                lab.topology.routers().len()
+            );
+        }
+    }
+
     for cmd in &commands {
         let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let result = runtime
@@ -540,11 +559,31 @@ async fn resolve_substrate(
     // single-box guess. Skipping the middle step meant a topology that named
     // its substrate was ignored, and a user with two boxes got "which one?"
     // for a question their file had already answered.
-    let from_topology = configured.filter(|s| !s.is_empty() && *s != "auto");
+    // A topology's `substrate` may name a *runtime kind* rather than a box —
+    // `lima`, `incus`, `host` are the documented values. Treating those as box
+    // names made such a topology fail unless a box happened to be called
+    // "lima", which nobody's is. A kind selects among the boxes; only an
+    // explicit `--substrate` is a name.
+    const RUNTIME_KINDS: &[&str] = &["lima", "incus", "multipass", "docker", "host"];
+    let configured = configured.filter(|s| !s.is_empty() && *s != "auto");
+    let (from_topology, want_kind) = match configured {
+        Some(value) if RUNTIME_KINDS.contains(&value) => (None, Some(value)),
+        other => (other, None),
+    };
+
     let name = match explicit.or(from_topology) {
         Some(name) => name.to_string(),
         None => {
-            let boxes = manager.list_sandboxes()?;
+            let mut boxes = manager.list_sandboxes()?;
+            if let Some(kind) = want_kind {
+                boxes.retain(|b| b.runtime == kind);
+                if boxes.is_empty() {
+                    bail!(
+                        "the topology asks for a '{kind}' substrate, but no box uses that \
+                         runtime. Create one, or pass `--substrate <name>`."
+                    );
+                }
+            }
             match boxes.as_slice() {
                 [] => bail!(
                     "no box to use as a substrate. A lab needs one Linux box to hold its \
@@ -565,6 +604,19 @@ async fn resolve_substrate(
 
     let state = manager.get_sandbox(&name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
+
+    // A lab needs network namespaces and veth pairs, which need CAP_NET_ADMIN.
+    // devbox creates Docker boxes without it, so such a substrate is accepted
+    // and then fails on the first `ip netns add` — after the user has waited
+    // for everything before it.
+    if state.runtime == "docker" {
+        bail!(
+            "box '{name}' runs under Docker without the capabilities a lab needs \
+             (network namespaces and veth pairs require CAP_NET_ADMIN).\n  \
+             Use a VM substrate — `devbox create --runtime lima` — and pass it \
+             with `--substrate <name>`."
+        );
+    }
 
     if runtime.status(&name).await? != SandboxStatus::Running {
         bail!("substrate box '{name}' is not running; start it with `devbox shell {name}`");

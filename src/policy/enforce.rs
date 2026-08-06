@@ -70,7 +70,19 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         );
     }
 
-    let ruleset = super::nftables::ruleset(policy);
+    // Built from the box, not assumed. Blanket DNS and RFC-1918 exemptions
+    // were holes; these are the specific addresses this box actually needs.
+    let ctx = discover_context(runtime, sandbox_name).await;
+    if ctx.resolvers.is_empty() {
+        // Worth saying out loud: with no resolver exempted, name resolution
+        // stops under an enforcing posture, and the user needs to know that is
+        // the cause rather than a mysterious network failure.
+        eprintln!(
+            "devbox: no resolver found in {sandbox_name}:/etc/resolv.conf — DNS is \
+             not exempted, so name resolution will fail under this posture"
+        );
+    }
+    let ruleset = super::nftables::ruleset_with(policy, &ctx);
 
     // Hand the agent the domains too. Without this the ruleset is default-deny
     // with a permanently empty allow set: `allowlist` and `mirror-only` would
@@ -240,6 +252,45 @@ fn load_command() -> String {
     )
 }
 
+/// Read the box's resolvers and any lab prefixes it hosts.
+///
+/// Best effort: a box that cannot be read yields an empty context, which
+/// generates the *strictest* ruleset rather than the most permissive one. The
+/// direction matters — the failure mode of a wrong guess here is a policy that
+/// silently does not enforce.
+async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::nftables::Context {
+    let resolvers = runtime
+        .exec_cmd(sandbox_name, &["cat", "/etc/resolv.conf"], false)
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| parse_resolvers(&r.stdout))
+        .unwrap_or_default();
+
+    super::nftables::Context {
+        resolvers,
+        // A box with no lab gets none, and `isolated` then means loopback
+        // only — which is what the posture says.
+        lab_prefixes: Vec::new(),
+    }
+}
+
+/// Pull nameserver addresses out of a resolv.conf.
+fn parse_resolvers(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let rest = line.strip_prefix("nameserver")?;
+            // Parsed as an address, because this becomes part of a ruleset
+            // loaded as root.
+            rest.trim()
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|a| a.to_string())
+        })
+        .collect()
+}
+
 /// The shell that writes the agent's policy file.
 fn policy_command(spec: &str) -> String {
     format!(
@@ -364,6 +415,17 @@ pub async fn apply_saved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolvers_are_parsed_and_validated() {
+        let conf = "# generated\nnameserver 192.0.2.53\nnameserver 2001:db8::53\n\
+                    nameserver not-an-address\nsearch example.com\n";
+        assert_eq!(parse_resolvers(conf), vec!["192.0.2.53", "2001:db8::53"]);
+
+        // Nothing unparseable reaches a root-loaded ruleset.
+        assert!(parse_resolvers("nameserver $(reboot)").is_empty());
+        assert!(parse_resolvers("").is_empty());
+    }
 
     #[test]
     fn the_ruleset_is_written_then_loaded_from_a_stable_path() {
