@@ -811,3 +811,43 @@ exists to exercise. It now retries across a restart window.
 
 **Gate** — 383 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T21:15Z — Codex review round 6: 14 findings, all addressed
+
+Series so far: **23, 23, 14, 27, 9, 14.**
+
+Three of my round-5 fixes had gaps, and the review found each. The pattern is
+worth naming, because it has now repeated four rounds running: **fixing a thing
+exposes the layer under it, and I keep stopping at the first layer.**
+
+- `frr::start_commands` used the bare node name; wiring creates
+  `devbox-{lab}-{node}`. My "FRR now starts" fix would have failed with
+  "namespace not found" on every routed lab — a silent non-start replaced by a
+  loud one.
+- Even fixed, nothing installs `frr`, so it would only have moved to
+  command-not-found. Same for `conntrack`: the flush I added to make tightening
+  take effect was silently skipped everywhere, because no package set provided
+  the binary. Both are provisioned now.
+- The ZTP retry I added made duplicate reports possible, and the state machine
+  rejected `from == to` as a regression — so after a lost response the
+  bootstrap retried into 409 forever. I converted a dropped report into a
+  guaranteed failure.
+
+The policy lifecycle produced the same shape it has since round 2: **the web
+path one round behind the CLI.** The Policy tab now applies as well as saves,
+`start_box` enforces for an already-running box, and `open` clears what a
+previous posture installed rather than returning early and leaving those rules
+in force.
+
+One fix caused a regression that testing caught rather than review: clearing on
+every start ran `sudo`, which a container exec neither has nor needs, so boxes
+refused to start. Privilege is decided in the guest now (ADR-0040) — the only
+place that knows.
+
+A UX decision worth recording: when the save succeeds and the apply fails, the
+Policy tab returns 200 with both facts rather than a 500 (ADR-0041). The policy
+really is saved, and a user told only "error" would not know whether to
+re-enter their allowlist.
+
+**Gate** — 384 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.

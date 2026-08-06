@@ -114,8 +114,8 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         // user decode an nft error: the box has no nftables at all.
         bail!(
             "failed to load the egress ruleset in box '{sandbox_name}': {}\n\n  \
-             If nftables is missing, enable the `network` set \
-             (`devbox sets enable network`) and rebuild.",
+             nftables ships in the locked `system` set, so a box that lacks it \
+             predates that change — `devbox reprovision` will install it.",
             load.stderr.trim()
         );
     }
