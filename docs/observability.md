@@ -103,8 +103,13 @@ re-applies it too, since rebuilding the box rebuilds its network stack. Nothing
 enforces `open` — it clears devbox's table rather than leaving an empty one
 behind that looks like it is doing something.
 
-Enforcement is nftables inside the box, with the allow set kept in sync from
-the DNS the agent is already capturing — so the firewall learns the address
+Enforcement is nftables inside the box, with the allow set kept in sync by the
+agent — `devbox-obsd -policy /etc/devbox/policy.json`, which the NixOS module
+passes whenever the control plane has written one. That file carries the
+domains as well as the compiled ruleset, because a ruleset alone cannot be
+enforced: it is default-deny with an allow set only DNS can populate. Enabling
+a posture without a running agent gives you the deny half and none of the
+allow half. Enforcement uses the DNS the agent is already capturing — so the firewall learns the address
 from the same resolution the application is about to use. DNS itself stays open
 in every posture except `isolated`: blocking it would make an allowlist
 *unenforceable*, not stricter.

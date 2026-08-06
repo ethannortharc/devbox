@@ -680,3 +680,37 @@ trade, but it means the eBPF source needs review rather than tests.
 
 **Gate after the fixes** — 378 Rust unit + 52 integration/e2e, 10 Go packages,
 64 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T15:40Z — Codex review round 3: 14 findings, all addressed
+
+Round 3 is mostly the bill for round 2, and it is the right bill to get. Making
+enforcement real turned a dormant subsystem into a live one, and live
+subsystems have failure modes that dormant ones do not.
+
+The sharpest finding: **`allowlist` and `mirror-only` blocked exactly what they
+promise to permit.** An allowlist names domains; nftables matches addresses.
+The generated ruleset is default-deny with `allow_v4`/`allow_v6` seeded only
+from literal CIDRs, and the only code that could add resolved answers — Go
+`Enforcer.OnDNS` — existed, was tested, and was never instantiated by anything.
+Before round 2 that was invisible, because no ruleset was ever loaded. After
+round 2 it would have broken every allowlisted box. `devbox-obsd -policy` now
+runs the enforcer (ADR-0033).
+
+Two findings were the same shape as ones I had already fixed, one layer out:
+the posture was applied where it was *set* but not in the *start* lifecycle, so
+it lasted until the first reboot (ADR-0034); and the web Sets path still did
+not `ensure_running` after I fixed the CLI path last round. Both are worth
+noting as a pattern — fixing the path in front of me rather than the lifecycle
+the path belongs to.
+
+The rest: per-mutation ZTP saves made concurrency real and every save wrote the
+same `.tmp` path; `ai-code.nix`/`ai-infra.nix` were being regenerated as flat
+lists, discarding the `tryEval` guards that exist because those tools are
+sometimes absent (ADR-0035); dotted package paths were read as nested TOML
+tables; behaviour diffs compared violation *counts*, so one violation against A
+and one against B read as no change; and `edge-a-edge-b` split on the first
+hyphen. Also, `ruff format --check` failed on the test I added last round —
+the CI lane would have gone red on the first push.
+
+**Gate after the fixes** — 381 Rust unit + 52 integration/e2e, 10 Go packages,
+64 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.

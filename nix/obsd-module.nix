@@ -86,6 +86,11 @@ in
             "-socket" (lib.escapeShellArg cfg.socket)
           ]
           ++ lib.optional (!cfg.enableEbpf) "-no-ebpf"
+          # The egress policy, when the control plane has written one. The
+          # agent is what keeps the firewall's allow sets in step with DNS, so
+          # an allowlist is only enforceable if this is passed.
+          ++ lib.optional (builtins.pathExists /etc/devbox/policy.json)
+               "-policy /etc/devbox/policy.json"
         );
 
         # Loading eBPF programs and reading every process needs real
