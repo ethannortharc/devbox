@@ -329,3 +329,78 @@ func TestScanProcsOnAMissingRoot(t *testing.T) {
 		t.Error("a missing procfs must be an error")
 	}
 }
+
+func TestProcPollsEstablishedConnections(t *testing.T) {
+	t.Parallel()
+
+	// The claim in `Domains()` has to be true: `-no-ebpf` advertises connect
+	// coverage, so the poll loop must actually read /proc/net/tcp.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "net"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tcp := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+		"   0: 0100007F:1F90 0500000A:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 54321 1",
+		"   1: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(root, "net", "tcp"), []byte(tcp), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Proc{Root: root, BoxID: "myapp", Boot: time.Now()}
+	out := make(chan *event.Event, 8)
+	seen := map[string]struct{}{}
+
+	if err := p.pollConnections(context.Background(), out, seen); err != nil {
+		t.Fatalf("pollConnections: %v", err)
+	}
+	close(out)
+
+	var events []*event.Event
+	for e := range out {
+		events = append(events, e)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want only the established one", len(events))
+	}
+
+	e := events[0]
+	if err := e.Validate(); err != nil {
+		t.Fatalf("a polled connection must be a valid event: %v", err)
+	}
+	if e.Type != event.TypeConnect {
+		t.Errorf("type = %s", e.Type)
+	}
+	if e.Net.DAddr != "10.0.0.5" || e.Net.DPort != 443 {
+		t.Errorf("peer = %s:%d", e.Net.DAddr, e.Net.DPort)
+	}
+	if e.BoxID != "myapp" {
+		t.Errorf("box_id = %q", e.BoxID)
+	}
+
+	// A second sweep sees the same socket and must not report it twice.
+	out2 := make(chan *event.Event, 8)
+	if err := p.pollConnections(context.Background(), out2, seen); err != nil {
+		t.Fatal(err)
+	}
+	close(out2)
+	if len(out2) != 0 {
+		t.Errorf("the same connection was reported twice")
+	}
+}
+
+func TestProcConnectionPollingToleratesAMissingTcp6(t *testing.T) {
+	t.Parallel()
+
+	// A kernel built without IPv6 has no /proc/net/tcp6; that is not a reason
+	// to end capture.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "net"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := &Proc{Root: root, BoxID: "b", Boot: time.Now()}
+	if err := p.pollConnections(context.Background(), make(chan *event.Event, 1), map[string]struct{}{}); err != nil {
+		t.Errorf("pollConnections: %v", err)
+	}
+}

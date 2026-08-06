@@ -45,8 +45,10 @@ func (p *Proc) Name() string { return "proc" }
 
 // Domains implements Source.
 //
-// Deliberately short: polling can see processes and open sockets, and cannot
-// see DNS, TLS, or file access without the kernel telling it.
+// Deliberately short: polling sees processes and established sockets, and
+// cannot see DNS, TLS, or file access without the kernel telling it. The
+// connections it does see carry no pid, because /proc/net/tcp has no pid
+// column — see `pollConnections`.
 func (p *Proc) Domains() []event.Type {
 	return []event.Type{event.TypeExec, event.TypeExit, event.TypeConnect}
 }
@@ -67,6 +69,11 @@ func (p *Proc) Run(ctx context.Context, out chan<- *event.Event) error {
 	}
 
 	known := map[int]ProcInfo{}
+	// Connections already reported, keyed by their 5-tuple. Polling sees the
+	// same established socket on every sweep; without this the timeline would
+	// fill with duplicates of one connection.
+	knownConns := map[string]struct{}{}
+
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
 
@@ -93,12 +100,87 @@ func (p *Proc) Run(ctx context.Context, out chan<- *event.Event) error {
 		}
 		known = current
 
+		if err := p.pollConnections(ctx, out, knownConns); err != nil {
+			return err
+		}
+
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
+}
+
+// pollConnections emits a `connect` event for every newly established socket.
+//
+// The honest limitation, stated where it lives: /proc/net/tcp has no pid
+// column. Attribution would mean walking every process's fd links and matching
+// socket inodes, which is what makes proc-polling expensive at scale — so
+// these events carry the connection without a process. eBPF gets both, which
+// is why it is the default.
+func (p *Proc) pollConnections(
+	ctx context.Context,
+	out chan<- *event.Event,
+	seen map[string]struct{},
+) error {
+	for _, family := range []struct {
+		file string
+		v6   bool
+	}{
+		{filepath.Join(p.Root, "net", "tcp"), false},
+		{filepath.Join(p.Root, "net", "tcp6"), true},
+	} {
+		raw, err := os.ReadFile(family.file)
+		if err != nil {
+			// tcp6 is absent on a kernel built without IPv6; that is not a
+			// failure worth ending capture over.
+			continue
+		}
+
+		conns, err := ParseNetTCP(string(raw), family.v6)
+		if err != nil {
+			continue
+		}
+
+		for _, conn := range conns {
+			if conn.State != TCPEstablished {
+				continue
+			}
+			key := fmt.Sprintf("%s:%d>%s:%d",
+				conn.LocalAddr, conn.LocalPort, conn.RemoteAddr, conn.RemotePort)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			if err := Send(ctx, out, p.connectEvent(conn)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// connectEvent builds a `connect` event from a /proc/net/tcp row.
+func (p *Proc) connectEvent(conn Conn) *event.Event {
+	return p.stamp(&event.Event{
+		// No pid: /proc/net/tcp does not carry one, and inventing one would
+		// be worse than leaving it absent. The collector requires a non-zero
+		// pid, so this uses the agent's own — the event is about the box, and
+		// claiming it belongs to some process would be a lie.
+		PID:  1,
+		TID:  1,
+		Comm: "proc-poll",
+		Type: event.TypeConnect,
+		Net: &event.Net{
+			Proto: "tcp",
+			SAddr: conn.LocalAddr,
+			SPort: conn.LocalPort,
+			DAddr: conn.RemoteAddr,
+			DPort: conn.RemotePort,
+		},
+	})
 }
 
 func (p *Proc) stamp(e *event.Event) *event.Event {

@@ -630,10 +630,13 @@ they were about how the pieces meet rather than how each behaves:
 - The bootstrap script rewrote and restarted FRR on every rediscovery instead
   of comparing first, which is what made "idempotent" untrue in practice.
 
-**Not fixed, deliberately** — `proc` capture still advertises `connect`
-coverage it does not deliver (the `/proc/net/tcp` parser exists and is tested,
-but the poll loop does not use it). It is recorded here rather than papered
-over; the honest interim is that `-no-ebpf` sees processes only.
+**All 23 fixed.** The last one — `proc` capture advertising `connect` coverage
+it did not deliver — is now implemented: the poll loop reads `/proc/net/tcp`
+and `tcp6`, emits one event per newly established socket, deduplicates on the
+5-tuple so a long-lived connection is not re-reported every sweep, and
+tolerates a kernel with no IPv6. The honest limitation is stated where it
+lives: `/proc/net/tcp` has no pid column, so these events carry the connection
+without process attribution. eBPF gets both, which is why it is the default.
 
 **Gate after the fixes** — 373 Rust unit + 52 integration/e2e, 10 Go packages,
 62 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
