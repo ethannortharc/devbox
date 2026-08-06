@@ -5,8 +5,10 @@ CO-RE programs that feed the observability plane (§7.1).
 | Program | Attach point | Produces |
 |---|---|---|
 | `handle_exec` | tracepoint `sched/sched_process_exec` | `exec` — path, argv, cwd |
-| `handle_tcp_v4_connect` | kprobe `tcp_v4_connect` | `connect` — 5-tuple |
-| `handle_tcp_v6_connect` | kprobe `tcp_v6_connect` | `connect` — 5-tuple |
+| `handle_tcp_v4_connect` | kprobe `tcp_v4_connect` | records the socket for the return probe |
+| `handle_tcp_v4_connect_ret` | kretprobe `tcp_v4_connect` | `connect` — 5-tuple |
+| `handle_tcp_v6_connect` | kprobe `tcp_v6_connect` | records the socket for the return probe |
+| `handle_tcp_v6_connect_ret` | kretprobe `tcp_v6_connect` | `connect` — 5-tuple |
 | `handle_accept` | kretprobe `inet_csk_accept` | `accept` — 5-tuple |
 | `handle_openat` | tracepoint `syscalls/sys_enter_openat` | `file` — path, flags, op |
 
@@ -57,3 +59,19 @@ go generate -tags bpf2go ./agent/bpf/...
 
 On macOS the agent runs inside the Lima guest, so eBPF is available there even
 though the host cannot load it (§13).
+
+## Why connect needs both an entry and a return probe
+
+At `tcp_v*_connect` **entry** the kernel has not yet copied the destination
+into `skc_daddr`/`skc_dport`, nor picked the local port. Reading the socket
+there yields zeroes or the previous connection's values — every outbound flow
+decoded wrong, plausibly enough that nothing looked broken. The entry probe
+therefore only stashes the socket pointer against the thread id, and the return
+probe reads the now-populated fields and emits the event. A non-zero return
+means the connect failed, so nothing is emitted: a destination that was never
+reached does not belong in the timeline.
+
+`fill_net` writes **every** field of the record, including `_pad`, the unused
+address bytes, and the byte/duration counters. `bpf_ringbuf_reserve` hands back
+reused memory, not zeroed memory, so a field left untouched carries whatever
+the previous record put there — and the Go decoder reports it as real traffic.
