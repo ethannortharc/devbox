@@ -14,8 +14,8 @@ ordered work list, §17 the quality bar).
 |---|---|---|
 | 0 | Foundations | **DONE** |
 | 1 | Web console: box management (retire TUI) | **DONE** |
-| 2 | On-demand build / selective sets | in progress |
-| 3 | Observability capture (Go agent + eBPF) | not started |
+| 2 | On-demand build / selective sets | **DONE** |
+| 3 | Observability capture (Go agent + eBPF) | in progress |
 | 4 | Observability presentation + behavior diff | not started |
 | 5 | Egress & activity control | not started |
 | 6 | Box lab: substrate & topology | not started |
@@ -148,3 +148,46 @@ state. It skips rather than fails when Docker is absent.
 checklist, compose `configuration.nix` from the selection, run the rebuild, and
 stream progress over SSE. Unit-test the nix-composition logic first
 (`src/nix/sets.rs` already has the set catalogue).
+
+---
+
+## 2026-08-06T07:25Z — Phase 2 DONE
+
+**Landed**
+
+- `src/nix/compose.rs` — the composition logic, pure and 15-tests deep.
+  `Selection` (sets + ad-hoc packages) composes a `configuration.nix` that
+  imports **only** the chosen set modules, in catalogue order, byte-identically
+  for the same selection. `validate()` rejects unknown sets and any attribute
+  path that is not dotted `[A-Za-z0-9_-]` — that string is interpolated into a
+  Nix expression evaluated as root inside the box.
+- Only `system` is locked now (ADR-0012), so a minimal box is expressible.
+- **Sets tab** in the console: grouped checklist with per-set package counts,
+  locked entries checked-and-disabled, free-text extra packages.
+- **Streamed rebuilds** (ADR-0014): POST returns `202` with a log panel and
+  spawns the work; output goes to per-box SSE events and appends with
+  `hx-swap="beforeend scroll:bottom"`. Persisted state is written only after
+  the rebuild exits zero.
+- **CLI parity** (§6.4): `devbox sets list`, `devbox sets apply --set … --package …
+  [--dry-run]`, the latter printing the package-closure diff first.
+- `Runtime::interactive_argv` generalized to `argv(name, cmd, interactive)`.
+
+**Gate** — all green:
+
+```
+cargo fmt --check                            ok
+cargo clippy --all-targets -- -D warnings    ok
+cargo test                                   146 unit + 15 cli + 26 console
+                                             + 1 docker e2e = 188 passed
+go vet ./... && go test ./...                ok
+```
+
+**e2e evidence** — the Docker test subscribes to `/api/stream` before posting a
+selection (as the page does), then asserts both build progress and the terminal
+build status arrive over SSE from a real container.
+
+**Next step** — Phase 3: the Go observability agent. Start with the canonical
+event schema from §11.1 in Go (`agent/event`), with JSON round-trip and decoder
+tests against recorded fixtures; then the Rust collector + SQLite store in
+`src/obs/`; then wire the transport. eBPF *loading* cannot be tested on macOS —
+that lives in the privileged Linux CI lane.

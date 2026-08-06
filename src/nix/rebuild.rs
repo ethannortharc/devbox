@@ -73,6 +73,41 @@ pub async fn write_state_toml(
     Ok(())
 }
 
+/// Path of the composed configuration inside a box.
+///
+/// The NixOS configuration imports this file; devbox owns it exclusively and
+/// regenerates it from the set checklist on every rebuild (§6.3).
+pub const DEVBOX_NIX_PATH: &str = "/etc/devbox/devbox.nix";
+
+/// Write the composed `configuration.nix` fragment inside the VM.
+pub async fn write_devbox_nix(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+    content: &str,
+) -> Result<()> {
+    let result = runtime
+        .exec_cmd(
+            sandbox_name,
+            &[
+                "sudo", "bash", "-c",
+                &format!(
+                    "mkdir -p /etc/devbox && cat > {DEVBOX_NIX_PATH} << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
+                ),
+            ],
+            false,
+        )
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!(
+            "Failed to write {DEVBOX_NIX_PATH}: {}",
+            result.stderr.trim()
+        );
+    }
+
+    Ok(())
+}
+
 /// Write a Nix file to /etc/devbox/sets/ inside the VM.
 pub async fn write_nix_file(
     runtime: &dyn Runtime,

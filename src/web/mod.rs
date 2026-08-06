@@ -8,6 +8,7 @@
 
 pub mod assets;
 pub mod auth;
+pub mod build;
 pub mod help;
 pub mod routes;
 pub mod server;

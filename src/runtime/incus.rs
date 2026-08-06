@@ -177,13 +177,13 @@ impl Runtime for IncusRuntime {
         }
     }
 
-    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
-        let mut argv = vec![
-            "incus".to_string(),
-            "exec".to_string(),
-            Self::vm_name(name),
-            "--".to_string(),
-        ];
+    fn argv(&self, name: &str, cmd: &[&str], interactive: bool) -> Vec<String> {
+        let mut argv = vec!["incus".to_string(), "exec".to_string(), Self::vm_name(name)];
+        if !interactive {
+            // Without a tty incus still wants to know not to allocate one.
+            argv.push("--force-noninteractive".to_string());
+        }
+        argv.push("--".to_string());
         argv.extend(cmd.iter().map(|s| s.to_string()));
         argv
     }
@@ -314,8 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn interactive_argv_targets_the_instance() {
-        let argv = IncusRuntime.interactive_argv("myapp", &["bash"]);
-        assert_eq!(argv, vec!["incus", "exec", "devbox-myapp", "--", "bash"]);
+    fn argv_targets_the_instance() {
+        assert_eq!(
+            IncusRuntime.argv("myapp", &["bash"], true),
+            vec!["incus", "exec", "devbox-myapp", "--", "bash"]
+        );
+        assert!(
+            IncusRuntime
+                .argv("myapp", &["true"], false)
+                .contains(&"--force-noninteractive".to_string())
+        );
     }
 }

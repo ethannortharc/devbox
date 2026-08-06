@@ -275,3 +275,78 @@ for anyone maintaining their own base image.
 
 **Revisit.** If per-box image selection becomes a product feature, promote it
 from an environment variable to a `devbox.toml` key.
+
+---
+
+## ADR-0012 — Only `system` is a locked set
+
+**Date:** 2026-08-06
+
+**Context.** v3 hard-coded four sets as "Locked: always true" — `system`,
+`shell`, `tools`, `editor`. §6.3 makes the set list a live checklist, and G5
+says nothing heavy is built until asked for. A checklist with four entries you
+cannot uncheck contradicts both.
+
+**Decision.** `LOCKED_SETS = ["system"]`. Everything else, including `shell`,
+`tools`, and `editor`, is toggleable. `system` stays locked because it carries
+coreutils, the CA bundle, and the compiler toolchain — a box without them is
+not a minimal box, it is a broken one.
+
+**Rationale.** A genuinely minimal box (say, `system` + `lang-rust`) is now
+expressible, which is the point of on-demand building. The default selection is
+unchanged, so nobody's existing box shrinks by surprise.
+
+**Revisit.** If people routinely end up with a box that has no editor and are
+surprised, the fix is a better default in the create form, not re-locking.
+
+---
+
+## ADR-0013 — Composition writes `configuration.nix`; set modules are pushed wholesale
+
+**Date:** 2026-08-06
+
+**Context.** §6.3 says the composed configuration should import "only the
+selected set modules". Two things could be selective: which module *files* land
+in the box, and which the configuration *imports*.
+
+**Decision.** All 15 set modules are always written to `/etc/devbox/sets/`;
+`/etc/devbox/devbox.nix` — regenerated from the selection on every rebuild —
+imports only the chosen ones.
+
+**Rationale.** The modules are a few kilobytes of text that Nix never evaluates
+unless imported, so writing them all costs nothing and makes toggling a set on
+later a pure configuration change with no extra round trip into the box. What
+actually matters — which closures get evaluated and built — is controlled
+exactly as the design requires. `compose_configuration_nix` is pure and has 8
+tests, including one asserting unselected sets appear nowhere in the output.
+
+**Revisit.** If the set catalogue grows to where pushing it is slow, push
+lazily and diff against what is already in the box.
+
+---
+
+## ADR-0014 — Rebuilds are fire-and-forget with an SSE log
+
+**Date:** 2026-08-06
+
+**Context.** `nixos-rebuild switch` can run for minutes. Holding the HTTP
+request open for it would hit a proxy, browser, or client timeout somewhere in
+between, and would give the user nothing to look at meanwhile.
+
+**Decision.** `POST /api/boxes/{name}/sets` validates, returns `202 Accepted`
+with a log panel, and spawns the rebuild. Output streams to per-box SSE events
+(`build-{name}`, `build-status-{name}`) that the panel appends to. The box's
+persisted set list is updated **only after** the rebuild exits zero.
+
+**Rationale.** The user sees progress immediately, the request cannot time out,
+and a failed rebuild leaves the recorded state matching the box's real state
+rather than what was hoped for. Per-box event names mean two concurrent
+rebuilds never interleave in one panel.
+
+**Cost.** A page opened *after* a rebuild starts misses the earlier lines.
+Acceptable: the terminal status event still arrives, and the log is not an
+audit record. If it needs to become one, the collector store from Phase 3 is
+the right place for it.
+
+**Revisit.** Phase 3 introduces a real event store; build logs could move
+there and become replayable.

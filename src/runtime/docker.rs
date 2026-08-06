@@ -146,13 +146,12 @@ impl Runtime for DockerRuntime {
         }
     }
 
-    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
-        let mut argv = vec![
-            "docker".to_string(),
-            "exec".to_string(),
-            "-it".to_string(),
-            Self::container_name(name),
-        ];
+    fn argv(&self, name: &str, cmd: &[&str], interactive: bool) -> Vec<String> {
+        let mut argv = vec!["docker".to_string(), "exec".to_string()];
+        if interactive {
+            argv.push("-it".to_string());
+        }
+        argv.push(Self::container_name(name));
         argv.extend(cmd.iter().map(|s| s.to_string()));
         argv
     }
@@ -277,11 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_argv_allocates_a_tty() {
-        let argv = DockerRuntime.interactive_argv("myapp", &["zsh", "-l"]);
+    fn argv_allocates_a_tty_only_when_interactive() {
         assert_eq!(
-            argv,
+            DockerRuntime.argv("myapp", &["zsh", "-l"], true),
             vec!["docker", "exec", "-it", "devbox-myapp", "zsh", "-l"]
+        );
+        assert_eq!(
+            DockerRuntime.argv("myapp", &["true"], false),
+            vec!["docker", "exec", "devbox-myapp", "true"]
         );
     }
 }

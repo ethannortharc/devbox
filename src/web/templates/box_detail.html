@@ -18,6 +18,8 @@
     <nav class="tabs">
       <a href="/boxes/{{ boxinfo.name }}?tab=overview"
          {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
+      <a href="/boxes/{{ boxinfo.name }}?tab=sets"
+         {% if tab == "sets" %}aria-current="page"{% endif %}>Sets</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=files"
          {% if tab == "files" %}aria-current="page"{% endif %}>Files</a>
       <a href="/boxes/{{ boxinfo.name }}?tab=terminal"
@@ -44,6 +46,22 @@
         <dt>languages</dt>
         <dd>{% if boxinfo.languages.is_empty() %}—{% else %}{{ boxinfo.languages|join(", ") }}{% endif %}</dd>
       </dl>
+
+      {% elif tab == "sets" %}
+      <p class="muted">
+        Toggle what this box has. Nix builds only what is checked, so an
+        unchecked set costs nothing — no download, no closure, no disk.
+      </p>
+      {% call m::set_checklist(boxinfo.name, groups, extra_packages) %}{% endcall %}
+
+      {#- Build output streams in here over SSE; `beforeend` appends rather
+          than replacing, so the log accumulates. -#}
+      <div id="build-panel">
+        <div class="buildlog"
+             sse-swap="build-{{ boxinfo.name }}"
+             hx-swap="beforeend scroll:bottom"></div>
+        <p class="muted" sse-swap="build-status-{{ boxinfo.name }}"></p>
+      </div>
 
       {% elif tab == "files" %}
       <p class="muted">

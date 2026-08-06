@@ -182,6 +182,103 @@ mod reqwest_lite {
         pub fn post(&self, url: &str) -> Res {
             self.request("POST", url)
         }
+
+        pub fn post_form(&self, url: &str, form: &str) -> Res {
+            let out = std::process::Command::new("curl")
+                .args([
+                    "-sS",
+                    "-X",
+                    "POST",
+                    "-H",
+                    &format!("Cookie: devbox_console={}", self.token),
+                    "-H",
+                    "Content-Type: application/x-www-form-urlencoded",
+                    "--data",
+                    form,
+                    "-w",
+                    "\n%{http_code}",
+                    url,
+                ])
+                .output()
+                .expect("curl runs");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let (body, status) = text.rsplit_once('\n').unwrap_or(("", "0"));
+            Res {
+                status: status.trim().parse().unwrap_or(0),
+                body: body.to_string(),
+            }
+        }
+
+        /// Open an SSE stream and start collecting it in the background.
+        ///
+        /// Subscribing *before* triggering the work is what the real page does
+        /// — the console connects its stream on page load, long before any
+        /// form is submitted — and it is the only way to see the first events.
+        pub fn start_stream(&self, url: &str) -> Stream {
+            use std::io::Read;
+
+            let mut child = std::process::Command::new("curl")
+                .args([
+                    "-sS",
+                    "-N",
+                    "-H",
+                    &format!("Cookie: devbox_console={}", self.token),
+                    url,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("curl runs");
+
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let sink = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut acc) = sink.lock() {
+                        acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            });
+
+            Stream { child, seen }
+        }
+    }
+
+    /// A live SSE subscription.
+    pub struct Stream {
+        child: std::process::Child,
+        seen: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    impl Stream {
+        /// Wait until `done` accepts what has arrived, or the timeout expires.
+        /// Returns everything seen either way.
+        pub fn wait_for(
+            &self,
+            timeout: std::time::Duration,
+            done: impl Fn(&str) -> bool,
+        ) -> String {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let snapshot = self.seen.lock().map(|s| s.clone()).unwrap_or_default();
+                if done(&snapshot) || std::time::Instant::now() >= deadline {
+                    return snapshot;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -328,6 +425,42 @@ async fn console_drives_a_real_docker_box_end_to_end() {
         "terminal produced no marker; saw: {seen:?}"
     );
     let _ = socket.close(None).await;
+
+    // ── set checklist streams a real build over SSE ──
+    // busybox has no nixos-rebuild, so the rebuild is expected to fail — what
+    // this asserts is that the request is accepted, the work really starts
+    // against the box, and both its progress and its outcome reach the SSE
+    // channel. Subscribe first, exactly as the page does.
+    let stream = http.start_stream(&format!("{base}/api/stream"));
+    stream.wait_for(Duration::from_secs(5), |s| s.contains("event: tick"));
+
+    let res = http.post_form(
+        &format!("{base}/api/boxes/{BOX}/sets"),
+        "set=system&set=git",
+    );
+    assert_eq!(res.status, 202, "apply sets: {}", res.body);
+    assert!(res.body.contains("sse-swap=\"build-e2e-console\""));
+
+    let seen = stream.wait_for(Duration::from_secs(30), |s| {
+        s.contains("build-status-e2e-console")
+    });
+    assert!(
+        seen.contains("event: build-e2e-console"),
+        "no build progress on the SSE stream; saw: {seen}"
+    );
+    assert!(
+        seen.contains("applying selection"),
+        "progress should name what is being applied; saw: {seen}"
+    );
+    assert!(
+        seen.contains("build-status-e2e-console"),
+        "no terminal build status; saw: {seen}"
+    );
+    assert!(
+        seen.contains("failed"),
+        "a busybox box cannot rebuild, so the status must say so; saw: {seen}"
+    );
+    drop(stream);
 
     // ── destroy through the API ──────────────────────
     let res = http.post(&format!("{base}/api/boxes/{BOX}/destroy"));

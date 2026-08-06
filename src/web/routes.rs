@@ -13,9 +13,10 @@ use axum::{Json, Router, middleware};
 use serde::Deserialize;
 
 use super::help::{self, Topic};
-use super::service::{self, BoxSummary, FileChange};
+use super::service::{self, BoxSummary, FileChange, SetGroup};
 use super::state::AppState;
-use super::{assets, auth, sse, term};
+use super::{assets, auth, build, sse, term};
+use crate::nix::compose::Selection;
 
 /// Build the console router. Exposed so tests can drive it without binding a
 /// socket.
@@ -32,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/boxes/{name}/start", post(start_box))
         .route("/api/boxes/{name}/stop", post(stop_box))
         .route("/api/boxes/{name}/destroy", post(destroy_box))
+        .route("/api/boxes/{name}/sets", post(apply_sets))
         .route("/api/boxes/{name}/files", get(box_files))
         .route("/api/boxes/{name}/term", get(box_terminal))
         .route("/api/stream", get(sse::stream))
@@ -93,6 +95,8 @@ struct BoxDetailTemplate {
     nav: &'static str,
     tab: &'static str,
     boxinfo: BoxSummary,
+    groups: Vec<SetGroup>,
+    extra_packages: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +110,7 @@ pub struct TabQuery {
 /// land on the box, not on an error page.
 pub fn resolve_tab(requested: Option<&str>) -> &'static str {
     match requested {
+        Some("sets") => "sets",
         Some("files") => "files",
         Some("terminal") => "terminal",
         _ => "overview",
@@ -131,10 +136,21 @@ async fn box_detail(
         Err(e) => return not_found(&name, &e),
     };
 
+    let selection = Selection::new(
+        boxinfo
+            .sets
+            .iter()
+            .cloned()
+            .chain(boxinfo.languages.iter().map(|l| format!("lang-{l}"))),
+        std::iter::empty(),
+    );
+
     render(BoxDetailTemplate {
         version: state.version,
         nav: "dashboard",
         tab,
+        groups: service::set_groups(&selection),
+        extra_packages: String::new(),
         boxinfo,
     })
 }
@@ -183,6 +199,69 @@ async fn destroy_box(State(state): State<AppState>, Path(name): Path<String>) ->
             HeaderValue::from_static("/"),
         )],
         Html(String::new()),
+    )
+        .into_response()
+}
+
+// ── sets ─────────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "_build_panel.html")]
+struct BuildPanelFragment {
+    name: String,
+    summary: String,
+}
+
+/// `POST /api/boxes/{name}/sets` — apply a set selection and rebuild.
+///
+/// Returns immediately with the log panel; the rebuild runs in the background
+/// and streams into it over SSE. A `nixos-rebuild` can take minutes, so
+/// holding the request open would just time out somewhere in between.
+async fn apply_sets(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
+    if state.manager.get_sandbox(&name).is_err() {
+        return (StatusCode::NOT_FOUND, format!("no such box: {name}")).into_response();
+    }
+
+    let selection = service::parse_selection_form(&body);
+    if let Err(e) = selection.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<div class=\"notice error\">Invalid selection: {e}</div>"
+            )),
+        )
+            .into_response();
+    }
+
+    let summary = format!(
+        "{} set(s), {} extra package(s)",
+        selection.sets.len(),
+        selection.packages.len()
+    );
+
+    let bg = state.clone();
+    let box_name = name.clone();
+    tokio::spawn(async move {
+        let manager = bg.manager.clone();
+        if let Err(e) = build::apply_selection(&manager, &bg, &box_name, &selection).await {
+            tracing::warn!(box_id = %box_name, error = ?e, "rebuild failed");
+            bg.publish(crate::web::state::ConsoleEvent::new(
+                build::status_event(&box_name),
+                format!(
+                    "<span class=\"term-err\">{}</span>",
+                    build::escape_html(&e.to_string())
+                ),
+            ));
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        render(BuildPanelFragment { name, summary }),
     )
         .into_response()
 }
@@ -462,47 +541,70 @@ mod tests {
         assert!(stopped[stop_idx..].contains("disabled"));
     }
 
+    fn detail(tab: &'static str) -> BoxDetailTemplate {
+        let selection = Selection::new(["system".to_string()], std::iter::empty());
+        BoxDetailTemplate {
+            version: "0.1.3",
+            nav: "dashboard",
+            tab,
+            groups: service::set_groups(&selection),
+            extra_packages: String::new(),
+            boxinfo: summary("alpha", "running"),
+        }
+    }
+
     #[test]
     fn detail_template_renders_each_tab() {
         for (tab, needle) in [
             ("overview", "mount mode"),
+            ("sets", "hx-post=\"/api/boxes/alpha/sets\""),
             ("files", "hx-get=\"/api/boxes/alpha/files\""),
             ("terminal", "data-endpoint=\"/api/boxes/alpha/term\""),
         ] {
-            let html = BoxDetailTemplate {
-                version: "0.1.3",
-                nav: "dashboard",
-                tab,
-                boxinfo: summary("alpha", "running"),
-            }
-            .render()
-            .expect("template renders");
+            let html = detail(tab).render().expect("template renders");
             assert!(html.contains(needle), "tab {tab} missing {needle}");
         }
     }
 
     #[test]
-    fn terminal_tab_loads_xterm_only_when_shown() {
-        let overview = BoxDetailTemplate {
-            version: "0.1.3",
-            nav: "dashboard",
-            tab: "overview",
-            boxinfo: summary("alpha", "running"),
-        }
-        .render()
-        .unwrap();
-        assert!(!overview.contains("xterm.js"));
+    fn sets_tab_renders_the_checklist_with_locked_entries_disabled() {
+        let html = detail("sets").render().unwrap();
 
-        let terminal = BoxDetailTemplate {
-            version: "0.1.3",
-            nav: "dashboard",
-            tab: "terminal",
-            boxinfo: summary("alpha", "running"),
-        }
-        .render()
-        .unwrap();
+        assert!(html.contains("value=\"system\""));
+        assert!(html.contains("value=\"lang-go\""));
+        assert!(html.contains("Languages"));
+        // `system` is locked: rendered checked *and* disabled.
+        let sys = html.split("value=\"system\"").nth(1).unwrap();
+        let sys_input = sys.split("/>").next().unwrap();
+        assert!(sys_input.contains("disabled"), "got: {sys_input}");
+        // A toggleable set must not be disabled.
+        let go = html.split("value=\"lang-go\"").nth(1).unwrap();
+        assert!(!go.split("/>").next().unwrap().contains("disabled"));
+        // The live build log is wired to this box's SSE stream.
+        assert!(html.contains("sse-swap=\"build-alpha\""));
+        assert!(html.contains("hx-swap=\"beforeend scroll:bottom\""));
+    }
+
+    #[test]
+    fn terminal_tab_loads_xterm_only_when_shown() {
+        assert!(!detail("overview").render().unwrap().contains("xterm.js"));
+
+        let terminal = detail("terminal").render().unwrap();
         assert!(terminal.contains("/assets/js/xterm.js"));
         assert!(terminal.contains("/assets/js/term.js"));
+    }
+
+    #[test]
+    fn build_panel_subscribes_to_the_right_box() {
+        let html = BuildPanelFragment {
+            name: "alpha".into(),
+            summary: "3 set(s), 0 extra package(s)".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("sse-swap=\"build-alpha\""));
+        assert!(html.contains("sse-swap=\"build-status-alpha\""));
+        assert!(html.contains("3 set(s)"));
     }
 
     #[test]

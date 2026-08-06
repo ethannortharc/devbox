@@ -445,6 +445,7 @@ dependencies = [
  "clap",
  "colored",
  "dirs",
+ "form_urlencoded",
  "futures",
  "http-body-util",
  "mime_guess",

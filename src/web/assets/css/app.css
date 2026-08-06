@@ -439,6 +439,96 @@ main {
   row-gap: 7px;
 }
 
+/* ── set checklist ────────────────────────────────────── */
+
+.setgroup {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  margin: 0 0 14px;
+}
+.setgroup legend {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.setgroup > .muted {
+  margin: 0 0 10px;
+}
+
+.setgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 4px 12px;
+}
+
+.setopt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+}
+.setopt:hover {
+  background: var(--bg-inset);
+}
+.setopt.locked {
+  cursor: default;
+  opacity: 0.75;
+}
+.setopt .setname {
+  font-family: var(--mono);
+}
+.setopt .setcount {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+input.text {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  width: 100%;
+  color: var(--fg);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+}
+input.text:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* ── build log ────────────────────────────────────────── */
+
+.buildlog {
+  max-height: 340px;
+  overflow-y: auto;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg-muted);
+}
+.buildlog:empty {
+  display: none;
+}
+.logline {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ── overlay file list ────────────────────────────────── */
 
 .filelist {

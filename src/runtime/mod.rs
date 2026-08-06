@@ -99,16 +99,17 @@ pub trait Runtime: Send + Sync {
     /// Execute a command inside a sandbox.
     async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult>;
 
-    /// Build the host-side argv that runs `cmd` interactively inside a sandbox.
+    /// Build the host-side argv that runs `cmd` inside a sandbox.
     ///
-    /// [`Runtime::exec_cmd`] with `interactive = true` inherits the parent's
-    /// stdio, which is exactly right for `devbox shell` and useless for the
-    /// browser terminal — that one needs the command running under a *pty* it
-    /// controls. Exposing the argv keeps pty ownership in the web layer while
-    /// each runtime still owns how its instances are addressed.
+    /// [`Runtime::exec_cmd`] owns the process it spawns: it either captures
+    /// the output or inherits the parent's stdio. Both are wrong for the web
+    /// tier, which needs to run the command under a *pty* it controls (the
+    /// browser terminal) or with piped stdio it can stream line by line (a
+    /// Nix rebuild). Exposing the argv keeps process ownership in the caller
+    /// while each runtime still owns how its instances are addressed.
     ///
     /// The returned vector is `[program, arg, ...]` and is never empty.
-    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String>;
+    fn argv(&self, name: &str, cmd: &[&str], interactive: bool) -> Vec<String>;
 
     /// Destroy a sandbox permanently.
     async fn destroy(&self, name: &str) -> Result<()>;

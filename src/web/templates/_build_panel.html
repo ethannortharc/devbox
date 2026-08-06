@@ -1,0 +1,7 @@
+{#- The live build log. `sse-swap` + `hx-swap="beforeend scroll:bottom"` appends each line
+    as it arrives instead of replacing the panel. -#}
+<p class="muted">Rebuilding with {{ summary }}…</p>
+<div class="buildlog"
+     sse-swap="build-{{ name }}"
+     hx-swap="beforeend scroll:bottom"></div>
+<p class="muted" sse-swap="build-status-{{ name }}"></p>

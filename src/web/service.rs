@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::nix::compose;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay::{ChangeStatus, OverlayChange};
@@ -196,7 +197,110 @@ pub async fn terminal_argv(manager: &Arc<SandboxManager>, name: &str) -> Result<
     let runtime = manager.runtime_for_sandbox(&state)?;
 
     let shell = detect_shell(runtime.as_ref(), name).await;
-    Ok(runtime.interactive_argv(name, &[shell, "-l"]))
+    Ok(runtime.argv(name, &[shell, "-l"], true))
+}
+
+// ── sets (the Sets tab) ──────────────────────────────────
+
+/// One checkbox in the set checklist.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetEntry {
+    pub name: String,
+    pub enabled: bool,
+    /// Locked sets render checked and disabled (see [`compose::LOCKED_SETS`]).
+    pub locked: bool,
+    pub package_count: usize,
+}
+
+/// A titled group of checkboxes.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetGroup {
+    pub title: &'static str,
+    pub blurb: &'static str,
+    pub entries: Vec<SetEntry>,
+}
+
+/// How the checklist is grouped, and what each group is for.
+///
+/// The grouping is presentational only — the set catalogue in
+/// [`crate::nix::sets`] stays flat — but it is what makes a 15-item checklist
+/// legible.
+const GROUPS: &[(&str, &str, &[&str])] = &[
+    (
+        "Core",
+        "The base box. `system` is always on — without it there is no shell, no certificates, no compiler.",
+        &["system", "shell", "tools", "editor"],
+    ),
+    (
+        "Workflow",
+        "Version control, containers, and network tooling.",
+        &["git", "container", "network"],
+    ),
+    (
+        "AI",
+        "Coding agents, and the local model-serving stack.",
+        &["ai-code", "ai-infra"],
+    ),
+    (
+        "Languages",
+        "Toolchains. Each is a full compiler or interpreter plus its language server.",
+        &[
+            "lang-go",
+            "lang-rust",
+            "lang-python",
+            "lang-node",
+            "lang-java",
+            "lang-ruby",
+        ],
+    ),
+];
+
+/// Build the checklist view model for a selection.
+pub fn set_groups(selection: &compose::Selection) -> Vec<SetGroup> {
+    GROUPS
+        .iter()
+        .map(|(title, blurb, names)| SetGroup {
+            title,
+            blurb,
+            entries: names
+                .iter()
+                .filter_map(|name| {
+                    let set = crate::nix::sets::find_set(name)?;
+                    Some(SetEntry {
+                        name: (*name).to_string(),
+                        enabled: selection.sets.contains(*name),
+                        locked: compose::LOCKED_SETS.contains(name),
+                        package_count: set.packages.len(),
+                    })
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Parse the checklist form body into a selection.
+///
+/// Accepts repeated `set=` fields and a single `packages=` field whose value
+/// is split on whitespace or commas — people type both.
+pub fn parse_selection_form(body: &str) -> compose::Selection {
+    let mut sets = Vec::new();
+    let mut packages = Vec::new();
+
+    for (key, value) in form_urlencoded::parse(body.as_bytes()) {
+        match key.as_ref() {
+            "set" => sets.push(value.into_owned()),
+            "packages" => packages.extend(
+                value
+                    .split([' ', ',', '\t', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            ),
+            _ => {}
+        }
+    }
+
+    compose::Selection::new(sets, packages)
 }
 
 // ── overlay (the Files tab) ──────────────────────────────
@@ -312,6 +416,70 @@ mod tests {
     fn failed_probe_reads_as_unknown() {
         let s = summarize(&state(), None);
         assert_eq!(s.status, "unknown");
+    }
+
+    #[test]
+    fn set_groups_cover_the_whole_catalogue() {
+        use std::collections::BTreeSet;
+        let listed: BTreeSet<String> = set_groups(&compose::Selection::default())
+            .iter()
+            .flat_map(|g| g.entries.iter().map(|e| e.name.clone()))
+            .collect();
+        let catalogue: BTreeSet<String> = crate::nix::sets::NIX_SETS
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(listed, catalogue, "every set must appear exactly once");
+    }
+
+    #[test]
+    fn set_groups_reflect_the_current_selection() {
+        let sel = compose::Selection::new(["system", "git"].map(String::from), std::iter::empty());
+        let groups = set_groups(&sel);
+        let entry = |n: &str| {
+            groups
+                .iter()
+                .flat_map(|g| &g.entries)
+                .find(|e| e.name == n)
+                .cloned()
+                .unwrap()
+        };
+
+        assert!(entry("git").enabled);
+        assert!(!entry("network").enabled);
+        assert!(entry("system").locked, "system cannot be turned off");
+        assert!(!entry("git").locked);
+        assert!(entry("lang-go").package_count > 0);
+    }
+
+    #[test]
+    fn parses_the_checklist_form() {
+        let sel = parse_selection_form("set=system&set=git&set=lang-go&packages=hyperfine+tokei");
+        assert!(sel.sets.contains("git"));
+        assert!(sel.sets.contains("lang-go"));
+        assert!(sel.packages.contains("hyperfine"));
+        assert!(sel.packages.contains("tokei"));
+    }
+
+    #[test]
+    fn form_parsing_accepts_commas_and_percent_encoding() {
+        let sel = parse_selection_form("packages=hyperfine%2C%20python312Packages.ipython");
+        assert!(sel.packages.contains("hyperfine"));
+        assert!(sel.packages.contains("python312Packages.ipython"));
+    }
+
+    #[test]
+    fn an_empty_form_still_yields_the_locked_sets() {
+        let sel = parse_selection_form("");
+        assert!(sel.sets.contains("system"));
+        assert!(sel.packages.is_empty());
+    }
+
+    #[test]
+    fn form_parsing_ignores_unknown_fields() {
+        let sel = parse_selection_form("set=git&csrf=whatever&nonsense=1");
+        assert!(sel.sets.contains("git"));
+        assert_eq!(sel.sets.len(), 2, "git plus the locked system set");
     }
 
     #[test]

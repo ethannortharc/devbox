@@ -73,6 +73,49 @@
 {% endif %}
 {% endmacro %}
 
+{#- The set checklist. Only checked entries are composed into
+    configuration.nix, so an unchecked set is never evaluated or built. -#}
+{% macro set_checklist(name, groups, packages) %}
+<form id="set-form"
+      hx-post="/api/boxes/{{ name }}/sets"
+      hx-target="#build-panel"
+      hx-swap="innerHTML">
+  {% for g in groups %}
+  <fieldset class="setgroup">
+    <legend>{{ g.title }}</legend>
+    <p class="muted">{{ g.blurb }}</p>
+    <div class="setgrid">
+      {% for s in g.entries %}
+      <label class="setopt {% if s.locked %}locked{% endif %}">
+        <input type="checkbox" name="set" value="{{ s.name }}"
+               {% if s.enabled %}checked{% endif %}
+               {% if s.locked %}disabled checked{% endif %} />
+        <span class="setname">{{ s.name }}</span>
+        <span class="setcount">{{ s.package_count }} pkg</span>
+        {% if s.locked %}<span class="chip">always on</span>{% endif %}
+      </label>
+      {% endfor %}
+    </div>
+  </fieldset>
+  {% endfor %}
+
+  <fieldset class="setgroup">
+    <legend>Extra packages</legend>
+    <p class="muted">
+      nixpkgs attribute paths, whitespace or comma separated —
+      e.g. <code>hyperfine</code>, <code>python312Packages.ipython</code>.
+    </p>
+    <input class="text" type="text" name="packages" value="{{ packages }}"
+           placeholder="hyperfine tokei" spellcheck="false" />
+  </fieldset>
+
+  <div class="actions">
+    <button class="btn btn-primary" type="submit">Apply &amp; rebuild</button>
+    <span class="muted">Only checked sets are built.</span>
+  </div>
+</form>
+{% endmacro %}
+
 {% macro file_changes(changes) %}
 {% if changes.is_empty() %}
 <p class="muted">No uncommitted changes in the overlay.</p>

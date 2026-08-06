@@ -230,7 +230,9 @@ impl Runtime for LimaRuntime {
         }
     }
 
-    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
+    fn argv(&self, name: &str, cmd: &[&str], _interactive: bool) -> Vec<String> {
+        // `limactl shell` is the only entry point; it allocates a tty when
+        // stdin is one, which is exactly the distinction the caller controls.
         let mut argv = vec![
             "limactl".to_string(),
             "shell".to_string(),
@@ -520,8 +522,8 @@ mod tests {
     }
 
     #[test]
-    fn interactive_argv_targets_the_vm() {
-        let argv = LimaRuntime.interactive_argv("myapp", &["zsh", "-l"]);
+    fn argv_targets_the_vm() {
+        let argv = LimaRuntime.argv("myapp", &["zsh", "-l"], true);
         assert_eq!(
             argv,
             vec![

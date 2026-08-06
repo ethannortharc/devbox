@@ -1,3 +1,4 @@
+pub mod compose;
 pub mod rebuild;
 pub mod sets;
 
@@ -5,7 +6,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use self::rebuild::{nixos_rebuild, write_nix_file, write_state_toml};
+use self::rebuild::{nixos_rebuild, write_devbox_nix, write_nix_file, write_state_toml};
 use self::sets::{NIX_SETS, generate_set_nix, generate_sets_default_nix, generate_state_toml};
 use crate::runtime::Runtime;
 use crate::sandbox::config::DevboxConfig;
@@ -49,6 +50,47 @@ pub async fn apply_config(
     nixos_rebuild(runtime, sandbox_name).await?;
 
     Ok(())
+}
+
+/// Push the Nix set modules and the composed `configuration.nix` for a
+/// selection, without rebuilding.
+///
+/// Split out from [`apply_config`] so the web console can do the fast,
+/// quiet part itself and then stream the slow `nixos-rebuild` (§6.3).
+pub async fn write_set_modules(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+    selection: &compose::Selection,
+) -> Result<()> {
+    // The set index and every set module are pushed regardless of selection:
+    // they are small text files, and having them all present means toggling a
+    // set on later needs no extra round trip. What the selection controls is
+    // `configuration.nix`, which imports only the chosen ones — so only those
+    // closures are ever evaluated or built.
+    write_nix_file(
+        runtime,
+        sandbox_name,
+        "default.nix",
+        &generate_sets_default_nix(),
+    )
+    .await?;
+
+    for set in NIX_SETS {
+        write_nix_file(
+            runtime,
+            sandbox_name,
+            &format!("{}.nix", set.name),
+            &generate_set_nix(set),
+        )
+        .await?;
+    }
+
+    write_devbox_nix(
+        runtime,
+        sandbox_name,
+        &compose::compose_configuration_nix(selection),
+    )
+    .await
 }
 
 /// Toggle additional sets/languages on a running sandbox, then rebuild.

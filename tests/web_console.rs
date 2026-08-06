@@ -76,6 +76,17 @@ fn post_authed(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn post_form(uri: &str, form: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form.to_string()))
+        .unwrap()
+}
+
 async fn body_string(res: axum::response::Response) -> String {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -330,6 +341,81 @@ async fn lifecycle_actions_require_a_token() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── sets ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sets_tab_renders_the_checklist() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_authed("/boxes/alpha?tab=sets"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let html = body_string(res).await;
+    assert!(html.contains("hx-post=\"/api/boxes/alpha/sets\""));
+    // The box's own sets are pre-checked; the rest are not.
+    assert!(html.contains("value=\"git\""));
+    assert!(html.contains("value=\"lang-rust\""));
+    assert!(html.contains("Apply &amp; rebuild"));
+}
+
+#[tokio::test]
+async fn applying_a_selection_is_accepted_and_returns_a_live_log_panel() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            "/api/boxes/alpha/sets",
+            "set=system&set=git&packages=hyperfine",
+        ))
+        .await
+        .unwrap();
+
+    // Accepted, not OK: the rebuild runs in the background and streams.
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let html = body_string(res).await;
+    assert!(html.contains("sse-swap=\"build-alpha\""));
+    assert!(html.contains("2 set(s), 1 extra package(s)"), "got: {html}");
+}
+
+#[tokio::test]
+async fn an_injectable_package_name_is_rejected_before_anything_runs() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            "/api/boxes/alpha/sets",
+            "set=system&packages=hyperfine%5D%3B%20evil",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(res).await.contains("Invalid selection"));
+}
+
+#[tokio::test]
+async fn an_unknown_set_is_rejected() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            "/api/boxes/alpha/sets",
+            "set=system&set=not-a-set",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn applying_a_selection_to_an_unknown_box_is_404() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app
+        .oneshot(post_form("/api/boxes/ghost/sets", "set=system"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 // ── help ─────────────────────────────────────────────────

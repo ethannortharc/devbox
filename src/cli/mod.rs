@@ -15,6 +15,7 @@ pub mod nix_cmd;
 pub mod prune;
 pub mod reprovision;
 pub mod self_update;
+pub mod sets;
 pub mod shell;
 pub mod snapshot;
 pub mod status;
@@ -135,6 +136,9 @@ pub enum Command {
     #[command(name = "use")]
     Use(use_cmd::UseArgs),
 
+    /// Show or change which Nix sets a box has
+    Sets(sets::SetsArgs),
+
     /// Start the local web console
     Web(web::WebArgs),
 }
@@ -165,6 +169,7 @@ impl Command {
             Command::Layer(args) => layer::run(args, manager).await,
             Command::Code(args) => code::run(args, manager).await,
             Command::Use(args) => use_cmd::run(args, manager).await,
+            Command::Sets(args) => sets::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
         }
     }
