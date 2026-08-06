@@ -32,11 +32,15 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
         SandboxStatus::Stopped => {
             println!("Starting sandbox '{name}'...");
             runtime.start(&name).await?;
-            crate::policy::enforce::apply_saved(manager, &state, &name).await?;
         }
         SandboxStatus::NotFound => bail!("Sandbox '{name}' not found."),
         SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),
     }
+
+    // Whether or not this call started it. A box already running may have been
+    // started outside devbox — after a host reboot, Lima and Incus bring their
+    // instances back on their own — and it then has no firewall at all.
+    crate::policy::enforce::apply_saved(manager, &state, &name).await?;
 
     // Refresh overlay before opening editor to avoid stale file handles
     if state.mount_mode != "writable" {

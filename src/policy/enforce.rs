@@ -267,12 +267,45 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         .map(|r| parse_resolvers(&r.stdout))
         .unwrap_or_default();
 
+    // Labs record their prefixes under /etc/devbox/lab/<name>/prefixes when
+    // they come up, and remove them on teardown. Reading the directory here is
+    // the handoff: the ruleset generator runs on the host and cannot otherwise
+    // know a lab exists. A box with no lab gets none, and `isolated` then
+    // means loopback only — which is what the posture says.
+    let lab_prefixes = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sh", "-c", "cat /etc/devbox/lab/*/prefixes 2>/dev/null"],
+            false,
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| parse_prefixes(&r.stdout))
+        .unwrap_or_default();
+
     super::nftables::Context {
         resolvers,
-        // A box with no lab gets none, and `isolated` then means loopback
-        // only — which is what the posture says.
-        lab_prefixes: Vec::new(),
+        lab_prefixes,
     }
+}
+
+/// Parse lab prefixes, one per line.
+///
+/// Validated as CIDRs for the same reason resolvers are: the result is
+/// interpolated into a ruleset that runs as root.
+fn parse_prefixes(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let Some((addr, len)) = line.split_once('/') else {
+                return false;
+            };
+            addr.parse::<std::net::IpAddr>().is_ok() && len.parse::<u8>().is_ok_and(|n| n <= 128)
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Pull nameserver addresses out of a resolv.conf.
@@ -415,6 +448,18 @@ pub async fn apply_saved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lab_prefixes_are_parsed_and_validated() {
+        assert_eq!(
+            parse_prefixes("10.99.0.0/16\n\n2001:db8::/32\n"),
+            vec!["10.99.0.0/16", "2001:db8::/32"]
+        );
+        // Nothing unvalidated reaches a root-loaded ruleset.
+        assert!(parse_prefixes("$(reboot)").is_empty());
+        assert!(parse_prefixes("10.0.0.0").is_empty());
+        assert!(parse_prefixes("10.0.0.0/999").is_empty());
+    }
 
     #[test]
     fn resolvers_are_parsed_and_validated() {

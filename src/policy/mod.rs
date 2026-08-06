@@ -213,8 +213,24 @@ impl Policy {
             }
 
             Posture::Isolated => {
+                // Only what the ruleset actually permits. This used to allow
+                // every RFC 1918 address, while the generated ruleset (since
+                // ADR-0046) permits only the prefixes of a lab that is
+                // *running* — so `policy test 192.168.1.1` answered "allowed"
+                // for traffic the box would drop.
+                //
+                // Whether a lab is up is a property of the box, and this runs
+                // offline against devbox.toml. Reporting the stricter of the
+                // two possible answers is the right way to be wrong: a tool
+                // that says "denied" about something permitted causes a second
+                // look, and one that says "allowed" about something dropped
+                // causes an outage nobody connects to the policy.
                 if is_lab_internal(&target.addr) {
-                    Decision::allow("lab-internal address")
+                    Decision::deny(
+                        self,
+                        "posture is isolated: private addresses are reachable only \
+                         while a lab that owns them is running on this box",
+                    )
                 } else {
                     Decision::deny(self, "posture is isolated: no egress")
                 }
@@ -676,18 +692,21 @@ mod tests {
                 .verdict,
             Verdict::Block
         );
-        // The box can still talk to itself and to its lab.
+        // The box can still talk to itself.
         assert_eq!(
             policy.evaluate(&target("", "127.0.0.1")).verdict,
             Verdict::Allow
         );
-        assert_eq!(
-            policy.evaluate(&target("", "10.0.12.1")).verdict,
-            Verdict::Allow
-        );
-        assert_eq!(
-            policy.evaluate(&target("", "192.168.5.5")).verdict,
-            Verdict::Allow
+        // A private address is *not* unconditionally allowed. The ruleset
+        // permits only the prefixes of a lab that is running (ADR-0046), and
+        // this evaluation is offline — so it reports the stricter answer and
+        // says why, rather than promising reachability the box will refuse.
+        let private = policy.evaluate(&target("", "192.168.5.5"));
+        assert_eq!(private.verdict, Verdict::Block);
+        assert!(
+            private.reason.contains("lab"),
+            "the reason must point at the lab condition: {}",
+            private.reason
         );
     }
 

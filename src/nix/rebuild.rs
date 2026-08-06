@@ -21,6 +21,7 @@ pub fn rebuild_argv() -> [&'static str; 4] {
 /// Returns Ok(()) on success, Err with rollback attempt on failure.
 pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     println!("Running nixos-rebuild switch...");
+    let before = crate::web::build::current_generation(runtime, sandbox_name).await;
 
     let result = runtime
         .exec_cmd(sandbox_name, &rebuild_argv(), false)
@@ -28,6 +29,20 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
 
     if result.exit_code != 0 {
         eprintln!("nixos-rebuild failed:\n{}", result.stderr.trim());
+
+        // Roll back only a switch that happened. `--rollback` activates the
+        // generation *before* the current one, and an evaluation or build
+        // failure never moved the profile — so this used to undo the user's
+        // last successful configuration as a side effect of a syntax error.
+        // The web path grew this guard first; the CLI one is the same bug.
+        let after = crate::web::build::current_generation(runtime, sandbox_name).await;
+        if before.is_some() && before == after {
+            bail!(
+                "nixos-rebuild failed before activation, so the box is unchanged.\n{}",
+                result.stderr.trim()
+            );
+        }
+
         eprintln!("Attempting rollback...");
 
         let rollback = runtime

@@ -277,8 +277,8 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
         if !probe.is_ok_and(|r| r.exit_code == 0) {
             bail!(
                 "this topology has {} router(s), but substrate '{substrate}' has no FRR.\n  \
-                 Enable the `network` set (`devbox sets enable network --name {substrate}`) \
-                 and rebuild, then re-run `devbox lab up`.",
+                 Add it with `devbox sets apply --name {substrate} --set network` \
+                 (keeping your other sets), then re-run `devbox lab up`.",
                 lab.topology.routers().len()
             );
         }
@@ -301,6 +301,21 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
         }
     }
     println!("Wiring is up ({} commands).", commands.len());
+
+    // Record this lab's prefixes where the policy engine can find them.
+    //
+    // `isolated` permits a running lab's subnets and nothing else (ADR-0046),
+    // which needs the ruleset generator to know what those subnets are — and
+    // it runs on the host, from a policy file, with no idea a lab exists. A
+    // file on the box is the handoff: written when a lab comes up, removed
+    // when it goes down, read at every policy apply.
+    push_file(
+        runtime.as_ref(),
+        &substrate,
+        &format!("/etc/devbox/lab/{}/prefixes", lab.name()),
+        &format!("{}\n", lab.topology.lab.base),
+    )
+    .await?;
 
     // Router configs, then the daemons that read them.
     //
@@ -327,7 +342,8 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
                 bail!(
                     "could not start the routing daemons in namespace '{node}': {}\n\n  \
                      A routed lab needs FRR on the substrate box — enable the \
-                     `network` set (`devbox sets enable network`) and rebuild, \
+                     `network` set (`devbox sets apply --set network`, keeping \
+                     your other sets) and rebuild, \
                      then re-run `devbox lab up`.",
                     result.stderr.trim()
                 );
@@ -364,16 +380,37 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
     .await?;
 
     // A teardown after a partial bring-up is the common case, so a namespace
-    // that is already gone is not an error.
+    // that is already gone is not an error. A command that could not be *run*
+    // is a different thing — the substrate is unreachable, and reporting a
+    // clean teardown then would be a lie.
     let mut removed = 0;
     for cmd in &commands {
         let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        if let Ok(result) = runtime.exec_cmd(&substrate, &argv, false).await
-            && result.exit_code == 0
-        {
+        let result = runtime
+            .exec_cmd(&substrate, &argv, false)
+            .await
+            .with_context(|| format!("could not reach substrate '{substrate}' to tear down"))?;
+        if result.exit_code == 0 {
             removed += 1;
         }
     }
+
+    // The lab is gone, so its prefixes must stop being an exemption — an
+    // `isolated` box would otherwise keep permitting a subnet nothing uses.
+    let _ = runtime
+        .exec_cmd(
+            &substrate,
+            &[
+                "sh",
+                "-c",
+                &crate::policy::enforce::elevated(&format!(
+                    "rm -rf /etc/devbox/lab/{}",
+                    lab.name()
+                )),
+            ],
+            false,
+        )
+        .await;
 
     println!(
         "Lab '{}' torn down ({removed} of {} namespaces removed).",
@@ -564,7 +601,18 @@ async fn resolve_substrate(
     // names made such a topology fail unless a box happened to be called
     // "lima", which nobody's is. A kind selects among the boxes; only an
     // explicit `--substrate` is a name.
-    const RUNTIME_KINDS: &[&str] = &["lima", "incus", "multipass", "docker", "host"];
+    // `host` is documented but not a registered runtime — sandbox state only
+    // ever records lima/incus/multipass/docker, and there is no host Runtime
+    // to execute through. Treating it as a kind sent the user off to create a
+    // box that cannot exist, so it is rejected by name instead.
+    const RUNTIME_KINDS: &[&str] = &["lima", "incus", "multipass", "docker"];
+    if configured == Some("host") && explicit.is_none() {
+        bail!(
+            "this topology asks for `substrate = \"host\"`, which devbox does not \
+             implement — a lab runs inside a Linux box, not on the host.\n  \
+             Set `substrate = \"auto\"` (or a box name), or pass `--substrate <name>`."
+        );
+    }
     let configured = configured.filter(|s| !s.is_empty() && *s != "auto");
     let (from_topology, want_kind) = match configured {
         Some(value) if RUNTIME_KINDS.contains(&value) => (None, Some(value)),
@@ -621,6 +669,13 @@ async fn resolve_substrate(
     if runtime.status(&name).await? != SandboxStatus::Running {
         bail!("substrate box '{name}' is not running; start it with `devbox shell {name}`");
     }
+
+    // Every lab operation goes through this function and then straight to
+    // `Runtime`, bypassing attach and exec — so a substrate started outside
+    // devbox ran `lab up`, faults, and teardown with no posture at all. This
+    // is the chokepoint, so the enforcement belongs here.
+    crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+
     Ok((runtime, name))
 }
 

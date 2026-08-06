@@ -195,9 +195,15 @@ pub async fn restore_generated(
                 &[
                     "sh",
                     "-c",
+                    // No archive means the box had no sets directory to begin
+                    // with — nothing to restore, which is success. A failed
+                    // extraction is not.
                     &crate::policy::enforce::elevated(&format!(
-                        "rm -rf {GENERATED_SETS_DIR} && mkdir -p {GENERATED_SETS_DIR} && \
-                         tar xf {SETS_BACKUP} -C {GENERATED_SETS_DIR} && rm -f {SETS_BACKUP}"
+                        "if [ -f {SETS_BACKUP} ]; then \
+                           rm -rf {GENERATED_SETS_DIR} && mkdir -p {GENERATED_SETS_DIR} && \
+                           tar xf {SETS_BACKUP} -C {GENERATED_SETS_DIR} && \
+                           rm -f {SETS_BACKUP}; \
+                         fi"
                     )),
                 ],
                 false,
@@ -208,6 +214,10 @@ pub async fn restore_generated(
         false
     };
 
+    // Every artifact, not any. `restored` used to be an OR across the files,
+    // so one successful write made the console print "restored to the last
+    // good selection" while the rest of the sources were still the failed
+    // ones — the message the user most needs to be able to trust.
     for (path, content) in &backup.files {
         let script = match content {
             Some(text) => {
@@ -216,10 +226,14 @@ pub async fn restore_generated(
             None => format!("rm -f {path}"),
         };
         let ok = runtime
-            .exec_cmd(box_name, &["sudo", "bash", "-c", &script], false)
+            .exec_cmd(
+                box_name,
+                &["sh", "-c", &crate::policy::enforce::elevated(&script)],
+                false,
+            )
             .await
             .is_ok_and(|r| r.exit_code == 0);
-        restored |= ok;
+        restored &= ok;
     }
     restored
 }
@@ -231,7 +245,7 @@ pub async fn restore_generated(
 /// activates one. `None` means the question could not be answered, and callers
 /// treat that as "assume it may have changed" — the conservative direction,
 /// since an unnecessary rollback is recoverable and a skipped one is not.
-async fn current_generation(
+pub async fn current_generation(
     runtime: &dyn crate::runtime::Runtime,
     box_name: &str,
 ) -> Option<String> {
@@ -408,14 +422,20 @@ pub async fn apply_selection(
     // meant destroying and recreating a box restored the selection from before
     // the checklist was ever touched — the change survived every restart and
     // vanished on the one operation people use to get a clean box.
+    // devbox.toml first. If it fails, `state.json` has not been touched, so
+    // the two still agree — on the old selection, which the box no longer
+    // has, but a mismatch the user can see and re-apply. Saving state first
+    // and failing here would leave devbox reporting the new selection with
+    // the project file describing the old one, and a later recreate silently
+    // reverting the box.
     let mut sandbox = sandbox;
     sandbox.sets = config.active_sets();
     sandbox.languages = config.active_languages();
     sandbox.packages = selection.packages.iter().cloned().collect();
-    sandbox.save(&manager.state_dir)?;
     config
         .save(&sandbox.project_dir.join("devbox.toml"))
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+    sandbox.save(&manager.state_dir)?;
 
     state.publish(ConsoleEvent::new(
         status_event(box_name),

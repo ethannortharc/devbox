@@ -6,7 +6,7 @@
 //!
 //! Both paths use the same package definitions from nix/sets/*.nix.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::runtime::Runtime;
 
@@ -386,6 +386,20 @@ fi"#;
     // state, and reported as selected — and never installed, because only the
     // NixOS path read them.
     let mut packages: Vec<String> = packages.into_iter().map(str::to_string).collect();
+
+    // Validated before they reach a shell. These come from `[custom_packages]`
+    // in a hand-written devbox.toml, are interpolated unquoted into
+    // `bash -c "nix profile install …"`, and nothing else checks them — so a
+    // key like `foo; touch /tmp/pwned; #` ran during provisioning. The NixOS
+    // path validates via `Selection::validate`; this one had no equivalent.
+    for name in extra {
+        if !crate::nix::compose::is_valid_attr_path(name) {
+            bail!(
+                "custom package '{name}' is not a valid nixpkgs attribute path; \
+                 names may contain letters, digits, '_', '-', and '.' only"
+            );
+        }
+    }
     packages.extend(extra.iter().cloned());
     packages.sort();
     packages.dedup();
@@ -1329,6 +1343,31 @@ mod tests {
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));
         assert!(toml.contains("name = \"user\""));
+    }
+
+    #[test]
+    fn a_custom_package_name_cannot_carry_shell_syntax() {
+        // `[custom_packages]` is hand-written and its keys are interpolated
+        // unquoted into `bash -c "nix profile install …"` on the Ubuntu path.
+        use crate::nix::compose::is_valid_attr_path;
+        for hostile in [
+            "foo; touch /tmp/pwned; #",
+            "$(reboot)",
+            "`id`",
+            "a b",
+            "../../etc/passwd",
+            "foo\nbar",
+        ] {
+            assert!(!is_valid_attr_path(hostile), "{hostile:?} must be rejected");
+        }
+        // And the shapes a real attribute path takes still pass.
+        for ok in [
+            "ripgrep",
+            "python312Packages.ipython",
+            "nodePackages_latest.pnpm",
+        ] {
+            assert!(is_valid_attr_path(ok), "{ok:?} is a real package");
+        }
     }
 
     #[test]

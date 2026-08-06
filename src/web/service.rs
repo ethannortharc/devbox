@@ -415,9 +415,16 @@ pub async fn apply_policy_now(
         SandboxStatus::Running => {
             crate::policy::enforce::apply(runtime.as_ref(), name, policy).await
         }
-        // Nothing to do: `start_box` applies it, and saying "not applied" for a
-        // box that is off would be noise.
-        _ => Ok(()),
+        // Deferred, honestly: `start_box` applies it, so the posture is not
+        // lost and the tab can say so.
+        SandboxStatus::Stopped => Ok(()),
+        // Not deferred — unknown. A box the runtime cannot find has certainly
+        // not had its firewall changed, and the wildcard that used to catch
+        // this rendered "Saved and applied".
+        other => bail!(
+            "box '{name}' is {other:?}, so the posture was saved but could not be \
+             applied to it"
+        ),
     }
 }
 
