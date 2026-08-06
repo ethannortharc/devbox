@@ -714,3 +714,58 @@ the CI lane would have gone red on the first push.
 
 **Gate after the fixes** — 381 Rust unit + 52 integration/e2e, 10 Go packages,
 64 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T17:20Z — Codex review round 4: 27 findings, and a note on convergence
+
+Round 4 returned **more** findings than round 3, not fewer: 27 (17 P1, 10 P2)
+against round 3's 14. Four rounds in, the counts are 23, 23, 14, 27. That is
+worth stating plainly rather than burying, because it changes what "review
+until clean" means.
+
+The reviewer is not repeating itself — almost every round-4 finding is in
+territory earlier rounds did not reach (nftables rule semantics, collector
+framing, ZTP concurrency depth, lab topology validation, ASN range checking).
+Each round the previous round's fixes become new surface to audit. At `xhigh`
+against a patch this size, a genuinely empty round is not obviously reachable.
+
+The most important finding was the hole under my own round-3 fix. Wiring the
+DNS enforcer into `devbox-obsd` made the *agent* correct, but nothing
+provisions the agent: no path pushes the binary, imports the module, or enables
+the service. So a domain allowlist loaded a default-deny ruleset whose allow
+set nothing could fill — **the user asks for less egress and gets none**, while
+the console reports the posture applied. That is the dangerous direction of
+wrong.
+
+The fix is a refusal, not a workaround (ADR-0036). `enforce::apply` probes for
+a running agent and declines a domain-based posture without one, naming what
+would have been blocked. CIDR allowlists, `isolated`, and `open` need no agent
+and still apply. Shipping the agent into every box is real work — a binary to
+embed, a module to import, a service to supervise, a version pin to honour —
+and doing it badly under review pressure would be worse than an honest refusal
+that names the gap. The obsd module now says so at the top.
+
+Three more were the same mistake in three places: reporting a failure where the
+caller could not act on it (ADR-0037). ZTP acknowledged nodes whose state had
+not been written; `policy set` printed enforcement errors and exited 0; and
+restoring a posture used `load_or_default`, so a malformed `devbox.toml` became
+posture `open` — corruption silently unfirewalling a box.
+
+**Addressed this round:** every P1 except the five nftables-semantics and
+counter items listed below, and every P2 except three.
+
+**Knowingly deferred, with reasons:**
+
+- *Ship the agent in provisioning* — the largest remaining gap, and the reason
+  domain allowlists are refused rather than broken. Needs its own change.
+- *Restrict DNS to trusted resolvers*, *limit local exemptions to real lab
+  destinations*, *revalidate established flows when tightening*, *emit policy
+  events for real drops* — all real hardening, all beyond what §8 specifies.
+  They change enforcement semantics and deserve a design decision, not a
+  reflex fix at the end of a review round.
+- *Ring-buffer and dropped-batch counters* — worth having; neither changes
+  behaviour, and the eBPF half cannot be tested here (ADR-0017).
+- *Fixed batching deadline*, *DNS allow-set expiry*, *capture selection in the
+  module*, *materializing hosts in Python IPAM* — small, real, not urgent.
+
+**Gate** — 382 Rust unit + 52 integration/e2e, 10 Go packages, 64 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
