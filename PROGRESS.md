@@ -18,8 +18,8 @@ ordered work list, §17 the quality bar).
 | 3 | Observability capture (Go agent + eBPF) | **DONE** |
 | 4 | Observability presentation + behavior diff | **DONE** |
 | 5 | Egress & activity control | **DONE** |
-| 6 | Box lab: substrate & topology | in progress |
-| 7 | Fault injection & scenario library | not started |
+| 6 | Box lab: substrate & topology | **DONE** |
+| 7 | Fault injection & scenario library | in progress |
 | 8 | ZTP fabric + SoT + config-gen | not started |
 | 9 | Polish, docs, examples | not started |
 
@@ -318,3 +318,49 @@ knows how to read.
 
 **Next step** — Phase 6: the lab. `src/lab/` with the topology schema, IPAM
 address assignment, and veth/bridge wiring inside one Linux substrate.
+
+---
+
+## 2026-08-06T09:20Z — Phase 6 DONE
+
+**Landed** — the lab as a chain of pure transformations with exactly one impure
+step at the end: `lab.toml → Topology → Plan → commands + configs → run`.
+
+- **Topology** (`src/lab/topology.rs`): the §9.1 schema, and validation that is
+  strict on purpose. A reused interface, a self-link, an unconnected node, or a
+  node name that is not interface-safe all fail *before* anything is created —
+  a topology that half-comes-up wastes an hour debugging a network that was
+  never going to work.
+- **IPAM** (`src/lab/ipam.rs`): /31 links (RFC 3021), router loopbacks, ASNs
+  from the RFC 6996 private range. Deterministic, so `lab down` then `lab up` is
+  the same lab. The base prefix splits in half — links below, loopbacks above —
+  so the two allocators cannot collide whatever the base happens to be, and
+  every allocation is verified for overlap rather than trusted.
+- **Wiring** (`src/lab/wiring.rs`): namespaces, veth pairs, addresses, link-up,
+  forwarding — generated as argv vectors, in the order that matters. Tests
+  assert the ordering constraints that actually break setups: namespace before
+  anything moves into it, address before link-up, `lo` up in every namespace.
+- **FRR** (`src/lab/frr.rs`): eBGP-unnumbered with ECMP and 3/9 timers, so a
+  lab converges while you watch instead of after 30 seconds; `no bgp
+  ebgp-requires-policy`, without which modern FRR shows "BGP up" and advertises
+  nothing. Byte-stable output, which is what `render → diff → apply → verify`
+  needs.
+- **Scenario library** (§9.4): all six, embedded so `devbox lab up clos-3node`
+  works from a clean install. A test loads, validates, allocates, wires, and
+  renders configs for every one of them.
+- **CLI**: `devbox lab list|up|down|status|config`, with `--dry-run` that works
+  on any host.
+
+**e2e evidence** — `tests/e2e_lab.rs` builds a privileged Alpine substrate, runs
+the generated wiring commands **verbatim**, then asserts: every namespace
+exists, every planned address is on the right interface and up, every router
+loopback landed, all four directly-connected pairs ping, a *non*-adjacent pair
+does **not** (proving the namespaces are really isolated rather than one flat
+segment), and teardown removes everything.
+
+**Scope stated plainly** — that test covers the wiring. Reachability *across*
+the fabric needs FRR running BGP in the substrate image, which belongs to the
+privileged Linux CI job; the generated config itself is covered by unit tests.
+
+**Next step** — Phase 7: per-link netem, partition/heal/flap, and the
+collective-traffic generator that makes a straggler visible.

@@ -1,0 +1,40 @@
+# Two sites across a WAN link worth abusing.
+#
+# A router at each end so delay, jitter, and loss injected on the middle link
+# are routing-visible rather than just slow. This is the topology to point
+# `devbox lab fault` at.
+
+[lab]
+name = "wan-lossy"
+substrate = "auto"
+
+[[nodes]]
+name = "site-a-host"
+role = "host"
+
+[[nodes]]
+name = "site-a-gw"
+role = "frr-router"
+sets = ["network"]
+
+[[nodes]]
+name = "site-b-gw"
+role = "frr-router"
+sets = ["network"]
+
+[[nodes]]
+name = "site-b-host"
+role = "host"
+
+[[links]]
+endpoints = ["site-a-host:eth1", "site-a-gw:eth1"]
+
+[[links]]
+endpoints = ["site-a-gw:eth2", "site-b-gw:eth2"]
+
+[[links]]
+endpoints = ["site-b-gw:eth1", "site-b-host:eth1"]
+
+[services]
+dns = true
+ntp = true

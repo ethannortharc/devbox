@@ -15,9 +15,11 @@
 //! - [`obs`] — the observability plane: schema, store, collector, correlation.
 //! - [`metrics`] — the Prometheus exporter.
 //! - [`policy`] — egress postures, the allowlist, and the nftables driver.
+//! - [`lab`] — multi-node topologies, IPAM, wiring, and routing config.
 //! - [`tools`] — language/tool detection and the tool registry.
 
 pub mod cli;
+pub mod lab;
 pub mod metrics;
 pub mod nix;
 pub mod obs;
