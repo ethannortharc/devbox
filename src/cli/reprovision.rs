@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 
 use crate::runtime::SandboxStatus;
@@ -78,7 +78,15 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Re-apply the saved egress posture. Provisioning rebuilds the box's
     // network stack, so a policy applied before this point is gone; without
     // this the box comes back open no matter what `devbox.toml` says.
-    let config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    // Fallibly. Provisioning has just rebuilt the network stack and removed
+    // the box's firewall; reading a malformed devbox.toml as the default
+    // `open` posture here would finish the command reporting success with the
+    // firewall gone.
+    let config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir).context(
+        "reprovisioning rebuilt the box's network stack, but its devbox.toml \
+             could not be read — so the egress posture it should be restored to \
+             is unknown. The box is currently unrestricted.",
+    )?;
     if config.policy.egress != crate::policy::Posture::Open {
         let runtime = manager.runtime_for_sandbox(&updated_state)?;
         crate::policy::enforce::apply(runtime.as_ref(), &name, &config.policy).await?;

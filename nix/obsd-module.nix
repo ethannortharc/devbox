@@ -50,15 +50,6 @@ in
       '';
     };
 
-    package = lib.mkOption {
-      type = lib.types.path;
-      description = ''
-        The `devbox-obsd` binary. No default: this module cannot conjure the
-        agent, and a default pointing at a path that does not exist would give
-        a restart loop instead of an evaluation error naming the problem.
-      '';
-    };
-
     enableEbpf = lib.mkOption {
       type = lib.types.bool;
       # The shipped agent has no eBPF source linked in — `chooseSource` errors

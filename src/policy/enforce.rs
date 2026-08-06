@@ -52,11 +52,12 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         .map(String::as_str)
         .collect();
     let needs_agent = !domains.is_empty() || policy.egress == Posture::MirrorOnly;
-    if needs_agent && !agent_present(runtime, sandbox_name).await {
+    if needs_agent && !agent_resolves_dns(runtime, sandbox_name).await {
         bail!(
-            "box '{sandbox_name}' has no running devbox-obsd, so a domain-based \
+            "box '{sandbox_name}' has no DNS-capturing devbox-obsd, so a domain-based \
              posture cannot be enforced: nftables matches addresses, and only the \
              agent turns the allowlisted names into addresses as they resolve. \
+             (An agent in the degraded `-no-ebpf` mode sees no DNS either.) \
              Applying it anyway would block {}.\n\n  \
              Use CIDRs instead, or `isolated`, both of which need no agent.",
             if domains.is_empty() {
@@ -158,16 +159,31 @@ fn clear_command() -> String {
     )
 }
 
-/// Is the observability agent running in this box?
+/// Can this box turn allowlisted names into firewall entries?
+///
+/// The question is not "is the agent running" but "is it capturing DNS". The
+/// degraded proc source (§13) sees processes and sockets and no DNS at all, so
+/// an agent started with `-no-ebpf` passes a liveness check and still cannot
+/// populate a single allow-set entry — leaving a default-deny ruleset that
+/// blocks every domain it promised to permit.
 ///
 /// Probed rather than assumed: the agent is not yet part of provisioning, so
-/// on most boxes the answer is no, and the caller needs to know before it
-/// installs a ruleset that depends on it.
-async fn agent_present(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
-    runtime
-        .exec_cmd(sandbox_name, &["pgrep", "-x", "devbox-obsd"], false)
+/// on most boxes the answer is no.
+async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
+    // The agent's own command line is the authority on which source it chose.
+    // `-no-ebpf` and `-fixture` both mean no DNS; anything else means the eBPF
+    // source, whose domains include it.
+    let Ok(result) = runtime
+        .exec_cmd(sandbox_name, &["pgrep", "-a", "-x", "devbox-obsd"], false)
         .await
-        .is_ok_and(|r| r.exit_code == 0)
+    else {
+        return false;
+    };
+    if result.exit_code != 0 {
+        return false;
+    }
+    let cmdline = result.stdout;
+    !cmdline.contains("-no-ebpf") && !cmdline.contains("-fixture")
 }
 
 /// The shell that writes the agent's policy file.

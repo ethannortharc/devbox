@@ -191,7 +191,16 @@ impl SandboxManager {
         // Check status, start if stopped
         let status = runtime.status(name).await?;
         match status {
-            SandboxStatus::Running => {}
+            // Running too. `create_sandbox` hands back a box that is already
+            // up and goes straight to attach, so gating enforcement on the
+            // Stopped arm meant a brand-new box with `isolated` in its
+            // devbox.toml ran unrestricted until its first restart. Applying
+            // is idempotent — the ruleset destroys its table before rebuilding
+            // it — so doing it on every attach costs one exec and closes the
+            // window for good.
+            SandboxStatus::Running => {
+                crate::policy::enforce::apply_saved(self, &state, name).await?;
+            }
             SandboxStatus::Stopped => {
                 println!("Starting sandbox '{name}'...");
                 runtime.start(name).await?;

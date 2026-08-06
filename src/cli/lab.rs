@@ -283,8 +283,15 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     }
     println!("Wiring is up ({} commands).", commands.len());
 
-    // Router configs go in next; the routing daemon is started by the node's
-    // own service manager, which the substrate provisioning installs.
+    // Router configs, then the daemons that read them.
+    //
+    // The comment that used to sit here said the node's own service manager
+    // starts the routing daemon — but a namespace is not a machine and has no
+    // service manager, and nothing in substrate provisioning installs one. So
+    // `lab up` wrote every frr.conf, printed success, and left BGP unstarted:
+    // adjacent nodes could ping, non-adjacent loopbacks never converged, and
+    // the only symptom was a scenario that quietly failed its assertions.
+    let mut started = 0usize;
     for (node, conf) in lab.router_configs() {
         push_file(
             runtime.as_ref(),
@@ -293,11 +300,23 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
             &conf,
         )
         .await?;
+
+        for argv in crate::lab::frr::start_commands(lab.name(), &node) {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let result = runtime.exec_cmd(&substrate, &args, false).await?;
+            if result.exit_code != 0 {
+                bail!(
+                    "could not start the routing daemons in namespace '{node}': {}\n\n  \
+                     A routed lab needs FRR on the substrate box — enable the \
+                     `network` set (`devbox sets enable network`) and rebuild, \
+                     then re-run `devbox lab up`.",
+                    result.stderr.trim()
+                );
+            }
+        }
+        started += 1;
     }
-    println!(
-        "Router configs written for {} node(s).",
-        lab.topology.routers().len()
-    );
+    println!("Router configs written and FRR started for {started} node(s).");
 
     // Service orchestration — dnsmasq, chrony, and `devbox-ztpd` — is not
     // wired yet. Saying so is the whole point: a topology that asks for those

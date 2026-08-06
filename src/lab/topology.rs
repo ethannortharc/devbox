@@ -108,7 +108,11 @@ pub struct Endpoint {
 ///
 /// IFNAMSIZ is 16 including the NUL, so 15 characters is the real limit.
 fn is_valid_iface(name: &str) -> bool {
+    // `.` and `..` are directory entries in sysfs, so the kernel rejects them
+    // by name — after the namespaces and veths already exist.
     !name.is_empty()
+        && name != "."
+        && name != ".."
         && name.len() <= 15
         && name
             .bytes()

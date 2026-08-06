@@ -120,9 +120,23 @@ set -eu
 ZTP="%s"
 SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || cat /etc/machine-id)"
 
+# §10.3 kills ztpd mid-provision. A dropped report is not cosmetic: if the
+# final "healthy" is lost, the node finishes and exits while the registry —
+# and ztp_fabric_converged — stay stale forever, because nothing schedules a
+# reconciliation. So retry across a restart window before giving up, and say
+# so on stderr when we do.
 report() {
-  wget -q -O- --post-data="{\"serial\":\"$SERIAL\",\"state\":\"$1\",\"reason\":\"${2:-}\"}" \
-    --header='Content-Type: application/json' "$ZTP/status" >/dev/null || true
+  _state="$1"; _reason="${2:-}"; _try=0
+  while [ "$_try" -lt 12 ]; do
+    if wget -q -O- --post-data="{\"serial\":\"$SERIAL\",\"state\":\"$_state\",\"reason\":\"$_reason\"}" \
+      --header='Content-Type: application/json' "$ZTP/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    _try=$((_try + 1))
+    sleep 5
+  done
+  echo "devbox-ztp: could not report '$_state' after $_try attempts" >&2
+  return 1
 }
 
 # Who am I?

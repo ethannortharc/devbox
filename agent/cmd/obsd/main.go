@@ -193,6 +193,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	if err != nil {
 		return err
 	}
+	policyStamp := policyFingerprint(cfg.policy)
 	if enforcer != nil {
 		fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
 	}
@@ -205,6 +206,16 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				// Source finished and the channel drained.
 				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
 				return <-srcDone
+			}
+			// Reload when the control plane rewrites the policy. `devbox
+			// policy allow` recreates the nftables sets empty and writes a
+			// new domain list; an enforcer built once at startup would keep
+			// the old list and leave the newly allowed domain blocked until
+			// someone restarted the service.
+			if cfg.policy != "" {
+				if reloaded, changed := reloadEnforcer(cfg, policyStamp, out); changed {
+					enforcer, policyStamp = reloaded.enforcer, reloaded.stamp
+				}
 			}
 			if enforcer != nil && e.Type == event.TypeDNS {
 				if added, err := enforcer.OnDNS(ctx, e); err != nil {
@@ -303,4 +314,48 @@ func loadEnforcer(cfg config) (*policy.Enforcer, error) {
 		}
 	}
 	return enforcer, nil
+}
+
+// reloadState is what a reload produces: the new enforcer and the stamp that
+// identifies the policy it was built from.
+type reloadState struct {
+	enforcer *policy.Enforcer
+	stamp    string
+}
+
+// reloadEnforcer rebuilds the enforcer when the policy file has changed.
+//
+// Cheap enough to check per DNS event: a stat, and a rebuild only when the
+// fingerprint moves. A failed reload keeps the old enforcer — a policy file
+// caught mid-write should not disable enforcement.
+func reloadEnforcer(cfg config, stamp string, out io.Writer) (reloadState, bool) {
+	current := policyFingerprint(cfg.policy)
+	if current == stamp {
+		return reloadState{}, false
+	}
+	enforcer, err := loadEnforcer(cfg)
+	if err != nil {
+		fmt.Fprintf(out, "devbox-obsd: policy reload failed, keeping the old one: %v\n", err)
+		// Stamp anyway, so a persistently broken file is not retried on every
+		// single event.
+		return reloadState{enforcer: nil, stamp: current}, false
+	}
+	fmt.Fprintf(out, "devbox-obsd: policy reloaded from %s\n", cfg.policy)
+	return reloadState{enforcer: enforcer, stamp: current}, true
+}
+
+// policyFingerprint identifies a version of the policy file.
+//
+// Size and mtime rather than a hash: the file is rewritten wholesale by the
+// control plane, and reading it on every event to hash it would be the
+// expensive thing this is avoiding.
+func policyFingerprint(path string) string {
+	if path == "" {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
 }

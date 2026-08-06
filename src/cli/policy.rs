@@ -214,8 +214,19 @@ async fn reapply(
         return Ok(());
     };
     let runtime = manager.runtime_for_sandbox(&state)?;
-    match runtime.status(name).await {
-        Ok(crate::runtime::SandboxStatus::Running) => {
+    // Only an explicit `Stopped` defers. A probe that *failed* says nothing
+    // about the box, and treating it as stopped exits 0 with the new posture
+    // saved and the running firewall untouched — the exact confusion between
+    // "configured" and "enforced" this command's exit status has to resolve.
+    match runtime
+        .status(name)
+        .await
+        .with_context(|| format!("could not determine whether box '{name}' is running"))?
+    {
+        crate::runtime::SandboxStatus::Stopped => {
+            println!("  Box is not running; the posture applies when it starts.");
+        }
+        crate::runtime::SandboxStatus::Running => {
             // The error is returned, not printed. A script that runs
             // `devbox policy set isolated` and gets exit 0 is entitled to
             // believe the box is isolated; saving the file is not the same
@@ -231,7 +242,10 @@ async fn reapply(
                 })?;
             println!("  Applied to the running box.");
         }
-        _ => println!("  Box is not running; the posture applies when it starts."),
+        other => bail!(
+            "box '{name}' is in state '{other:?}'; the posture was saved but not \
+             applied. Start the box, or fix its runtime state, then re-run this."
+        ),
     }
     Ok(())
 }

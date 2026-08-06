@@ -862,3 +862,40 @@ And the same shape in `apply_saved`: it used `load_or_default`, so a malformed
 `devbox.toml` became the *default* config — posture `open`. Corruption silently
 unfirewalled a box that had been isolated. It loads fallibly now. Corruption is
 not consent.
+
+## ADR-0038: a namespace is not a machine
+
+**Status:** accepted (2026-08-06)
+
+`lab up` wrote every `frr.conf` and printed success on the strength of a
+comment claiming "the routing daemon is started by the node's own service
+manager, which the substrate provisioning installs." Neither half was true: a
+network namespace has no init, and nothing in provisioning installed one. So a
+routed lab came up with adjacent nodes able to ping and BGP never started —
+non-adjacent loopbacks simply never converged, and the only symptom was a
+scenario quietly failing its assertions.
+
+`frr::start_commands` now starts `zebra` then `bgpd` under `ip netns exec`,
+with a per-namespace socket and pidfile directory. The ordering matters —
+`bgpd` talks to `zebra` over zserv, so starting it first gives a daemon with
+nowhere to install what it learns — and so does the socket path, since every
+namespace runs its own `zebra` and a shared `/var/run` would have them all
+talking to whichever started first.
+
+The comment is the lesson: it described an architecture nobody had built, and
+it read plausibly enough to survive four review rounds.
+
+## ADR-0039: liveness is not capability
+
+**Status:** accepted (2026-08-06)
+
+ADR-0036's guard checked that `devbox-obsd` was running. But the degraded proc
+source (§13) captures processes and sockets and no DNS at all, so an agent
+started with `-no-ebpf` passed the check and still could not populate a single
+allow-set entry — leaving exactly the default-deny-with-empty-allowlist that
+ADR-0036 exists to prevent.
+
+The guard now reads the agent's command line and requires a DNS-capturing
+source. The general form: when a guard exists to establish that something *can
+be done*, checking that the thing which would do it is *present* is a different
+question, and the gap between them is where this class of bug lives.

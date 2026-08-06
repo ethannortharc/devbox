@@ -316,3 +316,84 @@ mod tests {
         );
     }
 }
+
+/// Commands that start the routing daemons inside a router's namespace.
+///
+/// `zebra` then `bgpd`: zebra owns the kernel routing table and bgpd talks to
+/// it over zserv, so starting bgpd first gives a daemon with nowhere to
+/// install the routes it learns.
+///
+/// Run with `ip netns exec` because a namespace has no init — there is no
+/// service manager inside one to hand this to, which is exactly the assumption
+/// that left `lab up` reporting success with BGP never started.
+pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
+    let dir = format!("/etc/devbox/lab/{lab}/{node}");
+    let run = format!("/run/devbox/lab/{lab}/{node}");
+
+    let daemon = |name: &str, extra: &[&str]| -> Vec<String> {
+        let mut argv = vec![
+            "sudo".to_string(),
+            "ip".to_string(),
+            "netns".to_string(),
+            "exec".to_string(),
+            node.to_string(),
+            name.to_string(),
+            "-d".to_string(),
+            "-f".to_string(),
+            format!("{dir}/frr.conf"),
+            "-i".to_string(),
+            format!("{run}/{name}.pid"),
+            // Per-namespace socket directory: every namespace runs its own
+            // zebra, and a shared /var/run path would have them all talking to
+            // whichever started first.
+            "-z".to_string(),
+            format!("{run}/zserv.api"),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        argv
+    };
+
+    vec![
+        vec![
+            "sudo".to_string(),
+            "mkdir".to_string(),
+            "-p".to_string(),
+            run.clone(),
+        ],
+        daemon("zebra", &[]),
+        daemon("bgpd", &[]),
+    ]
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+
+    #[test]
+    fn zebra_starts_before_bgpd_in_its_own_namespace() {
+        let commands = start_commands("clos", "leaf1");
+        let flat: Vec<String> = commands.iter().map(|c| c.join(" ")).collect();
+
+        let zebra = flat.iter().position(|c| c.contains("zebra")).unwrap();
+        let bgpd = flat.iter().position(|c| c.contains("bgpd")).unwrap();
+        assert!(
+            zebra < bgpd,
+            "bgpd has nowhere to install routes without zebra"
+        );
+
+        assert!(
+            flat.iter()
+                .all(|c| !c.contains("zebra") || c.contains("ip netns exec leaf1"))
+        );
+        // Per-namespace sockets and pidfiles, or every router talks to the
+        // first zebra that started.
+        assert!(
+            flat.iter()
+                .any(|c| c.contains("/run/devbox/lab/clos/leaf1/zserv.api"))
+        );
+        assert!(
+            flat.iter()
+                .any(|c| c.contains("mkdir -p /run/devbox/lab/clos/leaf1"))
+        );
+    }
+}
