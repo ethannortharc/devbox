@@ -28,6 +28,13 @@ pub static NIX_SETS: &[NixSet] = &[
             // firewall would make enforcement conditional on a checkbox they
             // have no reason to connect to it.
             "nftables",
+            // conntrack, because tightening a policy must drop the sessions it
+            // no longer allows — `ct state established,related accept` sits
+            // first in the ruleset, so without a flush an open→isolated box
+            // keeps every connection it already had, while reporting success.
+            // It was in the checked-in system.nix but only the *network* set
+            // here, so any Sets apply silently regenerated the box without it.
+            "conntrack-tools",
             "which",
             "tree",
             "less",
@@ -281,6 +288,55 @@ pub fn generate_state_toml_with(
 
 #[cfg(test)]
 mod tests {
+    /// The Ubuntu package mapping must carry everything the catalog does.
+    ///
+    /// Ubuntu provisioning does not read `NIX_SETS`; it uses a separate
+    /// `nix_packages_for_set` mapping. A package added to one and not the
+    /// other means an Ubuntu box is reported provisioned without a tool that
+    /// a later command shells out to — `nft` for a policy, `frr` for a lab.
+    #[test]
+    fn the_ubuntu_mapping_covers_every_catalogued_package() {
+        for set in super::NIX_SETS {
+            let ubuntu = crate::sandbox::provision::nix_packages_for_set(set.name);
+            if ubuntu.is_empty() {
+                continue; // not offered on Ubuntu at all
+            }
+            for package in set.packages {
+                assert!(
+                    ubuntu.contains(package),
+                    "`{package}` is in the `{}` catalog but not in the Ubuntu \
+                     mapping; an Ubuntu box would be provisioned without it",
+                    set.name
+                );
+            }
+        }
+    }
+
+    /// The generated `system` set and the checked-in `system.nix` must agree.
+    ///
+    /// Provisioning pushes the checked-in module; `write_set_modules`
+    /// regenerates from this catalog. When they disagree, a box gets one set
+    /// of packages at create and a different one after any Sets apply — which
+    /// is how `conntrack` came to be present on a fresh box and absent after
+    /// the user touched a checkbox, silently disarming the conntrack flush
+    /// that makes a tightened policy take effect.
+    #[test]
+    fn system_set_matches_the_checked_in_module() {
+        let module = include_str!("../../nix/sets/system.nix");
+        let system = super::NIX_SETS
+            .iter()
+            .find(|s| s.name == "system")
+            .expect("a system set");
+
+        for package in system.packages {
+            assert!(
+                module.contains(package),
+                "`{package}` is in the generated system set but not in \
+                 nix/sets/system.nix; a Sets apply would remove it from the box"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

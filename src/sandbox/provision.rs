@@ -65,9 +65,15 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 // These map set names to nixpkgs attribute paths for `nix profile install`.
 // The names match the nix/sets/*.nix files exactly.
 
-fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
+pub(crate) fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
     match set {
+        // Kept in step with `NIX_SETS`; the test below asserts it. The Ubuntu
+        // path uses this mapping rather than the catalog, so a package added
+        // there and forgotten here means an Ubuntu box is reported provisioned
+        // without the tool a later command shells out to.
         "system" => vec![
+            "nftables",
+            "conntrack-tools",
             "coreutils",
             "gnugrep",
             "gnused",
@@ -140,6 +146,8 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
             "skopeo",
         ],
         "network" => vec![
+            "frr",
+            "conntrack-tools",
             "tailscale",
             "mosh",
             "nmap",
@@ -1320,10 +1328,21 @@ mod tests {
     #[test]
     fn nix_packages_system_set() {
         let pkgs = nix_packages_for_set("system");
-        assert_eq!(pkgs.len(), 24);
         assert!(pkgs.contains(&"coreutils"));
         assert!(pkgs.contains(&"gcc"));
         assert!(pkgs.contains(&"curl"));
+        // The tools enforcement shells out to. A count assertion used to sit
+        // here; it only ever said "somebody edited this list", which is not a
+        // property worth failing a build over — naming what has to be present
+        // says why.
+        assert!(
+            pkgs.contains(&"nftables"),
+            "policies load a ruleset with it"
+        );
+        assert!(
+            pkgs.contains(&"conntrack-tools"),
+            "tightening a policy has to drop the sessions it no longer allows"
+        );
     }
 
     #[test]

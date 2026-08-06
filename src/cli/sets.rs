@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use crate::nix::compose::{LOCKED_SETS, Selection, describe_change};
@@ -159,6 +159,11 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     state.languages = config.active_languages();
     state.packages = after.packages.iter().cloned().collect();
     state.save(&manager.state_dir)?;
+    // And the project's own file, which box creation reads — see the note in
+    // `web::build::apply_selection`.
+    config
+        .save(&state.project_dir.join("devbox.toml"))
+        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
 
     println!("Box '{name}' rebuilt with the new selection.");
     Ok(())

@@ -190,11 +190,41 @@ pub fn evaluate_hello(hello: &Hello, expected_box: Option<&str>) -> HelloAck {
         };
     }
 
+    // The version pin the module header promises. Matching protocol versions
+    // says the *framing* agrees; it says nothing about the record layouts
+    // inside, which are asserted byte-for-byte against this release's structs.
+    // An agent from another release can hand over frames that parse and decode
+    // to nonsense, which is worse than refusing it.
+    //
+    // A development build (`0.0.0`, or any version containing `-dev`) is
+    // exempt: that is someone running a locally built agent against a locally
+    // built collector on purpose.
+    let host_version = env!("CARGO_PKG_VERSION");
+    if !is_development_build(&hello.version)
+        && !is_development_build(host_version)
+        && hello.version != host_version
+    {
+        return HelloAck {
+            protocol: PROTOCOL_VERSION,
+            accepted: false,
+            reason: format!(
+                "agent is devbox {} but this collector is {host_version}; \
+                 event layouts are pinned per release",
+                hello.version
+            ),
+        };
+    }
+
     HelloAck {
         protocol: PROTOCOL_VERSION,
         accepted: true,
         reason: String::new(),
     }
+}
+
+/// Is this a build that should skip the release pin?
+fn is_development_build(version: &str) -> bool {
+    version.is_empty() || version == "0.0.0" || version.contains("-dev")
 }
 
 /// A running collector.
@@ -282,7 +312,10 @@ impl Collector {
             let me = Arc::clone(&self);
             let tx = tx.clone();
             tokio::spawn(async move {
-                me.stats.agents_connected.fetch_add(1, Ordering::Relaxed);
+                // Counted inside `serve_agent`, once the hello is accepted.
+                // Incrementing here counted malformed clients and agents
+                // rejected for the wrong box, so a retry loop inflated the
+                // metric without a single agent ever connecting.
                 if let Err(e) = me.serve_agent(stream, tx).await {
                     tracing::warn!(error = %e, "agent connection ended");
                 }
@@ -307,6 +340,8 @@ impl Collector {
         if !ack.accepted {
             bail!("rejected agent: {}", ack.reason);
         }
+        // Only now: an accepted agent is what the metric claims to count.
+        self.stats.agents_connected.fetch_add(1, Ordering::Relaxed);
 
         tracing::info!(
             box_id = %hello.box_id,
@@ -421,6 +456,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_agent_from_another_release_is_refused() {
+        // Matching protocol versions say the *framing* agrees. The record
+        // layouts inside are asserted against this release's structs, so an
+        // agent from another release can hand over frames that parse and
+        // decode to nonsense — worse than refusing it.
+        let mut hello = Hello {
+            protocol: PROTOCOL_VERSION,
+            version: "0.0.9".into(),
+            box_id: "myapp".into(),
+            capture: vec!["exec".into()],
+            ebpf: true,
+        };
+        let ack = evaluate_hello(&hello, None);
+        assert!(!ack.accepted);
+        assert!(ack.reason.contains("pinned per release"), "{}", ack.reason);
+
+        // A locally built agent is exempt on purpose: that is the `-dev` build
+        // the cross-language pipeline test runs, and refusing it would make
+        // local development impossible.
+        hello.version = "0.0.0-dev".into();
+        assert!(evaluate_hello(&hello, None).accepted);
+
+        // And the release the collector itself is.
+        hello.version = env!("CARGO_PKG_VERSION").into();
+        assert!(evaluate_hello(&hello, None).accepted);
+    }
+
+    #[test]
     fn paths_are_scoped_per_box() {
         let dir = Path::new("/home/x/.devbox");
         assert_eq!(
@@ -438,7 +501,7 @@ mod tests {
     fn handshake_accepts_a_matching_agent() {
         let hello = Hello {
             protocol: PROTOCOL_VERSION,
-            version: "0.1.3".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             box_id: "myapp".into(),
             capture: vec!["exec".into()],
             ebpf: true,

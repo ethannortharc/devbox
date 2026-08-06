@@ -151,3 +151,18 @@ def test_roles_decide_who_routes() -> None:
     assert Device(name="a", role="border", serial="S").routes
     assert not Device(name="a", role="host", serial="S").routes
     assert not Device(name="a", role="service", serial="S").routes
+
+
+def test_an_interface_cannot_peer_with_itself() -> None:
+    """Self-peering collapses the link and dies far from the cause.
+
+    `far` resolves to the same interface, so the reciprocity check passes and
+    the failure surfaces later as a bare StopIteration inside rendering.
+    """
+    with pytest.raises(ValidationError, match="peers with itself"):
+        Device(
+            name="r1",
+            role="leaf",
+            serial="AAA",
+            interfaces=[Interface(name="eth1", peer="r1:eth1")],
+        )

@@ -110,6 +110,18 @@ pub type Generated = Vec<(&'static str, Option<String>)>;
 /// Files `write_set_modules` overwrites.
 const GENERATED_FILES: &[&str] = &["/etc/devbox/devbox.nix", "/etc/devbox/devbox-state.toml"];
 
+/// The directory of per-set modules `write_set_modules` also rewrites.
+///
+/// Backing up only the two composition files left every `sets/*.nix` replaced
+/// after a failed rebuild, so a later manual rebuild would evaluate the new
+/// modules and reintroduce exactly the change that was reported as rolled
+/// back. The whole directory is snapshotted as a tarball: the set of files is
+/// not fixed, and restoring a stale list would be its own bug.
+const GENERATED_SETS_DIR: &str = "/etc/devbox/sets";
+
+/// Where the pre-rebuild copy of the sets directory lives inside the box.
+const SETS_BACKUP: &str = "/etc/devbox/.sets-backup.tar";
+
 /// Read the generated files so a failed rebuild can put them back.
 pub async fn snapshot_generated(
     runtime: &dyn crate::runtime::Runtime,
@@ -125,6 +137,26 @@ pub async fn snapshot_generated(
             .map(|r| r.stdout);
         out.push((*path, content));
     }
+
+    // The per-set modules too, as a tarball. Their names are not a fixed list
+    // — the catalog changes — so copying the directory is the only honest way
+    // to put it back exactly as it was.
+    let _ = runtime
+        .exec_cmd(
+            box_name,
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "rm -f {SETS_BACKUP}; \
+                     [ -d {GENERATED_SETS_DIR} ] && \
+                     tar cf {SETS_BACKUP} -C {GENERATED_SETS_DIR} . 2>/dev/null; exit 0"
+                ),
+            ],
+            false,
+        )
+        .await;
+
     out
 }
 
@@ -135,7 +167,26 @@ pub async fn restore_generated(
     box_name: &str,
     backup: &Generated,
 ) -> bool {
-    let mut restored = false;
+    // The set modules first, so a partially written directory is replaced
+    // wholesale rather than merged with what the failed run left behind.
+    let mut restored = runtime
+        .exec_cmd(
+            box_name,
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "if [ -f {SETS_BACKUP} ]; then \
+                       rm -rf {GENERATED_SETS_DIR} && mkdir -p {GENERATED_SETS_DIR} && \
+                       tar xf {SETS_BACKUP} -C {GENERATED_SETS_DIR} && rm -f {SETS_BACKUP}; \
+                     fi; exit 0"
+                ),
+            ],
+            false,
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
+
     for (path, content) in backup {
         let script = match content {
             Some(text) => {
@@ -150,6 +201,58 @@ pub async fn restore_generated(
         restored |= ok;
     }
     restored
+}
+
+/// Write the modules and rebuild, with everything after the snapshot fallible.
+///
+/// Split out so a single `?` covers each step: the caller restores on any
+/// error, which is the property that was missing when only the non-zero exit
+/// code triggered a rollback.
+async fn apply_after_snapshot(
+    runtime: &dyn crate::runtime::Runtime,
+    box_name: &str,
+    selection: &Selection,
+    publish: &(impl Fn(&str) + Sync),
+) -> Result<()> {
+    crate::nix::write_set_modules(runtime, box_name, selection)
+        .await
+        .context("failed to push Nix set modules into the box")?;
+    publish("devbox: set modules written to /etc/devbox/sets/");
+
+    let argv = runtime.argv(box_name, &crate::nix::rebuild::rebuild_argv(), false);
+    publish(&format!("devbox: {}", argv.join(" ")));
+
+    let code = stream_command(&argv, |line| publish(line)).await?;
+    if code != 0 {
+        // `nixos-rebuild switch` can fail *during activation*, after the new
+        // generation has been made current — only evaluation and build
+        // failures leave the box genuinely untouched. Restoring the sources
+        // alone would then leave the guest running the new generation while
+        // the console reported a rollback, so switch back explicitly. The CLI
+        // path has always done this; the streamed one did not.
+        publish("devbox: rebuild failed — rolling back to the previous generation");
+        let rollback = runtime
+            .exec_cmd(
+                box_name,
+                &["sudo", "nixos-rebuild", "switch", "--rollback"],
+                false,
+            )
+            .await;
+        match rollback {
+            Ok(r) if r.exit_code == 0 => {
+                publish("devbox: rolled back to the previous generation");
+                bail!(
+                    "nixos-rebuild switch failed with exit code {code}; \
+                     rolled back to the previous generation"
+                );
+            }
+            _ => bail!(
+                "nixos-rebuild switch failed with exit code {code}, and the \
+                 rollback also failed — the box may be on the new generation"
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Apply a set selection to a box and rebuild it, streaming progress.
@@ -209,36 +312,43 @@ pub async fn apply_selection(
     let backup = snapshot_generated(runtime.as_ref(), box_name).await;
     let base = DevboxConfig::load_or_default(&sandbox.project_dir);
     let config = selection.to_config(&base);
-    crate::nix::write_set_modules(runtime.as_ref(), box_name, selection)
-        .await
-        .context("failed to push Nix set modules into the box")?;
-    publish("devbox: set modules written to /etc/devbox/sets/");
 
-    // 2. Rebuild, streamed.
-    let argv = runtime.argv(box_name, &crate::nix::rebuild::rebuild_argv(), false);
-    publish(&format!("devbox: {}", argv.join(" ")));
+    // Every step past the snapshot rolls back on failure, not just the
+    // rebuild. A write that fails partway leaves some modules replaced and
+    // some not, and a runtime command that fails to spawn leaves all of them
+    // replaced — both reported as "the box is unchanged" while the sources
+    // said otherwise.
+    let outcome = apply_after_snapshot(runtime.as_ref(), box_name, selection, &publish).await;
 
-    let code = stream_command(&argv, |line| publish(line)).await?;
-    if code != 0 {
-        let restored = restore_generated(runtime.as_ref(), box_name, &backup).await;
-        if restored {
+    if let Err(e) = outcome {
+        if restore_generated(runtime.as_ref(), box_name, &backup).await {
             publish("devbox: generated files restored to the last good selection");
         }
         state.publish(ConsoleEvent::new(
             status_event(box_name),
             format!(
-                "<span class=\"term-err\">rebuild failed (exit {code}) — the box is unchanged</span>"
+                "<span class=\"term-err\">{}</span>",
+                escape_html(&e.to_string())
             ),
         ));
-        bail!("nixos-rebuild switch failed with exit code {code}");
+        return Err(e);
     }
 
-    // 3. Only now is the selection real: record it.
+    // 3. Only now is the selection real: record it, in both places.
+    //
+    // `state.json` is devbox's own bookkeeping; `devbox.toml` is the project's
+    // source of truth, and box *creation* reads it. Writing only the former
+    // meant destroying and recreating a box restored the selection from before
+    // the checklist was ever touched — the change survived every restart and
+    // vanished on the one operation people use to get a clean box.
     let mut sandbox = sandbox;
     sandbox.sets = config.active_sets();
     sandbox.languages = config.active_languages();
     sandbox.packages = selection.packages.iter().cloned().collect();
     sandbox.save(&manager.state_dir)?;
+    config
+        .save(&sandbox.project_dir.join("devbox.toml"))
+        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
 
     state.publish(ConsoleEvent::new(
         status_event(box_name),

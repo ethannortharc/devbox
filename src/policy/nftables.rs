@@ -20,6 +20,61 @@ use super::{Policy, Posture, parse_cidr};
 /// rules without touching anything the box's own configuration installed.
 pub const TABLE: &str = "devbox";
 
+/// The rules that implement a posture, emitted into whichever chain.
+///
+/// Shared by `output` and `forward` so the two can never drift: a rule added
+/// to one and forgotten in the other is a hole shaped exactly like the
+/// container-egress bypass this was factored out to fix.
+fn emit_policy_rules(nft: &mut String, policy: &Policy) {
+    // Established traffic first: a reply to a connection we already allowed
+    // must not be re-evaluated, and putting this rule anywhere but first costs
+    // a lookup on every packet.
+    let _ = writeln!(nft, "    ct state established,related accept");
+
+    // Loopback and link-local are never egress. Blocking them breaks the box's
+    // own services and its neighbour discovery — and `Policy::evaluate` already
+    // treats both as local, so omitting them here made `devbox policy test`
+    // report "allowed" for an address the box would then drop.
+    let _ = writeln!(nft, "    oifname \"lo\" accept");
+    let _ = writeln!(nft, "    ip daddr 127.0.0.0/8 accept");
+    let _ = writeln!(nft, "    ip6 daddr ::1 accept");
+    let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
+    let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
+
+    // DNS must survive every posture except `isolated`: the allowlist is
+    // resolved by name, so blocking resolution would make the allowlist
+    // unenforceable rather than strict.
+    if policy.egress != Posture::Isolated {
+        let _ = writeln!(nft, "    udp dport 53 accept");
+        let _ = writeln!(nft, "    tcp dport 53 accept");
+    }
+
+    match policy.egress {
+        Posture::Open => {
+            let _ = writeln!(nft, "    # posture is open: nothing is blocked");
+        }
+        Posture::Isolated => {
+            // Lab subnets stay reachable: the posture means "no egress", not
+            // "no networking".
+            let _ = writeln!(
+                nft,
+                "    ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} accept"
+            );
+            let _ = writeln!(nft, "    ip6 daddr fc00::/7 accept");
+            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
+        }
+        Posture::Allowlist | Posture::MirrorOnly => {
+            let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
+            let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
+            let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
+            let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
+            // Logging is what turns a dropped packet into a `policy` event:
+            // the agent tails these and emits one per blocked connection.
+            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
+        }
+    }
+}
+
 /// Named sets the agent populates from resolved DNS answers.
 pub const SET_V4: &str = "allow_v4";
 pub const SET_V6: &str = "allow_v6";
@@ -99,61 +154,24 @@ pub fn ruleset(policy: &Policy) -> String {
     } else {
         "accept"
     };
-    let _ = writeln!(nft, "  chain output {{");
-    let _ = writeln!(
-        nft,
-        "    type filter hook output priority filter; policy {verdict};"
-    );
-
-    // Established traffic first: a reply to a connection we already allowed
-    // must not be re-evaluated, and putting this rule anywhere but first costs
-    // a lookup on every packet.
-    let _ = writeln!(nft, "    ct state established,related accept");
-
-    // Loopback and link-local are never egress. Blocking them breaks the box's
-    // own services and its neighbour discovery — and `Policy::evaluate` already
-    // treats both as local, so omitting them here made `devbox policy test`
-    // report "allowed" for an address the box would then drop.
-    let _ = writeln!(nft, "    oifname \"lo\" accept");
-    let _ = writeln!(nft, "    ip daddr 127.0.0.0/8 accept");
-    let _ = writeln!(nft, "    ip6 daddr ::1 accept");
-    let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
-    let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
-
-    // DNS must survive every posture except `isolated`: the allowlist is
-    // resolved by name, so blocking resolution would make the allowlist
-    // unenforceable rather than strict.
-    if policy.egress != Posture::Isolated {
-        let _ = writeln!(nft, "    udp dport 53 accept");
-        let _ = writeln!(nft, "    tcp dport 53 accept");
+    // Two hooks, one policy.
+    //
+    // `output` covers packets the box itself sends. It does not cover packets
+    // it *forwards* — and with the `container` set enabled, everything a
+    // nested Docker container sends is forwarded, not output. So `docker run
+    // … curl` walked straight past `isolated` and every allowlist: the one
+    // command a developer is most likely to run inside a sandboxed box was the
+    // one the sandbox did not cover.
+    for hook in ["output", "forward"] {
+        let _ = writeln!(nft, "  chain {hook} {{");
+        let _ = writeln!(
+            nft,
+            "    type filter hook {hook} priority filter; policy {verdict};"
+        );
+        emit_policy_rules(&mut nft, policy);
+        let _ = writeln!(nft, "  }}");
     }
 
-    match policy.egress {
-        Posture::Open => {
-            let _ = writeln!(nft, "    # posture is open: nothing is blocked");
-        }
-        Posture::Isolated => {
-            // Lab subnets stay reachable: the posture means "no egress", not
-            // "no networking".
-            let _ = writeln!(
-                nft,
-                "    ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} accept"
-            );
-            let _ = writeln!(nft, "    ip6 daddr fc00::/7 accept");
-            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
-        }
-        Posture::Allowlist | Posture::MirrorOnly => {
-            let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
-            let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
-            let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
-            let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
-            // Logging is what turns a dropped packet into a `policy` event:
-            // the agent tails these and emits one per blocked connection.
-            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
-        }
-    }
-
-    let _ = writeln!(nft, "  }}");
     let _ = writeln!(nft, "}}");
     nft
 }
@@ -281,6 +299,30 @@ mod tests {
             !nft.contains("udp dport 53 accept"),
             "isolated means isolated"
         );
+    }
+
+    #[test]
+    fn forwarded_traffic_is_policed_like_output() {
+        // With the `container` set on, everything a nested Docker container
+        // sends is *forwarded*, not output — so an output-only ruleset let
+        // `docker run … curl` walk past isolated and every allowlist.
+        let nft = ruleset(&policy(Posture::Allowlist, &["10.0.0.0/8"]));
+
+        assert!(nft.contains("hook forward priority filter; policy drop;"));
+
+        let output = nft.split("chain output {").nth(1).unwrap();
+        let output = output.split("  }").next().unwrap();
+        let forward = nft.split("chain forward {").nth(1).unwrap();
+        let forward = forward.split("  }").next().unwrap();
+
+        for rule in ["@static_v4 accept", "@allow_v4 accept", "devbox-blocked"] {
+            assert!(output.contains(rule), "output missing {rule}");
+            assert!(
+                forward.contains(rule),
+                "forward missing {rule}: a rule in one chain and not the other \
+                 is a hole the shape of the container bypass"
+            );
+        }
     }
 
     #[test]

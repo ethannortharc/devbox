@@ -235,12 +235,13 @@ pub fn diff(before: &Summary, after: &Summary) -> Diff {
         // zero — so a run that started hitting a different blocked target
         // reported nothing new, which is precisely the alarm this exists for.
         new_violations: {
+            // Both sides deduplicated. `violation_key` says a target blocked
+            // twice for the same reason is one recurring problem — but only
+            // `before` was a set, so one unseen target hit a hundred times
+            // reported a hundred new violations.
             let seen: BTreeSet<_> = before.violations.iter().map(violation_key).collect();
-            after
-                .violations
-                .iter()
-                .filter(|v| !seen.contains(&violation_key(v)))
-                .count()
+            let now: BTreeSet<_> = after.violations.iter().map(violation_key).collect();
+            now.difference(&seen).count()
         },
     }
 }

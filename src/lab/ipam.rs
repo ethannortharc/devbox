@@ -195,7 +195,25 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
                 // derived allocation the same /31 the explicit one had taken —
                 // and then fail its own verification.
                 let link_capacity = host_capacity(base_len).map(|c| c / 2);
+                // Bounded by the number of links, not by the address space. A
+                // base of `0.0.0.0/0` with an explicit `/0` link makes every
+                // candidate overlap, and stepping one /31 at a time examined
+                // ~2^31 of them before failing — `lab up` looked like a hang,
+                // which is worse than the error it was on its way to. A
+                // topology cannot need more than one free prefix per link, so
+                // that many consecutive claimed candidates means the pool is
+                // covered and further stepping cannot help.
+                let ceiling = topology.links.len() + 1;
+                let mut attempts = 0usize;
                 loop {
+                    attempts += 1;
+                    if attempts > ceiling {
+                        bail!(
+                            "the lab base '{}' is fully covered by explicit link \
+                             prefixes, so link {index} has nowhere to go",
+                            topology.lab.base
+                        );
+                    }
                     let offset = next_link
                         .checked_mul(2)
                         .filter(|o| link_capacity.is_none_or(|cap| *o + 1 < cap))
@@ -690,6 +708,25 @@ mod tests {
         let mut t = clos();
         t.lab.base = "2001:db8::/32".into();
         assert!(allocate(&t).is_err());
+    }
+
+    #[test]
+    fn a_fully_covered_pool_fails_fast_instead_of_hanging() {
+        // `0.0.0.0/0` claimed explicitly leaves no free /31 anywhere, and the
+        // search used to step through ~2^31 candidates before saying so.
+        let topology = topology(
+            &[("a", Role::FrrRouter), ("b", Role::FrrRouter)],
+            &[
+                ("a:eth1", "b:eth1", Some("0.0.0.0/0")),
+                ("a:eth2", "b:eth2", None),
+            ],
+        );
+
+        let err = allocate(&topology).expect_err("no prefix is available");
+        assert!(
+            err.to_string().contains("fully covered"),
+            "the error must name the cause: {err}"
+        );
     }
 
     #[test]

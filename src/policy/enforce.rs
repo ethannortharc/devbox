@@ -11,7 +11,7 @@
 //! `isolated` and still reach the whole internet. A posture that is displayed
 //! but not enforced is worse than no posture at all, because it is believed.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use super::{Policy, Posture};
 use crate::runtime::Runtime;
@@ -286,11 +286,24 @@ fn json_escape(s: &str) -> String {
 /// while `devbox.toml` and the console both keep reporting it. This is the
 /// shared start path, so every route into a running box goes through it.
 ///
-/// Failure is an error, not a warning. A box that starts with a restrictive
-/// posture saved and no firewall installed is exactly the situation the
-/// posture exists to prevent, and reporting it quietly in a log leaves the user
-/// believing the opposite of what is true. Callers that must start the box
-/// regardless can catch it — but they have to decide that explicitly.
+/// **Who is asking decides what failure means.**
+///
+/// ADR-0034 said this must not be fatal, then ADR-0037 made it fatal, and both
+/// were half right — which produced a box the user could not get into. The
+/// resolution is that the two callers are asking different questions:
+///
+/// * `policy set` / `policy allow` — "make this true." Failure is the answer
+///   to the question, and it must reach the exit status, or a script cannot
+///   tell a saved posture from an enforced one. Those call [`apply`] directly.
+/// * start / attach / exec / console — "let me in." The user is not asking
+///   about policy at all. Locking them out of a *running* box because its
+///   firewall could not be installed strands them with no way to fix the very
+///   thing that failed — and the box is no more exposed than it was a moment
+///   earlier, when it was running without the posture and nobody was blocked.
+///
+/// So this returns `Ok` after reporting loudly. It never returns `Ok` silently:
+/// the warning names the posture that is *not* in force, so the failure cannot
+/// be mistaken for enforcement.
 pub async fn apply_saved(
     manager: &crate::sandbox::SandboxManager,
     state: &crate::sandbox::state::SandboxState,
@@ -308,32 +321,38 @@ pub async fn apply_saved(
                 error = ?e,
                 "devbox.toml could not be read; refusing to guess at the egress posture"
             );
-            return Err(e).with_context(|| {
-                format!(
-                    "box '{name}' has an unreadable devbox.toml, so its egress posture is \
-                     unknown. Fix the file, or set a posture explicitly with \
-                     `devbox policy set <posture>`."
-                )
-            });
+            eprintln!(
+                "\ndevbox: WARNING — box '{name}' has an unreadable devbox.toml, so its \
+                 egress posture is unknown and none was applied.\n  {e}\n  Fix the \
+                 file, or set one explicitly with `devbox policy set <posture>`.\n"
+            );
+            return Ok(());
         }
     };
     let runtime = manager.runtime_for_sandbox(state)?;
-    if config.policy.egress == Posture::Open {
+    let outcome = if config.policy.egress == Posture::Open {
         // Not a no-op. A box that was `isolated` and is now `open` still has
         // devbox's table in whatever state the guest kept across the restart;
         // returning early left those rules in force while every surface
         // reported the box unrestricted.
-        return clear(runtime.as_ref(), name).await;
+        clear(runtime.as_ref(), name).await
+    } else {
+        apply(runtime.as_ref(), name, &config.policy).await
+    };
+
+    if let Err(e) = outcome {
+        let posture = config.policy.egress;
+        tracing::error!(box_id = %name, %posture, error = ?e, "egress posture not applied");
+        // stderr as well as the log: the log is off by default, and a user who
+        // is about to type into this box needs to know its posture is not in
+        // force. Loud, and not fatal — see the note above.
+        eprintln!(
+            "\ndevbox: WARNING — box '{name}' is running WITHOUT its '{posture}' egress \
+             posture.\n  {e}\n  Traffic is unrestricted. Fix the cause, then \
+             `devbox policy set {posture}` to apply it.\n"
+        );
     }
-    apply(runtime.as_ref(), name, &config.policy)
-        .await
-        .with_context(|| {
-            format!(
-                "box '{name}' started, but its '{}' egress posture could not be applied — \
-                 the box is running with whatever egress it had",
-                config.policy.egress
-            )
-        })
+    Ok(())
 }
 
 #[cfg(test)]

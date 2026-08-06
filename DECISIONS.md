@@ -976,3 +976,52 @@ bootstrap called a node healthy when `show bgp summary` exited zero, which it
 does whenever bgpd is answering even with every neighbour Idle. It now waits
 for sessions to leave Idle/Active/Connect, bounded, and reports `failed` if
 they do not.
+
+## ADR-0044: who is asking decides what an enforcement failure means
+
+**Status:** accepted (2026-08-06). Supersedes the conflict between ADR-0034 and
+ADR-0037.
+
+I wrote both sides of this and shipped the contradiction. ADR-0034 said an
+enforcement failure must not be fatal, "because refusing to start a box because
+its firewall could not be installed would strand the user with no way in to fix
+it." ADR-0037 then made it fatal, because a caller that cannot see the failure
+cannot act on it. Round 9 found the result: a box whose posture could not be
+applied became permanently inaccessible — terminal, attach, and exec all
+repeated the same error — which is exactly the stranding ADR-0034 named.
+
+Both were half right, because the two callers are asking different questions:
+
+- **`policy set` / `policy allow` — "make this true."** The failure *is* the
+  answer, and it must reach the exit status, or a script cannot tell a saved
+  posture from an enforced one. These call `apply` directly and propagate.
+- **start / attach / exec / console — "let me in."** The user is not asking
+  about policy. Locking them out of a running box because its firewall failed
+  strands them with no way to fix the thing that failed — and the box is no
+  more exposed than it was a moment earlier, running without the posture while
+  nobody was blocked.
+
+So `apply_saved` returns `Ok` after reporting loudly: `tracing::error!` plus a
+stderr warning that names the posture *not* in force. It never returns `Ok`
+quietly — the failure must be impossible to mistake for enforcement, which was
+ADR-0037's real point, separate from who gets to be blocked by it.
+
+The lesson is not about firewalls. Two ADRs can each be locally right and
+jointly produce a broken system, and nothing in a per-change review catches
+that. It took a reviewer holding the whole thing at once.
+
+## ADR-0045: one policy, every hook
+
+**Status:** accepted (2026-08-06)
+
+The ruleset filtered `hook output` only. With the `container` set enabled —
+nested Docker, which is a headline feature — every packet a container sends is
+*forwarded*, not output. So `docker run … curl` walked past `isolated` and
+every allowlist: the command a developer is most likely to run inside a
+sandboxed box was the one the sandbox did not cover.
+
+`emit_policy_rules` is now shared by `output` and `forward`, with a test
+asserting the two chains carry identical rules. Factoring it out is the point —
+a rule added to one chain and forgotten in the other is a hole shaped exactly
+like this bug, and a shared emitter makes that impossible rather than merely
+unlikely.

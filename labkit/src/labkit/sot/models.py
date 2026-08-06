@@ -134,6 +134,24 @@ class Device(Model):
             raise ValueError(f"loopback {value} should be a /32 host route")
         return value
 
+    @model_validator(mode="after")
+    def _no_self_peering(self) -> Device:
+        """An interface cannot peer with itself.
+
+        `r1:eth1` naming `r1:eth1` passes the reciprocity check — `far`
+        resolves to the very same interface — and then collapses the link to a
+        single endpoint, so rendering dies in `peer_of` with a bare
+        StopIteration nowhere near the cause. Caught here, where the device
+        name is known and the message can name the interface.
+        """
+        for iface in self.interfaces:
+            if iface.peer == f"{self.name}:{iface.name}":
+                raise ValueError(
+                    f"{self.name}:{iface.name} peers with itself; "
+                    "a link needs two distinct endpoints"
+                )
+        return self
+
     def interface(self, name: str) -> Interface | None:
         """Look up one interface."""
         return next((i for i in self.interfaces if i.name == name), None)
