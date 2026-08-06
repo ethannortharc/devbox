@@ -57,7 +57,9 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
             "box '{sandbox_name}' has no DNS-capturing devbox-obsd, so a domain-based \
              posture cannot be enforced: nftables matches addresses, and only the \
              agent turns the allowlisted names into addresses as they resolve. \
-             (An agent in the degraded `-no-ebpf` mode sees no DNS either.) \
+             (An agent in `-no-ebpf` mode sees no DNS, and one started without \
+             `-policy` never reads the allowlist — restart it after the first \
+             policy is written.) \
              Applying it anyway would block {}.\n\n  \
              Use CIDRs instead, or `isolated`, both of which need no agent.",
             if domains.is_empty() {
@@ -150,7 +152,7 @@ pub async fn clear(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
 /// `sudo` unconditionally is wrong in both directions: a container exec is
 /// already root and may not have sudo installed at all, while a VM's user
 /// needs it. Deciding inside the guest is the only place that knows.
-fn elevated(script: &str) -> String {
+pub fn elevated(script: &str) -> String {
     format!(
         "if [ \"$(id -u)\" -eq 0 ]; then sh -c '{}'; else sudo sh -c '{}'; fi",
         shell_quote(script),
@@ -212,7 +214,11 @@ async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
         return false;
     }
     let cmdline = result.stdout;
-    !cmdline.contains("-no-ebpf") && !cmdline.contains("-fixture")
+    // Three things have to be true, not one. The agent must be up, capturing
+    // DNS (the proc source sees none), *and* started with `-policy` — an agent
+    // launched before the policy file existed has an empty `cfg.policy` and
+    // will never add a single element, however healthy it looks.
+    cmdline.contains("-policy") && !cmdline.contains("-no-ebpf") && !cmdline.contains("-fixture")
 }
 
 /// The shell that loads the ruleset and drops connections it no longer allows.

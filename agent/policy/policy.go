@@ -61,6 +61,18 @@ func (NFT) AddElement(ctx context.Context, set, addr string) error {
 	if _, err := netip.ParseAddr(addr); err != nil {
 		return fmt.Errorf("refusing to add %q to %s: not an address", addr, set)
 	}
+	// `add element` on an element that already exists returns EEXIST and
+	// leaves its timeout alone, so a refresh before expiry would do nothing
+	// and the address would lapse anyway — the exact failure the refresh
+	// window exists to prevent. Deleting first makes the add unconditional.
+	//
+	// The delete is best-effort: the element is usually absent, and the pair
+	// is not atomic in the sense that matters here — a packet arriving in the
+	// gap is denied and retried by the application, whereas an element that
+	// silently stopped being renewed fails for an hour.
+	del := fmt.Sprintf("delete element inet %s %s { %s }", Table, set, addr)
+	_ = exec.CommandContext(ctx, "nft", del).Run()
+
 	element := fmt.Sprintf("add element inet %s %s { %s }", Table, set, addr)
 	cmd := exec.CommandContext(ctx, "nft", element)
 	if out, err := cmd.CombinedOutput(); err != nil {

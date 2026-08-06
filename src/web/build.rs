@@ -105,7 +105,16 @@ where
 ///
 /// `None` for a file means it did not exist — restoring then removes it, so a
 /// box that never had a selection does not end up with an empty one.
-pub type Generated = Vec<(&'static str, Option<String>)>;
+pub struct Generated {
+    /// The composition files and their previous contents; `None` means absent.
+    files: Vec<(&'static str, Option<String>)>,
+    /// Whether the per-set module directory was successfully archived.
+    ///
+    /// Tracked rather than assumed: a snapshot that silently did not happen
+    /// makes the later "restored" message a lie, which is worse than saying
+    /// the rollback was incomplete.
+    sets_archived: bool,
+}
 
 /// Files `write_set_modules` overwrites.
 const GENERATED_FILES: &[&str] = &["/etc/devbox/devbox.nix", "/etc/devbox/devbox-state.toml"];
@@ -141,23 +150,32 @@ pub async fn snapshot_generated(
     // The per-set modules too, as a tarball. Their names are not a fixed list
     // — the catalog changes — so copying the directory is the only honest way
     // to put it back exactly as it was.
-    let _ = runtime
+    // Elevated, and its failure recorded. `/etc/devbox/sets` is root-owned,
+    // and on a VM runtime these commands run as the ordinary guest user — so
+    // an unprivileged `tar` silently produced no backup, and the restore then
+    // reported success without restoring anything.
+    let archived = runtime
         .exec_cmd(
             box_name,
             &[
                 "sh",
                 "-c",
-                &format!(
-                    "rm -f {SETS_BACKUP}; \
-                     [ -d {GENERATED_SETS_DIR} ] && \
-                     tar cf {SETS_BACKUP} -C {GENERATED_SETS_DIR} . 2>/dev/null; exit 0"
-                ),
+                &crate::policy::enforce::elevated(&format!(
+                    "if [ -d {GENERATED_SETS_DIR} ]; then \
+                       rm -f {SETS_BACKUP} && \
+                       tar cf {SETS_BACKUP} -C {GENERATED_SETS_DIR} .; \
+                     fi"
+                )),
             ],
             false,
         )
-        .await;
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
 
-    out
+    Generated {
+        files: out,
+        sets_archived: archived,
+    }
 }
 
 /// Put the generated files back. Best effort: a box that is now unreachable
@@ -169,25 +187,28 @@ pub async fn restore_generated(
 ) -> bool {
     // The set modules first, so a partially written directory is replaced
     // wholesale rather than merged with what the failed run left behind.
-    let mut restored = runtime
-        .exec_cmd(
-            box_name,
-            &[
-                "sh",
-                "-c",
-                &format!(
-                    "if [ -f {SETS_BACKUP} ]; then \
-                       rm -rf {GENERATED_SETS_DIR} && mkdir -p {GENERATED_SETS_DIR} && \
-                       tar xf {SETS_BACKUP} -C {GENERATED_SETS_DIR} && rm -f {SETS_BACKUP}; \
-                     fi; exit 0"
-                ),
-            ],
-            false,
-        )
-        .await
-        .is_ok_and(|r| r.exit_code == 0);
+    // Only claim to restore the modules if they were actually archived.
+    let mut restored = if backup.sets_archived {
+        runtime
+            .exec_cmd(
+                box_name,
+                &[
+                    "sh",
+                    "-c",
+                    &crate::policy::enforce::elevated(&format!(
+                        "rm -rf {GENERATED_SETS_DIR} && mkdir -p {GENERATED_SETS_DIR} && \
+                         tar xf {SETS_BACKUP} -C {GENERATED_SETS_DIR} && rm -f {SETS_BACKUP}"
+                    )),
+                ],
+                false,
+            )
+            .await
+            .is_ok_and(|r| r.exit_code == 0)
+    } else {
+        false
+    };
 
-    for (path, content) in backup {
+    for (path, content) in &backup.files {
         let script = match content {
             Some(text) => {
                 format!("cat > {path} << 'DEVBOX_RESTORE_EOF'\n{text}\nDEVBOX_RESTORE_EOF")
@@ -310,7 +331,15 @@ pub async fn apply_selection(
     // back. Worse, a source that failed to build keeps failing until someone
     // notices why.
     let backup = snapshot_generated(runtime.as_ref(), box_name).await;
-    let base = DevboxConfig::load_or_default(&sandbox.project_dir);
+    // Fallibly, and *before* the box is touched. `load_or_default` turns a
+    // malformed devbox.toml into defaults, and step 3 writes the derived
+    // config back over the original — so a syntax error anywhere in the file
+    // would silently discard the user's mounts, resources, environment, and
+    // policy.
+    let base = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
+        "refusing to apply a selection: this box's devbox.toml cannot be read, and \
+         applying would overwrite it with defaults",
+    )?;
     let config = selection.to_config(&base);
 
     // Every step past the snapshot rolls back on failure, not just the

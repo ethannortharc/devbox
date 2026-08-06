@@ -284,3 +284,43 @@ def test_ipv6_is_rejected_at_the_declared_boundary() -> None:
         AddressPlan(p2p_base="2001:db8::/32")
     with pytest.raises(ValidationError, match="IPv6"):
         Interface(name="eth1", peer="b:eth1", address="2001:db8::1/64")
+
+
+def test_a_wide_explicit_prefix_does_not_stall_allocation() -> None:
+    """A /8 claimed inside a /8 pool must not be walked one /31 at a time.
+
+    The naive filter examined 8,388,608 candidates before reporting
+    exhaustion, which reads as a hang rather than an error.
+    """
+    fabric = Fabric(
+        name="wide",
+        address_plan=AddressPlan(p2p_base="10.0.0.0/8", loopback_base="192.168.255.0/24"),
+        devices=[
+            Device(
+                name="a",
+                role="leaf",
+                serial="AAA",
+                interfaces=[
+                    Interface(name="eth1", peer="b:eth1", address="10.0.0.0/31"),
+                    Interface(name="eth2", peer="c:eth1"),
+                ],
+            ),
+            Device(
+                name="b",
+                role="spine",
+                serial="BBB",
+                interfaces=[Interface(name="eth1", peer="a:eth1", address="10.0.0.1/31")],
+            ),
+            Device(
+                name="c",
+                role="spine",
+                serial="CCC",
+                interfaces=[Interface(name="eth1", peer="a:eth2")],
+            ),
+        ],
+    )
+
+    allocation = allocate(fabric)
+    verify(allocation)
+    subnets = [link.subnet for link in allocation.links]
+    assert len(set(subnets)) == len(subnets)

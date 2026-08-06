@@ -190,7 +190,11 @@ while [ "$_try" -lt 30 ]; do
   if [ -n "$_summary" ]; then
     # "show bgp summary" prints one row per neighbour; Established rows carry
     # an uptime in the Up/Down column instead of a state word.
-    _est="$(echo "$_summary" | grep -cE 'Established|[0-9]{2}:[0-9]{2}:[0-9]{2}' || true)"
+    # FRR writes Up/Down as HH:MM:SS for the first day, then 1d02h, then
+    # 1w3d. Matching only the clock form reported a fabric that had been up
+    # for a day as failed — the rerun-after-a-week case the idempotence
+    # story depends on.
+    _est="$(echo "$_summary" | grep -cE 'Established|[0-9]{2}:[0-9]{2}:[0-9]{2}|[0-9]+[dw][0-9]+[hd]' || true)"
     _pending="$(echo "$_summary" | grep -cE 'Idle|Active|Connect|OpenSent|OpenConfirm' || true)"
     if [ "$_est" -gt 0 ] && [ "$_pending" -eq 0 ]; then
       _ok=1

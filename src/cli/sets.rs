@@ -145,8 +145,18 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // replaced, so a later manual rebuild would apply a selection this command
     // reported as failed.
     let backup = crate::web::build::snapshot_generated(runtime.as_ref(), &name).await;
-    crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
-    if let Err(e) = crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await {
+
+    // Every step past the snapshot rolls back, not only the rebuild. A write
+    // that fails partway leaves some modules replaced and some not, and a
+    // later manual rebuild would apply that half-selection — which is the same
+    // hole the console path had, on the path that was fixed second.
+    let applied = async {
+        crate::nix::write_set_modules(runtime.as_ref(), &name, &after).await?;
+        crate::nix::rebuild::nixos_rebuild(runtime.as_ref(), &name).await
+    }
+    .await;
+
+    if let Err(e) = applied {
         if crate::web::build::restore_generated(runtime.as_ref(), &name, &backup).await {
             eprintln!("devbox: generated files restored to the last good selection");
         }

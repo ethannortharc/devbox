@@ -203,14 +203,21 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
                 // topology cannot need more than one free prefix per link, so
                 // that many consecutive claimed candidates means the pool is
                 // covered and further stepping cannot help.
+                // Bounded by the number of *skips*, not by address space. The
+                // previous cap counted every candidate, so one explicit `/24`
+                // at the start of a `/16` — far more consecutive /31s than
+                // there are links — reported exhaustion with the rest of the
+                // pool empty. Each claimed range now costs a single step
+                // regardless of its size, so the only thing left to bound is
+                // how many distinct claimed ranges can be in the way: at most
+                // one per link.
                 let ceiling = topology.links.len() + 1;
-                let mut attempts = 0usize;
+                let mut skips = 0usize;
                 loop {
-                    attempts += 1;
-                    if attempts > ceiling {
+                    if skips > ceiling {
                         bail!(
-                            "the lab base '{}' is fully covered by explicit link \
-                             prefixes, so link {index} has nowhere to go",
+                            "the lab base '{}' has no free prefix for link {index}: \
+                             explicit link subnets cover it",
                             topology.lab.base
                         );
                     }
@@ -225,11 +232,22 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
                         })?;
                     next_link += 1;
                     let candidate = offset_addr(base, offset);
-                    if !claimed
+                    match claimed
                         .iter()
-                        .any(|(net, len)| overlaps((candidate, P2P_PREFIX), (*net, *len)))
+                        .find(|(net, len)| overlaps((candidate, P2P_PREFIX), (*net, *len)))
                     {
-                        break (candidate, P2P_PREFIX);
+                        None => break (candidate, P2P_PREFIX),
+                        Some((net, len)) => {
+                            // Jump past the whole claimed prefix rather than
+                            // stepping through it: a `/8` in the way is one
+                            // step, not four million.
+                            skips += 1;
+                            let size = host_capacity(*len).unwrap_or(u32::MAX);
+                            let past = u32::from(*net)
+                                .saturating_add(size)
+                                .saturating_sub(u32::from(base));
+                            next_link = next_link.max(past.div_ceil(2));
+                        }
                     }
                 }
             }
@@ -722,11 +740,34 @@ mod tests {
             ],
         );
 
+        // What matters is that it fails *fast* and names the base. Which of
+        // the two exhaustion messages it reaches depends on whether the jump
+        // past the claimed range runs off the end of the pool or lands inside
+        // it, and both are accurate.
         let err = allocate(&topology).expect_err("no prefix is available");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("fully covered"),
-            "the error must name the cause: {err}"
+            message.contains("0.0.0.0/0") || message.contains("no room"),
+            "the error must name the exhausted pool: {message}"
         );
+    }
+
+    #[test]
+    fn a_wide_explicit_prefix_does_not_exhaust_the_pool() {
+        // A `/24` claimed at the start of a `/16` covers far more consecutive
+        // /31s than there are links. Counting candidates rather than skips
+        // reported exhaustion here while almost the whole pool sat free.
+        let topology = topology(
+            &[("a", Role::FrrRouter), ("b", Role::FrrRouter)],
+            &[
+                ("a:eth1", "b:eth1", Some("10.0.0.0/24")),
+                ("a:eth2", "b:eth2", None),
+            ],
+        );
+
+        let plan = allocate(&topology).expect("there is room after the /24");
+        verify(&plan).expect("and the result is self-consistent");
+        assert_ne!(plan.links[0].subnet, plan.links[1].subnet);
     }
 
     #[test]

@@ -242,11 +242,28 @@ def _subnets(
     network = ipaddress.IPv4Network(base)
     if prefix < network.prefixlen:
         raise ValueError(f"cannot carve /{prefix} subnets out of {base}")
-    taken = skip or set()
-    for candidate in network.subnets(new_prefix=prefix):
-        if any(candidate.overlaps(claimed) for claimed in taken):
+    taken = sorted(skip or set(), key=lambda n: (int(n.network_address), n.prefixlen))
+
+    # Walked by address, not by iterating every subnet. A wide explicit prefix
+    # — a `/8` claimed inside a `/8` pool — made the naive filter examine
+    # 8,388,608 candidates before reporting exhaustion, which reads as a hang
+    # rather than an error. Skipping to the end of a claimed range costs one
+    # step regardless of its size.
+    step = 2 ** (32 - prefix)
+    current = int(network.network_address)
+    end = int(network.broadcast_address) + 1
+
+    while current < end:
+        candidate = IPv4Network((current, prefix))
+        covering = next((c for c in taken if candidate.overlaps(c)), None)
+        if covering is None:
+            yield candidate
+            current += step
             continue
-        yield candidate
+        # Jump past the whole claimed prefix, rounded up to the next candidate
+        # boundary so the walk stays aligned.
+        after = int(covering.broadcast_address) + 1
+        current = max(current + step, -(-after // step) * step)
 
 
 def _hosts(
