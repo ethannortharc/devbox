@@ -15,9 +15,6 @@ pub struct GlobalDefaults {
     #[serde(default = "default_runtime")]
     pub runtime: String,
 
-    #[serde(default = "default_layout")]
-    pub layout: String,
-
     #[serde(default)]
     pub tools: Vec<String>,
 }
@@ -26,7 +23,6 @@ impl Default for GlobalDefaults {
     fn default() -> Self {
         Self {
             runtime: default_runtime(),
-            layout: default_layout(),
             tools: vec![],
         }
     }
@@ -56,7 +52,6 @@ impl GlobalConfig {
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
             "default.runtime" => Some(self.default.runtime.clone()),
-            "default.layout" => Some(self.default.layout.clone()),
             "default.tools" => {
                 if self.default.tools.is_empty() {
                     Some(String::new())
@@ -77,9 +72,6 @@ impl GlobalConfig {
                 }
                 self.default.runtime = value.to_string();
             }
-            "default.layout" => {
-                self.default.layout = value.to_string();
-            }
             "default.tools" => {
                 self.default.tools = value
                     .split(',')
@@ -89,7 +81,7 @@ impl GlobalConfig {
             }
             _ => {
                 anyhow::bail!(
-                    "Unknown config key '{}'. Available keys: default.runtime, default.layout, default.tools",
+                    "Unknown config key '{}'. Available keys: default.runtime, default.tools",
                     key
                 );
             }
@@ -101,9 +93,6 @@ impl GlobalConfig {
 fn default_runtime() -> String {
     "auto".to_string()
 }
-fn default_layout() -> String {
-    "default".to_string()
-}
 
 #[cfg(test)]
 mod tests {
@@ -113,7 +102,6 @@ mod tests {
     fn default_global_config() {
         let config = GlobalConfig::default();
         assert_eq!(config.default.runtime, "auto");
-        assert_eq!(config.default.layout, "default");
         assert!(config.default.tools.is_empty());
     }
 
@@ -143,12 +131,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = GlobalConfig::default();
         config.set("default.runtime", "docker").unwrap();
-        config.set("default.layout", "ai-pair").unwrap();
         config.save(dir.path()).unwrap();
 
         let loaded = GlobalConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.default.runtime, "docker");
-        assert_eq!(loaded.default.layout, "ai-pair");
     }
 
     #[test]

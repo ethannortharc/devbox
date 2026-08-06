@@ -13,8 +13,8 @@ ordered work list, §17 the quality bar).
 | Phase | Title | Status |
 |---|---|---|
 | 0 | Foundations | **DONE** |
-| 1 | Web console: box management (retire TUI) | in progress |
-| 2 | On-demand build / selective sets | not started |
+| 1 | Web console: box management (retire TUI) | **DONE** |
+| 2 | On-demand build / selective sets | in progress |
 | 3 | Observability capture (Go agent + eBPF) | not started |
 | 4 | Observability presentation + behavior diff | not started |
 | 5 | Egress & activity control | not started |
@@ -90,3 +90,61 @@ and status pill.
 the full lifecycle (start/stop/create/destroy), add the browser terminal
 (xterm.js ↔ WebSocket ↔ PTY), migrate the cheat sheets into a Help view, then
 remove `src/tui/` and drop Zellij from the default `shell` set.
+
+---
+
+## 2026-08-06T07:00Z — Phase 1 DONE
+
+**Landed**
+
+- **Box detail page** (`/boxes/{name}`) with Overview / Files / Terminal tabs;
+  an unknown tab falls back to Overview rather than 404ing.
+- **Full lifecycle from the browser**: `POST /api/boxes/{name}/{start,stop,
+  destroy}`. Each action re-renders the box card so button state can never
+  disagree with the status beside it. Destroy keeps the CLI's
+  uncommitted-overlay guard and sends the detail page back to the dashboard via
+  `HX-Redirect`.
+- **Browser terminal**: xterm.js ↔ WebSocket ↔ a real pty
+  (`portable-pty`). Keystrokes and output are binary frames so no byte is
+  mangled by UTF-8 validation; resize is a JSON control frame driving
+  `TIOCSWINSZ`. New `Runtime::interactive_argv` gives the web layer the
+  host-side argv without moving pty ownership into the runtime abstraction.
+- **Lazy start** (§6.3): opening the Terminal tab, or the terminal socket,
+  starts a stopped box.
+- **Files tab**: overlay diff rendered live, degrading to "nothing to show"
+  (never a 500) when the box is stopped, the runtime is missing, or the overlay
+  was never provisioned.
+- **Help view**: all 13 cheat sheets rendered from the same embedded markdown
+  `devbox guide` serves, via `pulldown-cmark`. Nothing was lost in the move.
+- **TUI + Zellij retired by replacement** (ADR-0009): `src/tui/`,
+  `devbox layout`, `devbox packages`, `layouts/*.kdl`, the `layout` field
+  everywhere, and the `ratatui`/`crossterm`/`dialoguer`/`indicatif`
+  dependencies are gone. `zellij` left the default `shell` Nix set; its cheat
+  sheet stays, marked optional. Old `state.json` files still load.
+- Bare `devbox` now ensures a box for the cwd and opens the console on it
+  (ADR-0005 resolved); `devbox shell` remains the browser-free path.
+- **DNS-rebinding guard** (ADR-0010): non-loopback `Host` headers get 421.
+- `DEVBOX_DOCKER_IMAGE` overrides the Docker base image (ADR-0011).
+
+**Gate** — all green:
+
+```
+cargo fmt --check                            ok
+cargo clippy --all-targets -- -D warnings    ok
+cargo test                                   112 unit + 15 cli + 21 console
+                                             + 1 docker e2e = 149 passed
+go vet ./... && go test ./...                ok (3 packages)
+gofmt -l agent ztpd internal                 clean
+```
+
+**e2e evidence** — `tests/e2e_docker.rs` builds a busybox-based image, creates a
+real container through `Runtime`, serves the console on an ephemeral port, and
+drives it end to end: list → stop → start (asserting the *runtime's* state each
+time, not just the HTML) → detail → files → **a real pty over a real
+WebSocket** (asserts a marker echoed back from `sh`) → destroy → gone from
+state. It skips rather than fails when Docker is absent.
+
+**Next step** — Phase 2: turn the create/edit form into a set/language/package
+checklist, compose `configuration.nix` from the selection, run the rebuild, and
+stream progress over SSE. Unit-test the nix-composition logic first
+(`src/nix/sets.rs` already has the set catalogue).

@@ -13,9 +13,22 @@ impl DockerRuntime {
         format!("devbox-{name}")
     }
 
-    /// Base NixOS Docker image name.
-    fn image_name() -> &'static str {
-        "devbox-nixos:latest"
+    /// Default base image for Docker boxes.
+    pub const DEFAULT_IMAGE: &'static str = "devbox-nixos:latest";
+
+    /// Environment variable that overrides the base image.
+    pub const IMAGE_ENV: &str = "DEVBOX_DOCKER_IMAGE";
+
+    /// Base image for Docker boxes.
+    ///
+    /// Overridable so an e2e run (or anyone with their own base image) can
+    /// point at something other than the NixOS image, which has to be built
+    /// locally and is not on any registry.
+    fn image_name() -> String {
+        std::env::var(Self::IMAGE_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_IMAGE.to_string())
     }
 }
 
@@ -92,7 +105,7 @@ impl Runtime for DockerRuntime {
         args.push("devbox=true".to_string());
 
         // Image
-        args.push(Self::image_name().to_string());
+        args.push(Self::image_name());
 
         println!("Creating Docker container '{container}'...");
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -131,6 +144,17 @@ impl Runtime for DockerRuntime {
             args.extend_from_slice(cmd);
             run_cmd("docker", &args).await
         }
+    }
+
+    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "docker".to_string(),
+            "exec".to_string(),
+            "-it".to_string(),
+            Self::container_name(name),
+        ];
+        argv.extend(cmd.iter().map(|s| s.to_string()));
+        argv
     }
 
     async fn destroy(&self, name: &str) -> Result<()> {
@@ -250,5 +274,14 @@ mod tests {
     #[test]
     fn image_name_is_set() {
         assert_eq!(DockerRuntime::image_name(), "devbox-nixos:latest");
+    }
+
+    #[test]
+    fn interactive_argv_allocates_a_tty() {
+        let argv = DockerRuntime.interactive_argv("myapp", &["zsh", "-l"]);
+        assert_eq!(
+            argv,
+            vec!["docker", "exec", "-it", "devbox-myapp", "zsh", "-l"]
+        );
     }
 }

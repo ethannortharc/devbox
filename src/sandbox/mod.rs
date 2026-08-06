@@ -128,7 +128,6 @@ impl SandboxManager {
             env_file,
             sets: config.active_sets(),
             tools: vec![],
-            layout: config.sandbox.layout.clone(),
             bare,
             writable: config.sandbox.mount_mode == "writable",
             image: config.sandbox.image.clone(),
@@ -163,7 +162,6 @@ impl SandboxManager {
             project_dir: cwd,
             created_at: info.created_at.unwrap_or_default(),
             mount_mode: config.sandbox.mount_mode.clone(),
-            layout: config.sandbox.layout.clone(),
             sets: config.active_sets(),
             languages: config.active_languages(),
             image: config.sandbox.image.clone(),
@@ -178,14 +176,13 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Attach to a sandbox (start if stopped, then launch Zellij or shell).
-    /// If `force_new_session` is true, any existing zellij session is killed first.
-    pub async fn attach(
-        &self,
-        name: &str,
-        layout_override: Option<&str>,
-        force_new_session: bool,
-    ) -> Result<()> {
+    /// Attach to a sandbox: start it if stopped, then hand the user a shell.
+    ///
+    /// v3 launched a Zellij session here. v4 retires the multiplexer from the
+    /// default path (§5): the console is the multi-pane experience now, and
+    /// `devbox shell` is a plain, predictable login shell. Anyone who wants a
+    /// multiplexer can still install and run one inside the box.
+    pub async fn attach(&self, name: &str) -> Result<()> {
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
 
@@ -228,121 +225,9 @@ impl SandboxManager {
             Self::check_and_prompt_refresh(runtime.as_ref(), name).await;
         }
 
-        // Determine layout: CLI flag > saved state > "default"
-        let layout = layout_override
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| state.layout.clone());
-
-        // "plain" layout = raw shell, no Zellij
-        if layout == "plain" {
-            println!("Attaching to sandbox '{name}'...");
-            let shell = Self::probe_shell(runtime.as_ref(), name).await;
-            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
-            return Ok(());
-        }
-
-        // Check if Zellij is available in the VM
-        let zellij_check = runtime.exec_cmd(name, &["which", "zellij"], false).await;
-        let has_zellij = zellij_check.is_ok() && zellij_check.unwrap().exit_code == 0;
-
-        if !has_zellij {
-            // No Zellij — fall back to raw shell
-            println!("Attaching to sandbox '{name}'...");
-            let shell = Self::probe_shell(runtime.as_ref(), name).await;
-            runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
-            return Ok(());
-        }
-
-        // Check for layout preference in VM (user set via management panel or `devbox layout save`)
-        // Priority: CLI --layout flag > layout preference in VM > state default > built-in default
-        // Use $HOME inside the VM to resolve the correct path regardless of username.
-        let layout_pref = if layout_override.is_some() {
-            // Explicit --layout flag always wins
-            None
-        } else {
-            // Check for layout preference file (contains layout name, not raw KDL)
-            let check = runtime
-                .exec_cmd(
-                    name,
-                    &[
-                        "bash",
-                        "-c",
-                        "f=\"$HOME/.config/devbox/layout-preference\"; [ -f \"$f\" ] && cat \"$f\"",
-                    ],
-                    false,
-                )
-                .await;
-            match check {
-                Ok(ref r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-                    let pref = r.stdout.trim().to_string();
-                    if !pref.is_empty() { Some(pref) } else { None }
-                }
-                _ => None,
-            }
-        };
-
-        // Use preference as the layout name, falling back to state/default
-        let effective_layout = layout_pref.unwrap_or(layout);
-
-        // Always use the template layout (with command directives) — never raw dump-layout
-        let layout_content = crate::tui::lookup_layout_kdl(&effective_layout);
-        Self::push_layout_to_vm(runtime.as_ref(), name, &effective_layout, layout_content).await?;
-
-        let layout_path = format!("/tmp/devbox-layout-{effective_layout}.kdl");
-        let session_name = format!("devbox-{name}");
-
-        // Always clean up dead sessions first, then check for alive ones.
-        // `zellij delete-all-sessions` removes only dead (EXITED) sessions.
-        let _ = runtime
-            .exec_cmd(name, &["zellij", "delete-all-sessions", "-y"], false)
-            .await;
-
-        if force_new_session {
-            // Kill the live session so we can start fresh
-            let kill_cmd = format!("zellij kill-session {session_name} 2>/dev/null; true");
-            let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &kill_cmd], false)
-                .await;
-        }
-
-        // Check if a live session exists
-        let list_cmd = format!("zellij list-sessions 2>/dev/null | grep -q '{session_name}'");
-        let session_alive = runtime
-            .exec_cmd(name, &["bash", "-c", &list_cmd], false)
-            .await
-            .map(|r| r.exit_code == 0)
-            .unwrap_or(false);
-
-        if session_alive {
-            // Reattach to existing live session
-            println!("Reattaching to sandbox '{name}'...");
-            runtime
-                .exec_cmd(name, &["zellij", "attach", &session_name], true)
-                .await?;
-        } else {
-            // Create new named session with layout.
-            // Write a zellij config that sets the session name,
-            // then launch with the layout file.
-            let config_content = format!("session_name \"{session_name}\"\n");
-            let config_path = format!("/tmp/devbox-zellij-{name}.kdl");
-            let write_cfg = format!(
-                "echo '{}' > {}",
-                config_content.replace('\'', "'\\''"),
-                config_path,
-            );
-            let _ = runtime
-                .exec_cmd(name, &["bash", "-c", &write_cfg], false)
-                .await;
-
-            println!("Attaching to sandbox '{name}' (layout: {effective_layout})...");
-            runtime
-                .exec_cmd(
-                    name,
-                    &["zellij", "--config", &config_path, "--layout", &layout_path],
-                    true,
-                )
-                .await?;
-        }
+        println!("Attaching to sandbox '{name}'...");
+        let shell = Self::probe_shell(runtime.as_ref(), name).await;
+        runtime.exec_cmd(name, &[&shell, "-l"], true).await?;
         Ok(())
     }
 
@@ -413,19 +298,33 @@ impl SandboxManager {
         }
     }
 
-    /// Push a Zellij layout KDL file into the VM at /tmp/.
-    async fn push_layout_to_vm(
-        runtime: &dyn crate::runtime::Runtime,
-        name: &str,
-        layout_name: &str,
-        content: &str,
-    ) -> Result<()> {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        let path = format!("/tmp/devbox-layout-{layout_name}.kdl");
-        let cmd = format!("echo '{encoded}' | base64 -d > {path}");
-        runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
-        Ok(())
+    /// Ensure a box exists for the current directory, creating one if needed.
+    ///
+    /// Returns the box's name. This is the half of the old `create_or_attach`
+    /// that v4 still wants: the "attach" half is now the console (§5).
+    pub async fn ensure_box_for_cwd(&self, tools: Option<&[String]>) -> Result<String> {
+        let cwd = env::current_dir().context("Cannot determine current directory")?;
+        let name = self.name_from_dir(&cwd);
+
+        if !self.sandbox_exists(&name) {
+            let runtime = self.resolve_runtime(None)?;
+            let mut config = self.generate_config(&cwd);
+            if let Some(t) = tools {
+                config.apply_tools(t);
+            }
+            self.create_sandbox(
+                &name,
+                runtime.as_ref(),
+                &config,
+                &[],
+                &HashMap::new(),
+                None,
+                false,
+            )
+            .await?;
+        }
+
+        Ok(name)
     }
 
     /// Smart default: if a sandbox exists for the current directory, attach.
@@ -435,7 +334,7 @@ impl SandboxManager {
         let name = self.name_from_dir(&cwd);
 
         if self.sandbox_exists(&name) {
-            self.attach(&name, None, false).await
+            self.attach(&name).await
         } else {
             let runtime = self.resolve_runtime(None)?;
             let mut config = self.generate_config(&cwd);
@@ -452,7 +351,7 @@ impl SandboxManager {
                 false,
             )
             .await?;
-            self.attach(&name, None, false).await
+            self.attach(&name).await
         }
     }
 
@@ -662,13 +561,10 @@ impl SandboxManager {
         config.languages.ruby = detected.ruby;
 
         // Apply global defaults if available
-        if let Ok(global) = self.load_global_config() {
-            if global.default.runtime != "auto" {
-                config.sandbox.runtime = global.default.runtime;
-            }
-            if global.default.layout != "default" {
-                config.sandbox.layout = global.default.layout;
-            }
+        if let Ok(global) = self.load_global_config()
+            && global.default.runtime != "auto"
+        {
+            config.sandbox.runtime = global.default.runtime;
         }
 
         config

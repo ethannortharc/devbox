@@ -16,6 +16,7 @@
       <a class="brand" href="/">devbox <span class="v">v{{ version }}</span></a>
       <nav class="nav">
         <a href="/" {% if nav == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+        <a href="/help" {% if nav == "help" %}aria-current="page"{% endif %}>Help</a>
       </nav>
       <span class="spacer"></span>
       <span class="pulse" id="pulse">

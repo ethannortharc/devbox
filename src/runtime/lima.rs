@@ -230,6 +230,19 @@ impl Runtime for LimaRuntime {
         }
     }
 
+    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "limactl".to_string(),
+            "shell".to_string(),
+            "--workdir".to_string(),
+            "/home".to_string(),
+            Self::vm_name(name),
+            "--".to_string(),
+        ];
+        argv.extend(cmd.iter().map(|s| s.to_string()));
+        argv
+    }
+
     async fn destroy(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         // Stop first if running (ignore errors)
@@ -407,7 +420,6 @@ mod tests {
             env_file: None,
             sets: vec![],
             tools: vec![],
-            layout: "default".to_string(),
             bare: false,
             writable: false,
             image: "nixos".to_string(),
@@ -435,7 +447,6 @@ mod tests {
             env_file: None,
             sets: vec![],
             tools: vec![],
-            layout: "default".to_string(),
             bare: false,
             writable: false,
             image: "nixos".to_string(),
@@ -472,7 +483,6 @@ mod tests {
             env_file: None,
             sets: vec![],
             tools: vec![],
-            layout: "default".to_string(),
             bare: false,
             writable: false,
             image: "ubuntu".to_string(),
@@ -497,7 +507,6 @@ mod tests {
             env_file: None,
             sets: vec![],
             tools: vec![],
-            layout: "default".to_string(),
             bare: false,
             writable: false,
             image: "nixos".to_string(),
@@ -508,5 +517,23 @@ mod tests {
         assert!(yaml.contains("x86_64"));
         // Should NOT contain ubuntu
         assert!(!yaml.contains("ubuntu"));
+    }
+
+    #[test]
+    fn interactive_argv_targets_the_vm() {
+        let argv = LimaRuntime.interactive_argv("myapp", &["zsh", "-l"]);
+        assert_eq!(
+            argv,
+            vec![
+                "limactl",
+                "shell",
+                "--workdir",
+                "/home",
+                "devbox-myapp",
+                "--",
+                "zsh",
+                "-l"
+            ]
+        );
     }
 }

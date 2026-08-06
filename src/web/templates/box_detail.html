@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}devbox — {{ boxinfo.name }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ boxinfo.name }}</h1>
+  <span class="sub">{{ boxinfo.runtime }} · {{ boxinfo.image }}</span>
+  <span class="spacer"></span>
+  <a class="btn" href="/">← all boxes</a>
+</div>
+
+<div class="detail">
+  {% call m::box_card(boxinfo) %}{% endcall %}
+
+  <section class="panel">
+    <nav class="tabs">
+      <a href="/boxes/{{ boxinfo.name }}?tab=overview"
+         {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
+      <a href="/boxes/{{ boxinfo.name }}?tab=files"
+         {% if tab == "files" %}aria-current="page"{% endif %}>Files</a>
+      <a href="/boxes/{{ boxinfo.name }}?tab=terminal"
+         {% if tab == "terminal" %}aria-current="page"{% endif %}>Terminal</a>
+    </nav>
+
+    <div class="tabpanel">
+      {% if tab == "overview" %}
+      <dl class="meta wide">
+        <dt>status</dt>
+        <dd>{{ boxinfo.status }}</dd>
+        <dt>runtime</dt>
+        <dd>{{ boxinfo.runtime }}</dd>
+        <dt>image</dt>
+        <dd>{{ boxinfo.image }}</dd>
+        <dt>mount mode</dt>
+        <dd>{{ boxinfo.mount_mode }}</dd>
+        <dt>project</dt>
+        <dd>{{ boxinfo.project_dir }}</dd>
+        <dt>created</dt>
+        <dd>{{ boxinfo.created_at }}</dd>
+        <dt>sets</dt>
+        <dd>{% if boxinfo.sets.is_empty() %}—{% else %}{{ boxinfo.sets|join(", ") }}{% endif %}</dd>
+        <dt>languages</dt>
+        <dd>{% if boxinfo.languages.is_empty() %}—{% else %}{{ boxinfo.languages|join(", ") }}{% endif %}</dd>
+      </dl>
+
+      {% elif tab == "files" %}
+      <p class="muted">
+        Changes written inside the box, on top of the read-only host mount.
+        Nothing here has touched your project directory yet.
+      </p>
+      <div id="files"
+           hx-get="/api/boxes/{{ boxinfo.name }}/files"
+           hx-trigger="load, every 5s">
+        <p class="muted">Loading…</p>
+      </div>
+
+      {% elif tab == "terminal" %}
+      <p class="muted">
+        A shell inside the box. The box starts automatically if it is stopped.
+      </p>
+      <div id="terminal"
+           class="terminal"
+           data-box="{{ boxinfo.name }}"
+           data-endpoint="/api/boxes/{{ boxinfo.name }}/term"></div>
+      <p class="muted" id="term-status">connecting…</p>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block head %}
+{% if tab == "terminal" %}
+<link rel="stylesheet" href="/assets/css/xterm.css" />
+<script src="/assets/js/xterm.js"></script>
+<script src="/assets/js/xterm-addon-fit.js"></script>
+<script src="/assets/js/term.js" defer></script>
+{% endif %}
+{% endblock %}

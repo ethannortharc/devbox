@@ -18,7 +18,7 @@ pub static TOOL_SETS: &[ToolSet] = &[
     },
     ToolSet {
         name: "shell",
-        description: "Terminal & Shell (zellij, zsh, starship, fzf, yazi, micro...)",
+        description: "Terminal & Shell (zsh, starship, fzf, zoxide, yazi, micro...)",
         package_count: 11,
         locked: true,
     },

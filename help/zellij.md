@@ -1,5 +1,9 @@
 # Zellij — Terminal Multiplexer
 
+> Optional since v4. The web console replaced the tiled-pane workflow, so
+> `zellij` is no longer in the default `shell` set. Install it inside a box
+> with `devbox nix add zellij` if you still want a multiplexer there.
+
 ## Essential Keys (Zellij uses a leader key: Ctrl+<key>)
   Ctrl+p → Pane mode      Ctrl+t → Tab mode
   Ctrl+n → Resize mode    Ctrl+s → Scroll mode

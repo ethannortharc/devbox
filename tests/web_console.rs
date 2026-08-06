@@ -32,7 +32,6 @@ fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
             project_dir: PathBuf::from(format!("/tmp/projects/{name}")),
             created_at: "2026-08-06T00:00:00Z".to_string(),
             mount_mode: "overlay".to_string(),
-            layout: "default".to_string(),
             sets: vec!["system".into(), "git".into()],
             languages: vec!["rust".into()],
             image: "nixos".to_string(),
@@ -48,13 +47,30 @@ fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
     (dir, router)
 }
 
+/// A request with a loopback `Host`, which every real browser request carries
+/// and the console requires (the DNS-rebinding guard).
 fn get(uri: &str) -> Request<Body> {
-    Request::builder().uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn get_authed(uri: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_authed(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
         .header(header::COOKIE, format!("devbox_console={TOKEN}"))
         .body(Body::empty())
         .unwrap()
@@ -115,6 +131,31 @@ async fn launch_token_preserves_other_query_parameters() {
         res.headers().get(header::LOCATION).unwrap(),
         "/?tab=activity"
     );
+}
+
+#[tokio::test]
+async fn a_rebound_host_name_is_refused() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    // An attacker pointing evil.example at 127.0.0.1 reaches the socket, but
+    // the Host header still names them — and that is what we reject.
+    let req = Request::builder()
+        .uri("/")
+        .header(header::HOST, "evil.example:7878")
+        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::MISDIRECTED_REQUEST);
+}
+
+#[tokio::test]
+async fn a_request_with_no_host_header_is_refused() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::MISDIRECTED_REQUEST);
 }
 
 #[tokio::test]
@@ -207,6 +248,123 @@ async fn api_requires_a_token_too() {
     let (_dir, app) = console_with_boxes(&["alpha"]);
     let res = app.oneshot(get("/api/boxes")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── box detail ───────────────────────────────────────────
+
+#[tokio::test]
+async fn box_detail_renders_each_tab() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for (query, needle) in [
+        ("", "mount mode"),
+        ("?tab=files", "/api/boxes/alpha/files"),
+        ("?tab=overview", "mount mode"),
+        // An unknown tab falls back to overview rather than 404ing.
+        ("?tab=bogus", "mount mode"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(get_authed(&format!("/boxes/alpha{query}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "tab query {query:?}");
+        let html = body_string(res).await;
+        assert!(html.contains(needle), "tab {query:?} missing {needle}");
+        assert!(html.contains("alpha"));
+    }
+}
+
+#[tokio::test]
+async fn box_detail_404s_for_an_unknown_box() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app.oneshot(get_authed("/boxes/ghost")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn overlay_changes_fragment_renders_for_a_box_that_is_not_running() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_authed("/api/boxes/alpha/files"))
+        .await
+        .unwrap();
+
+    // The runtime is unavailable, so there is nothing to diff — the tab must
+    // still render rather than error.
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(body_string(res).await.contains("No uncommitted changes"));
+}
+
+// ── lifecycle ────────────────────────────────────────────
+
+#[tokio::test]
+async fn lifecycle_actions_report_a_conflict_when_the_runtime_is_missing() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for action in ["start", "stop", "destroy"] {
+        let res = app
+            .clone()
+            .oneshot(post_authed(&format!("/api/boxes/alpha/{action}")))
+            .await
+            .unwrap();
+        // "test-null" is not a real runtime, so every action fails — but with
+        // an actionable 409 and an explanatory body, never a 500 or a panic.
+        assert_eq!(
+            res.status(),
+            StatusCode::CONFLICT,
+            "{action} should report a conflict"
+        );
+        assert!(body_string(res).await.contains("alpha"));
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_actions_require_a_token() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/boxes/alpha/destroy")
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── help ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn help_index_lists_topics() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app.oneshot(get_authed("/help")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let html = body_string(res).await;
+    assert!(html.contains("href=\"/help/lazygit\""));
+    assert!(html.contains("href=\"/help/git\""));
+    assert!(html.contains("cheat sheets"));
+}
+
+#[tokio::test]
+async fn help_topic_renders_markdown_as_html() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app.oneshot(get_authed("/help/git")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let html = body_string(res).await;
+    assert!(
+        html.contains("<h1>"),
+        "markdown must be rendered, not escaped"
+    );
+    assert!(html.contains("class=\"prose\""));
+}
+
+#[tokio::test]
+async fn help_topic_404s_for_an_unknown_sheet() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app.oneshot(get_authed("/help/nonexistent")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 // ── sse ──────────────────────────────────────────────────

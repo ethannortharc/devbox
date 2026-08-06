@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use devbox::cli::Cli;
 use devbox::sandbox::SandboxManager;
+use devbox::web::{WebOptions, serve};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -12,12 +15,29 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(cmd) => cmd.run(&manager).await,
-        None => {
-            // Smart default: create-or-attach
-            let tools = cli.tools.as_deref();
-            manager.create_or_attach(tools).await
-        }
+        None => open_console_for_cwd(&manager, cli.tools.as_deref()).await,
     }
+}
+
+/// Bare `devbox`: make sure this project has a box, then open the console on
+/// it (§5 — the console replaces the Zellij attach as the default experience).
+///
+/// `devbox shell` is still the way to get a terminal without a browser, so
+/// nothing is lost for headless use.
+async fn open_console_for_cwd(manager: &SandboxManager, tools: Option<&[String]>) -> Result<()> {
+    let name = manager.ensure_box_for_cwd(tools).await?;
+    let manager = Arc::new(SandboxManager {
+        state_dir: manager.state_dir.clone(),
+    });
+
+    serve(
+        manager,
+        WebOptions {
+            landing: format!("/boxes/{name}"),
+            ..WebOptions::default()
+        },
+    )
+    .await
 }
 
 /// Structured logging, off unless asked for.

@@ -19,5 +19,4 @@ pub mod nix;
 pub mod runtime;
 pub mod sandbox;
 pub mod tools;
-pub mod tui;
 pub mod web;

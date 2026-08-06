@@ -25,6 +25,9 @@ pub struct WebOptions {
     pub port: u16,
     /// Open the console in the default browser once it is listening.
     pub open: bool,
+    /// Path the opened URL lands on. Bare `devbox` in a project directory
+    /// lands on that project's box rather than the dashboard.
+    pub landing: String,
 }
 
 impl Default for WebOptions {
@@ -32,6 +35,7 @@ impl Default for WebOptions {
         Self {
             port: DEFAULT_PORT,
             open: true,
+            landing: "/".to_string(),
         }
     }
 }
@@ -64,12 +68,20 @@ pub async fn bind_loopback(start: u16, scan: u16) -> Result<(TcpListener, Socket
 }
 
 /// The URL to hand the user, carrying the one-time token.
-pub fn console_url(addr: &SocketAddr, token: &str) -> String {
+///
+/// `landing` is a path such as `/` or `/boxes/myapp`; the token rides as a
+/// query parameter and is exchanged for a cookie on the first request.
+pub fn console_url(addr: &SocketAddr, token: &str, landing: &str) -> String {
+    let path = if landing.starts_with('/') {
+        landing
+    } else {
+        "/"
+    };
+    let sep = if path.contains('?') { '&' } else { '?' };
     format!(
-        "http://{}:{}/?t={}",
+        "http://{}:{}{path}{sep}t={token}",
         Ipv4Addr::LOCALHOST,
-        addr.port(),
-        token
+        addr.port()
     )
 }
 
@@ -100,7 +112,7 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
     tokio::spawn(super::watch::run(state));
 
     let (listener, addr) = bind_loopback(opts.port, PORT_SCAN).await?;
-    let url = console_url(&addr, &token);
+    let url = console_url(&addr, &token, &opts.landing);
 
     println!("devbox console  →  {url}");
     println!("  bound to loopback only; press Ctrl-C to stop");
@@ -135,8 +147,31 @@ mod tests {
     fn console_url_includes_loopback_port_and_token() {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
         assert_eq!(
-            console_url(&addr, "tok"),
-            "http://127.0.0.1:7878/?t=tok".to_string()
+            console_url(&addr, "tok", "/"),
+            "http://127.0.0.1:7878/?t=tok"
+        );
+    }
+
+    #[test]
+    fn console_url_lands_on_a_specific_box() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
+        assert_eq!(
+            console_url(&addr, "tok", "/boxes/myapp"),
+            "http://127.0.0.1:7878/boxes/myapp?t=tok"
+        );
+        assert_eq!(
+            console_url(&addr, "tok", "/boxes/myapp?tab=terminal"),
+            "http://127.0.0.1:7878/boxes/myapp?tab=terminal&t=tok"
+        );
+    }
+
+    #[test]
+    fn a_landing_path_that_is_not_a_path_falls_back_to_the_dashboard() {
+        // Guards against a box name ever being spliced in as a full URL.
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
+        assert_eq!(
+            console_url(&addr, "tok", "https://evil.example/"),
+            "http://127.0.0.1:7878/?t=tok"
         );
     }
 

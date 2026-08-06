@@ -100,6 +100,18 @@ impl Runtime for MultipassRuntime {
         }
     }
 
+    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String> {
+        // `multipass exec` does not allocate a tty; `multipass shell` does, but
+        // only for a login shell. The browser terminal always asks for a
+        // shell, so route through `shell` and ignore the requested argv.
+        let _ = cmd;
+        vec![
+            "multipass".to_string(),
+            "shell".to_string(),
+            Self::vm_name(name),
+        ]
+    }
+
     async fn destroy(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         // Stop first (ignore errors)
@@ -228,5 +240,11 @@ mod tests {
     #[test]
     fn vm_name_prefix() {
         assert_eq!(MultipassRuntime::vm_name("myapp"), "devbox-myapp");
+    }
+
+    #[test]
+    fn interactive_argv_uses_shell_because_exec_has_no_tty() {
+        let argv = MultipassRuntime.interactive_argv("myapp", &["zsh", "-l"]);
+        assert_eq!(argv, vec!["multipass", "shell", "devbox-myapp"]);
     }
 }

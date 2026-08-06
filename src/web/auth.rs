@@ -93,8 +93,43 @@ pub fn is_public(path: &str) -> bool {
     path.starts_with("/assets/") || path == "/healthz" || path == "/favicon.ico"
 }
 
-/// Axum middleware enforcing the token on every non-public route.
+/// Whether a `Host` header names this machine's loopback interface.
+///
+/// This is the DNS-rebinding guard. An attacker's page cannot read our
+/// responses cross-origin and cannot send our `SameSite=Strict` cookie, but it
+/// *can* point its own hostname at `127.0.0.1` and issue requests that the
+/// browser considers same-origin with the attacker. Requiring a loopback
+/// `Host` closes that door: `evil.example` never appears here, whatever it
+/// resolves to.
+pub fn is_loopback_host(host: &str) -> bool {
+    // Strip the port, tolerating a bracketed IPv6 literal.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+
+    name.eq_ignore_ascii_case("localhost")
+        || name == "127.0.0.1"
+        || name == "::1"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Axum middleware enforcing the loopback host and the token on every
+/// non-public route.
 pub async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    // Applies to public paths too: even a stylesheet should not be reachable
+    // through a rebound hostname, and rejecting early keeps the rule simple.
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_loopback_host);
+    if !host_ok {
+        return wrong_host();
+    }
+
     let path = req.uri().path();
     if is_public(path) {
         return next.run(req).await;
@@ -130,6 +165,14 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
     }
 
     unauthorized()
+}
+
+fn wrong_host() -> Response {
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        "the devbox console only answers to a loopback host name",
+    )
+        .into_response()
 }
 
 fn unauthorized() -> Response {
@@ -208,5 +251,36 @@ mod tests {
         assert!(!is_public("/api/boxes"));
         // A path that merely mentions assets must not slip through.
         assert!(!is_public("/api/assets/js"));
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognized() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:7878",
+            "localhost",
+            "localhost:7878",
+            "LocalHost:7878",
+            "[::1]:7878",
+            "127.0.0.5:7878",
+        ] {
+            assert!(is_loopback_host(host), "{host} should be loopback");
+        }
+    }
+
+    #[test]
+    fn rebound_hosts_are_rejected() {
+        // A DNS-rebinding attacker resolves their own name to 127.0.0.1; the
+        // Host header still carries their name, which is what we reject.
+        for host in [
+            "evil.example",
+            "evil.example:7878",
+            "192.168.1.10:7878",
+            "0.0.0.0:7878",
+            "localhost.evil.example",
+            "",
+        ] {
+            assert!(!is_loopback_host(host), "{host} must not pass");
+        }
     }
 }

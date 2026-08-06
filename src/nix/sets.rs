@@ -41,7 +41,6 @@ pub static NIX_SETS: &[NixSet] = &[
     NixSet {
         name: "shell",
         packages: &[
-            "zellij",
             "zsh",
             "zsh-autosuggestions",
             "zsh-syntax-highlighting",

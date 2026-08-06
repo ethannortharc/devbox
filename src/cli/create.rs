@@ -54,7 +54,6 @@ pub struct CreateArgs {
     #[arg(long)]
     pub bare: bool,
 
-    /// Zellij layout to use
     #[arg(long)]
     pub layout: Option<String>,
 
@@ -122,9 +121,6 @@ pub async fn run(args: CreateArgs, manager: &SandboxManager) -> Result<()> {
     if !args.memory.is_empty() {
         config.resources.memory = args.memory.clone();
     }
-    if let Some(layout) = &args.layout {
-        config.sandbox.layout = layout.clone();
-    }
     if args.writable {
         config.sandbox.mount_mode = "writable".to_string();
     }
@@ -165,7 +161,7 @@ pub async fn run(args: CreateArgs, manager: &SandboxManager) -> Result<()> {
         .await?;
 
     // Attach immediately after create
-    manager.attach(&name, None, false).await
+    manager.attach(&name).await
 }
 
 fn parse_mounts(mounts: &[String]) -> Result<Vec<Mount>> {

@@ -34,7 +34,6 @@ pub async fn run(args: StatusArgs, manager: &SandboxManager) -> Result<()> {
     println!("Image:       {}", state.image);
     println!("Project:     {}", state.project_dir.display());
     println!("Mount mode:  {}", state.mount_mode);
-    println!("Layout:      {}", state.layout);
     println!("Created:     {}", state.created_at);
 
     if !state.sets.is_empty() {

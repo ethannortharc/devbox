@@ -32,6 +32,7 @@ pub async fn run(args: WebArgs, manager: &SandboxManager) -> Result<()> {
         WebOptions {
             port: args.port,
             open: !args.no_open,
+            landing: "/".to_string(),
         },
     )
     .await

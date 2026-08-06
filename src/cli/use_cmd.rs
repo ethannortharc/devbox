@@ -43,7 +43,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
                 cwd.display(),
                 mount_mode
             );
-            return manager.attach(name, None, false).await;
+            return manager.attach(name).await;
         }
     }
 
@@ -94,5 +94,5 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     state.save(&manager.state_dir)?;
 
     println!("Sandbox '{}' updated. Attaching...", name);
-    manager.attach(name, None, false).await
+    manager.attach(name).await
 }

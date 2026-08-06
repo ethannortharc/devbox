@@ -70,7 +70,6 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
     match manager.load_global_config() {
         Ok(config) => {
             println!("  Runtime:  {}", config.default.runtime);
-            println!("  Layout:   {}", config.default.layout);
             if config.default.tools.is_empty() {
                 println!("  Tools:    (none)");
             } else {
@@ -96,15 +95,6 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
 
     // Supporting tools
     println!("\nSupporting tools:");
-    check_binary_with_install(
-        "  Zellij",
-        "zellij",
-        if os == "macos" {
-            "brew install zellij"
-        } else {
-            "cargo install zellij  # or: https://zellij.dev/documentation/installation"
-        },
-    );
     check_binary_with_install(
         "  Nix",
         "nix",

@@ -64,10 +64,6 @@ fn generate_commented_toml(
         config.sandbox.runtime
     ));
     s.push_str(&format!(
-        "layout = \"{}\"         # Default zellij layout\n",
-        config.sandbox.layout
-    ));
-    s.push_str(&format!(
         "mount_mode = \"{}\"     # \"overlay\" = safe (host read-only) | \"writable\" = direct\n",
         config.sandbox.mount_mode
     ));

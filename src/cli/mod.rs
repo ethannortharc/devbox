@@ -10,10 +10,8 @@ pub mod exec;
 pub mod help;
 pub mod init;
 pub mod layer;
-pub mod layout;
 pub mod list;
 pub mod nix_cmd;
-pub mod packages;
 pub mod prune;
 pub mod reprovision;
 pub mod self_update;
@@ -99,12 +97,6 @@ pub enum Command {
     /// Diagnose issues
     Doctor(doctor::DoctorArgs),
 
-    /// Manage Zellij layouts
-    Layout(layout::LayoutArgs),
-
-    /// Open TUI package manager
-    Packages(packages::PackagesArgs),
-
     /// Remove all stopped sandboxes
     Prune(prune::PruneArgs),
 
@@ -161,8 +153,6 @@ impl Command {
             Command::Upgrade(args) => upgrade::run(args, manager).await,
             Command::Config(args) => config::run(args, manager).await,
             Command::Doctor(args) => doctor::run(args, manager).await,
-            Command::Layout(args) => layout::run(args, manager).await,
-            Command::Packages(args) => packages::run(args, manager).await,
             Command::Prune(args) => prune::run(args, manager).await,
             Command::Init(args) => init::run(args, manager).await,
             Command::Nix(args) => nix_cmd::run(args, manager).await,

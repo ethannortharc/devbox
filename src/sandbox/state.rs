@@ -11,7 +11,6 @@ pub struct SandboxState {
     pub project_dir: PathBuf,
     pub created_at: String,
     pub mount_mode: String,
-    pub layout: String,
     pub sets: Vec<String>,
     pub languages: Vec<String>,
     /// Base image type: "nixos" or "ubuntu"
@@ -90,7 +89,6 @@ mod tests {
             project_dir: PathBuf::from("/Users/test/projects/myapp"),
             created_at: "2026-03-07T12:00:00Z".to_string(),
             mount_mode: "overlay".to_string(),
-            layout: "default".to_string(),
             sets: vec!["system".into(), "shell".into(), "tools".into()],
             languages: vec!["go".into()],
             image: "nixos".to_string(),

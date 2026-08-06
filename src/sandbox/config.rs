@@ -34,9 +34,6 @@ pub struct SandboxSection {
     #[serde(default = "default_runtime")]
     pub runtime: String,
 
-    #[serde(default = "default_layout")]
-    pub layout: String,
-
     #[serde(default = "default_mount_mode")]
     pub mount_mode: String,
 
@@ -48,7 +45,6 @@ impl Default for SandboxSection {
     fn default() -> Self {
         Self {
             runtime: default_runtime(),
-            layout: default_layout(),
             mount_mode: default_mount_mode(),
             image: default_image(),
         }
@@ -283,9 +279,6 @@ impl DevboxConfig {
 
 fn default_runtime() -> String {
     "auto".to_string()
-}
-fn default_layout() -> String {
-    "default".to_string()
 }
 fn default_mount_mode() -> String {
     "overlay".to_string()

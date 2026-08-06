@@ -63,9 +63,8 @@ lines 9–11 of `.gitignore` and the negation together.
 **Context.** §6.1/§13 of the design fix the stack but not the exact crate
 versions or how assets get into the binary.
 
-**Decision.** `axum` 0.8 (+ `tower-http` for tracing/compression), `askama` 0.14
-with its `askama::Template` derive, `rust-embed` 8 for vendored assets, and
-`tokio-stream` for SSE. Vendored assets (htmx, xterm.js, CSS) live in
+**Decision.** `axum` 0.8, `askama` 0.16 with its `askama::Template` derive,
+`rust-embed` 8 for vendored assets, and `tokio-stream` for SSE. Vendored assets (htmx, xterm.js, CSS) live in
 `src/web/assets/` and are compiled in with `rust-embed`; there is no npm/node
 step anywhere in the release path.
 
@@ -90,7 +89,7 @@ on the first internal navigation and leaks into `Referer` headers.
 exchanges it for a `HttpOnly`, `SameSite=Strict` session cookie and redirects to
 the clean path. Every subsequent request authenticates from the cookie. The
 listener still binds `127.0.0.1` only. The token is 32 bytes of OS randomness,
-hex-encoded, regenerated per launch, and compared in constant time.
+URL-safe base64 encoded, regenerated per launch, and compared in constant time.
 
 **Rationale.** Preserves the design's UX (one clickable URL, no accounts) while
 surviving navigation and keeping the token out of browser history and `Referer`.
@@ -121,6 +120,11 @@ Phase 1, once the console can do the full box lifecycle.
 becomes the default entry point, and a one-line change flips it later.
 
 **Revisit.** Phase 1, acceptance criterion "full box lifecycle from the browser".
+
+**Resolved (Phase 1).** Bare `devbox` now *ensures a box exists for the current
+directory and then opens the console on that box's page* — the union of the two
+readings rather than a choice between them. `devbox shell` remains the
+browser-free way to get a terminal, so headless use is unaffected.
 
 ---
 
@@ -193,3 +197,81 @@ some other tool set in the shell.
 
 **Revisit.** If the console grows a log view, route the same subscriber into a
 broadcast layer so the UI can show what the CLI would print.
+
+---
+
+## ADR-0009 — Retire the TUI by replacement, and take Zellij with it
+
+**Date:** 2026-08-06
+
+**Context.** §5 requires the TUI to go, "by replacement, not deletion-first".
+The question was how far the removal reaches: `src/tui/` also held the Zellij
+layout catalogue that `devbox shell`, `devbox layout`, and provisioning all
+depended on.
+
+**Decision.** Remove `src/tui/` (ratatui package manager + layout catalogue),
+`devbox layout`, `devbox packages`, and `layouts/*.kdl`. `devbox shell` now
+opens a plain login shell. `zellij` leaves the default `shell` Nix set and the
+`ratatui`/`crossterm`/`dialoguer`/`indicatif` dependencies leave `Cargo.toml`.
+The `layout` field disappears from `devbox.toml`, `state.json`, `CreateOpts`,
+and the global config. The Zellij cheat sheet stays, marked optional.
+
+**Rationale.** The replacements shipped first and are tested: the console does
+box management and the browser terminal, and the Help view renders the same
+cheat sheets. Keeping a half-wired Zellij path would mean two ways to attach,
+one of them untested. Old `state.json` files still load — serde ignores the now
+unknown `layout` key — so no box is broken by the upgrade.
+
+**Cost.** Anyone who scripted `devbox layout …` or `devbox shell --layout …`
+must stop. Both were interactive conveniences, not automation surfaces.
+
+**Revisit.** If a multiplexer turns out to be load-bearing for someone, the
+honest fix is `devbox nix add zellij` inside the box, not resurrecting a
+devbox-managed layout catalogue.
+
+---
+
+## ADR-0010 — Reject non-loopback `Host` headers
+
+**Date:** 2026-08-06
+
+**Context.** Binding to `127.0.0.1` stops remote traffic but not DNS
+rebinding: a page on `evil.example` can resolve that name to `127.0.0.1` and
+issue requests the browser treats as same-origin with the attacker.
+
+**Decision.** The auth middleware rejects any request whose `Host` header is
+not a loopback name (`localhost`, `127.0.0.0/8`, `::1`), with
+`421 Misdirected Request`. The check runs before the public-path exemption, so
+it covers assets too.
+
+**Rationale.** Cheap, total, and independent of the cookie: a rebound request
+carries the attacker's hostname whatever it resolves to. The `SameSite=Strict`
+cookie already prevents the *session* from being replayed cross-site; this
+closes the same-origin-by-rebinding variant.
+
+**Revisit.** If the console ever needs to answer to a real hostname (it should
+not — N1), this becomes an allowlist rather than a predicate.
+
+---
+
+## ADR-0011 — `DEVBOX_DOCKER_IMAGE` overrides the Docker base image
+
+**Date:** 2026-08-06
+
+**Context.** `DockerRuntime` hard-coded `devbox-nixos:latest`, an image that
+has to be built locally and exists on no registry. That made a real end-to-end
+test against the Docker runtime impossible, which is exactly what Phase 1's
+acceptance criteria call for.
+
+**Decision.** `DockerRuntime::image_name()` reads `DEVBOX_DOCKER_IMAGE`,
+falling back to `devbox-nixos:latest`. `tests/e2e_docker.rs` builds a
+few-megabyte busybox image with `CMD ["sleep","infinity"]` and points the
+variable at it.
+
+**Rationale.** One environment variable buys a genuine e2e test — create,
+start, stop, destroy, overlay diff, and a real pty over a real WebSocket, all
+through the HTTP API against a real container. It is also useful outside tests
+for anyone maintaining their own base image.
+
+**Revisit.** If per-box image selection becomes a product feature, promote it
+from an environment variable to a `devbox.toml` key.

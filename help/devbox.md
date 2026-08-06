@@ -1,15 +1,24 @@
 # Devbox — Quick Reference
 
 ## Everyday Commands
-  devbox                Start or attach to sandbox
+  devbox                Ensure this project has a box, then open the console
+  devbox web            Open the console without touching any box
+  devbox shell          Attach a terminal (no browser needed)
   devbox stop           Stop sandbox (preserves state)
   devbox destroy        Remove sandbox (warns on uncommitted changes)
   devbox list           List all sandboxes
 
+## Console
+  devbox web                       Start the local web console
+  devbox web --port 8080           Use a specific port
+  devbox web --no-open             Print the URL, do not open a browser
+
+The console is loopback-only and the URL carries a per-launch token. It does
+everything the CLI does: manage boxes, browse overlay changes, and open a
+terminal in the browser.
+
 ## Workspace
-  devbox shell --layout ai-pair    Switch layout
   devbox use /path/to/project      Remount different directory
-  devbox packages                  Manage tools (TUI)
   devbox exec -- make test         Run one-off command
 
 ## Layer Management (OverlayFS)
@@ -19,15 +28,6 @@
   devbox layer discard             Throw away all changes
   devbox layer stash               Stash current changes
   devbox layer stash-pop           Restore stashed changes
-
-## Layout Management
-  devbox layout list               List available layouts
-  devbox layout preview NAME       ASCII preview of layout
-  devbox layout save               Save layout preference for sandbox
-  devbox layout reset              Reset to built-in default layout
-  devbox layout create NAME        Create a custom layout
-  devbox layout edit NAME          Edit a layout in $EDITOR
-  devbox layout set-default NAME   Set global default layout
 
 ## Safety
   devbox snapshot save NAME        Create checkpoint

@@ -27,6 +27,7 @@ fn help_flag() {
     assert!(stdout.contains("create"));
     assert!(stdout.contains("shell"));
     assert!(stdout.contains("guide"));
+    assert!(stdout.contains("web"));
 }
 
 #[test]
@@ -43,8 +44,6 @@ fn subcommand_help() {
         "upgrade",
         "config",
         "doctor",
-        "layout",
-        "packages",
         "prune",
         "init",
         "nix",
@@ -127,24 +126,25 @@ fn doctor_runs() {
 }
 
 #[test]
-fn layout_list() {
-    let output = devbox().args(["layout", "list"]).output().unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("default"));
-    assert!(stdout.contains("ai-pair"));
+fn retired_commands_are_gone() {
+    // v4 retires the TUI and the Zellij layout manager (§5). Both must fail
+    // as unknown subcommands rather than lingering as no-ops.
+    for cmd in ["layout", "packages"] {
+        let output = devbox().arg(cmd).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "`devbox {cmd}` should no longer exist"
+        );
+    }
 }
 
 #[test]
-fn layout_preview() {
-    let output = devbox()
-        .args(["layout", "preview", "default"])
-        .output()
-        .unwrap();
+fn web_help_documents_the_console() {
+    let output = devbox().args(["web", "--help"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // ASCII preview should contain box characters or layout description
-    assert!(!stdout.is_empty());
+    assert!(stdout.contains("--port"));
+    assert!(stdout.contains("--no-open"));
 }
 
 #[test]

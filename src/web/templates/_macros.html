@@ -6,6 +6,34 @@
 <span class="status status-{{ status }}">{{ status }}</span>
 {% endmacro %}
 
+{#- Lifecycle buttons. Every action posts and swaps the whole card, so the
+    button states can never disagree with the status they sit next to. -#}
+{% macro box_actions(b) %}
+<div class="actions">
+  <button class="btn btn-primary"
+          hx-post="/api/boxes/{{ b.name }}/start"
+          hx-target="#box-{{ b.name }}"
+          hx-swap="outerHTML"
+          hx-indicator="#box-{{ b.name }}"
+          {% if b.status == "running" %}disabled{% endif %}>Start</button>
+
+  <button class="btn"
+          hx-post="/api/boxes/{{ b.name }}/stop"
+          hx-target="#box-{{ b.name }}"
+          hx-swap="outerHTML"
+          hx-indicator="#box-{{ b.name }}"
+          {% if b.status != "running" %}disabled{% endif %}>Stop</button>
+
+  <a class="btn" href="/boxes/{{ b.name }}?tab=terminal">Terminal</a>
+
+  <button class="btn btn-danger"
+          hx-post="/api/boxes/{{ b.name }}/destroy"
+          hx-confirm="Destroy box &quot;{{ b.name }}&quot;? The box and its overlay are removed. Your project directory on the host is untouched."
+          hx-target="#box-{{ b.name }}"
+          hx-swap="outerHTML">Destroy</button>
+</div>
+{% endmacro %}
+
 {% macro box_card(b) %}
 <article class="card" id="box-{{ b.name }}">
   <div class="card-head">
@@ -28,6 +56,8 @@
     {% for s in b.sets %}<span class="chip">{{ s }}</span>{% endfor %}
   </div>
   {% endif %}
+
+  {% call box_actions(b) %}{% endcall %}
 </article>
 {% endmacro %}
 
@@ -40,5 +70,21 @@
 </div>
 {% else %}
 {% for b in boxes %}{% call box_card(b) %}{% endcall %}{% endfor %}
+{% endif %}
+{% endmacro %}
+
+{% macro file_changes(changes) %}
+{% if changes.is_empty() %}
+<p class="muted">No uncommitted changes in the overlay.</p>
+{% else %}
+<ul class="filelist">
+  {% for c in changes %}
+  <li class="file file-{{ c.status }}">
+    <span class="glyph" aria-hidden="true"></span>
+    <span class="path">{{ c.path }}</span>
+    <span class="kind">{{ c.status }}</span>
+  </li>
+  {% endfor %}
+</ul>
 {% endif %}
 {% endmacro %}

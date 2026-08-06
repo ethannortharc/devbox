@@ -50,7 +50,6 @@ pub struct CreateOpts {
     pub env_file: Option<PathBuf>,
     pub sets: Vec<String>,
     pub tools: Vec<String>,
-    pub layout: String,
     pub bare: bool,
     pub writable: bool,
     /// Base image type: "nixos" or "ubuntu"
@@ -99,6 +98,17 @@ pub trait Runtime: Send + Sync {
 
     /// Execute a command inside a sandbox.
     async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult>;
+
+    /// Build the host-side argv that runs `cmd` interactively inside a sandbox.
+    ///
+    /// [`Runtime::exec_cmd`] with `interactive = true` inherits the parent's
+    /// stdio, which is exactly right for `devbox shell` and useless for the
+    /// browser terminal — that one needs the command running under a *pty* it
+    /// controls. Exposing the argv keeps pty ownership in the web layer while
+    /// each runtime still owns how its instances are addressed.
+    ///
+    /// The returned vector is `[program, arg, ...]` and is never empty.
+    fn interactive_argv(&self, name: &str, cmd: &[&str]) -> Vec<String>;
 
     /// Destroy a sandbox permanently.
     async fn destroy(&self, name: &str) -> Result<()>;

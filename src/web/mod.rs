@@ -8,11 +8,13 @@
 
 pub mod assets;
 pub mod auth;
+pub mod help;
 pub mod routes;
 pub mod server;
 pub mod service;
 pub mod sse;
 pub mod state;
+pub mod term;
 pub mod watch;
 
 pub use server::{WebOptions, serve};

@@ -14,7 +14,7 @@ pub struct ConfigArgs {
 pub enum ConfigAction {
     /// Set a default value
     Set {
-        /// Key (e.g., default.runtime, default.tools, default.layout)
+        /// Key (e.g., default.runtime, default.tools)
         key: String,
         /// Value
         value: String,
@@ -46,7 +46,7 @@ pub async fn run(args: ConfigArgs, manager: &SandboxManager) -> Result<()> {
                 }
                 None => {
                     bail!(
-                        "Unknown config key '{}'. Available: default.runtime, default.layout, default.tools",
+                        "Unknown config key '{}'. Available: default.runtime, default.tools",
                         key
                     );
                 }
@@ -60,7 +60,6 @@ pub async fn run(args: ConfigArgs, manager: &SandboxManager) -> Result<()> {
                 "default.runtime".cyan(),
                 config.default.runtime
             );
-            println!("  {} = {}", "default.layout".cyan(), config.default.layout);
             println!(
                 "  {} = {}",
                 "default.tools".cyan(),

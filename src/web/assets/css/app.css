@@ -371,6 +371,248 @@ main {
   color: var(--fg-muted);
 }
 
+.notice.error {
+  border-left-color: var(--err);
+  color: var(--err);
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+/* ── box detail ───────────────────────────────────────── */
+
+.detail {
+  display: grid;
+  gap: var(--gap);
+  grid-template-columns: minmax(280px, 340px) 1fr;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .detail {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-inset);
+}
+.tabs a {
+  color: var(--fg-muted);
+  font-size: 13px;
+  padding: 7px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  margin-bottom: -1px;
+}
+.tabs a:hover {
+  color: var(--fg);
+  text-decoration: none;
+}
+.tabs a[aria-current="page"] {
+  color: var(--fg);
+  background: var(--bg-raised);
+  border-color: var(--border);
+}
+
+.tabpanel {
+  padding: 18px;
+}
+
+.meta.wide {
+  grid-template-columns: 140px 1fr;
+  font-size: 13px;
+  row-gap: 7px;
+}
+
+/* ── overlay file list ────────────────────────────────── */
+
+.filelist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.file:last-child {
+  border-bottom: none;
+}
+.file .path {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.file .kind {
+  color: var(--fg-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.file .glyph::before {
+  display: inline-block;
+  width: 1ch;
+  font-weight: 700;
+}
+.file-added .glyph::before {
+  content: "+";
+  color: var(--ok);
+}
+.file-modified .glyph::before {
+  content: "~";
+  color: var(--warn);
+}
+.file-deleted .glyph::before {
+  content: "−";
+  color: var(--err);
+}
+
+/* ── terminal ─────────────────────────────────────────── */
+
+.terminal {
+  height: min(60vh, 520px);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+}
+.term-ok {
+  color: var(--ok);
+}
+.term-err {
+  color: var(--err);
+}
+
+/* ── help ─────────────────────────────────────────────── */
+
+.help-layout {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  gap: 28px;
+  align-items: start;
+}
+
+@media (max-width: 760px) {
+  .help-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.help-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  position: sticky;
+  top: 72px;
+}
+.help-nav a {
+  color: var(--fg-muted);
+  font-size: 13px;
+  padding: 5px 10px;
+  border-radius: var(--radius);
+  border-left: 2px solid transparent;
+}
+.help-nav a:hover {
+  background: var(--bg-raised);
+  color: var(--fg);
+  text-decoration: none;
+}
+.help-nav a[aria-current="page"] {
+  color: var(--fg);
+  background: var(--bg-raised);
+  border-left-color: var(--accent);
+}
+
+.prose {
+  max-width: 76ch;
+  overflow-wrap: anywhere;
+}
+.prose h1 {
+  font-size: 22px;
+  letter-spacing: -0.02em;
+  margin: 0 0 16px;
+}
+.prose h2 {
+  font-size: 16px;
+  margin: 28px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.prose h3 {
+  font-size: 14px;
+  margin: 20px 0 8px;
+}
+.prose code {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.prose pre {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+.prose table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 14px 0;
+  font-size: 13px;
+  display: block;
+  overflow-x: auto;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.prose th {
+  background: var(--bg-inset);
+  font-weight: 600;
+}
+.prose blockquote {
+  margin: 14px 0;
+  padding: 2px 14px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--fg-muted);
+}
+
+/* htmx marks in-flight requests on the element named by hx-indicator */
+.htmx-request {
+  opacity: 0.6;
+  transition: opacity 120ms ease;
+}
+
 footer {
   max-width: 1180px;
   margin: 0 auto;

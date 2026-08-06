@@ -94,7 +94,6 @@ fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
             "man-db",
         ],
         "shell" => vec![
-            "zellij",
             "zsh",
             "zsh-autosuggestions",
             "zsh-syntax-highlighting",
@@ -1298,10 +1297,12 @@ mod tests {
     #[test]
     fn nix_packages_shell_set() {
         let pkgs = nix_packages_for_set("shell");
-        assert_eq!(pkgs.len(), 11);
-        assert!(pkgs.contains(&"zellij"));
+        assert_eq!(pkgs.len(), 10);
         assert!(pkgs.contains(&"starship"));
         assert!(pkgs.contains(&"yazi"));
+        // v4 retires the multiplexer from the default path (§5); the console
+        // is the multi-pane experience now.
+        assert!(!pkgs.contains(&"zellij"));
     }
 
     #[test]

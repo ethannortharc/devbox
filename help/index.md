@@ -3,7 +3,6 @@
 Available cheat sheets:
 
   devbox        Devbox commands
-  zellij        Terminal multiplexer
   lazygit       Git TUI
   nvim          Neovim editor
   fzf           Fuzzy finder
@@ -15,5 +14,7 @@ Available cheat sheets:
   git           Git quick reference
   delta         delta (diff viewer)
   httpie        HTTPie (HTTP client)
+  zellij        Terminal multiplexer (optional — not installed by default)
 
-Usage: devbox guide <tool>
+Usage: `devbox guide <tool>`, or open the console (`devbox web`) and use the
+Help view, which renders the same sheets in the browser.

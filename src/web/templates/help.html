@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}devbox — help{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Help</h1>
+  <span class="sub">{{ subtitle }}</span>
+</div>
+
+<div class="help-layout">
+  <nav class="help-nav">
+    <a href="/help" {% if current == "index" %}aria-current="page"{% endif %}>Overview</a>
+    {% for t in topics %}
+    <a href="/help/{{ t.slug }}" {% if current == t.slug %}aria-current="page"{% endif %}>{{ t.title }}</a>
+    {% endfor %}
+  </nav>
+
+  {#- Cheat-sheet HTML is rendered from markdown that is compiled into the
+      binary, never from user input, so it is emitted unescaped on purpose. -#}
+  <article class="prose">{{ body|safe }}</article>
+</div>
+{% endblock %}

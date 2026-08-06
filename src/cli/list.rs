@@ -26,7 +26,7 @@ pub async fn run(args: ListArgs, manager: &SandboxManager) -> Result<()> {
     } else {
         println!(
             "{:<20} {:<12} {:<10} {:<30}",
-            "NAME", "RUNTIME", "LAYOUT", "PROJECT DIR"
+            "NAME", "RUNTIME", "MOUNT", "PROJECT DIR"
         );
         println!("{}", "-".repeat(72));
         for s in &sandboxes {
@@ -34,7 +34,7 @@ pub async fn run(args: ListArgs, manager: &SandboxManager) -> Result<()> {
                 "{:<20} {:<12} {:<10} {:<30}",
                 s.name,
                 s.runtime,
-                s.layout,
+                s.mount_mode,
                 s.project_dir.display()
             );
         }
