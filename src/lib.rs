@@ -16,6 +16,7 @@
 
 pub mod cli;
 pub mod nix;
+pub mod obs;
 pub mod runtime;
 pub mod sandbox;
 pub mod tools;

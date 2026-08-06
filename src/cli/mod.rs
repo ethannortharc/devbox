@@ -22,6 +22,7 @@ pub mod status;
 pub mod stop;
 pub mod upgrade;
 pub mod use_cmd;
+pub mod watch;
 pub mod web;
 
 use anyhow::Result;
@@ -139,6 +140,9 @@ pub enum Command {
     /// Show or change which Nix sets a box has
     Sets(sets::SetsArgs),
 
+    /// Show what a box has been doing
+    Watch(watch::WatchArgs),
+
     /// Start the local web console
     Web(web::WebArgs),
 }
@@ -170,6 +174,7 @@ impl Command {
             Command::Code(args) => code::run(args, manager).await,
             Command::Use(args) => use_cmd::run(args, manager).await,
             Command::Sets(args) => sets::run(args, manager).await,
+            Command::Watch(args) => watch::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
         }
     }

@@ -350,3 +350,88 @@ the right place for it.
 
 **Revisit.** Phase 3 introduces a real event store; build logs could move
 there and become replayable.
+
+---
+
+## ADR-0015 — Length-prefixed JSON on the wire, not protobuf (yet)
+
+**Date:** 2026-08-06
+
+**Context.** §11.3 specifies "length-prefixed protobuf (or JSON in dev)". Real
+protobuf means `protoc` (or `buf`) in the build path for two languages, plus
+generated code checked in or regenerated in CI.
+
+**Decision.** Length-prefixed **JSON**, with the framer deliberately ignorant of
+the payload: a 4-byte big-endian length, then that many opaque bytes. The
+handshake carries a `protocol` version so a payload-format change is a
+detectable, refusable event rather than a silent misread.
+
+**Rationale.** The framing — which is the part that is hard to change later —
+is already protobuf-ready. What JSON buys today is a *cross-language
+conformance test*: `agent/event/testdata/events.jsonl` is decoded by both the
+Go and the Rust test suites, so a field rename on either side fails a test
+instead of producing blanks in the console. That is worth more right now than
+the bytes protobuf would save.
+
+Two related choices fall out of this. Unused sub-objects are **omitted**, not
+serialized as `null`: at 10k events/s, five null fields per event cost more
+than they explain, and every reader treats absent and null identically.
+`ts_wall` is millisecond-precision UTC because that string sorts
+lexicographically in chronological order, which makes a plain `TEXT` column a
+usable index.
+
+**Revisit.** When event volume actually hurts. The framer does not change; only
+`Encode`/`Decode` and the protocol version do.
+
+---
+
+## ADR-0016 — Parse DNS and TLS by hand instead of vendoring gopacket
+
+**Date:** 2026-08-06
+
+**Context.** §13 names `gopacket` for DNS and TLS ClientHello parsing. The agent
+is embedded in the devbox binary and pushed into every box.
+
+**Decision.** Hand-rolled parsers in `agent/decode/wire.go`. The Go module has
+no third-party dependencies at all.
+
+**Rationale.** Only two things are needed — a DNS question/answer set and a
+ClientHello's SNI and ALPN — and both are small, frozen, well-specified
+formats. A few hundred lines with exhaustive tests (compression pointers,
+pointer loops, truncation, reserved label types, non-handshake records) beats
+several megabytes of dependency in a binary that ships inside every box. It
+also keeps `go.sum` empty, which is one less supply-chain surface on something
+that runs privileged inside a sandbox.
+
+**Cost.** If devbox ever needs real packet decoding — VLAN, tunnelling,
+fragment reassembly — this is the wrong foundation and `gopacket` is right.
+
+**Revisit.** The moment a third protocol needs parsing.
+
+---
+
+## ADR-0017 — A `fixture` capture source alongside eBPF and proc
+
+**Date:** 2026-08-06
+
+**Context.** Phase 3's acceptance criteria require an integration test that
+generates known activity and asserts the correlated chain. eBPF cannot load on
+macOS, and even on Linux a real capture is not reproducible enough to assert
+exact chains against.
+
+**Decision.** `capture.Source` has three implementations: `ebpf` (Linux with
+BTF), `proc` (any Linux, degraded), and `fixture` (any host, replays a recorded
+JSONL file). `devbox-obsd -fixture <path>` selects the last.
+
+**Rationale.** `tests/obs_pipeline.rs` now builds the **real agent binary**,
+runs it as a **real process**, and streams a recorded capture through the real
+handshake, the real framing, the real SQLite store, and the real correlation
+pass — deterministically, on any host, in about a second. The only synthetic
+part is where the events came from. The fixture is also the same file both
+languages' schema tests read, so it earns its keep three times over.
+
+Asking for eBPF from a binary built without it **fails loudly** rather than
+falling back to `proc`. A quiet timeline reads as "the box did nothing", which
+is the worst possible failure mode for an observability tool.
+
+**Revisit.** Not expected to; a replay source is useful for demos regardless.
