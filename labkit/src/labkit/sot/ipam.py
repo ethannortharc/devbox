@@ -191,6 +191,29 @@ def verify(allocation: Allocation) -> None:
             if left.overlaps(right):
                 raise OverlapError(f"subnets {left} and {right} overlap")
 
+    # A loopback inside a link's subnet installs both a connected route and a
+    # host route for the same address. The fabric comes up and forwards
+    # ambiguously — the worst kind of lab bug, because it looks like it works.
+    for device, loopback in allocation.loopbacks.items():
+        address = ipaddress.IPv4Interface(loopback).ip
+        for subnet in subnets:
+            if address in subnet:
+                raise OverlapError(
+                    f"loopback {loopback} for {device!r} falls inside link subnet "
+                    f"{subnet}: a connected route and a host route for the same "
+                    "address make forwarding ambiguous"
+                )
+
+    # Every allocated ASN must be private (RFC 6996). The base is validated at
+    # the model boundary, but derivation walks upward from it, so the last
+    # device in a large fabric can still land outside the range.
+    for device, asn in allocation.asns.items():
+        if not (64512 <= asn <= 65534 or 4_200_000_000 <= asn <= 4_294_967_294):
+            raise OverlapError(
+                f"{device!r} would use AS {asn}, which is not a private ASN; "
+                "leave room in 64512-65534 or 4200000000-4294967294 (RFC 6996)"
+            )
+
     # Two routers sharing an AS do not form an eBGP session, so the fabric
     # comes up and never converges.
     by_asn: dict[int, str] = {}

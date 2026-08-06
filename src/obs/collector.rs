@@ -105,13 +105,21 @@ pub struct StatsSnapshot {
 
 /// Read one length-prefixed frame.
 pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    // Read the header a byte at a time for the first byte, so "nothing at all"
+    // can be told apart from "half a header". `read_exact` reports both as
+    // UnexpectedEof, and treating a truncated header as a clean hangup hides
+    // the difference between an agent that finished and one that was killed
+    // mid-frame — which is precisely what a chaos test needs to see.
     let mut header = [0u8; 4];
-    match reader.read_exact(&mut header).await {
+    match reader.read(&mut header[..1]).await {
+        Ok(0) => return Ok(None), // clean EOF on a frame boundary
         Ok(_) => {}
-        // A clean EOF on a frame boundary means the agent hung up normally.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e).context("failed to read a frame header"),
     }
+    reader
+        .read_exact(&mut header[1..])
+        .await
+        .context("frame header truncated: the agent stopped mid-frame")?;
 
     let size = u32::from_be_bytes(header) as usize;
     if size > MAX_FRAME_SIZE {

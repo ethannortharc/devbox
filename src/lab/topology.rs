@@ -104,6 +104,17 @@ pub struct Endpoint {
     pub iface: String,
 }
 
+/// Is this a name the kernel will accept for an interface?
+///
+/// IFNAMSIZ is 16 including the NUL, so 15 characters is the real limit.
+fn is_valid_iface(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
 impl Endpoint {
     /// Parse `node:iface`.
     pub fn parse(text: &str) -> Result<Self> {
@@ -112,6 +123,15 @@ impl Endpoint {
             .with_context(|| format!("endpoint '{text}' must be written node:interface"))?;
         if node.is_empty() || iface.is_empty() {
             bail!("endpoint '{text}' has an empty node or interface");
+        }
+        // Validated here rather than at `ip link` time. These names become
+        // arguments to root commands inside the box, and a name the kernel
+        // rejects fails partway through bring-up — with half a lab standing.
+        if !is_valid_iface(iface) {
+            bail!(
+                "endpoint '{text}' has an unusable interface name: it must be 1-15 \
+                 characters of letters, digits, '-', '_', or '.'"
+            );
         }
         Ok(Self {
             node: node.to_string(),
