@@ -640,3 +640,43 @@ without process attribution. eBPF gets both, which is why it is the default.
 
 **Gate after the fixes** — 373 Rust unit + 52 integration/e2e, 10 Go packages,
 62 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-06T14:10Z — Codex review round 2: 23 findings, all addressed
+
+A second pass at `xhigh` found 23 more (3 P1, 20 P2). The three P1s were all
+the same failure mode, and it is the one worth naming: **a feature that reports
+success without doing the work.**
+
+- `nix/devbox-module.nix` force-installed `shell`, `tools`, and `editor`, and
+  never read `custom_packages`. Unchecking a set in the console wrote the right
+  file, rebuilt successfully, and installed the old selection. Only `system` is
+  locked now (ADR-0029), which is what §6.4 always said.
+- `write_set_modules` regenerated `devbox-state.toml` from `DevboxConfig::
+  default()` — a fix I made in round 1 — which dropped the `[user]` and
+  `[sandbox]` sections the in-box module reads. Every Sets apply silently reset
+  the guest username to `dev` and the mount mode to `overlay`. It now reads the
+  box's existing state back and preserves both.
+- Egress postures were never enforced. `devbox policy set isolated` saved the
+  posture and printed "apply it with `devbox reprovision`"; no provisioning
+  path generated or loaded a ruleset. The box reported `isolated` and had
+  unrestricted egress. `policy::enforce` closes it (ADR-0030).
+
+The P2s clustered into four groups. **Ordering**: `ts_mono_ns` resets at guest
+boot but the store persists across boots, so any summary spanning a reboot came
+out backwards; and pids are recycled, so process chains merged unrelated
+processes (ADR-0031). **Durability**: ZTP saved on a 2s ticker, losing exactly
+the writes the chaos test kills the process to exercise (ADR-0032).
+**Allocation**: both IPAMs let automatic allocation hand out a prefix an
+explicit link already held, and both verified overlap by comparing subnet
+strings — which a `/29` containing a `/31` passes. **eBPF**: six real capture
+bugs, including reading the socket at `tcp_v*_connect` *entry*, before the
+kernel has filled in the destination, so every outbound flow decoded as zeroes.
+
+The eBPF ones deserve a note on why they survived two rounds of testing: the C
+is `//go:build ignore` and only compiles in the privileged Linux lane, so the
+Go and Rust test suites — which run against the fixture capture source — cannot
+see them. That is the cost of the decision in ADR-0017, and it is the right
+trade, but it means the eBPF source needs review rather than tests.
+
+**Gate after the fixes** — 378 Rust unit + 52 integration/e2e, 10 Go packages,
+64 Python; fmt/clippy/vet/gofmt/ruff/mypy all clean.
