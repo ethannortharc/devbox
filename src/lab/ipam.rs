@@ -118,6 +118,25 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
     let (base, base_len) = parse_v4_cidr(&topology.lab.base)
         .with_context(|| format!("lab base '{}' is not an IPv4 CIDR", topology.lab.base))?;
 
+    // A base like `10.0.0.1/16` names a host, not a network. Deriving /31s
+    // from it puts the two ends of the first link in *different* /31s, so
+    // directly connected nodes cannot reach each other — and nothing else
+    // catches it, because every derived address is individually valid.
+    // Explicit link subnets are already held to this; the base was not.
+    let mask = if base_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - base_len)
+    };
+    if u32::from(base) & mask != u32::from(base) {
+        let canonical = Ipv4Addr::from(u32::from(base) & mask);
+        bail!(
+            "lab base '{}' is a host inside {canonical}/{base_len}, not the network itself; \
+             use '{canonical}/{base_len}'",
+            topology.lab.base
+        );
+    }
+
     if base_len > 24 {
         bail!(
             "lab base '{}' is too small: a /{} leaves no room for link subnets",
@@ -270,6 +289,14 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
 ///
 /// Checked after every allocation rather than trusted, because an overlapping
 /// address plan produces a lab that comes up and then behaves inexplicably.
+/// Is this a private-use AS number (RFC 6996)?
+///
+/// 65535 and 4294967295 are reserved, not private, so both ranges stop one
+/// short of their upper bound.
+pub fn is_private_asn(asn: u32) -> bool {
+    (64512..=65534).contains(&asn) || (4_200_000_000..=4_294_967_294).contains(&asn)
+}
+
 /// Do two IPv4 prefixes cover any address in common?
 ///
 /// Comparing canonical subnet *strings* only catches exact duplicates. A `/29`
@@ -308,6 +335,39 @@ pub fn verify(plan: &Plan) -> Result<()> {
             );
         }
         seen.push((net, len));
+    }
+
+    // A loopback inside a link's subnet installs both a connected route and a
+    // host route for the same address. The fabric comes up and routes
+    // ambiguously — the worst kind of lab bug, because it looks like it works.
+    for (node, addr) in &plan.loopbacks {
+        for link in &plan.links {
+            let Some((net, len)) = parse_v4_cidr(&link.subnet) else {
+                continue;
+            };
+            if overlaps((*addr, 32), (net, len)) {
+                bail!(
+                    "loopback {addr} for '{node}' falls inside link subnet {}: \
+                     a connected route and a host route for the same address make \
+                     the fabric's forwarding ambiguous",
+                    link.subnet
+                );
+            }
+        }
+    }
+
+    // A lab must not advertise itself with someone else's AS number. RFC 6996
+    // reserves 64512–65534 and 4200000000–4294967294 for private use; 65535
+    // and 4294967295 are reserved outright. Only duplicates were checked, so
+    // an `asn_base` of 65534 with two routers quietly allocated 65535.
+    for (node, asn) in &plan.asns {
+        if !is_private_asn(*asn) {
+            bail!(
+                "node '{node}' would use AS {asn}, which is not a private ASN; \
+                 pick an `asn_base` leaving room in 64512-65534 or \
+                 4200000000-4294967294 for every router in the lab"
+            );
+        }
     }
 
     // Two routers sharing an AS do not form an eBGP session, so the fabric

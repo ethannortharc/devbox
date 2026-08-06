@@ -154,6 +154,23 @@ class AddressPlan(Model):
     #: First ASN handed out to a device that does not declare one.
     asn_base: int = 65000
 
+    @field_validator("asn_base")
+    @classmethod
+    def _private_asn_base(cls, value: int) -> int:
+        """RFC 6996 private-use ranges only.
+
+        A lab must not advertise itself with someone else's AS number. 65535
+        and 4294967295 are reserved rather than private, so both ranges stop
+        one short — and a base at the very top would allocate straight into
+        them for the second router.
+        """
+        if not (64512 <= value <= 65534 or 4_200_000_000 <= value <= 4_294_967_294):
+            raise ValueError(
+                f"asn_base {value} is not a private ASN; "
+                "use 64512-65534 or 4200000000-4294967294 (RFC 6996)"
+            )
+        return value
+
     @field_validator("p2p_base", "loopback_base")
     @classmethod
     def _valid_prefix(cls, value: str) -> str:

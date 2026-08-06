@@ -288,7 +288,11 @@ func (r *Registry) Discover(serial string) (node *Node, restarted bool, err erro
 		}
 		r.nodes[serial] = node
 		mutated = true
-		return node, false, nil
+		// A copy. Returning the registry's own pointer lets the HTTP handler
+		// serialize a node while a concurrent transition writes it — a data
+		// race, and a response that can describe two states at once.
+		snapshot := *node
+		return &snapshot, false, nil
 	}
 
 	// A node that comes back is starting over. Keeping FirstSeen makes the
@@ -299,7 +303,8 @@ func (r *Registry) Discover(serial string) (node *Node, restarted bool, err erro
 	node.Attempts++
 	node.Reason = ""
 	mutated = true
-	return node, true, nil
+	snapshot := *node
+	return &snapshot, true, nil
 }
 
 // Advance moves a node to a new state.
@@ -331,7 +336,8 @@ func (r *Registry) Advance(serial string, to State, reason string) (node *Node, 
 	node.UpdatedAt = r.now()
 	node.Reason = reason
 	mutated = true
-	return node, nil
+	snapshot := *node
+	return &snapshot, nil
 }
 
 // Identify attaches a node's identity from the source of truth.

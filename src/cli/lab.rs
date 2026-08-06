@@ -257,7 +257,12 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+    let (runtime, substrate) = resolve_substrate(
+        manager,
+        args.substrate.as_deref(),
+        Some(&lab.topology.lab.substrate),
+    )
+    .await?;
     println!("Substrate: '{substrate}' ({})\n", runtime.name());
 
     for cmd in &commands {
@@ -313,7 +318,12 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+    let (runtime, substrate) = resolve_substrate(
+        manager,
+        args.substrate.as_deref(),
+        Some(&lab.topology.lab.substrate),
+    )
+    .await?;
 
     // A teardown after a partial bring-up is the common case, so a namespace
     // that is already gone is not an error.
@@ -434,7 +444,12 @@ async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+    let (runtime, substrate) = resolve_substrate(
+        manager,
+        args.substrate.as_deref(),
+        Some(&lab.topology.lab.substrate),
+    )
+    .await?;
     run_all(runtime.as_ref(), &substrate, &commands).await?;
     println!(
         "Applied. Clear it with `devbox lab heal {} {}`.",
@@ -453,7 +468,12 @@ async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    let (runtime, substrate) = resolve_substrate(manager, args.substrate.as_deref()).await?;
+    let (runtime, substrate) = resolve_substrate(
+        manager,
+        args.substrate.as_deref(),
+        Some(&lab.topology.lab.substrate),
+    )
+    .await?;
 
     // Healing a link that was never impaired is a no-op, not an error.
     let mut cleared = 0;
@@ -495,8 +515,14 @@ async fn run_all(runtime: &dyn Runtime, substrate: &str, commands: &[Vec<String>
 async fn resolve_substrate(
     manager: &SandboxManager,
     explicit: Option<&str>,
+    configured: Option<&str>,
 ) -> Result<(Box<dyn Runtime>, String)> {
-    let name = match explicit {
+    // `--substrate` wins, then the topology's own `lab.substrate`, then the
+    // single-box guess. Skipping the middle step meant a topology that named
+    // its substrate was ignored, and a user with two boxes got "which one?"
+    // for a question their file had already answered.
+    let from_topology = configured.filter(|s| !s.is_empty() && *s != "auto");
+    let name = match explicit.or(from_topology) {
         Some(name) => name.to_string(),
         None => {
             let boxes = manager.list_sandboxes()?;
