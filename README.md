@@ -3,14 +3,19 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-**The sandbox that AI coding agents deserve.** Isolated developer VMs where Claude, Codex, and Aider can write, build, and test code freely -- without ever touching your host machine.
+**The sandbox that AI coding agents deserve.** Isolated developer VMs where Claude, Codex, and Aider can write, build, and test code freely — without ever touching your host machine, and without doing anything you cannot see.
 
 ```bash
 cd my-project
 devbox
 ```
 
-That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and drops you into a workspace with AI coding assistants, a brainstorming panel, file browser, and git -- all pre-configured and ready to go.
+That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and opens a local web console where you can watch and govern everything the box does.
+
+> **v4 is in progress on the `v4` branch.** It keeps the v3 sandbox core and
+> replaces the terminal UI with a local web console, adds eBPF-based
+> observability and egress policy, and adds a multi-node network lab.
+> Start at [docs/quickstart-v4.md](docs/quickstart-v4.md).
 
 ---
 
@@ -28,6 +33,11 @@ devbox discard                  # 3. Or throw everything away
 ```
 
 Your project directory is mounted **read-only** inside the VM. Every file write goes to an isolated overlay layer. Nothing reaches your real files until you explicitly run `devbox commit`. It's like a code review for your entire filesystem.
+
+v4 extends that to *behaviour*. Every process, connection, DNS lookup, and TLS
+handshake is captured and correlated, so `devbox behavior diff` answers "what
+did this run do that the last one didn't?" the same way `devbox diff` answers
+"what files changed?" — and `devbox policy` turns the answer into enforcement.
 
 > **Claude just `rm -rf`'d your src directory?**
 > With devbox: `devbox discard`. Done. Your files were never touched.
