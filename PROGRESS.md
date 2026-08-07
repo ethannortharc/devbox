@@ -939,3 +939,56 @@ confirming the failure names the package and the file.
 
 **Gate** — 395 Rust unit + 52 integration/e2e, 10 Go packages, 66 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-07T05:00Z — Rounds 10–13, and what the series is telling us
+
+Findings per round, thirteen rounds in:
+
+```
+23  23  14  27   9  14  11  13  13   8   7  12  14
+ 1   2   3   4   5   6   7   8   9  10  11  12  13
+```
+
+Every round's findings were fixed before the next ran, and the gate was green
+at every commit. The series is not converging. Over the last eight rounds it
+oscillates around eleven with no downward trend.
+
+The reason is visible in the findings themselves: **most of each round's
+findings are in the code written to fix the previous round.** A sample from
+round 13 — the forward chain that closed the container-egress bypass (round 9)
+dropped every inbound connection to a published port; the lab-prefix file
+(round 12) recorded the address pool instead of the allocated prefixes, and
+nothing reapplied the ruleset after writing it; the `-once` flag (round 7)
+needed a follow-up in round 8, and its follow-up needed one in round 10.
+
+That is a fixed-point problem, not a backlog. Each fix is a new change of
+comparable size to the ones being reviewed, written under the same conditions
+that produced the original defects, and it gets reviewed for the first time in
+the following round. A process with a per-change defect rate meaningfully above
+zero does not terminate just because it keeps running.
+
+Three things are genuinely improving, and they are worth separating from the
+count:
+
+- **Severity is drifting down in aggregate.** Rounds 1–4 turned up unenforced
+  postures, an inaccessible box, and a firewall that did nothing. Rounds 10–13
+  turn up an inbound SYN drop, a metrics series that vanishes, a wildcard that
+  matches one label too many. Still real, less likely to be catastrophic.
+- **Classes are getting closed rather than instances patched.** Cross-file
+  drift now has three guards covering every set, the Ubuntu mapping, and the
+  allow-set TTL. Each was added after the second or third instance of the
+  same shape — later than it should have been, but they hold now.
+- **The same asymmetry keeps recurring and is now nameable:** a fix lands on
+  the path in front of me and not on its sibling. CLI before web, start before
+  attach, rebuild-failure before write-failure. When a fix touches a lifecycle,
+  the question to ask is which *other* entry points reach the same state.
+
+**Recommendation, stated plainly:** further rounds will keep finding real
+defects at roughly this rate, and each round costs a full review plus the work
+to fix it. The value is still positive — these are genuine bugs — but "run
+until the reviewer has no opinions" is not a condition this process reaches.
+A better stopping rule is a severity floor: stop when a round produces no P1s
+and no security findings, and take the remaining P2s as a backlog.
+
+**Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
