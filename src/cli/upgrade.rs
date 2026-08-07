@@ -40,6 +40,11 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     println!("Adding tools: {}", args.tools.join(", "));
     nix::upgrade_sets(runtime.as_ref(), &name, &mut config, &args.tools).await?;
 
+    // A rebuild restarts the network stack and removes devbox's nftables
+    // table, so the saved posture has to go back on — the same reason
+    // `reprovision`, `use`, and the Sets paths do it.
+    crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+
     // Update saved state with new sets/languages
     let mut updated_state = state;
     updated_state.sets = config.active_sets();
