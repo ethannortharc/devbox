@@ -203,8 +203,8 @@ fn dedup_in_order(items: impl Iterator<Item = String>) -> Vec<String> {
 /// This is what lets a connection to `151.101.0.223` be labelled `pypi.org`
 /// after the fact, even when the connect event itself carried only an address
 /// (§7.3, "IPs reverse-mapped to the DNS name that produced them").
-pub fn dns_map(events: &[Event]) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+pub fn dns_map(events: &[Event]) -> BTreeMap<String, Vec<(String, String)>> {
+    let mut map: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for event in events {
         if event.kind != EventType::Dns {
             continue;
@@ -214,10 +214,15 @@ pub fn dns_map(events: &[Event]) -> BTreeMap<String, String> {
             continue;
         }
         for answer in &net.answers {
-            // First answer wins: a later lookup of a different name that
-            // happens to share a CDN address must not relabel earlier flows.
+            // Every answer, with when it was given. A single first-wins name
+            // per address misattributed every connection once two domains
+            // shared a CDN address — including connections that *preceded*
+            // the lookup it was credited to. The label a flow deserves is the
+            // most recent answer before it, so the timestamps have to survive
+            // into the map.
             map.entry(answer.clone())
-                .or_insert_with(|| net.qname.clone());
+                .or_default()
+                .push((event.ts_wall.clone(), net.qname.clone()));
         }
     }
     map
@@ -226,16 +231,29 @@ pub fn dns_map(events: &[Event]) -> BTreeMap<String, String> {
 /// Fill in `net.domain` on connections whose address a DNS answer explains.
 ///
 /// Returns how many events gained a name.
-pub fn apply_dns_map(events: &mut [Event], map: &BTreeMap<String, String>) -> usize {
+pub fn apply_dns_map(events: &mut [Event], map: &BTreeMap<String, Vec<(String, String)>>) -> usize {
     let mut labelled = 0;
     for event in events.iter_mut() {
+        let when = event.ts_wall.clone();
         let Some(net) = event.net.as_mut() else {
             continue;
         };
         if !net.domain.is_empty() || net.daddr.is_empty() {
             continue;
         }
-        if let Some(name) = map.get(&net.daddr) {
+        let Some(answers) = map.get(&net.daddr) else {
+            continue;
+        };
+        // The most recent answer at or before this connection. Falling back to
+        // the earliest answer covers a connect whose lookup the capture missed
+        // — better a plausible name than none — but a connection that follows
+        // a *different* lookup now gets that lookup's name.
+        let name = answers
+            .iter()
+            .filter(|(ts, _)| *ts <= when)
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .or_else(|| answers.iter().min_by(|a, b| a.0.cmp(&b.0)));
+        if let Some((_, name)) = name {
             net.domain = name.clone();
             labelled += 1;
         }
@@ -448,14 +466,13 @@ mod tests {
         let mut events = pip_install();
         let map = dns_map(&events);
 
-        assert_eq!(
-            map.get("151.101.0.223").map(String::as_str),
-            Some("pypi.org")
-        );
-        assert_eq!(
-            map.get("151.101.1.63").map(String::as_str),
-            Some("files.pythonhosted.org")
-        );
+        let named = |addr: &str| -> Vec<String> {
+            map.get(addr)
+                .map(|answers| answers.iter().map(|(_, n)| n.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(named("151.101.0.223"), vec!["pypi.org"]);
+        assert_eq!(named("151.101.1.63"), vec!["files.pythonhosted.org"]);
 
         let labelled = apply_dns_map(&mut events, &map);
         assert_eq!(labelled, 2, "both connections gained a name");
@@ -477,7 +494,34 @@ mod tests {
             dns(812, 2_000, "b.example", &["10.0.0.9"]),
         ];
         let map = dns_map(&events);
-        assert_eq!(map.get("10.0.0.9").map(String::as_str), Some("a.example"));
+        let answers = map.get("10.0.0.9").expect("the address was answered");
+        assert!(answers.iter().any(|(_, name)| name == "a.example"));
+    }
+
+    #[test]
+    fn a_shared_cdn_address_follows_the_most_recent_lookup() {
+        // Two domains behind one address is the normal case for a CDN, and a
+        // first-wins map credited every connection to whichever resolved
+        // first — including connections made before that lookup happened.
+        // Whole seconds apart: the fixture derives `ts_wall` from the
+        // monotonic value at second granularity, and correlation orders by
+        // wall clock (it is what survives a guest reboot).
+        const SEC: u64 = 1_000_000_000;
+        let mut events = vec![
+            dns(812, SEC, "first.example", &["10.0.0.9"]),
+            connect(812, 2 * SEC, "10.0.0.9", 0, 0),
+            dns(812, 3 * SEC, "second.example", &["10.0.0.9"]),
+            connect(812, 4 * SEC, "10.0.0.9", 0, 0),
+        ];
+
+        let map = dns_map(&events);
+        assert_eq!(apply_dns_map(&mut events, &map), 2);
+        assert_eq!(events[1].net.as_ref().unwrap().domain, "first.example");
+        assert_eq!(
+            events[3].net.as_ref().unwrap().domain,
+            "second.example",
+            "a connection after the second lookup belongs to the second name"
+        );
     }
 
     #[test]
@@ -485,8 +529,11 @@ mod tests {
         let mut events = vec![connect(812, 1_000, "10.0.0.9", 0, 0)];
         events[0].net.as_mut().unwrap().domain = "authoritative.example".into();
 
-        let mut map = BTreeMap::new();
-        map.insert("10.0.0.9".to_string(), "guessed.example".to_string());
+        let mut map: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        map.insert(
+            "10.0.0.9".to_string(),
+            vec![("2026-08-07T00:00:00.000Z".into(), "guessed.example".into())],
+        );
 
         assert_eq!(apply_dns_map(&mut events, &map), 0);
         assert_eq!(

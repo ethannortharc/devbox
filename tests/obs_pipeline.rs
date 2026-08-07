@@ -181,10 +181,13 @@ async fn go_agent_streams_into_the_rust_collector() {
         .unwrap();
 
     let dns_map = correlate::dns_map(&all);
-    assert_eq!(
-        dns_map.get("151.101.0.223").map(String::as_str),
-        Some("pypi.org"),
-        "the DNS answer should explain the address that was connected to"
+    let names: Vec<&str> = dns_map
+        .get("151.101.0.223")
+        .map(|answers| answers.iter().map(|(_, n)| n.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"pypi.org"),
+        "the DNS answer should explain the address that was connected to; saw {names:?}"
     );
 
     let chains = correlate::chains(&all);

@@ -316,9 +316,18 @@ pub fn matches(entry: &str, target: &Target) -> bool {
         return match_cidr(entry, &target.addr);
     }
 
+    // A wildcard entry means subdomains, and only subdomains — which is what
+    // the console's help text promises. Stripping `*.` and forgetting it was
+    // there made `*.example.com` permit `example.com` as well, a wider grant
+    // than the user wrote. The Go enforcer applies the same rule; a Go test
+    // pins the two together.
+    let wildcard = entry.starts_with("*.");
     let pattern = entry.strip_prefix("*.").unwrap_or(entry);
     let domain = target.domain.trim_end_matches('.');
     if domain.is_empty() {
+        return false;
+    }
+    if wildcard && domain.eq_ignore_ascii_case(pattern) {
         return false;
     }
 
@@ -550,9 +559,22 @@ mod tests {
             "*.githubusercontent.com",
             &t("raw.githubusercontent.com")
         ));
-        assert!(matches(
+        // Not the apex. The test's own name said "subdomains only" while
+        // asserting the opposite — and the console's help text says the same
+        // thing the name does, so this is the behaviour both promised.
+        assert!(!matches(
             "*.githubusercontent.com",
             &t("githubusercontent.com")
+        ));
+        // A bare entry still covers both, which is how `github.com` reaches
+        // `codeload.github.com`.
+        assert!(matches(
+            "githubusercontent.com",
+            &t("githubusercontent.com")
+        ));
+        assert!(matches(
+            "githubusercontent.com",
+            &t("raw.githubusercontent.com")
         ));
         assert!(!matches(
             "*.githubusercontent.com",

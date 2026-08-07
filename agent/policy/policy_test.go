@@ -55,14 +55,20 @@ func TestPermitsMatchesOnLabelBoundaries(t *testing.T) {
 	e := New(&fakeApplier{}, []string{"github.com", "*.githubusercontent.com"}, false)
 
 	for _, name := range []string{
+		// A bare entry covers the apex and its subdomains.
 		"github.com", "codeload.github.com", "GitHub.com", "github.com.",
-		"raw.githubusercontent.com", "githubusercontent.com",
+		// A wildcard entry covers subdomains.
+		"raw.githubusercontent.com",
 	} {
 		if !e.Permits(name) {
 			t.Errorf("%q should be permitted", name)
 		}
 	}
 	for _, name := range []string{
+		// ...but not its own apex: `*.githubusercontent.com` says subdomains,
+		// which is what the console promises, and permitting the apex too is
+		// a wider grant than the user wrote.
+		"githubusercontent.com",
 		"evilgithub.com", "github.com.evil.example", "example.com", "", "   ",
 	} {
 		if e.Permits(name) {

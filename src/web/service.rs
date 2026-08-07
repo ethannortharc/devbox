@@ -404,20 +404,32 @@ pub fn load_policy(manager: &Arc<SandboxManager>, name: &str) -> Result<crate::p
 /// The console's counterpart to `cli::policy::reapply`. A stopped box picks it
 /// up at start; an unreachable one is an error, because the tab has just told
 /// the user the posture is set.
+/// What happened when a saved policy was pushed at the box.
+///
+/// Three outcomes, because there are three: applied, deferred to the next
+/// start, or failed. Collapsing "deferred" into "applied" let the Policy tab
+/// tell the user a stopped box was firewalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// In force on the running box now.
+    Now,
+    /// Saved; `start_box` will apply it when the box next starts.
+    OnNextStart,
+}
+
 pub async fn apply_policy_now(
     manager: &Arc<SandboxManager>,
     name: &str,
     policy: &crate::policy::Policy,
-) -> Result<()> {
+) -> Result<Applied> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
     match runtime.status(name).await? {
         SandboxStatus::Running => {
-            crate::policy::enforce::apply(runtime.as_ref(), name, policy).await
+            crate::policy::enforce::apply(runtime.as_ref(), name, policy).await?;
+            Ok(Applied::Now)
         }
-        // Deferred, honestly: `start_box` applies it, so the posture is not
-        // lost and the tab can say so.
-        SandboxStatus::Stopped => Ok(()),
+        SandboxStatus::Stopped => Ok(Applied::OnNextStart),
         // Not deferred — unknown. A box the runtime cannot find has certainly
         // not had its firewall changed, and the wildcard that used to catch
         // this rendered "Saved and applied".

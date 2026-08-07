@@ -102,7 +102,9 @@ type Enforcer struct {
 
 	mu sync.RWMutex
 	// allow holds the domains the policy names, lower-cased.
-	allow map[string]struct{}
+	// allow maps a domain to whether the *apex* is permitted. A wildcard entry
+	// (`*.example.com`) stores false: subdomains only.
+	allow map[string]bool
 	// seen records when each address was last added, so an entry that has
 	// aged out of the kernel set is added again rather than suppressed
 	// forever. See AllowTTL.
@@ -115,11 +117,18 @@ type Enforcer struct {
 
 // New builds an enforcer for a set of allowlisted domains.
 func New(applier Applier, domains []string, mirrorOnly bool) *Enforcer {
-	allow := make(map[string]struct{}, len(domains))
+	// `*.example.com` means subdomains, which is what the console says it
+	// means. Stripping the prefix and forgetting it had been there made the
+	// entry permit the apex as well — a wider grant than the user wrote.
+	allow := make(map[string]bool, len(domains))
 	for _, d := range domains {
-		d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(d, "*.")))
+		d = strings.ToLower(strings.TrimSpace(d))
+		wildcard := strings.HasPrefix(d, "*.")
+		d = strings.TrimPrefix(d, "*.")
 		if d != "" {
-			allow[d] = struct{}{}
+			// A bare entry also covers the apex; a wildcard entry does not.
+			// If both forms appear, the broader one wins.
+			allow[d] = allow[d] || !wildcard
 		}
 	}
 	return &Enforcer{
@@ -152,7 +161,13 @@ func (e *Enforcer) Permits(name string) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	for allowed := range e.allow {
+	for allowed, apexToo := range e.allow {
+		if name == allowed {
+			if apexToo {
+				return true
+			}
+			continue // a wildcard entry does not cover its own apex
+		}
 		if suffixMatch(name, allowed) {
 			return true
 		}

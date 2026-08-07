@@ -114,6 +114,13 @@ pub struct Generated {
     /// makes the later "restored" message a lie, which is worse than saying
     /// the rollback was incomplete.
     sets_archived: bool,
+    /// Whether the directory existed at all when the snapshot was taken.
+    ///
+    /// "No archive" has two meanings and they need opposite handling. On a
+    /// first or legacy box the directory was simply absent, and a failed apply
+    /// *creates* it — so restoring means deleting what the failed run wrote,
+    /// not leaving it in place for a later rebuild to evaluate.
+    sets_existed: bool,
 }
 
 /// Files `write_set_modules` overwrites.
@@ -172,9 +179,19 @@ pub async fn snapshot_generated(
         .await
         .is_ok_and(|r| r.exit_code == 0);
 
+    let existed = runtime
+        .exec_cmd(
+            box_name,
+            &["sh", "-c", &format!("[ -d {GENERATED_SETS_DIR} ]")],
+            false,
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
+
     Generated {
         files: out,
         sets_archived: archived,
+        sets_existed: existed,
     }
 }
 
@@ -188,7 +205,25 @@ pub async fn restore_generated(
     // The set modules first, so a partially written directory is replaced
     // wholesale rather than merged with what the failed run left behind.
     // Only claim to restore the modules if they were actually archived.
-    let mut restored = if backup.sets_archived {
+    let mut restored = if !backup.sets_existed {
+        // Nothing was there before, so putting it back means removing what the
+        // failed run created. Leaving it left failed modules staged for the
+        // next rebuild to pick up — the thing the rollback exists to prevent.
+        runtime
+            .exec_cmd(
+                box_name,
+                &[
+                    "sh",
+                    "-c",
+                    &crate::policy::enforce::elevated(&format!(
+                        "rm -rf {GENERATED_SETS_DIR} {SETS_BACKUP}"
+                    )),
+                ],
+                false,
+            )
+            .await
+            .is_ok_and(|r| r.exit_code == 0)
+    } else if backup.sets_archived {
         runtime
             .exec_cmd(
                 box_name,

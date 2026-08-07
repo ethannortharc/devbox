@@ -138,10 +138,23 @@ impl Selection {
         config.languages.java = has("lang-java");
         config.languages.ruby = has("lang-ruby");
 
+        // A retained package keeps whatever source the project gave it. A
+        // devbox.toml can point one at a flake — `my-tool =
+        // "github:user/flake#pkg"` — and rewriting every entry to `nixpkgs`
+        // on each set apply silently replaced the thing the user installed,
+        // in the file that is their source of truth. Only genuinely new
+        // packages get the default.
         config.custom_packages = self
             .packages
             .iter()
-            .map(|p| (p.clone(), "nixpkgs".to_string()))
+            .map(|p| {
+                let source = base
+                    .custom_packages
+                    .get(p)
+                    .cloned()
+                    .unwrap_or_else(|| "nixpkgs".to_string());
+                (p.clone(), source)
+            })
             .collect();
 
         config

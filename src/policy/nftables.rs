@@ -102,6 +102,9 @@ pub const SET_V6: &str = "allow_v6";
 pub const SET_STATIC_V4: &str = "static_v4";
 pub const SET_STATIC_V6: &str = "static_v6";
 
+/// Chain holding the egress verdict for forwarded traffic.
+pub const FORWARD_EGRESS: &str = "forward_egress";
+
 /// How long a DNS-derived allow-set entry lives.
 ///
 /// Long enough that an active session is not interrupted by an expiry between
@@ -134,6 +137,12 @@ pub struct Context {
     pub resolvers: Vec<String>,
     /// Prefixes belonging to a lab running on this box.
     pub lab_prefixes: Vec<String>,
+    /// Networks nested containers send from.
+    ///
+    /// Forwarded traffic is policed only when it *originates* here: everything
+    /// else crossing the forward hook is inbound or lab-internal routing, and
+    /// egress control is about where the box can reach, not who can reach it.
+    pub container_prefixes: Vec<String>,
 }
 
 pub fn ruleset(policy: &Policy) -> String {
@@ -208,15 +217,53 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
     // … curl` walked straight past `isolated` and every allowlist: the one
     // command a developer is most likely to run inside a sandboxed box was the
     // one the sandbox did not cover.
-    for hook in ["output", "forward"] {
-        let _ = writeln!(nft, "  chain {hook} {{");
+    // `output` covers packets the box sends. `forward` covers packets it
+    // routes — which, with the `container` set, is everything a nested Docker
+    // container sends, and is why an output-only ruleset let `docker run …
+    // curl` ignore every posture.
+    //
+    // But `forward` also carries *inbound* traffic: a published container port
+    // arrives DNATed and traverses this hook as `ct state new` toward an
+    // address that is not in any egress allow set. Filtering it identically
+    // dropped the first SYN of every inbound connection to a published
+    // service. Egress control is about where the box can *reach*, not who can
+    // reach it, so the forward chain polices only what leaves.
+    let _ = writeln!(nft, "  chain output {{");
+    let _ = writeln!(
+        nft,
+        "    type filter hook output priority filter; policy {verdict};"
+    );
+    emit_policy_rules(&mut nft, policy, ctx);
+    let _ = writeln!(nft, "  }}");
+
+    let _ = writeln!(nft, "  chain forward {{");
+    let _ = writeln!(
+        nft,
+        "    type filter hook forward priority filter; policy accept;"
+    );
+    let _ = writeln!(nft, "    ct state established,related accept");
+    // Traffic arriving from outside and being routed inward is not egress.
+    // Only what a container originates gets judged against the posture.
+    for prefix in &ctx.container_prefixes {
+        let family = if prefix.contains(':') { "ip6" } else { "ip" };
+        let _ = writeln!(nft, "    {family} saddr {prefix} jump {FORWARD_EGRESS}");
+    }
+    if ctx.container_prefixes.is_empty() {
         let _ = writeln!(
             nft,
-            "    type filter hook {hook} priority filter; policy {verdict};"
+            "    # no container networks discovered: nothing forwarded is policed"
         );
-        emit_policy_rules(&mut nft, policy, ctx);
-        let _ = writeln!(nft, "  }}");
     }
+    let _ = writeln!(nft, "  }}");
+
+    // The egress verdict for forwarded traffic, reached only from the jumps
+    // above so inbound connections never see it.
+    let _ = writeln!(nft, "  chain {FORWARD_EGRESS} {{");
+    emit_policy_rules(&mut nft, policy, ctx);
+    if policy.egress.enforces() {
+        let _ = writeln!(nft, "    drop");
+    }
+    let _ = writeln!(nft, "  }}");
 
     let _ = writeln!(nft, "}}");
     nft
@@ -358,27 +405,47 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_traffic_is_policed_like_output() {
-        // With the `container` set on, everything a nested Docker container
-        // sends is *forwarded*, not output — so an output-only ruleset let
-        // `docker run … curl` walk past isolated and every allowlist.
-        let nft = ruleset(&policy(Posture::Allowlist, &["10.0.0.0/8"]));
+    fn container_egress_is_policed_but_inbound_is_not() {
+        // Two failures, one chain. An output-only ruleset let `docker run …
+        // curl` bypass every posture; filtering `forward` identically then
+        // dropped the first SYN of every inbound connection to a published
+        // container port, which arrives DNATed as `ct state new` toward an
+        // address no egress rule matches.
+        //
+        // Egress control is about where the box can reach, not who can reach
+        // it — so only traffic *originating* in a container is judged.
+        let ctx = Context {
+            resolvers: vec!["192.0.2.53".into()],
+            container_prefixes: vec!["172.17.0.0/16".into()],
+            ..Default::default()
+        };
+        let nft = ruleset_with(&policy(Posture::Allowlist, &["10.0.0.0/8"]), &ctx);
 
-        assert!(nft.contains("hook forward priority filter; policy drop;"));
-
-        let output = nft.split("chain output {").nth(1).unwrap();
-        let output = output.split("  }").next().unwrap();
         let forward = nft.split("chain forward {").nth(1).unwrap();
         let forward = forward.split("  }").next().unwrap();
 
-        for rule in ["@static_v4 accept", "@allow_v4 accept", "devbox-blocked"] {
-            assert!(output.contains(rule), "output missing {rule}");
-            assert!(
-                forward.contains(rule),
-                "forward missing {rule}: a rule in one chain and not the other \
-                 is a hole the shape of the container bypass"
-            );
-        }
+        // The chain itself must not default-deny, or inbound dies.
+        assert!(forward.contains("policy accept;"));
+        assert!(forward.contains("ct state established,related accept"));
+        // Container-sourced traffic is sent to the egress verdict.
+        assert!(forward.contains("ip saddr 172.17.0.0/16 jump forward_egress"));
+
+        // And that verdict really does deny: an allowlist that only accepts is
+        // not an allowlist.
+        let egress = nft.split("chain forward_egress {").nth(1).unwrap();
+        let egress = egress.split("  }").next().unwrap();
+        assert!(egress.contains("@static_v4 accept"));
+        assert!(egress.contains("@allow_v4 accept"));
+        assert!(egress.contains("drop"));
+    }
+
+    #[test]
+    fn a_box_without_containers_polices_nothing_forwarded() {
+        let nft = ruleset(&policy(Posture::Isolated, &[]));
+        let forward = nft.split("chain forward {").nth(1).unwrap();
+        let forward = forward.split("  }").next().unwrap();
+        assert!(forward.contains("no container networks discovered"));
+        assert!(!forward.contains("jump forward_egress"));
     }
 
     #[test]

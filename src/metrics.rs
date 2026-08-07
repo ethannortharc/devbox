@@ -115,16 +115,19 @@ pub fn render(snapshot: &Snapshot) -> String {
     }
 
     header(&mut out, "devbox_events_by_type");
-    if snapshot.events_by_type.is_empty() {
-        // Emit every type at zero rather than nothing: a series that only
-        // appears once it is non-zero cannot be alerted on.
-        for kind in EventType::ALL {
-            let _ = writeln!(out, "devbox_events_by_type{{type=\"{kind}\"}} 0");
-        }
-    } else {
-        for (kind, n) in &snapshot.events_by_type {
-            let _ = writeln!(out, "devbox_events_by_type{{type=\"{kind}\"}} {n}");
-        }
+    // Every type, every scrape, zero when absent — not only when the whole map
+    // is empty. The old branch emitted the full set at zero on a quiet box and
+    // then, the moment one type appeared, dropped every other series. An alert
+    // on "no exec events" would have gone blind exactly when the box got busy,
+    // which is the opposite of when you want it working.
+    for kind in EventType::ALL {
+        let n = snapshot
+            .events_by_type
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        let _ = writeln!(out, "devbox_events_by_type{{type=\"{kind}\"}} {n}");
     }
 
     header(&mut out, "devbox_boxes");

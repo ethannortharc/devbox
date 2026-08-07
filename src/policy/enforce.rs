@@ -284,9 +284,31 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         .map(|r| parse_prefixes(&r.stdout))
         .unwrap_or_default();
 
+    // Docker's bridge networks, which is where nested containers send from.
+    // `docker network inspect` is the authority; a box without Docker returns
+    // nothing and no forwarded traffic is policed, which is correct because
+    // there is none to police.
+    let container_prefixes = runtime
+        .exec_cmd(
+            sandbox_name,
+            &[
+                "sh",
+                "-c",
+                "docker network inspect $(docker network ls -q) \
+                 --format '{{range .IPAM.Config}}{{.Subnet}}\n{{end}}' 2>/dev/null",
+            ],
+            false,
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| parse_prefixes(&r.stdout))
+        .unwrap_or_default();
+
     super::nftables::Context {
         resolvers,
         lab_prefixes,
+        container_prefixes,
     }
 }
 

@@ -167,7 +167,15 @@ else
   report pushing
   mv /tmp/frr.conf.new /etc/frr/frr.conf
   hostname "$NAME"
-  /etc/init.d/frr restart >/dev/null 2>&1 || service frr restart >/dev/null 2>&1 || true
+  # Not "|| true". A restart that fails leaves the *old* bgpd running with the
+  # old configuration, and the verification below then finds established
+  # sessions and reports healthy — for a node that never loaded the config it
+  # was just given.
+  if ! /etc/init.d/frr restart >/dev/null 2>&1 && \
+     ! service frr restart >/dev/null 2>&1; then
+    report failed "frr restart failed; the new config was not loaded"
+    exit 1
+  fi
   report verifying
 fi
 
@@ -209,6 +217,10 @@ if [ "$_ok" -eq 1 ]; then
   report healthy
 else
   report failed "no established bgp session within 60s"
+  # Nonzero, so a boot hook or supervisor sees a failure and retries. Falling
+  # off the end here exited 0 and looked like a successful provision, with the
+  # failure visible only to whoever read the registry.
+  exit 1
 fi
 `, s.bootURL)
 }

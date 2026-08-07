@@ -511,6 +511,13 @@ async fn put_policy(
     let applied = service::apply_policy_now(&state.manager, &name, &policy).await;
 
     let note = match (&applied, posture.enforces()) {
+        // Deferred is its own answer: the box is off, so nothing was
+        // firewalled, and saying "applied" would be false.
+        (Ok(service::Applied::OnNextStart), _) => format!(
+            "Saved: <strong>{posture}</strong> with {entries} allowlist entr{}. \
+             The box is stopped; it applies when the box next starts.",
+            if entries == 1 { "y" } else { "ies" }
+        ),
         // The count appears in both branches: what was saved is a fact either
         // way, and the user needs to know their entries are recorded even when
         // the box could not be reached.
@@ -520,11 +527,11 @@ async fn put_policy(
             if entries == 1 { "y" } else { "ies" },
             build::escape_html(&e.to_string())
         ),
-        (Ok(()), true) => format!(
+        (Ok(_), true) => format!(
             "Saved and applied: <strong>{posture}</strong> with {entries} allowlist entr{}.",
             if entries == 1 { "y" } else { "ies" }
         ),
-        (Ok(()), false) => {
+        (Ok(_), false) => {
             format!("Saved: <strong>{posture}</strong>. Nothing is blocked in this posture.")
         }
     };

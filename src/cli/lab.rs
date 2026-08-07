@@ -309,13 +309,33 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     // it runs on the host, from a policy file, with no idea a lab exists. A
     // file on the box is the handoff: written when a lab comes up, removed
     // when it goes down, read at every policy apply.
+    // The prefixes this lab actually allocated, not the pool it drew from.
+    // Writing the base exempted every address in a `/16` when the lab used a
+    // handful of `/31`s — and omitted explicit links outside the base
+    // entirely, so it was both too permissive and incomplete.
+    let mut prefixes: Vec<String> = lab
+        .plan
+        .links
+        .iter()
+        .map(|link| link.subnet.clone())
+        .collect();
+    prefixes.extend(lab.plan.loopbacks.values().map(|addr| format!("{addr}/32")));
+    prefixes.sort();
+    prefixes.dedup();
+
     push_file(
         runtime.as_ref(),
         &substrate,
         &format!("/etc/devbox/lab/{}/prefixes", lab.name()),
-        &format!("{}\n", lab.topology.lab.base),
+        &format!("{}\n", prefixes.join("\n")),
     )
     .await?;
+
+    // And reload, so the exemption is in force now. `resolve_substrate`
+    // applied the posture before this file existed, so an isolated substrate
+    // would otherwise run the whole lab with its own subnets blocked until
+    // some later operation happened to reapply.
+    reapply_policy(manager, &substrate).await?;
 
     // Router configs, then the daemons that read them.
     //
@@ -392,6 +412,16 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
             .with_context(|| format!("could not reach substrate '{substrate}' to tear down"))?;
         if result.exit_code == 0 {
             removed += 1;
+        } else if !result.stderr.contains("No such file or directory") {
+            // A namespace that is already gone is the expected case after a
+            // partial bring-up. One that is *busy*, or that permissions
+            // refuse, is a real failure — and reporting a clean teardown then
+            // left a live namespace behind while the policy metadata that
+            // exempted it was removed.
+            bail!(
+                "could not remove namespace during teardown: {}",
+                result.stderr.trim()
+            );
         }
     }
 
@@ -411,6 +441,11 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
             false,
         )
         .await;
+
+    // Reload, or the torn-down subnet stays permitted until something else
+    // reapplies — and a routed network overlapping the old range would be
+    // reachable from a box reporting itself isolated.
+    reapply_policy(manager, &substrate).await?;
 
     println!(
         "Lab '{}' torn down ({removed} of {} namespaces removed).",
@@ -677,6 +712,16 @@ async fn resolve_substrate(
     crate::policy::enforce::apply_saved(manager, &state, &name).await?;
 
     Ok((runtime, name))
+}
+
+/// Re-apply the substrate's saved posture.
+///
+/// Called whenever the set of lab prefixes changes. The ruleset embeds those
+/// prefixes (ADR-0046), so writing the file is only half the job — the table
+/// in the kernel is what decides, and it does not reread anything.
+async fn reapply_policy(manager: &SandboxManager, substrate: &str) -> Result<()> {
+    let state = manager.get_sandbox(substrate)?;
+    crate::policy::enforce::apply_saved(manager, &state, substrate).await
 }
 
 /// Write a file inside the substrate.
