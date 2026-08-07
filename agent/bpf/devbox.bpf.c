@@ -244,7 +244,15 @@ static __always_inline int connect_return(int ret)
 
 	// A failed connect never established anything; reporting it as a flow
 	// would put destinations in the timeline that were never reached.
+	//
+	// `tcp_v*_connect` returning 0 only means the SYN went out — a refusal or
+	// a timeout arrives later, higher in the stack — so the socket state is
+	// checked as well. TCP_SYN_SENT here means "still trying", and the
+	// timeline claims reachability it cannot know.
 	if (ret != 0)
+		return 0;
+	__u8 state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	if (state != 1 /* TCP_ESTABLISHED */)
 		return 0;
 
 	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);

@@ -304,6 +304,13 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 		return nil, nil
 	}
 	raw, err := os.ReadFile(cfg.policy)
+	if os.IsNotExist(err) {
+		// Not an error. The unit passes `-policy` unconditionally because the
+		// path cannot be checked at Nix evaluation time without baking in the
+		// answer forever — so an agent that starts before the first policy is
+		// staged enforces nothing and picks one up on the next reload.
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read the policy at %s: %w", cfg.policy, err)
 	}

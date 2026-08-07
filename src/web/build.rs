@@ -443,6 +443,10 @@ pub async fn apply_selection(
         // And the firewall. A rebuild that failed during activation has
         // already torn the old network stack down, so the box is sitting
         // unrestricted on precisely the path where something went wrong.
+        // Composed into one terminal status rather than two competing ones.
+        // Publishing the rebuild error separately overwrote this — same event
+        // key, last value retained — so the browser showed the *less* severe
+        // message. The route only publishes if nothing here did.
         if let Err(policy_err) =
             crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name).await
         {
@@ -458,39 +462,28 @@ pub async fn apply_selection(
                     escape_html(&policy_err.to_string())
                 ),
             ));
+        } else {
+            // Only when the firewall did come back. Otherwise the message
+            // above — the one that says the box is exposed — stands.
+            state.publish(ConsoleEvent::new(
+                status_event(box_name),
+                format!(
+                    "<span class=\"term-err\">{}</span>",
+                    escape_html(&e.to_string())
+                ),
+            ));
         }
-        state.publish(ConsoleEvent::new(
-            status_event(box_name),
-            format!(
-                "<span class=\"term-err\">{}</span>",
-                escape_html(&e.to_string())
-            ),
-        ));
         return Err(e);
     }
 
-    // 3. Only now is the selection real: record it, in both places.
+    // Before persistence, not after.
     //
-    // `state.json` is devbox's own bookkeeping; `devbox.toml` is the project's
-    // source of truth, and box *creation* reads it. Writing only the former
-    // meant destroying and recreating a box restored the selection from before
-    // the checklist was ever touched — the change survived every restart and
-    // vanished on the one operation people use to get a clean box.
-    // devbox.toml first. If it fails, `state.json` has not been touched, so
-    // the two still agree — on the old selection, which the box no longer
-    // has, but a mismatch the user can see and re-apply. Saving state first
-    // and failing here would leave devbox reporting the new selection with
-    // the project file describing the old one, and a later recreate silently
-    // reverting the box.
-    let mut sandbox = sandbox;
-    sandbox.sets = config.active_sets();
-    sandbox.languages = config.active_languages();
-    sandbox.packages = selection.packages.iter().cloned().collect();
-    config
-        .save(&sandbox.project_dir.join("devbox.toml"))
-        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
-    sandbox.save(&manager.state_dir)?;
-
+    // A read-only devbox.toml or a failed state write returned through `?`
+    // and the firewall was never reattempted — so a rebuild that succeeded
+    // left the box live and unrestricted, reporting only a bookkeeping error.
+    // The box is already running the new configuration by this point; getting
+    // its firewall back matters more than recording what it is running.
+    //
     // A Sets rebuild restarts the box's network stack — toggling `network` or
     // `container` certainly does — which takes devbox's nftables table with
     // it. Reprovision already re-applies the posture for exactly this reason;
@@ -516,6 +509,27 @@ pub async fn apply_selection(
         ));
         return Err(e).context("rebuild succeeded but the egress posture could not be restored");
     }
+    // 3. Only now is the selection real: record it, in both places.
+    //
+    // `state.json` is devbox's own bookkeeping; `devbox.toml` is the project's
+    // source of truth, and box *creation* reads it. Writing only the former
+    // meant destroying and recreating a box restored the selection from before
+    // the checklist was ever touched — the change survived every restart and
+    // vanished on the one operation people use to get a clean box.
+    // devbox.toml first. If it fails, `state.json` has not been touched, so
+    // the two still agree — on the old selection, which the box no longer
+    // has, but a mismatch the user can see and re-apply. Saving state first
+    // and failing here would leave devbox reporting the new selection with
+    // the project file describing the old one, and a later recreate silently
+    // reverting the box.
+    let mut sandbox = sandbox;
+    sandbox.sets = config.active_sets();
+    sandbox.languages = config.active_languages();
+    sandbox.packages = selection.packages.iter().cloned().collect();
+    config
+        .save(&sandbox.project_dir.join("devbox.toml"))
+        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+    sandbox.save(&manager.state_dir)?;
 
     state.publish(ConsoleEvent::new(
         status_event(box_name),

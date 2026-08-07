@@ -106,8 +106,14 @@ in
           # The egress policy, when the control plane has written one. The
           # agent is what keeps the firewall's allow sets in step with DNS, so
           # an allowlist is only enforceable if this is passed.
-          ++ lib.optional (builtins.pathExists /etc/devbox/policy.json)
-               "-policy /etc/devbox/policy.json"
+          # No `pathExists` here. It is evaluated while *building* the
+          # configuration, so a module enabled before the first policy is
+          # staged bakes in a unit that never passes `-policy` — and writing
+          # the file later does not reevaluate Nix. The agent tolerates an
+          # absent file (it enforces nothing until one appears), so the flag
+          # is unconditional and the decision happens at run time where it
+          # belongs.
+          ++ [ "-policy" "/etc/devbox/policy.json" ]
         );
 
         # Loading eBPF programs and reading every process needs real

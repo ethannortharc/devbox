@@ -165,8 +165,12 @@ set -eu
 ZTP="%s"
 # "cat" on an empty DMI file succeeds, so "||" never fired — a board that
 # reports a blank serial produced an empty identity instead of falling back.
-SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null)"
-[ -n "$SERIAL" ] || SERIAL="$(cat /etc/machine-id 2>/dev/null)"
+# "set -e" is on, and a failed command substitution fails the assignment — so
+# on ARM and anything else without a DMI serial file, the script exited here
+# before the fallback could run. The trailing "|| true" keeps the assignment
+# succeeding with an empty value, and the emptiness check does the real work.
+SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || true)"
+[ -n "$SERIAL" ] || SERIAL="$(cat /etc/machine-id 2>/dev/null || true)"
 # Stripped to what a serial can legitimately contain. It is interpolated into
 # the JSON bodies below, so a quote or a backslash from DMI — which is not a
 # trusted source; it is whatever the board vendor wrote — would produce a

@@ -9,6 +9,9 @@
     <link rel="stylesheet" href="/assets/css/app.css" />
     {% block head %}{% endblock %}
     <script src="/assets/js/htmx.min.js" defer></script>
+    <!-- Must load after htmx and before any request: 4xx bodies carry the
+         actionable error text, and htmx 2 does not swap them by default. -->
+    <script src="/assets/js/htmx-config.js" defer></script>
     <script src="/assets/js/sse.js" defer></script>
   </head>
   <body hx-ext="sse" sse-connect="/api/stream">

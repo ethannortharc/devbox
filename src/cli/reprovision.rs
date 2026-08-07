@@ -86,6 +86,12 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Update saved state with migrated sets
     let mut updated_state = state.clone();
     updated_state.sets = sets;
+    if saved_policy.egress != crate::policy::Posture::Open {
+        let runtime = manager.runtime_for_sandbox(&updated_state)?;
+        crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await?;
+        println!("Egress posture '{}' re-applied.", saved_policy.egress);
+    }
+
     updated_state.save(&manager.state_dir)?;
 
     // Re-apply the posture read before the rebuild. Provisioning rebuilds the
@@ -93,11 +99,6 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // box comes back open no matter what `devbox.toml` says. Using the value
     // captured up front means a file that became unreadable *during* the
     // rebuild cannot leave the box unrestricted either.
-    if saved_policy.egress != crate::policy::Posture::Open {
-        let runtime = manager.runtime_for_sandbox(&updated_state)?;
-        crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await?;
-        println!("Egress posture '{}' re-applied.", saved_policy.egress);
-    }
 
     println!("Re-provisioning complete. Run `devbox shell --name {name}` to attach.");
     Ok(())

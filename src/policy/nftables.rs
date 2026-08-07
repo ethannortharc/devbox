@@ -25,6 +25,31 @@ pub const TABLE: &str = "devbox";
 /// Shared by `output` and `forward` so the two can never drift: a rule added
 /// to one and forgotten in the other is a hole shaped exactly like the
 /// container-egress bypass this was factored out to fix.
+/// Rules that keep the *host* on the network, for the output chain only.
+///
+/// DHCP renewal goes to broadcast and neighbour discovery to `ff02::/16`, so
+/// neither matches the unicast loopback and link-local exemptions — without
+/// these an enforcing box loses its lease and drops off the network hours
+/// later, which reads as anything except a firewall rule.
+///
+/// Deliberately *not* in `emit_policy_rules`: that is shared with the chain
+/// that judges forwarded traffic, so putting them there let a nested container
+/// send DHCP-shaped packets straight past an isolated posture. A rule that
+/// exists for the host has no business applying to what the host routes.
+fn emit_host_control_rules(nft: &mut String) {
+    let _ = writeln!(nft, "    udp sport 68 udp dport 67 accept");
+    let _ = writeln!(nft, "    udp sport 546 udp dport 547 accept");
+    // Typed, not a blanket multicast accept. nftables rules are alternatives,
+    // so `ip6 daddr ff02::/16 accept` on its own permitted *every* protocol to
+    // link-local multicast and the ICMPv6 rule below constrained nothing.
+    let _ = writeln!(
+        nft,
+        "    ip6 daddr ff02::/16 icmpv6 type {{ nd-router-solicit, \
+         nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, \
+         mld-listener-query, mld-listener-report }} accept"
+    );
+}
+
 fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     // Established traffic first: a reply to a connection we already allowed
     // must not be re-evaluated, and putting this rule anywhere but first costs
@@ -40,27 +65,6 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     let _ = writeln!(nft, "    ip6 daddr ::1 accept");
     let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
     let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
-
-    // The traffic that keeps the box on the network at all.
-    //
-    // DHCP renewal goes to the broadcast address, and router/neighbour
-    // discovery goes to `ff02::/16` — neither is unicast loopback or
-    // link-local, so neither matched the rules above. An enforcing posture
-    // therefore let the box's own DHCP lease expire and broke IPv6 neighbour
-    // discovery: the box drops off the network some hours after the policy is
-    // applied, which reads as anything except a firewall rule.
-    //
-    // Scoped to the protocols and ports, not opened generally, and only in the
-    // output chain — a nested container does not need to renew the host's
-    // lease.
-    let _ = writeln!(nft, "    udp sport 68 udp dport 67 accept");
-    let _ = writeln!(nft, "    udp sport 546 udp dport 547 accept");
-    let _ = writeln!(nft, "    ip6 daddr ff02::/16 accept");
-    let _ = writeln!(
-        nft,
-        "    icmpv6 type {{ nd-router-solicit, nd-router-advert, \
-         nd-neighbor-solicit, nd-neighbor-advert }} accept"
-    );
 
     // DNS must survive every posture except `isolated`: the allowlist is
     // resolved by name, so blocking resolution would make the allowlist
@@ -260,6 +264,7 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
         nft,
         "    type filter hook output priority filter; policy {verdict};"
     );
+    emit_host_control_rules(&mut nft);
     emit_policy_rules(&mut nft, policy, ctx);
     let _ = writeln!(nft, "  }}");
 
@@ -530,12 +535,33 @@ mod tests {
             );
         }
 
-        // But not in the forward chain: a nested container has no business
-        // renewing the host's lease.
-        let forward = ruleset(&policy(Posture::Isolated, &[]));
-        let forward = forward.split("chain forward {").nth(1).unwrap();
-        let forward = forward.split("  }").next().unwrap();
-        assert!(!forward.contains("dport 67"));
+        // And nowhere near forwarded traffic. The previous version of this
+        // assertion checked `chain forward`, which never carried them — the
+        // leak was into `forward_egress`, the chain that actually judges. The
+        // test passed while the bug it was written for was live, which is a
+        // worse outcome than not having written it.
+        let nft = ruleset(&policy(Posture::Isolated, &[]));
+        for chain in ["chain forward {", "chain forward_egress {"] {
+            let body = nft.split(chain).nth(1).unwrap();
+            let body = body.split("\n  }").next().unwrap();
+            assert!(
+                !body.contains("dport 67") && !body.contains("dport 547"),
+                "{chain} must not carry host DHCP exceptions — a container \
+                 would send DHCP-shaped packets straight past the posture:\n{body}"
+            );
+            assert!(
+                !body.contains("ff02::/16"),
+                "{chain} must not carry the host's multicast exception:\n{body}"
+            );
+        }
+
+        // The blanket multicast accept is gone: nftables rules are
+        // alternatives, so `ip6 daddr ff02::/16 accept` permitted every
+        // protocol and the ICMPv6 rule after it constrained nothing.
+        let output = nft.split("chain output {").nth(1).unwrap();
+        let output = output.split("\n  }").next().unwrap();
+        assert!(!output.contains("ff02::/16 accept"));
+        assert!(output.contains("ff02::/16 icmpv6 type"));
     }
 
     #[test]

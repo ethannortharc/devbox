@@ -170,6 +170,15 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         return Err(e);
     }
 
+    // The firewall first, then the bookkeeping.
+    //
+    // A read-only devbox.toml returned through `?` and the posture was never
+    // reattempted, so a successful rebuild left the box live and unrestricted
+    // while reporting only a write error. The box is already running the new
+    // configuration; getting its firewall back matters more than recording
+    // what it is running.
+    crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await?;
+
     let config = after.to_config(&base);
     let mut state = state;
     state.sets = config.active_sets();
@@ -186,7 +195,6 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     state.save(&manager.state_dir)?;
 
     // Same as the console path: the rebuild can take the firewall with it.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await?;
 
     println!("Box '{name}' rebuilt with the new selection.");
     Ok(())

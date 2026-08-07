@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -459,5 +460,39 @@ func TestBootstrapScriptIsValidShell(t *testing.T) {
 	cmd.Stdin = strings.NewReader(script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("bootstrap script is not valid shell: %v\n%s", err, out)
+	}
+}
+
+// TestBootstrapSourceHasNoBackticks guards the raw string that holds it.
+//
+// I have broken this file five times by writing a backtick inside the
+// bootstrap script's comments — Go ends the raw string there, and the error
+// surfaces dozens of lines away as "unexpected name". The compiler does catch
+// it, but only after a build cycle, and the message never points at the cause.
+// This says the cause.
+func TestBootstrapSourceHasNoBackticks(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Skipf("cannot read own source: %v", err)
+	}
+	text := string(src)
+
+	start := strings.Index(text, "fmt.Fprintf(w, `#!/bin/sh")
+	if start < 0 {
+		t.Fatal("could not find the bootstrap script; this guard needs updating")
+	}
+	end := strings.Index(text[start:], "`, s.bootURL)")
+	if end < 0 {
+		t.Fatal("bootstrap raw string is not terminated where expected")
+	}
+
+	// One backtick opens it and one closes it; anything else is inside.
+	body := text[start : start+end]
+	if n := strings.Count(body, "`"); n != 1 {
+		t.Errorf("bootstrap script contains %d backticks; a backtick anywhere "+
+			"inside — including in a comment — ends the Go raw string. Use "+
+			"double quotes when naming a command.", n)
 	}
 }
