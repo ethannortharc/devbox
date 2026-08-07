@@ -189,16 +189,30 @@ fn write_command(ruleset: &str) -> String {
 
 /// The shell that removes devbox's table and its generated files.
 fn clear_command() -> String {
+    let table = super::nftables::TABLE;
     format!(
-        // No nft means no devbox table, so there is nothing to clear and this
-        // is not a failure. Clearing runs on every start of an `open` box,
-        // including boxes that have never had a policy and images that ship no
-        // firewall at all — erroring there would refuse to start them.
-        "command -v nft >/dev/null 2>&1 && \
-         nft destroy table inet {} 2>/dev/null; \
+        // Two cases that look alike and must not be treated alike.
+        //
+        // *No nft, or no table* — nothing to clear, and not a failure. This
+        // runs on every start of an `open` box, including boxes that never had
+        // a policy and images with no firewall at all; erroring there would
+        // refuse to start them.
+        //
+        // *nft present and the destroy failed* — a permission problem, an
+        // unsupported version, something else. The old restrictive table is
+        // still live while every surface reports the box open, which is the
+        // dangerous direction. A trailing `exit 0` used to swallow both.
+        //
+        // The generated files are removed only once the table is really gone,
+        // so a failed clear does not additionally strand the agent without its
+        // configuration.
+        "if ! command -v nft >/dev/null 2>&1; then exit 0; fi; \
+         if ! nft list table inet {table} >/dev/null 2>&1; then \
+           rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; exit 0; \
+         fi; \
+         nft destroy table inet {table} || exit 1; \
          rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; \
-         exit 0",
-        super::nftables::TABLE
+         exit 0"
     )
 }
 
@@ -587,18 +601,19 @@ mod tests {
     #[test]
     fn clearing_succeeds_on_a_box_that_never_had_a_policy() {
         let cmd = clear_command();
-        // `destroy` and the `|| true` are both load-bearing: `delete` on a
-        // missing table is an error, and this runs on every `policy set open`.
-        assert!(cmd.contains("destroy table inet devbox"));
-        // Exits 0 whatever it finds: this runs on every start of an open box,
-        // including images with no firewall at all.
+        // A box with no nft, or no devbox table, has nothing to clear and must
+        // still start — this runs on every start of an `open` box.
         assert!(cmd.contains("command -v nft"));
+        assert!(cmd.contains("nft list table inet devbox"));
+        // But a destroy that *fails* must not report success. The old
+        // restrictive table would still be live while every surface reads the
+        // box as open, which is the dangerous direction to be wrong in.
+        assert!(cmd.contains("nft destroy table inet devbox || exit 1"));
         // Privilege is decided in the guest: a container exec is already root
         // and may have no sudo at all, while a VM's user needs it.
         let wrapped = elevated(&cmd);
         assert!(wrapped.contains("id -u"));
         assert!(wrapped.contains("sudo sh -c"));
-        assert!(cmd.trim_end().ends_with("exit 0"));
         assert!(cmd.contains(RULESET_PATH));
     }
 }

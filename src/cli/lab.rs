@@ -585,14 +585,33 @@ async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
     )
     .await?;
 
-    // Healing a link that was never impaired is a no-op, not an error.
+    // Healing a link that was never impaired is a no-op, not an error. A heal
+    // that *failed* is a different thing: the fault is still in place, and
+    // printing "healed" sends the user chasing a symptom they believe they
+    // just fixed.
     let mut cleared = 0;
     for cmd in &commands {
         let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        if let Ok(result) = runtime.exec_cmd(&substrate, &argv, false).await
-            && result.exit_code == 0
-        {
+        let result = runtime
+            .exec_cmd(&substrate, &argv, false)
+            .await
+            .with_context(|| format!("could not reach substrate '{substrate}' to heal"))?;
+        if result.exit_code == 0 {
             cleared += 1;
+        } else if !result
+            .stderr
+            .contains("Cannot delete qdisc with handle of zero")
+            && !result.stderr.contains("No such file or directory")
+            && !result
+                .stderr
+                .contains("RTNETLINK answers: No such file or directory")
+        {
+            bail!(
+                "could not heal {} ↔ {}: {}\n  The fault is still in place.",
+                link.0,
+                link.1,
+                result.stderr.trim()
+            );
         }
     }
     println!(

@@ -74,15 +74,33 @@ func New(registry *statemachine.Registry, catalog Catalog, bootURL string) *Serv
 	return &Server{registry: registry, catalog: catalog, bootURL: bootURL}
 }
 
-// Handler returns the routed HTTP handler.
+// Handler returns every route, including metrics.
+//
+// Used for the dedicated metrics listener and by tests. The node-facing
+// listener must use ProvisioningHandler instead.
 func (s *Server) Handler() http.Handler {
+	mux := s.provisioningMux()
+	mux.HandleFunc("GET /metrics", s.metrics)
+	return mux
+}
+
+// ProvisioningHandler returns the routes a booting node needs, and no others.
+//
+// Blank devices boot from the provisioning network, and `/metrics` carries
+// every node name and its provisioning state. Serving it there gave anything
+// on that network a fabric inventory, which is exactly what the separate
+// -metrics listener exists to prevent.
+func (s *Server) ProvisioningHandler() http.Handler {
+	return s.provisioningMux()
+}
+
+func (s *Server) provisioningMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /bootstrap.sh", s.bootstrap)
 	mux.HandleFunc("POST /identify", s.identify)
 	mux.HandleFunc("GET /config/{name}", s.config)
 	mux.HandleFunc("POST /status", s.report)
 	mux.HandleFunc("GET /status", s.status)
-	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})

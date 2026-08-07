@@ -327,3 +327,38 @@ func TestANodeThatFailsHalfwayCanStartOverAndReachHealthy(t *testing.T) {
 		t.Error("the fabric should have converged after recovery")
 	}
 }
+
+// TestProvisioningListenerHasNoMetrics pins the port separation.
+//
+// Blank devices boot from the provisioning network, and /metrics carries every
+// node name and its state. Serving it there handed anything on that network a
+// fabric inventory — which is what the separate -metrics listener exists to
+// prevent, so the separation has to be real and not just configured.
+func TestProvisioningListenerHasNoMetrics(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("metrics reachable on the provisioning listener: got %d", rec.Code)
+	}
+
+	// And the node routes it does need still work.
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec = httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("healthz should serve on the provisioning listener: got %d", rec.Code)
+	}
+
+	// The metrics listener still has them.
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("metrics should serve on its own listener: got %d", rec.Code)
+	}
+}

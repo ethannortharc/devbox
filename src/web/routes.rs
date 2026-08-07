@@ -437,6 +437,9 @@ async fn apply_sets(
     let box_name = name.clone();
     tokio::spawn(async move {
         let _guard = guard;
+        // Let the replacement panel subscribe before anything is published.
+        // Bounded, so a client that never returns cannot stall the rebuild.
+        bg.await_listener(std::time::Duration::from_secs(2)).await;
         let manager = bg.manager.clone();
         if let Err(e) = build::apply_selection(&manager, &bg, &box_name, &selection).await {
             tracing::warn!(box_id = %box_name, error = ?e, "rebuild failed");

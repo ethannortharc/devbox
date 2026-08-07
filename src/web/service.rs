@@ -131,10 +131,19 @@ pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
         // and never had its posture installed. Applying is idempotent.
         SandboxStatus::Running => crate::policy::enforce::apply_saved(manager, &state, name).await,
         SandboxStatus::Stopped => {
-            runtime
-                .start(name)
-                .await
-                .with_context(|| format!("failed to start box '{name}'"))?;
+            // Two requests can see `Stopped` at once — clicking Start while the
+            // Terminal tab opens is enough. Incus rejects the second start as
+            // already-running, and that request used to fail *and skip policy
+            // application*, so the box came up unrestricted while the user saw
+            // an error about starting it.
+            //
+            // Losing the race is not a failure: the box is running, which is
+            // what was asked for. Only a start that leaves it not running is.
+            if let Err(e) = runtime.start(name).await
+                && runtime.status(name).await? != SandboxStatus::Running
+            {
+                return Err(e).with_context(|| format!("failed to start box '{name}'"));
+            }
             crate::policy::enforce::apply_saved(manager, &state, name).await
         }
         SandboxStatus::NotFound => bail!(

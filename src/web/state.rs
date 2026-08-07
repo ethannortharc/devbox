@@ -58,6 +58,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Wait until a browser is listening, or give up after `timeout`.
+    ///
+    /// A rebuild is started by the same request that returns the replacement
+    /// build panel, so the work can finish — or fail in preflight — before the
+    /// browser has swapped that panel in and resubscribed. The channel has no
+    /// replay, so those lines went to a listener that was about to be
+    /// discarded and the new panel sat on "Rebuilding…" forever.
+    ///
+    /// The timeout is what keeps this from being a new way to hang: a client
+    /// that never comes back should not stop the build it asked for.
+    pub async fn await_listener(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.events.receiver_count() == 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Subscribed, but htmx installs the panel and opens the stream in that
+        // order; a beat here lets the swap land before the first line.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     pub fn new(manager: Arc<SandboxManager>, token: impl Into<Arc<str>>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {

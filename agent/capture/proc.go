@@ -50,7 +50,12 @@ func (p *Proc) Name() string { return "proc" }
 // connections it does see carry no pid, because /proc/net/tcp has no pid
 // column — see `pollConnections`.
 func (p *Proc) Domains() []event.Type {
-	return []event.Type{event.TypeExec, event.TypeExit, event.TypeConnect}
+	return []event.Type{
+		event.TypeExec,
+		event.TypeExit,
+		event.TypeConnect,
+		event.TypeAccept,
+	}
 }
 
 // Run implements Source.
@@ -148,6 +153,18 @@ func (p *Proc) pollConnections(
 			continue
 		}
 
+		// Which local ports this box is listening on. An established socket
+		// whose *local* port is a listener is a connection someone made to
+		// us, not one we made — and the activity view maps connect events to
+		// outbound traffic, so emitting these as connects reported inbound
+		// clients as destinations the box had contacted.
+		listening := map[uint16]struct{}{}
+		for _, conn := range conns {
+			if conn.State == TCPListen {
+				listening[conn.LocalPort] = struct{}{}
+			}
+		}
+
 		for _, conn := range conns {
 			if conn.State != TCPEstablished {
 				continue
@@ -159,7 +176,8 @@ func (p *Proc) pollConnections(
 			}
 			seen[key] = struct{}{}
 
-			if err := Send(ctx, out, p.connectEvent(conn)); err != nil {
+			_, inbound := listening[conn.LocalPort]
+			if err := Send(ctx, out, p.flowEvent(conn, inbound)); err != nil {
 				return err
 			}
 		}
@@ -188,8 +206,19 @@ func connKey(conn Conn) string {
 		conn.LocalAddr, conn.LocalPort, conn.RemoteAddr, conn.RemotePort, conn.Inode)
 }
 
-// connectEvent builds a `connect` event from a /proc/net/tcp row.
-func (p *Proc) connectEvent(conn Conn) *event.Event {
+// TCPListen is the state value for a listening socket.
+const TCPListen uint8 = 10
+
+// flowEvent builds a `connect` or `accept` event from a /proc/net/tcp row.
+//
+// The direction is decided by whether the local port is one this box listens
+// on: outbound sockets get an ephemeral local port, inbound ones share the
+// listener's.
+func (p *Proc) flowEvent(conn Conn, inbound bool) *event.Event {
+	kind := event.TypeConnect
+	if inbound {
+		kind = event.TypeAccept
+	}
 	return p.stamp(&event.Event{
 		// No pid: /proc/net/tcp does not carry one, and inventing one would
 		// be worse than leaving it absent. The collector requires a non-zero
@@ -198,7 +227,7 @@ func (p *Proc) connectEvent(conn Conn) *event.Event {
 		PID:  1,
 		TID:  1,
 		Comm: "proc-poll",
-		Type: event.TypeConnect,
+		Type: kind,
 		Net: &event.Net{
 			Proto: "tcp",
 			SAddr: conn.LocalAddr,

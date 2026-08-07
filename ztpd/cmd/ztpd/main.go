@@ -121,9 +121,13 @@ func run(args []string, out io.Writer) error {
 	}()
 	fmt.Fprintf(out, "  metrics on %s\n", cfg.metrics)
 
+	// The node-facing listener serves provisioning only. `Handler()` includes
+	// GET /metrics, so registering it here also published node names and
+	// provisioning state on the network blank devices boot from — defeating
+	// the port separation the -metrics flag exists to provide.
 	srv := &http.Server{
 		Addr:              cfg.listen,
-		Handler:           server.Handler(),
+		Handler:           server.ProvisioningHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return srv.ListenAndServe()

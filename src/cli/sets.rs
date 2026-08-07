@@ -168,12 +168,15 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     state.sets = config.active_sets();
     state.languages = config.active_languages();
     state.packages = after.packages.iter().cloned().collect();
-    state.save(&manager.state_dir)?;
-    // And the project's own file, which box creation reads — see the note in
-    // `web::build::apply_selection`.
+    // devbox.toml first, then state — the order the console path uses, and for
+    // the same reason: a failure here leaves the two agreeing on the old
+    // selection, which the user can see and re-apply. The other order leaves
+    // devbox reporting the new selection while the project file describes the
+    // old one, and a later recreate silently reverts the box.
     config
         .save(&state.project_dir.join("devbox.toml"))
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+    state.save(&manager.state_dir)?;
 
     println!("Box '{name}' rebuilt with the new selection.");
     Ok(())
