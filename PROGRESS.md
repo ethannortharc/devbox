@@ -990,5 +990,9 @@ until the reviewer has no opinions" is not a condition this process reaches.
 A better stopping rule is a severity floor: stop when a round produces no P1s
 and no security findings, and take the remaining P2s as a backlog.
 
+**Adopted (2026-08-07).** The stopping rule is now the severity floor: rounds
+continue until one produces no P1 findings and nothing security-relevant.
+Surviving P2s are recorded as a backlog rather than treated as a blocker.
+
 **Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
