@@ -55,7 +55,9 @@ class ProvisionReport:
         return self.state in TERMINAL
 
 
-def all_nodes_healthy(reports: list[ProvisionReport]) -> tuple[bool, str]:
+def all_nodes_healthy(
+    reports: list[ProvisionReport], expected: list[str] | None = None
+) -> tuple[bool, str]:
     """Whether every node reached `healthy`.
 
     Returns the verdict and an explanation, so a failing assertion says *which*
@@ -63,6 +65,19 @@ def all_nodes_healthy(reports: list[ProvisionReport]) -> tuple[bool, str]:
     """
     if not reports:
         return False, "no nodes reported at all — did the ZTP server ever see one?"
+
+    # A node that never boots is absent from `reports`, not present-and-sick,
+    # so "everything I can see is healthy" is not the same claim as "the fabric
+    # converged". Nineteen healthy out of an expected twenty passed this until
+    # the caller could say what it expected — the same distinction ztpd's own
+    # convergence calculation makes.
+    if expected is not None:
+        seen = {r.device for r in reports}
+        missing = sorted(set(expected) - seen)
+        if missing:
+            return False, (
+                f"{len(missing)} expected device(s) never reported: {', '.join(missing)}"
+            )
 
     unhealthy = [r for r in reports if not r.healthy]
     if not unhealthy:

@@ -51,8 +51,35 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         .filter(|entry| super::parse_cidr(entry).is_none())
         .map(String::as_str)
         .collect();
+    // ...but not on the first application, or nothing could ever be applied.
+    //
+    // The guard and the agent were a deadlock: the agent exits without
+    // `/etc/devbox/policy.json`, and this refused to write that file until a
+    // qualifying agent was running. Moving from `open` to an allowlist was
+    // therefore impossible — the command always bailed, and the box stayed
+    // open, which is the failure the guard exists to prevent.
+    //
+    // So the file is staged either way; the refusal is about *loading a
+    // default-deny ruleset* the agent cannot populate, which is the part that
+    // strands traffic. With the policy written and no agent, the posture is
+    // saved and inert, and the message says exactly that.
     let needs_agent = !domains.is_empty() || policy.egress == Posture::MirrorOnly;
-    if needs_agent && !agent_resolves_dns(runtime, sandbox_name).await {
+    let agent_ready = !needs_agent || agent_resolves_dns(runtime, sandbox_name).await;
+
+    if !agent_ready {
+        // Stage the policy so an agent started next can read it, then refuse
+        // to install the ruleset.
+        let spec = agent_policy_json(policy, "");
+        let _ = runtime
+            .exec_cmd(
+                sandbox_name,
+                &["sh", "-c", &elevated(&policy_command(&spec))],
+                false,
+            )
+            .await;
+    }
+
+    if !agent_ready {
         bail!(
             "box '{sandbox_name}' has no DNS-capturing devbox-obsd, so a domain-based \
              posture cannot be enforced: nftables matches addresses, and only the \

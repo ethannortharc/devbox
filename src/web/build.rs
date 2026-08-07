@@ -440,6 +440,17 @@ pub async fn apply_selection(
         if restore_generated(runtime.as_ref(), box_name, &backup).await {
             publish("devbox: generated files restored to the last good selection");
         }
+        // And the firewall. A rebuild that failed during activation has
+        // already torn the old network stack down, so the box is sitting
+        // unrestricted on precisely the path where something went wrong.
+        if let Err(policy_err) =
+            crate::policy::enforce::apply_saved(manager, &sandbox, box_name).await
+        {
+            publish(&format!(
+                "devbox: WARNING — egress posture not restored after the failed \
+                 rebuild; this box is unrestricted: {policy_err}"
+            ));
+        }
         state.publish(ConsoleEvent::new(
             status_event(box_name),
             format!(
@@ -477,7 +488,19 @@ pub async fn apply_selection(
     // it. Reprovision already re-applies the posture for exactly this reason;
     // this path did not, so a box could finish a rebuild reporting `isolated`
     // with open egress.
-    if let Err(e) = crate::policy::enforce::apply_saved(manager, &sandbox, box_name).await {
+    // `apply` rather than `apply_saved`: the latter reports and returns Ok by
+    // design (ADR-0044), because a *user asking for access* must not be locked
+    // out. A rebuild is not that — nobody is waiting at a prompt, and the
+    // console is about to print a verdict — so this path wants the strict
+    // form, which propagates.
+    let restore = match DevboxConfig::load_for_edit(&sandbox.project_dir) {
+        Ok(cfg) if cfg.policy.egress != crate::policy::Posture::Open => {
+            crate::policy::enforce::apply(runtime.as_ref(), box_name, &cfg.policy).await
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = restore {
         // Terminal status, not a log line among the build output. "rebuild
         // complete" printed underneath a warning nobody scrolled back to read
         // is the console saying the box is fine while its firewall is gone.

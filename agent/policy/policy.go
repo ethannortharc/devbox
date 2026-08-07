@@ -70,15 +70,34 @@ func (NFT) AddElement(ctx context.Context, set, addr string) error {
 	// is not atomic in the sense that matters here — a packet arriving in the
 	// gap is denied and retried by the application, whereas an element that
 	// silently stopped being renewed fails for an hour.
-	del := fmt.Sprintf("delete element inet %s %s { %s }", Table, set, addr)
-	_ = exec.CommandContext(ctx, "nft", del).Run()
+	// Tokenized, not one string. `exec.Command` does not shell-split, so
+	// passing "add element inet devbox allow_v4 { 1.2.3.4 }" handed nft a
+	// single argv entry it cannot parse — every insertion failed, and the
+	// default-deny allow set stayed empty for the life of the box. The
+	// enforcer has never actually added an address.
+	//
+	// The braces are their own arguments because nft's parser wants them as
+	// separate tokens once the shell is not doing the splitting.
+	// Delete first so the add is unconditional: `add element` on an existing
+	// element returns EEXIST without renewing its timeout, and renewal is the
+	// whole point of re-adding an address that is still in use.
+	_ = exec.CommandContext(ctx, "nft", elementArgs("delete", set, addr)...).Run()
 
-	element := fmt.Sprintf("add element inet %s %s { %s }", Table, set, addr)
-	cmd := exec.CommandContext(ctx, "nft", element)
+	cmd := exec.CommandContext(ctx, "nft", elementArgs("add", set, addr)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("nft %q: %w: %s", element, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("nft add %s %s: %w: %s", set, addr, err,
+			strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// elementArgs builds the argv for an nft set-element operation.
+//
+// Separate from the call so the tokenization is testable without nft present:
+// the bug it exists to prevent is invisible at runtime, because a failed
+// insertion looks like a domain that simply cannot be reached.
+func elementArgs(op, set, addr string) []string {
+	return []string{op, "element", "inet", Table, set, "{", addr, "}"}
 }
 
 // AllowTTL is how long a DNS-derived allow-set entry is trusted.

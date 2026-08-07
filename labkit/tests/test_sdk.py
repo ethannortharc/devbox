@@ -198,3 +198,20 @@ def test_normal_advancement_is_progress() -> None:
     ]
     for previous, current in itertools.pairwise(states):
         assert is_forward_progress(previous, current), f"{previous} → {current}"
+
+
+def test_a_device_that_never_reports_is_not_healthy() -> None:
+    """Absent is not the same as present-and-well.
+
+    A node that never boots is missing from the report list, so "everything I
+    can see is healthy" passed for nineteen out of an expected twenty.
+    """
+    reports = [
+        ProvisionReport(device="leaf1", state="healthy", duration_secs=1.0),
+    ]
+    ok, why = all_nodes_healthy(reports)
+    assert ok, why
+
+    ok, why = all_nodes_healthy(reports, expected=["leaf1", "leaf2"])
+    assert not ok
+    assert "leaf2" in why

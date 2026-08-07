@@ -36,6 +36,21 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
         config.apply_tools(&[tool_name.to_string()]);
     }
 
+    // The box's ad-hoc packages, which `load_or_default` reads from the
+    // *current directory's* devbox.toml — not necessarily this box's project.
+    // Without them `apply_config` writes guest state with an empty
+    // custom-package map, so the rebuild removes every package added through
+    // the Sets tab while state.json goes on reporting them.
+    let project = DevboxConfig::load_or_default(&state.project_dir);
+    for pkg in &state.packages {
+        let source = project
+            .custom_packages
+            .get(pkg)
+            .cloned()
+            .unwrap_or_else(|| "nixpkgs".to_string());
+        config.custom_packages.insert(pkg.clone(), source);
+    }
+
     // Apply new tools
     println!("Adding tools: {}", args.tools.join(", "));
     nix::upgrade_sets(runtime.as_ref(), &name, &mut config, &args.tools).await?;

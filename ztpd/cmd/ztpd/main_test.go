@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,13 +52,26 @@ func TestBootURLIsAnAddressANodeCanReach(t *testing.T) {
 		t.Errorf("bootURL = %q", got)
 	}
 
-	// With no advertised address, the lab's service address is the default.
+	// With no advertised address, the default is *this host's* address.
+	//
+	// It used to be a hardcoded `10.0.0.1`, which was wrong for the built-in
+	// ztp-fabric: `svc` is endpoint A of the first /31, so IPAM gives it
+	// 10.0.0.0 and gives .1 to spine1 — every node was sent to the spine.
+	// Asserting the 10/8 prefix here encoded that same wrong assumption, so
+	// the property is what it always should have been: a real address, and
+	// never one a node provably cannot fetch from.
 	cfg, _ = parseFlags(nil, io.Discard)
-	if got := cfg.bootURL(); !strings.HasPrefix(got, "http://10.") {
-		t.Errorf("bootURL = %q, want a routable default", got)
+	got := cfg.bootURL()
+	host := strings.TrimPrefix(got, "http://")
+	host, _, err = net.SplitHostPort(host)
+	if err != nil {
+		t.Fatalf("bootURL = %q, which has no host:port", got)
 	}
-	if strings.Contains(cfg.bootURL(), "0.0.0.0") || strings.Contains(cfg.bootURL(), "localhost") {
-		t.Errorf("bootURL = %q, which no node could fetch", cfg.bootURL())
+	if net.ParseIP(host) == nil {
+		t.Errorf("bootURL host %q is not an IP address", host)
+	}
+	if host == "0.0.0.0" || host == "localhost" {
+		t.Errorf("bootURL = %q, which no node could fetch", got)
 	}
 }
 

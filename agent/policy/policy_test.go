@@ -343,3 +343,31 @@ func TestAllowTTLMatchesTheRuleset(t *testing.T) {
 			AllowTTL, want)
 	}
 }
+
+// TestNFTArgumentsAreTokenized pins the shape of the nft invocation.
+//
+// `exec.Command` does not shell-split, so the whole rule as one string was a
+// single argv entry nft could not parse. Every insertion failed and the
+// default-deny allow set stayed empty for the life of the box — the enforcer
+// never added an address, and nothing noticed because a blocked domain looks
+// exactly like a network problem.
+func TestNFTArgumentsAreTokenized(t *testing.T) {
+	t.Parallel()
+
+	args := elementArgs("add", SetV4, "192.0.2.1")
+	for _, arg := range args {
+		if strings.ContainsAny(arg, " \t") {
+			t.Errorf("argument %q contains whitespace; nft receives it as one token", arg)
+		}
+	}
+
+	want := []string{"add", "element", "inet", Table, SetV4, "{", "192.0.2.1", "}"}
+	if len(args) != len(want) {
+		t.Fatalf("got %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("got %v, want %v", args, want)
+		}
+	}
+}

@@ -43,7 +43,13 @@ type config struct {
 func (c config) bootURL() string {
 	host := c.advertise
 	if host == "" {
-		host = "10.0.0.1"
+		// The service node's own address, discovered rather than assumed.
+		//
+		// `10.0.0.1` was a guess that happens to be wrong for the built-in
+		// `ztp-fabric`: `svc` is endpoint A of the first derived /31, so IPAM
+		// gives it `10.0.0.0` and gives `.1` to spine1. Every node was told to
+		// fetch its config from the spine, where nothing is listening.
+		host = firstNonLoopbackIPv4()
 	}
 	_, port, err := net.SplitHostPort(c.listen)
 	if err != nil || port == "" {
@@ -135,6 +141,31 @@ func run(args []string, out io.Writer) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return srv.ListenAndServe()
+}
+
+// firstNonLoopbackIPv4 is this host's own address on the fabric.
+//
+// A ZTP server sits on the provisioning network by definition, so its first
+// non-loopback IPv4 address is the one nodes can reach. `-advertise` overrides
+// it for the multi-homed case; the default is now at least *this machine*
+// rather than an address from a topology that may not be the one running.
+func firstNonLoopbackIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	// Nothing else to offer. A node cannot reach this, and the banner prints
+	// the URL, so it is visible rather than silently wrong.
+	return "127.0.0.1"
 }
 
 // loadCatalog reads the rendered artifacts the Python side produced.

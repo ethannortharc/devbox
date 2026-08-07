@@ -76,6 +76,12 @@ func CanTransition(from, to State) bool {
 	if to == Discovered || to == Failed {
 		return true
 	}
+	// A repeat of the current state is a retry, checked before terminality:
+	// the bootstrap resends its final `healthy` when the response is lost, and
+	// rejecting that made a successfully provisioned node's script fail.
+	if from == to {
+		return true
+	}
 	if from == Healthy || from == Failed {
 		// Both are terminal: the only way out is a restart through
 		// `discovered`, which the case above already allows. Without this,
@@ -83,13 +89,6 @@ func CanTransition(from, to State) bool {
 		// a stale status update could revive a failed node straight into
 		// `healthy` and manufacture convergence.
 		return false
-	}
-	// A repeat of the state the node is already in is a retry, not a
-	// regression. The bootstrap resends when a response is lost, and after the
-	// first request landed the identical retry would otherwise get 409 —
-	// forever, until the node gave up on a transition that had succeeded.
-	if from == to {
-		return true
 	}
 	return index(to) > index(from)
 }

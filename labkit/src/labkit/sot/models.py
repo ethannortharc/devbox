@@ -93,6 +93,14 @@ class Interface(Model):
         return value
 
 
+#: What the bootstrap script's `tr -cd` leaves of a serial. A catalog key
+#: outside this set can never be matched, because the node reports the stripped
+#: form — and two different keys can strip to the same value, so one device
+#: would answer for another. Module scope, not a class attribute: pydantic
+#: treats a leading-underscore name as a private attr rather than a constant.
+SERIAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
+
+
 class Device(Model):
     """One device in the fabric."""
 
@@ -118,8 +126,27 @@ class Device(Model):
     @field_validator("serial")
     @classmethod
     def _valid_serial(cls, value: str) -> str:
+        """Only what a node can actually report.
+
+        The bootstrap script strips its serial to `[A-Za-z0-9._:-]` and
+        truncates at 128 before calling `/identify`, because DMI is not a
+        trusted source. A catalog key outside that set can therefore never be
+        matched — and two distinct keys can strip to the same value, so one
+        device would answer for another.
+        """
         if not value.strip():
             raise ValueError("a device needs a serial; it is how ZTP identifies it")
+        if len(value) > 128:
+            raise ValueError(
+                f"serial {value!r} is longer than 128 characters; the node "
+                "truncates it before reporting, so it could never match"
+            )
+        stray = sorted(set(value) - SERIAL_CHARS)
+        if stray:
+            raise ValueError(
+                f"serial {value!r} contains {stray!r}, which the node strips "
+                "before reporting; use letters, digits, '.', '_', ':' or '-'"
+            )
         return value
 
     @field_validator("asn")
