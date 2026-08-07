@@ -1092,3 +1092,50 @@ missing code was never covered by one.
 
 **Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-07T12:00Z — Rounds 16–20 under the severity floor
+
+P1 counts since the floor was adopted: **0, 0, 2, 2, 7, 6, 3** (rounds 14–20).
+
+The spike at seven tracked round 17, which was the heaviest change of the whole
+exercise — a forward-chain inversion, a listener split, and a package-source
+refactor in one commit. Rounds 19 and 20 were deliberately narrow and the count
+came down. The floor is measuring change rate more than residual defect count,
+which is worth knowing when reading it.
+
+Three findings in this stretch were worse than ordinary bugs.
+
+**I reopened a hole I had personally closed.** Round 12 added
+`is_valid_attr_path` to stop shell injection through `[custom_packages]`. Round
+17 taught that path about flake references and validated only the fragment
+after `#`, so `github:user/repo; touch /tmp/pwn; #pkg` passed the guard whose
+entire purpose was to stop it. Adding a feature to a validated path without
+extending the validation is a distinct mistake from writing an unvalidated
+path, and it is harder to notice, because the guard is right there.
+
+**The DNS enforcer never worked.** `exec.Command` does not shell-split, so the
+whole nft rule as one string was a single argv entry nft could not parse. Every
+insertion failed for the life of every box, and nothing noticed because a
+blocked domain looks exactly like a network problem. It survived nineteen
+rounds because no test could reach it.
+
+**A guard I added guaranteed the outcome it prevented.** The agent exits
+without `/etc/devbox/policy.json`; `enforce::apply` refused to write that file
+until a qualifying agent was running. Moving from `open` to an allowlist was
+therefore impossible — every attempt bailed and the box stayed open.
+
+The common thread is the one worth carrying forward: **the code that stayed
+broken longest is the code no test could reach** — nft calls needing a kernel,
+the bootstrap script running only on a blank device, eBPF needing BTF. Each has
+now produced a serious defect that survived many rounds. The response in each
+case was to pull a pure function out of the untestable path and test that:
+`elementArgs` for nft, `clear_command`/`write_command` for the firewall shell,
+`sh -n` over the generated bootstrap script.
+
+Two guards now exist for classes rather than instances — `policy_lifecycle.rs`
+for posture restoration, the set-drift tests for catalog/module agreement — and
+the lifecycle one caught a rename in round 20, within the same session it was
+written. That is the first time one of these has paid for itself immediately.
+
+**Gate** — 403 Rust unit + 53 integration/e2e, 10 Go packages, 68 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
