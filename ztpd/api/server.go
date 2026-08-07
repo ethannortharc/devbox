@@ -81,6 +81,7 @@ func New(registry *statemachine.Registry, catalog Catalog, bootURL string) *Serv
 func (s *Server) Handler() http.Handler {
 	mux := s.provisioningMux()
 	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /status", s.status)
 	return mux
 }
 
@@ -100,7 +101,11 @@ func (s *Server) provisioningMux() *http.ServeMux {
 	mux.HandleFunc("POST /identify", s.identify)
 	mux.HandleFunc("GET /config/{name}", s.config)
 	mux.HandleFunc("POST /status", s.report)
-	mux.HandleFunc("GET /status", s.status)
+	// GET /status is *not* here. It returns the whole registry — serials,
+	// names, roles, states, config hashes — and the bootstrap script never
+	// reads it. Leaving it on the node-facing listener let the provisioning
+	// network enumerate the fabric even after /metrics moved off, which is
+	// the same exposure with a different path.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
@@ -178,13 +183,18 @@ mkdir -p /etc/frr
 wget -q -O /tmp/frr.conf.new "$ZTP/config/$NAME" || {
   report failed "config fetch failed"; exit 1; }
 
+# The hostname is runtime state, not a file, so it does not survive a reboot
+# and has to be set on every run — not only when the config changed. A node
+# that rebooted and found its config unchanged used to come back healthy with
+# the OS default hostname, which is what an operator reads in every log.
+hostname "$NAME"
+
 if [ -f /etc/frr/frr.conf ] && cmp -s /tmp/frr.conf.new /etc/frr/frr.conf; then
   rm -f /tmp/frr.conf.new
   report verifying
 else
   report pushing
   mv /tmp/frr.conf.new /etc/frr/frr.conf
-  hostname "$NAME"
   # Not "|| true". A restart that fails leaves the *old* bgpd running with the
   # old configuration, and the verification below then finds established
   # sessions and reports healthy — for a node that never loaded the config it

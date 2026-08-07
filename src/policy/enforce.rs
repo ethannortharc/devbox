@@ -84,24 +84,6 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     }
     let ruleset = super::nftables::ruleset_with(policy, &ctx);
 
-    // Hand the agent the domains too. Without this the ruleset is default-deny
-    // with a permanently empty allow set: `allowlist` and `mirror-only` would
-    // block precisely the traffic they promise to permit.
-    let spec = agent_policy_json(policy, &ruleset);
-    let write_policy = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sh", "-c", &elevated(&policy_command(&spec))],
-            false,
-        )
-        .await?;
-    if write_policy.exit_code != 0 {
-        bail!(
-            "failed to write the policy into box '{sandbox_name}': {}",
-            write_policy.stderr.trim()
-        );
-    }
-
     let write = runtime
         .exec_cmd(
             sandbox_name,
@@ -131,6 +113,32 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
              nftables ships in the locked `system` set, so a box that lacks it \
              predates that change — `devbox reprovision` will install it.",
             load.stderr.trim()
+        );
+    }
+
+    // The agent's policy goes in *after* the table exists, not before.
+    //
+    // The other order had a window: the agent notices the new policy file,
+    // resolves an allowlisted domain, and inserts the address into the *old*
+    // table — which `nft -f` then destroys and rebuilds empty. The agent has
+    // already recorded that address as seen, so it will not re-add it until
+    // the refresh window elapses, and the domain stays blocked for most of an
+    // hour with nothing in any log to explain it.
+    //
+    // Without this file at all the ruleset is default-deny with a permanently
+    // empty allow set, so it still has to be written — just second.
+    let spec = agent_policy_json(policy, &ruleset);
+    let write_policy = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sh", "-c", &elevated(&policy_command(&spec))],
+            false,
+        )
+        .await?;
+    if write_policy.exit_code != 0 {
+        bail!(
+            "failed to write the policy into box '{sandbox_name}': {}",
+            write_policy.stderr.trim()
         );
     }
 

@@ -183,8 +183,15 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	fs.BoolVar(&cfg.showVersion, "version", false, "print version and exit")
 	fs.StringVar(&cfg.listen, "listen", ":8080",
 		"address to serve bootstrap scripts and configs on")
-	fs.StringVar(&cfg.metrics, "metrics", ":9090",
-		"address to serve Prometheus metrics on")
+	// Loopback by default, not `:9090`. On a multi-homed ZTP host — which is
+	// every real one, since it sits between a management network and the
+	// provisioning network — a bare port binds every interface, so splitting
+	// the operator routes onto their own port did nothing to keep blank
+	// devices from scraping the fabric inventory. An operator who wants it
+	// reachable can name a management address explicitly.
+	fs.StringVar(&cfg.metrics, "metrics", "127.0.0.1:9090",
+		"address to serve metrics and the status inventory on; defaults to "+
+			"loopback so the provisioning network cannot reach it")
 	fs.StringVar(&cfg.sotPath, "sot", "/etc/devbox/ztp",
 		"directory holding serials.json and the rendered <device>.conf files")
 	fs.StringVar(&cfg.advertise, "advertise", "",

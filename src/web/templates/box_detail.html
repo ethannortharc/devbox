@@ -185,7 +185,7 @@
         <div class="buildlog"
              sse-swap="build-{{ boxinfo.name }}"
              hx-swap="beforeend scroll:bottom"></div>
-        <p class="muted" sse-swap="build-status-{{ boxinfo.name }}"></p>
+        <p class="muted" sse-swap="build-status-{{ boxinfo.name }}">{{ retained_build|safe }}</p>
       </div>
 
       {% elif tab == "policy" %}

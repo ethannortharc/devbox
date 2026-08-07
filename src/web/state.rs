@@ -42,6 +42,19 @@ pub struct AppState {
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
     pub version: &'static str,
+    /// The last terminal build status per box, for replay.
+    ///
+    /// The broadcast channel has no history, and the request that starts a
+    /// rebuild is the same one that returns the replacement panel — so a fast
+    /// failure can publish its status before htmx has installed the element
+    /// that would show it, leaving the panel on "Rebuilding…" forever.
+    ///
+    /// A previous attempt waited for a subscriber, which does not work: the
+    /// page-level `/api/stream` subscription already makes the receiver count
+    /// nonzero, and `sse-swap` elements create no server-side receiver. There
+    /// is nothing to wait *for*, so the fix is to keep the answer instead of
+    /// trying to time its delivery.
+    pub build_status: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     /// Boxes with a rebuild in flight.
     ///
     /// Two submissions from a double-click or two tabs would otherwise both
@@ -58,29 +71,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Wait until a browser is listening, or give up after `timeout`.
-    ///
-    /// A rebuild is started by the same request that returns the replacement
-    /// build panel, so the work can finish — or fail in preflight — before the
-    /// browser has swapped that panel in and resubscribed. The channel has no
-    /// replay, so those lines went to a listener that was about to be
-    /// discarded and the new panel sat on "Rebuilding…" forever.
-    ///
-    /// The timeout is what keeps this from being a new way to hang: a client
-    /// that never comes back should not stop the build it asked for.
-    pub async fn await_listener(&self, timeout: std::time::Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.events.receiver_count() == 0 {
-            if tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        // Subscribed, but htmx installs the panel and opens the stream in that
-        // order; a beat here lets the swap land before the first line.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
     pub fn new(manager: Arc<SandboxManager>, token: impl Into<Arc<str>>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
@@ -89,6 +79,7 @@ impl AppState {
             events,
             version: env!("CARGO_PKG_VERSION"),
             rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
+            build_status: Arc::new(std::sync::Mutex::new(Default::default())),
             collector_stats: Arc::new(crate::obs::collector::Stats::default()),
         }
     }
@@ -113,7 +104,26 @@ impl AppState {
     /// Returns the number of receivers reached. Zero is normal — it just means
     /// no browser is open — so this never errors.
     pub fn publish(&self, event: ConsoleEvent) -> usize {
+        // Retain terminal build statuses so a panel that missed the broadcast
+        // can render it on arrival.
+        if let Some(box_name) = event.kind.strip_prefix("build-status-")
+            && let Ok(mut retained) = self.build_status.lock()
+        {
+            retained.insert(box_name.to_string(), event.data.clone());
+        }
         self.events.send(event).unwrap_or(0)
+    }
+
+    /// The last build status for a box, if one finished without being seen.
+    pub fn retained_build_status(&self, box_name: &str) -> Option<String> {
+        self.build_status.lock().ok()?.get(box_name).cloned()
+    }
+
+    /// Forget a box's retained status, when a new build starts.
+    pub fn clear_build_status(&self, box_name: &str) {
+        if let Ok(mut retained) = self.build_status.lock() {
+            retained.remove(box_name);
+        }
     }
 }
 

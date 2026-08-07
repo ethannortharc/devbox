@@ -109,6 +109,8 @@ struct BoxDetailTemplate {
     tree: Vec<TreeRow>,
     behavior: String,
     has_store: bool,
+    /// A build status published before this page loaded.
+    retained_build: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +196,7 @@ async fn box_detail(
         lookups: act.lookups,
         tree: act.tree,
         has_store: act.has_store,
+        retained_build: state.retained_build_status(&name).unwrap_or_default(),
     })
 }
 
@@ -386,6 +389,8 @@ async fn destroy_box(State(state): State<AppState>, Path(name): Path<String>) ->
 struct BuildPanelFragment {
     name: String,
     summary: String,
+    /// A status published before this panel existed; empty in the usual case.
+    retained: String,
 }
 
 /// `POST /api/boxes/{name}/sets` — apply a set selection and rebuild.
@@ -435,11 +440,11 @@ async fn apply_sets(
 
     let bg = state.clone();
     let box_name = name.clone();
+    // A new build supersedes whatever the last one ended with.
+    state.clear_build_status(&name);
+
     tokio::spawn(async move {
         let _guard = guard;
-        // Let the replacement panel subscribe before anything is published.
-        // Bounded, so a client that never returns cannot stall the rebuild.
-        bg.await_listener(std::time::Duration::from_secs(2)).await;
         let manager = bg.manager.clone();
         if let Err(e) = build::apply_selection(&manager, &bg, &box_name, &selection).await {
             tracing::warn!(box_id = %box_name, error = ?e, "rebuild failed");
@@ -455,7 +460,11 @@ async fn apply_sets(
 
     (
         StatusCode::ACCEPTED,
-        render(BuildPanelFragment { name, summary }),
+        render(BuildPanelFragment {
+            retained: state.retained_build_status(&name).unwrap_or_default(),
+            name,
+            summary,
+        }),
     )
         .into_response()
 }
@@ -831,6 +840,7 @@ mod tests {
     fn detail(tab: &'static str) -> BoxDetailTemplate {
         let selection = Selection::new(["system".to_string()], std::iter::empty());
         BoxDetailTemplate {
+            retained_build: String::new(),
             version: "0.1.3",
             nav: "dashboard",
             tab,
@@ -982,6 +992,7 @@ mod tests {
     #[test]
     fn build_panel_subscribes_to_the_right_box() {
         let html = BuildPanelFragment {
+            retained: String::new(),
             name: "alpha".into(),
             summary: "3 set(s), 0 extra package(s)".into(),
         }

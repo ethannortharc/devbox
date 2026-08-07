@@ -339,11 +339,27 @@ func TestProvisioningListenerHasNoMetrics(t *testing.T) {
 
 	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
 
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	// Both operator routes, not just metrics: GET /status returns the same
+	// inventory by another path, and moving one without the other left the
+	// exposure exactly where it was.
+	for _, path := range []string{"/metrics", "/status"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.ProvisioningHandler().ServeHTTP(rec, req)
+		// Not 200 is the property that matters: GET /status returns 405
+		// rather than 404 because POST /status is still registered there,
+		// and either way no inventory crosses the wire.
+		if rec.Code == http.StatusOK {
+			t.Errorf("%s served an inventory on the provisioning listener", path)
+		}
+	}
+
+	// POST /status is a node reporting its own progress, and must still work.
+	req := httptest.NewRequest(http.MethodPost, "/status", strings.NewReader("{}"))
 	rec := httptest.NewRecorder()
 	s.ProvisioningHandler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("metrics reachable on the provisioning listener: got %d", rec.Code)
+	if rec.Code == http.StatusNotFound {
+		t.Error("nodes must still be able to report status")
 	}
 
 	// And the node routes it does need still work.

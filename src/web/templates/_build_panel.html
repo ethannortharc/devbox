@@ -4,4 +4,7 @@
 <div class="buildlog"
      sse-swap="build-{{ name }}"
      hx-swap="beforeend scroll:bottom"></div>
-<p class="muted" sse-swap="build-status-{{ name }}"></p>
+{#- Any status published before this element existed. The broadcast has no
+    history, so a build that failed in preflight — faster than htmx can install
+    this panel — would otherwise leave it reading "Rebuilding…" forever. -#}
+<p class="muted" sse-swap="build-status-{{ name }}">{{ retained|safe }}</p>

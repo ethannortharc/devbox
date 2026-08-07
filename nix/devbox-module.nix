@@ -22,6 +22,7 @@ let
   mountMode = sandbox.mount_mode or "overlay";
   isOverlay = mountMode == "overlay";
   hasEditor = sets.editor or true;
+  hasShell = sets.shell or true;
 
   # Ad-hoc packages from the Sets checklist's free-text field.
   #
@@ -74,6 +75,7 @@ in {
     # validated host-side against a strict attribute-path pattern before it is
     # written here, and an attribute that does not exist is skipped rather
     # than failing the whole rebuild.
+    ++ (lib.optional (!hasEditor) pkgs.nano)
     ++ customPackages;
 
   # ── Services ───────────────────────────────────────
@@ -86,7 +88,10 @@ in {
   programs.nix-ld.enable = true;
 
   # ── Shell ──────────────────────────────────────────
-  programs.zsh.enable = true;
+  # Only when the shell set is installed. Enabling zsh and then forcing it as
+  # the login shell on a box where the user unchecked `shell` left them with a
+  # login shell that does not exist.
+  programs.zsh.enable = lib.mkDefault hasShell;
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
 
   # ── Environment ──────────────────────────────────
@@ -94,8 +99,12 @@ in {
     # Only when the editor set is actually installed. Exporting EDITOR=nvim on
     # a box where the user unchecked `editor` makes `git commit` fail with a
     # missing editor rather than falling back to something that exists.
-    EDITOR = if hasEditor then "nvim" else "vi";
-    VISUAL = if hasEditor then "nvim" else "vi";
+    # `vi` is not guaranteed either — the system set has no editor at all. The
+    # fallback has to be something the closure really contains, and `nano` is
+    # in `pkgs` unconditionally, so it is added alongside when the editor set
+    # is off rather than named on faith.
+    EDITOR = if hasEditor then "nvim" else "nano";
+    VISUAL = if hasEditor then "nvim" else "nano";
   };
 
   # ── User configuration ────────────────────────────
@@ -103,7 +112,7 @@ in {
   # manages the shell and group memberships properly.
   users.users.${username} = {
     isNormalUser = true;
-    shell = lib.mkForce pkgs.zsh;
+    shell = lib.mkForce (if hasShell then pkgs.zsh else pkgs.bashInteractive);
     extraGroups = lib.mkAfter ([ "wheel" ] ++ lib.optionals (sets.container or false) [ "docker" ]);
   };
 

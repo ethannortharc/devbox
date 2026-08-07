@@ -149,7 +149,16 @@ impl SandboxManager {
             &active_langs,
             image,
             mount_mode,
-            &config.custom_packages.keys().cloned().collect::<Vec<_>>(),
+            // Names only — the Ubuntu path installs from nixpkgs by
+            // attribute. A package whose configured source is a flake needs
+            // the NixOS path; passing the bare name there would install a
+            // *different* package that happens to share it.
+            &config
+                .custom_packages
+                .iter()
+                .filter(|(_, source)| source.as_str() == "nixpkgs")
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
         )
         .await
         {

@@ -427,7 +427,11 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
 
     // The lab is gone, so its prefixes must stop being an exemption — an
     // `isolated` box would otherwise keep permitting a subnet nothing uses.
-    let _ = runtime
+    // Checked, not fired and forgotten. If the metadata survives, the
+    // isolated ruleset keeps exempting the subnet this lab just gave up — and
+    // reapplying below would then re-install that exemption while the command
+    // printed a clean teardown.
+    let cleaned = runtime
         .exec_cmd(
             &substrate,
             &[
@@ -440,7 +444,18 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
             ],
             false,
         )
-        .await;
+        .await
+        .with_context(|| format!("could not reach substrate '{substrate}' to clean up"))?;
+    if cleaned.exit_code != 0 {
+        bail!(
+            "namespaces are gone, but the lab's policy metadata could not be \
+             removed: {}\n  An isolated box would keep permitting this lab's \
+             subnets. Remove /etc/devbox/lab/{} on '{substrate}' and re-run \
+             `devbox policy set` to rebuild the ruleset.",
+            cleaned.stderr.trim(),
+            lab.name()
+        );
+    }
 
     // Reload, or the torn-down subnet stays permitted until something else
     // reapplies — and a routed network overlapping the old range would be
