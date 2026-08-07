@@ -996,3 +996,55 @@ Surviving P2s are recorded as a backlog rather than treated as a blocker.
 
 **Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-07T07:30Z — Rounds 14–15 under the severity floor
+
+The stopping rule changed after round 13: continue until a round produces no
+P1 findings **and** nothing security-relevant, where security-relevant means
+the policy/firewall path, authentication or the session cookie, path handling
+that reaches a filesystem operation, shell construction from user or config
+data, privilege decisions, or network exposure — regardless of the tag the
+reviewer put on it.
+
+That second clause is not belt-and-braces. This reviewer routinely files
+security defects below P1: the shell-injection hole in Ubuntu provisioning was
+a P2, so was the wildcard that matched its own apex, and so were all five of
+round 15's blockers. A stop rule keyed on the P1 count alone would have shipped
+every one of them.
+
+```
+round   findings   P1   security-relevant P2
+  14        7       0            3
+  15       10       0            5
+```
+
+Both rounds cleared the P1 bar and neither stopped. What is striking is *what*
+the security-relevant findings were: in both rounds, most were defects in the
+previous round's fixes.
+
+- Round 14 fixed the nftables clear to stop swallowing failures. Round 15 found
+  that the new probe treated *any* `nft list` error as "table absent".
+- Round 14 moved `/metrics` off the node-facing ZTP listener. Round 15 found
+  `GET /status` still there, serving the same inventory by another path — and
+  that `:9090` binds every interface anyway, so the split had achieved nothing.
+- Round 14 added a listener handshake before publishing build output. Round 15
+  showed it could not work: the page-level SSE subscription already makes the
+  receiver count nonzero, so it waited 50ms and called it synchronisation.
+
+So the severity floor has lowered the *class* of defect without yet reaching
+zero: the P1 stream has genuinely stopped, and the security-relevant stream has
+not. The honest reading is that the fixed-point dynamic persists at every
+severity band, and the floor simply picks which band is worth continuing to pay
+for. That was the point of choosing it, and it is holding up — but it is not
+converging faster than the raw count did, and nobody should expect round 16 to
+be the last on the strength of two clean-P1 rounds.
+
+One pattern is now unmistakable and worth stating as a rule rather than an
+observation: **when a fix removes something from one exposed surface, the next
+question is which sibling surface still has it.** `/metrics` and `/status`.
+CLI and web. Start and attach. Rebuild-failure and write-failure. Every
+instance of this in fifteen rounds has been the same shape, and it has been
+caught by the reviewer rather than by me every single time.
+
+**Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
