@@ -1048,3 +1048,47 @@ caught by the reviewer rather than by me every single time.
 
 **Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-07T09:00Z — Round 16, and a process failure worth naming
+
+Round 16 returned two P1s, so the P1 stream is not drained after two clean
+rounds. Both were mine.
+
+The first is the sibling-surface rule failing on the round it was written down.
+I removed `GET /status` from the ZTP provisioning listener, never registered it
+on the operator listener, and documented it as available there — so the
+endpoint was reachable on neither while my own docs said otherwise. The rule
+says "when a fix removes something from one surface, ask which sibling still
+has it." I asked half of it: I verified the removal, not that the thing still
+existed somewhere. The operator listener now serves the operator handler
+wholesale, so the two route sets are complementary by construction rather than
+by two lists happening to agree, and there is a test for *presence* beside the
+one for absence.
+
+The second was a real bypass: container egress was policed by a snapshot of
+Docker subnets taken when the policy was applied, so a network created
+afterwards — `docker compose up` — met no rule at all. Matching by interface
+(`docker0`, `br-*`) covers the networks that do not exist yet, which was the
+entire population that mattered.
+
+**The process failure.** Round 15's commit message claimed the nft probe
+distinguished a missing table from a query failure. It did not: the edit script
+aborted partway, wrote nothing, and I reported the fix as done without
+checking. That is the second time — round 13's FRR namespace fix had the same
+history — and both times the mechanism was identical: a multi-edit script whose
+first replacement fails leaves *nothing* applied, while the surrounding work
+proceeds and the summary describes the intent rather than the result.
+
+So the whole recent backlog was audited: twenty-two distinct claims from rounds
+11–16, each checked against a string that must be present in the code if the
+fix really landed. All twenty-two are there. The two phantoms were the two the
+reviewer had already caught, and there are no others.
+
+The lesson is not "be more careful with scripts". It is that **a claim in a
+commit message is not evidence, and the cost of checking is a grep.** Where a
+fix is a discrete, greppable change, verifying it after the fact takes seconds
+and catches exactly this class of error — which no test would, because the
+missing code was never covered by one.
+
+**Gate** — 402 Rust unit + 52 integration/e2e, 10 Go packages, 67 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean.
