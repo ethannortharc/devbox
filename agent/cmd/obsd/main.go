@@ -351,6 +351,16 @@ func reloadEnforcer(cfg config, stamp string, out io.Writer) (reloadState, bool)
 	if current == stamp {
 		return reloadState{}, false
 	}
+	// An absent policy file means the control plane has retired it, not that
+	// the reload failed. Keeping the old enforcer then let a stale domain list
+	// insert addresses into a table built for a *newer*, tighter policy, where
+	// they lived out the TTL. Absent means enforce nothing until a new policy
+	// appears; the table's own default-deny still applies.
+	if _, statErr := os.Stat(cfg.policy); os.IsNotExist(statErr) {
+		fmt.Fprintf(out, "devbox-obsd: policy withdrawn; adding no further addresses\n")
+		return reloadState{stamp: current}, true
+	}
+
 	enforcer, err := loadEnforcer(cfg, false)
 	if err != nil {
 		fmt.Fprintf(out, "devbox-obsd: policy reload failed, keeping the old one: %v\n", err)

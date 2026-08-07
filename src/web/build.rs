@@ -478,9 +478,18 @@ pub async fn apply_selection(
     // this path did not, so a box could finish a rebuild reporting `isolated`
     // with open egress.
     if let Err(e) = crate::policy::enforce::apply_saved(manager, &sandbox, box_name).await {
-        publish(&format!(
-            "devbox: WARNING — egress posture not restored: {e}"
+        // Terminal status, not a log line among the build output. "rebuild
+        // complete" printed underneath a warning nobody scrolled back to read
+        // is the console saying the box is fine while its firewall is gone.
+        state.publish(ConsoleEvent::new(
+            status_event(box_name),
+            format!(
+                "<span class=\"term-err\">rebuilt, but the egress posture was NOT \
+                 restored — this box is running unrestricted: {}</span>",
+                escape_html(&e.to_string())
+            ),
         ));
+        return Err(e).context("rebuild succeeded but the egress posture could not be restored");
     }
 
     state.publish(ConsoleEvent::new(

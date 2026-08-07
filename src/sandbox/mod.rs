@@ -149,17 +149,18 @@ impl SandboxManager {
             &active_langs,
             image,
             mount_mode,
-            // The installable reference for each package, not its key.
-            //
-            // `terraform = "nixpkgs"` means the nixpkgs attribute `terraform`;
-            // `my-tool = "github:user/flake#pkg"` means that flake output. An
-            // equality filter on the literal `"nixpkgs"` dropped both
-            // `nixpkgs#terraform` and every flake reference, so provisioning
-            // omitted packages that state.json went on reporting as selected.
+            // Names *and* sources, so each provisioning path can use what it
+            // needs. NixOS writes `[custom_packages]` keys that the module
+            // resolves as attribute paths under `pkgs`, so it wants the key;
+            // Ubuntu runs `nix profile install`, so it wants the complete
+            // reference. Handing both paths the same string was wrong for one
+            // of them either way — first by dropping flake packages, then by
+            // turning `terraform` into a `nixpkgs#terraform` key that resolves
+            // to nothing.
             &config
                 .custom_packages
                 .iter()
-                .map(|(name, source)| provision::installable(name, source))
+                .map(|(name, source)| (name.clone(), source.clone()))
                 .collect::<Vec<_>>(),
         )
         .await

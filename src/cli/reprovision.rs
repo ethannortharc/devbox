@@ -79,7 +79,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         &state.languages,
         image,
         &state.mount_mode,
-        &state.packages,
+        &provision::package_pairs(&state),
     )
     .await?;
 

@@ -160,6 +160,13 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         if crate::web::build::restore_generated(runtime.as_ref(), &name, &backup).await {
             eprintln!("devbox: generated files restored to the last good selection");
         }
+        // Before returning. A failed rebuild can still have restarted the
+        // network stack — activation gets far enough to tear the old one down
+        // and then fails — so the posture has to go back on whether the
+        // rebuild worked or not. Returning the rebuild error first left the
+        // box unrestricted on exactly the path where something already went
+        // wrong.
+        crate::policy::enforce::apply_saved(manager, &state, &name).await?;
         return Err(e);
     }
 

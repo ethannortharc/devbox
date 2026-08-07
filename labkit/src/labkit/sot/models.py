@@ -49,6 +49,22 @@ class Interface(Model):
     @field_validator("name")
     @classmethod
     def _valid_name(cls, value: str) -> str:
+        """The same rule the Rust topology validator applies.
+
+        These names are rendered unescaped into FRR configuration and become
+        arguments to `ip link`, so a name with whitespace, a colon, or a
+        newline produces an invalid — or injected — statement a long way from
+        where it was written. IFNAMSIZ is 16 including the NUL, and `.`/`..`
+        are rejected by the kernel outright.
+        """
+        if value in {".", ".."} or len(value) > 15:
+            raise ValueError(
+                f"interface name {value!r} must be 1-15 characters and not '.' or '..'"
+            )
+        if value and not all(c.isalnum() or c in "-_." for c in value):
+            raise ValueError(
+                f"interface name {value!r} may contain letters, digits, '-', '_', and '.' only"
+            )
         if not value:
             raise ValueError("an interface needs a name")
         return value

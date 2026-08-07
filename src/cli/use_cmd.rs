@@ -85,7 +85,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
             &state.languages,
             &state.image,
             "overlay",
-            &state.packages,
+            &provision::package_pairs(&state),
         )
         .await
         {

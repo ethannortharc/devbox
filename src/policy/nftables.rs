@@ -142,12 +142,12 @@ pub struct Context {
     /// Retained for the allow-set seeding; the forward chain no longer keys on
     /// them, because a snapshot cannot cover a network created later.
     pub container_prefixes: Vec<String>,
-    /// Interfaces whose forwarded traffic is internal, not egress.
+    /// Retained for compatibility; the forward chain no longer exempts
+    /// interfaces at all.
     ///
-    /// The forward chain policies everything *except* these, so the list has
-    /// to be the things that are genuinely not leaving the box — lab veths.
-    /// Getting this wrong fails closed (internal traffic judged as egress),
-    /// which is the right direction for a list that might be incomplete.
+    /// Lab traffic between two namespaces does not traverse the root forward
+    /// hook — both veth ends live inside namespaces — so there was nothing for
+    /// this to legitimately name.
     pub internal_ifaces: Vec<String>,
 }
 
@@ -260,21 +260,27 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
     //
     // The discovered subnets stay as a second match: a user-defined network
     // with a custom bridge name would otherwise escape the pattern.
-    // Inverted: everything forwarded is egress *unless* it arrives on an
-    // interface the box owns.
+    // Inbound published ports, before the verdict.
     //
-    // Enumerating container bridges cannot work. `docker0` and `br-*` cover
-    // Docker's defaults, but `--opt com.docker.network.bridge.name=foo` names
-    // a bridge anything at all, and it did not exist when the ruleset was
-    // generated — so a pattern list is a list of the cases someone thought of,
-    // and the default-accept behind it is a bypass for the rest.
+    // A DNATed connection to a nested container's published port arrives here
+    // as `ct state new` toward an address no egress rule matches, so the
+    // verdict below drops its first SYN and the service is unreachable. This
+    // has now been broken twice by changes to this chain, so it is stated as
+    // its own rule rather than left implicit: `ct status dnat` is exactly
+    // "something outside asked for a port this box publishes", which is not
+    // egress by any reading.
+    let _ = writeln!(nft, "    ct status dnat accept");
+
+    // Everything else forwarded is egress, with no interface exemptions.
     //
-    // The complement is finite and known: the lab's veth interfaces, which are
-    // internal routing rather than egress. Everything else that this box
-    // forwards is something leaving it, and gets the posture.
-    for iface in &ctx.internal_ifaces {
-        let _ = writeln!(nft, "    iifname \"{iface}\" accept");
-    }
+    // Enumerating container bridges cannot work — `--opt
+    // com.docker.network.bridge.name=foo` names a bridge anything at all — so
+    // the previous version inverted the test and exempted `dvb*`, devbox's own
+    // veth names. That was worse than useless: lab wiring *moves* both veth
+    // ends into node namespaces and renames them, so no interface at the root
+    // keeps that name, while a Docker network created as `dvb0` would have
+    // bypassed the posture entirely. An exemption for something that does not
+    // exist is a bypass with no beneficiary.
     let _ = writeln!(nft, "    jump {FORWARD_EGRESS}");
     let _ = writeln!(nft, "  }}");
 
@@ -427,19 +433,17 @@ mod tests {
     }
 
     #[test]
-    fn everything_forwarded_is_egress_unless_it_is_internal() {
-        // Enumerating container bridges cannot work: `docker0` and `br-*`
-        // cover Docker's defaults, but `--opt
-        // com.docker.network.bridge.name=foo` names a bridge anything at all,
-        // and it does not exist when the ruleset is generated. A pattern list
-        // is a list of the cases someone thought of, with default-accept
-        // behind it for the rest.
+    fn forwarded_traffic_is_egress_except_inbound_dnat() {
+        // Three attempts at this chain, three bugs, so the shape is pinned.
         //
-        // Inverted, the complement is finite and ours: the lab's own veths.
+        // Filtering forward like output dropped inbound published ports.
+        // Enumerating container bridges missed every custom-named one.
+        // Exempting `dvb*` exempted a name no root interface ever has — a
+        // bypass with no beneficiary, since lab wiring moves both veth ends
+        // into namespaces.
         let ctx = Context {
             resolvers: vec!["192.0.2.53".into()],
             lab_prefixes: vec!["10.99.0.0/16".into()],
-            internal_ifaces: vec!["dvb*".into()],
             ..Default::default()
         };
         let nft = ruleset_with(&policy(Posture::Allowlist, &["10.0.0.0/8"]), &ctx);
@@ -447,15 +451,21 @@ mod tests {
         let forward = nft.split("chain forward {").nth(1).unwrap();
         let forward = forward.split("  }").next().unwrap();
 
-        // Inbound replies still flow.
         assert!(forward.contains("ct state established,related accept"));
-        // Lab routing is not egress.
-        assert!(forward.contains("iifname \"dvb*\" accept"));
-        // Everything else is judged, including bridges that do not exist yet.
+        // Someone outside reaching a port this box publishes is not egress.
+        assert!(forward.contains("ct status dnat accept"));
+        // And no interface is exempt.
         assert!(
-            forward.trim_end().ends_with("jump forward_egress"),
-            "the unconditional jump must be last: {forward}"
+            !forward.contains("iifname"),
+            "an interface exemption is a bypass for anything that can take \
+             that name: {forward}"
         );
+        assert!(forward.trim_end().ends_with("jump forward_egress"));
+
+        // Order matters: the DNAT accept has to precede the verdict.
+        let dnat = forward.find("ct status dnat").unwrap();
+        let jump = forward.find("jump forward_egress").unwrap();
+        assert!(dnat < jump);
     }
 
     #[test]

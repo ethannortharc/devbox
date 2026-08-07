@@ -76,6 +76,70 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 ///
 /// Only the first needs the name attached; treating the other two as bare
 /// attribute names installed something else, or nothing.
+/// Is this a complete installable reference that is safe to put in a shell?
+///
+/// Deliberately narrower than what nix accepts. Everything devbox generates
+/// satisfies it, a hand-written `devbox.toml` entry that does not is a typo or
+/// an attack, and the value ends up in a root command either way.
+pub(crate) fn is_safe_installable(reference: &str) -> bool {
+    if reference.is_empty() || reference.len() > 256 {
+        return false;
+    }
+    // No shell metacharacters at all, and no whitespace.
+    if reference.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '&' | '|' | '$' | '`' | '(' | ')' | '<' | '>' | '\'' | '"' | '\\' | '\n'
+            )
+    }) {
+        return false;
+    }
+    // `flake-ref#attr.path` or a bare attribute path. Both halves are checked;
+    // the fragment with the existing attribute rule, the flake part with the
+    // characters a flake URL legitimately needs.
+    let (flake, attr) = match reference.split_once('#') {
+        Some((flake, attr)) => (Some(flake), attr),
+        None => (None, reference),
+    };
+    if !crate::nix::compose::is_valid_attr_path(attr) {
+        return false;
+    }
+    match flake {
+        None => true,
+        Some(flake) => {
+            !flake.is_empty()
+                && flake.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, ':' | '/' | '.' | '-' | '_' | '+' | '?' | '=' | '&')
+                })
+        }
+    }
+}
+
+/// A box's packages paired with the source its project config declares.
+///
+/// `state.packages` records only the names — enough for the checklist, not
+/// enough to install. `reprovision` and `use` passed those bare names to
+/// provisioning, so the first lifecycle operation after adding a flake package
+/// replaced it with a same-named nixpkgs attribute, or dropped it, while the
+/// UI went on reporting it selected.
+pub fn package_pairs(state: &crate::sandbox::state::SandboxState) -> Vec<(String, String)> {
+    let config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    state
+        .packages
+        .iter()
+        .map(|name| {
+            let source = config
+                .custom_packages
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| "nixpkgs".to_string());
+            (name.clone(), source)
+        })
+        .collect()
+}
+
 pub(crate) fn installable(name: &str, source: &str) -> String {
     if source == "nixpkgs" || source.is_empty() {
         format!("nixpkgs#{name}")
@@ -263,11 +327,18 @@ pub async fn provision_vm_full(
     languages: &[String],
     image: &str,
     mount_mode: &str,
-    packages: &[String],
+    packages: &[(String, String)],
 ) -> Result<()> {
     match image {
         "ubuntu" => provision_ubuntu(runtime, name, sets, languages, packages).await,
-        _ => provision_nixos(runtime, name, sets, languages, mount_mode, packages).await,
+        // NixOS writes `[custom_packages]` keys, which the module resolves as
+        // attribute paths under `pkgs` — so it wants the name, not the
+        // installable reference. Ubuntu runs `nix profile install` and wants
+        // the reference. Same input, different projection.
+        _ => {
+            let names: Vec<String> = packages.iter().map(|(n, _)| n.clone()).collect();
+            provision_nixos(runtime, name, sets, languages, mount_mode, &names).await
+        }
     }
 }
 
@@ -376,7 +447,7 @@ async fn provision_ubuntu(
     name: &str,
     sets: &[String],
     languages: &[String],
-    extra: &[String],
+    extra: &[(String, String)],
 ) -> Result<()> {
     // 1. Install the Nix package manager
     println!("Installing Nix package manager on Ubuntu...");
@@ -413,19 +484,24 @@ fi"#;
     // `bash -c "nix profile install …"`, and nothing else checks them — so a
     // key like `foo; touch /tmp/pwned; #` ran during provisioning. The NixOS
     // path validates via `Selection::validate`; this one had no equivalent.
-    for name in extra {
-        // A complete flake reference is validated by nix itself; a bare
-        // attribute path still has to pass, because it is interpolated into a
-        // shell command.
-        let bare = name.split('#').next_back().unwrap_or(name);
-        if !crate::nix::compose::is_valid_attr_path(bare) {
+    for (name, source) in extra {
+        let reference = installable(name, source);
+        // The *whole* reference, not the fragment after `#`.
+        //
+        // Validating only the tail reopened the injection this guard was added
+        // to close: `github:user/repo; touch /tmp/pwn; #pkg` has a clean
+        // fragment and a shell command in front of it, and the value is joined
+        // unquoted into `bash -c "nix profile install …"`. I introduced that
+        // gap last round by teaching this path about flake references without
+        // extending the check to cover them.
+        if !is_safe_installable(&reference) {
             bail!(
                 "custom package '{name}' is not a valid nixpkgs attribute path; \
                  names may contain letters, digits, '_', '-', and '.' only"
             );
         }
     }
-    packages.extend(extra.iter().cloned());
+    packages.extend(extra.iter().map(|(n, s)| installable(n, s)));
     packages.sort();
     packages.dedup();
 
@@ -1380,6 +1456,35 @@ mod tests {
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));
         assert!(toml.contains("name = \"user\""));
+    }
+
+    #[test]
+    fn a_flake_reference_cannot_carry_shell_syntax() {
+        // The regression this exists for: validating only the fragment after
+        // `#` let a command sit in front of it, and the whole value is joined
+        // unquoted into `bash -c "nix profile install …"`.
+        for hostile in [
+            "github:user/repo; touch /tmp/pwn; #pkg",
+            "$(reboot)#pkg",
+            "nixpkgs#pkg; id",
+            "`id`#pkg",
+            "nixpkgs #pkg",
+            "nixpkgs#pkg\nid",
+        ] {
+            assert!(
+                !is_safe_installable(hostile),
+                "{hostile:?} must be rejected"
+            );
+        }
+        for ok in [
+            "nixpkgs#ripgrep",
+            "nixpkgs#python312Packages.ipython",
+            "github:user/repo#pkg",
+            "git+https://example.com/r.git?ref=main#pkg",
+            "ripgrep",
+        ] {
+            assert!(is_safe_installable(ok), "{ok:?} is a real reference");
+        }
     }
 
     #[test]

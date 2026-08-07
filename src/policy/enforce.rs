@@ -84,6 +84,23 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     }
     let ruleset = super::nftables::ruleset_with(policy, &ctx);
 
+    // Retire the old policy before the new table goes in.
+    //
+    // Ordering alone is not enough. With the file left in place across the
+    // switch, the running agent keeps its *previous* domain list and can
+    // insert an answer for a domain the new policy no longer permits — into
+    // the new table, where it survives until its TTL. Removing the file first
+    // makes the agent's next reload find nothing and stop enforcing anything,
+    // which is the correct behaviour for the moment between two policies: it
+    // adds no addresses, and the table's own default-deny still applies.
+    let _ = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sh", "-c", &elevated(&format!("rm -f {POLICY_PATH}"))],
+            false,
+        )
+        .await;
+
     let write = runtime
         .exec_cmd(
             sandbox_name,
@@ -115,23 +132,6 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
             load.stderr.trim()
         );
     }
-
-    // Retire the old policy before the new table goes in.
-    //
-    // Ordering alone is not enough. With the file left in place across the
-    // switch, the running agent keeps its *previous* domain list and can
-    // insert an answer for a domain the new policy no longer permits — into
-    // the new table, where it survives until its TTL. Removing the file first
-    // makes the agent's next reload find nothing and stop enforcing anything,
-    // which is the correct behaviour for the moment between two policies: it
-    // adds no addresses, and the table's own default-deny still applies.
-    let _ = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sh", "-c", &elevated(&format!("rm -f {POLICY_PATH}"))],
-            false,
-        )
-        .await;
 
     // The agent's policy goes in *after* the table exists, not before.
     //
@@ -348,14 +348,11 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         .map(|r| parse_prefixes(&r.stdout))
         .unwrap_or_default();
 
-    // The lab's veth interfaces, whose forwarded traffic is internal routing
-    // rather than egress. Named `dvb*` by `lab::wiring`, so the pattern is
-    // ours rather than a guess about someone else's naming.
-    let internal_ifaces = if lab_prefixes.is_empty() {
-        Vec::new()
-    } else {
-        vec!["dvb*".to_string()]
-    };
+    // No interface exemptions. `dvb*` named devbox's veths, but wiring moves
+    // both ends into node namespaces and renames them, so nothing at the root
+    // ever carries that name — while a Docker network created as `dvb0` would
+    // have inherited the exemption.
+    let internal_ifaces = Vec::new();
 
     super::nftables::Context {
         resolvers,

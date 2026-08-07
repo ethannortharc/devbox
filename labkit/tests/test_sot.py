@@ -166,3 +166,13 @@ def test_an_interface_cannot_peer_with_itself() -> None:
             serial="AAA",
             interfaces=[Interface(name="eth1", peer="r1:eth1")],
         )
+
+
+def test_interface_names_match_the_kernel_and_the_rust_validator() -> None:
+    """Names reach `ip link` and FRR config unescaped, so the limits are real."""
+    for bad in ["eth 1", "eth:1", "eth\n1", ".", "..", "e" * 16, "eth$1"]:
+        with pytest.raises(ValidationError):
+            Interface(name=bad, peer="b:eth1")
+
+    for good in ["eth1", "eth-1", "eth_1", "eth.1", "e" * 15]:
+        Interface(name=good, peer="b:eth1")

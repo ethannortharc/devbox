@@ -164,6 +164,11 @@ set -eu
 
 ZTP="%s"
 SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || cat /etc/machine-id)"
+# Stripped to what a serial can legitimately contain. It is interpolated into
+# the JSON bodies below, so a quote or a backslash from DMI — which is not a
+# trusted source; it is whatever the board vendor wrote — would produce a
+# malformed request or inject a field.
+SERIAL="$(echo "$SERIAL" | tr -cd 'A-Za-z0-9._:-' | cut -c1-128)"
 
 # §10.3 kills ztpd mid-provision. A dropped report is not cosmetic: if the
 # final "healthy" is lost, the node finishes and exits while the registry —
@@ -477,11 +482,42 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		if name == "" {
 			name = node.Serial
 		}
-		fmt.Fprintf(&b, "ztp_node_attempts{node=%q} %d\n", name, node.Attempts)
+		fmt.Fprintf(&b, "ztp_node_attempts{node=%s} %d\n", promLabel(name), node.Attempts)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	fmt.Fprint(w, b.String())
+}
+
+// promLabel renders a label value the Prometheus text format accepts.
+//
+// Go's %q emits Go escapes — \t, \x1b — and Prometheus rejects them, so a
+// serial containing a control character would break *every* scrape until the
+// node was removed. An unauthenticated provisioning client can register an
+// arbitrary serial, which makes that a denial of service on the metrics
+// surface rather than a cosmetic bug.
+//
+// The exposition format allows \\, \" and \n and nothing else, so anything
+// outside printable ASCII is replaced rather than escaped.
+func promLabel(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r < 0x20 || r > 0x7e:
+			b.WriteByte('?')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // Hash identifies a rendered config.
