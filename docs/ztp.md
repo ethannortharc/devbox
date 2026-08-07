@@ -113,3 +113,33 @@ back through `discovered` and converge. Assert on `attempts` to confirm
 recovery actually happened rather than the fabric having got lucky.
 
 © 2026 Ethan H.B. Zhou
+
+## Two listeners, and why
+
+`ztpd` serves two disjoint sets of routes on two addresses.
+
+| Listener | Default | Routes |
+|---|---|---|
+| provisioning (`-listen`) | `:8080` | `GET /bootstrap.sh`, `POST /identify`, `GET /config/{name}`, `POST /status`, `GET /healthz` |
+| operator (`-metrics`) | `127.0.0.1:9090` | `GET /metrics`, `GET /status` |
+
+The provisioning listener sits on the network blank devices boot from, and
+everything on it is a route a booting node needs. `GET /status` and `/metrics`
+are not: both return the fabric inventory — serials, names, roles, states,
+config hashes — and neither is authenticated, because the operator listener is
+expected to be on a management network.
+
+Two things follow, and both have been gotten wrong once already:
+
+- **A new operator route goes on the operator listener.** Adding it to the
+  shared mux puts it on the provisioning network too. `/metrics` was moved off
+  and `/status` was left behind, which achieved nothing until the second was
+  moved as well.
+- **The operator listener defaults to loopback deliberately.** A bare `:9090`
+  binds every interface, including the provisioning one, so a separate *port*
+  is not separation on a multi-homed host — and a ZTP server is multi-homed by
+  definition. Passing `-metrics 10.0.0.5:9090` to bind a management address is
+  the supported way to expose it; passing `-metrics :9090` undoes the split.
+
+`api.ProvisioningHandler()` and `api.Handler()` are the two route sets, and a
+test asserts the inventory routes are absent from the first.
