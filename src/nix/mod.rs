@@ -27,8 +27,14 @@ pub async fn apply_config(
     let sets = sets_map(config);
     let languages = languages_map(config);
 
-    // Generate and write state TOML
-    let state_toml = generate_state_toml(&sets, &languages, &HashMap::new());
+    // Generate and write state TOML, carrying the config's own packages.
+    //
+    // An empty map here silently dropped every ad-hoc package on any path
+    // through `apply_config` — notably `devbox upgrade`, which rebuilt the box
+    // without them while state.json went on reporting them as installed. The
+    // caller has the config; there was never a reason to discard this part
+    // of it.
+    let state_toml = generate_state_toml(&sets, &languages, &config.custom_packages);
     write_state_toml(runtime, sandbox_name, &state_toml).await?;
 
     // Write all set Nix files

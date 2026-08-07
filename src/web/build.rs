@@ -444,11 +444,19 @@ pub async fn apply_selection(
         // already torn the old network stack down, so the box is sitting
         // unrestricted on precisely the path where something went wrong.
         if let Err(policy_err) =
-            crate::policy::enforce::apply_saved(manager, &sandbox, box_name).await
+            crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name).await
         {
-            publish(&format!(
-                "devbox: WARNING — egress posture not restored after the failed \
-                 rebuild; this box is unrestricted: {policy_err}"
+            // Reported as its own terminal status, not folded into the rebuild
+            // error: "the rebuild failed" and "and now the firewall is gone
+            // too" are different facts, and the second is the one that leaves
+            // the box exposed.
+            state.publish(ConsoleEvent::new(
+                status_event(box_name),
+                format!(
+                    "<span class=\"term-err\">rebuild failed AND the egress posture \
+                     could not be restored — this box is unrestricted: {}</span>",
+                    escape_html(&policy_err.to_string())
+                ),
             ));
         }
         state.publish(ConsoleEvent::new(
@@ -493,14 +501,8 @@ pub async fn apply_selection(
     // out. A rebuild is not that — nobody is waiting at a prompt, and the
     // console is about to print a verdict — so this path wants the strict
     // form, which propagates.
-    let restore = match DevboxConfig::load_for_edit(&sandbox.project_dir) {
-        Ok(cfg) if cfg.policy.egress != crate::policy::Posture::Open => {
-            crate::policy::enforce::apply(runtime.as_ref(), box_name, &cfg.policy).await
-        }
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = restore {
+    if let Err(e) = crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name).await
+    {
         // Terminal status, not a log line among the build output. "rebuild
         // complete" printed underneath a warning nobody scrolled back to read
         // is the console saying the box is fine while its firewall is gone.

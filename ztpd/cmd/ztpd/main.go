@@ -49,7 +49,7 @@ func (c config) bootURL() string {
 		// `ztp-fabric`: `svc` is endpoint A of the first derived /31, so IPAM
 		// gives it `10.0.0.0` and gives `.1` to spine1. Every node was told to
 		// fetch its config from the spine, where nothing is listening.
-		host = firstNonLoopbackIPv4()
+		host = advertiseHost(c.listen)
 	}
 	_, port, err := net.SplitHostPort(c.listen)
 	if err != nil || port == "" {
@@ -149,6 +149,21 @@ func run(args []string, out io.Writer) error {
 // non-loopback IPv4 address is the one nodes can reach. `-advertise` overrides
 // it for the multi-homed case; the default is now at least *this machine*
 // rather than an address from a topology that may not be the one running.
+// advertiseHost is the address nodes should fetch from.
+//
+// If `-listen` names a specific address, that is the answer: the operator has
+// already said which interface serves provisioning, and guessing a different
+// one contradicts them. Only a wildcard bind has to be resolved to something
+// concrete.
+func advertiseHost(listen string) string {
+	if host, _, err := net.SplitHostPort(listen); err == nil && host != "" {
+		if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+			return host
+		}
+	}
+	return firstNonLoopbackIPv4()
+}
+
 func firstNonLoopbackIPv4() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

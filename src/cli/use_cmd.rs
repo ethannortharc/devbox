@@ -95,7 +95,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         // Provisioning rebuilt the box's network stack, which takes devbox's
         // nftables table with it — the same reason `reprovision` and the Sets
         // paths restore the posture afterwards.
-        crate::policy::enforce::apply_saved(manager, &state, name).await?;
+        crate::policy::enforce::restore_after_rebuild(manager, &state, name).await?;
     }
 
     // Update sandbox state

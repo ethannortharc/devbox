@@ -131,12 +131,32 @@ pub fn render(snapshot: &Snapshot) -> String {
     }
 
     header(&mut out, "devbox_boxes");
+    // Every status, every scrape — the same reason the event types are all
+    // emitted. A status series that only appears once a box is in that state
+    // cannot be alerted on, and "no box is running" is exactly the condition
+    // worth alerting on.
+    for status in ["running", "stopped", "not-found", "unknown"] {
+        let n = snapshot
+            .boxes_by_status
+            .iter()
+            .find(|(s, _)| s == status)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        let _ = writeln!(out, "devbox_boxes{{status=\"{status}\"}} {n}");
+    }
+    // Anything the runtime reports that is not in that list still gets a
+    // series, so an unexpected state is visible rather than swallowed.
     for (status, n) in &snapshot.boxes_by_status {
-        let _ = writeln!(
-            out,
-            "devbox_boxes{{status=\"{}\"}} {n}",
-            escape_label(status)
-        );
+        if !matches!(
+            status.as_str(),
+            "running" | "stopped" | "not-found" | "unknown"
+        ) {
+            let _ = writeln!(
+                out,
+                "devbox_boxes{{status=\"{}\"}} {n}",
+                escape_label(status)
+            );
+        }
     }
 
     header(&mut out, "devbox_build_info");

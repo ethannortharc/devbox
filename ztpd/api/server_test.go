@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -423,5 +424,40 @@ func TestOperatorListenerTakesNoProvisioningInput(t *testing.T) {
 		if rec.Code == http.StatusOK {
 			t.Errorf("%s %s must not serve on the operator listener", tc.method, tc.path)
 		}
+	}
+}
+
+// TestBootstrapScriptIsValidShell parses the script the nodes run.
+//
+// It lives in a Go raw string, is assembled with Fprintf, and only ever
+// executes on a blank device that has just booted — so nothing in this
+// repository would notice a syntax error until a fabric failed to provision.
+// It has been broken three times during development, every time by a backtick
+// in a comment terminating the raw string, and once by a `%s` in added shell
+// being eaten as a format verb.
+func TestBootstrapScriptIsValidShell(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+
+	script := rec.Body.String()
+	if !strings.HasPrefix(script, "#!/bin/sh") {
+		t.Fatalf("bootstrap script does not start with a shebang: %.40q", script)
+	}
+	// The advertised URL must have been substituted, not left as a verb.
+	if strings.Contains(script, "%s") || strings.Contains(script, "%!") {
+		t.Error("bootstrap script contains an unsubstituted or malformed format verb")
+	}
+	if !strings.Contains(script, "http://ztp.example") {
+		t.Error("bootstrap script does not carry the advertised URL")
+	}
+
+	cmd := exec.Command("sh", "-n")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("bootstrap script is not valid shell: %v\n%s", err, out)
 	}
 }

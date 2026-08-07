@@ -11,7 +11,7 @@
 //! `isolated` and still reach the whole internet. A posture that is displayed
 //! but not enforced is worse than no posture at all, because it is believed.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::{Policy, Posture};
 use crate::runtime::Runtime;
@@ -70,13 +70,31 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         // Stage the policy so an agent started next can read it, then refuse
         // to install the ruleset.
         let spec = agent_policy_json(policy, "");
-        let _ = runtime
+        let staged = runtime
             .exec_cmd(
                 sandbox_name,
                 &["sh", "-c", &elevated(&policy_command(&spec))],
                 false,
             )
             .await;
+        // Checked, because the message below tells the user to restart the
+        // agent — and an agent restarted without this file exits again. A
+        // discarded failure here leaves exactly the deadlock the staging was
+        // added to break, with instructions that cannot work.
+        match staged {
+            Ok(r) if r.exit_code == 0 => {}
+            Ok(r) => bail!(
+                "could not stage the policy in box '{sandbox_name}': {}\n  \
+                 Without it the agent has nothing to enforce and will exit \
+                 again, so restarting it will not help.",
+                r.stderr.trim()
+            ),
+            Err(e) => {
+                return Err(e).context(format!(
+                    "could not reach box '{sandbox_name}' to stage the policy"
+                ));
+            }
+        }
     }
 
     if !agent_ready {
@@ -493,6 +511,47 @@ fn json_escape(s: &str) -> String {
 /// So this returns `Ok` after reporting loudly. It never returns `Ok` silently:
 /// the warning names the posture that is *not* in force, so the failure cannot
 /// be mistaken for enforcement.
+/// Restore a box's posture after a rebuild, strictly.
+///
+/// [`apply_saved`] is lenient on purpose (ADR-0044): a user asking for *access*
+/// must never be locked out of a running box because its firewall could not be
+/// installed. A rebuild is the opposite situation — nobody is waiting at a
+/// prompt, a command is about to print a verdict or a script is about to read
+/// an exit status, and "rebuilt successfully" for a box whose firewall is gone
+/// is the lie this whole subsystem exists to prevent.
+///
+/// The two callers want opposite things from the same failure, so the choice
+/// is named once here rather than re-decided at each call site — which is how
+/// three rebuild paths came to use the lenient form and report success over an
+/// unrestricted box.
+pub async fn restore_after_rebuild(
+    manager: &crate::sandbox::SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+) -> Result<()> {
+    let config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
+        .with_context(|| {
+            format!(
+                "box '{name}' rebuilt, but its devbox.toml could not be read, so \
+                     the egress posture it should have is unknown"
+            )
+        })?;
+    let runtime = manager.runtime_for_sandbox(state)?;
+
+    if config.policy.egress == Posture::Open {
+        return clear(runtime.as_ref(), name).await;
+    }
+    apply(runtime.as_ref(), name, &config.policy)
+        .await
+        .with_context(|| {
+            format!(
+                "box '{name}' rebuilt, but its '{}' egress posture could not be \
+                 restored — the box is running unrestricted",
+                config.policy.egress
+            )
+        })
+}
+
 pub async fn apply_saved(
     manager: &crate::sandbox::SandboxManager,
     state: &crate::sandbox::state::SandboxState,
