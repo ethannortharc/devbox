@@ -99,8 +99,14 @@ func run(args []string, out io.Writer) error {
 	// its config should not be able to reach the metrics surface by accident,
 	// and a scrape target of `:9090` that refuses connections is worse than
 	// no flag at all.
+	// Both operator routes, and only they. `server.Handler()` is the full set;
+	// dispatching a single path to it left `GET /status` reachable on neither
+	// listener — removed from the provisioning one, never registered here, and
+	// documented as available. Serve the operator handler wholesale so the two
+	// sets stay complementary by construction rather than by two lists
+	// happening to agree.
 	metricsMux := http.NewServeMux()
-	metricsMux.Handle("GET /metrics", server.Handler())
+	metricsMux.Handle("/", server.Handler())
 	metricsSrv := &http.Server{
 		Addr:              cfg.metrics,
 		Handler:           metricsMux,

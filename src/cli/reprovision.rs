@@ -45,6 +45,16 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         }
     }
 
+    // Read the posture *before* provisioning, not after. The rebuild removes
+    // the box's firewall, so discovering an unreadable devbox.toml afterwards
+    // leaves a live box unrestricted with no saved posture to restore.
+    let saved_policy = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
+        .context(
+            "refusing to reprovision: this box's devbox.toml cannot be read, and \
+             rebuilding would remove its firewall with no posture to restore",
+        )?
+        .policy;
+
     println!("Re-provisioning sandbox '{name}'...");
     println!("This will push all config files and rebuild the system.");
 
@@ -78,22 +88,15 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     updated_state.sets = sets;
     updated_state.save(&manager.state_dir)?;
 
-    // Re-apply the saved egress posture. Provisioning rebuilds the box's
-    // network stack, so a policy applied before this point is gone; without
-    // this the box comes back open no matter what `devbox.toml` says.
-    // Fallibly. Provisioning has just rebuilt the network stack and removed
-    // the box's firewall; reading a malformed devbox.toml as the default
-    // `open` posture here would finish the command reporting success with the
-    // firewall gone.
-    let config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir).context(
-        "reprovisioning rebuilt the box's network stack, but its devbox.toml \
-             could not be read — so the egress posture it should be restored to \
-             is unknown. The box is currently unrestricted.",
-    )?;
-    if config.policy.egress != crate::policy::Posture::Open {
+    // Re-apply the posture read before the rebuild. Provisioning rebuilds the
+    // box's network stack, so whatever was enforced is gone; without this the
+    // box comes back open no matter what `devbox.toml` says. Using the value
+    // captured up front means a file that became unreadable *during* the
+    // rebuild cannot leave the box unrestricted either.
+    if saved_policy.egress != crate::policy::Posture::Open {
         let runtime = manager.runtime_for_sandbox(&updated_state)?;
-        crate::policy::enforce::apply(runtime.as_ref(), &name, &config.policy).await?;
-        println!("Egress posture '{}' re-applied.", config.policy.egress);
+        crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await?;
+        println!("Egress posture '{}' re-applied.", saved_policy.egress);
     }
 
     println!("Re-provisioning complete. Run `devbox shell --name {name}` to attach.");

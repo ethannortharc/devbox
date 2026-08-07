@@ -211,6 +211,14 @@
       <p class="muted">
         A shell inside the box. The box starts automatically if it is stopped.
       </p>
+      {#- The box is started by this POST, not by the GET that rendered the
+          page. A side-effecting GET can be triggered by a hostile page on
+          another loopback port: it is same-site enough for the browser to
+          send the session cookie, and a subresource request carries no
+          `Origin` for the middleware to reject. POST is origin-checked. -#}
+      <div hx-post="/api/boxes/{{ boxinfo.name }}/start"
+           hx-trigger="load"
+           hx-swap="none"></div>
       <div id="terminal"
            class="terminal"
            data-box="{{ boxinfo.name }}"

@@ -74,13 +74,18 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     // If overlay mode, reprovision so NixOS module sets up the overlay mount
     if is_overlay {
         println!("Setting up OverlayFS mount via NixOS...");
-        if let Err(e) = provision::provision_vm_with_mode(
+        // The box's ad-hoc packages come along. The three-argument wrapper
+        // rebuilds with an empty list, so switching a project silently removed
+        // every package added through the Sets tab while `state.packages` went
+        // on reporting them as selected.
+        if let Err(e) = provision::provision_vm_full(
             runtime.as_ref(),
             name,
             &state.sets,
             &state.languages,
             &state.image,
             "overlay",
+            &state.packages,
         )
         .await
         {

@@ -116,6 +116,23 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
         );
     }
 
+    // Retire the old policy before the new table goes in.
+    //
+    // Ordering alone is not enough. With the file left in place across the
+    // switch, the running agent keeps its *previous* domain list and can
+    // insert an answer for a domain the new policy no longer permits — into
+    // the new table, where it survives until its TTL. Removing the file first
+    // makes the agent's next reload find nothing and stop enforcing anything,
+    // which is the correct behaviour for the moment between two policies: it
+    // adds no addresses, and the table's own default-deny still applies.
+    let _ = runtime
+        .exec_cmd(
+            sandbox_name,
+            &["sh", "-c", &elevated(&format!("rm -f {POLICY_PATH}"))],
+            false,
+        )
+        .await;
+
     // The agent's policy goes in *after* the table exists, not before.
     //
     // The other order had a window: the agent notices the new policy file,
@@ -215,9 +232,13 @@ fn clear_command() -> String {
         // so a failed clear does not additionally strand the agent without its
         // configuration.
         "if ! command -v nft >/dev/null 2>&1; then exit 0; fi; \
-         if ! nft list table inet {table} >/dev/null 2>&1; then \
-           rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; exit 0; \
-         fi; \
+         probe=$(nft list table inet {table} 2>&1) || {{ \
+           case \"$probe\" in \
+             *\"No such file or directory\"*|*\"does not exist\"*) \
+               rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; exit 0 ;; \
+             *) exit 1 ;; \
+           esac; \
+         }}; \
          nft destroy table inet {table} || exit 1; \
          rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; \
          exit 0"

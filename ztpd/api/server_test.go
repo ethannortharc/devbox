@@ -378,3 +378,24 @@ func TestProvisioningListenerHasNoMetrics(t *testing.T) {
 		t.Errorf("metrics should serve on its own listener: got %d", rec.Code)
 	}
 }
+
+// TestOperatorListenerServesTheInventory is the other half of
+// TestProvisioningListenerHasNoMetrics.
+//
+// Asserting a route is absent from one listener says nothing about whether it
+// is present on the other, and that gap is exactly how GET /status came to be
+// reachable on neither while the documentation said otherwise.
+func TestOperatorListenerServesTheInventory(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+
+	for _, path := range []string{"/metrics", "/status"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s must serve on the operator listener: got %d", path, rec.Code)
+		}
+	}
+}

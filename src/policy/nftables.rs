@@ -242,17 +242,23 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
         "    type filter hook forward priority filter; policy accept;"
     );
     let _ = writeln!(nft, "    ct state established,related accept");
-    // Traffic arriving from outside and being routed inward is not egress.
-    // Only what a container originates gets judged against the posture.
+
+    // Matched by *interface*, not by subnet.
+    //
+    // A subnet snapshot is only true at the moment it is taken: `docker
+    // compose up` after the policy was applied creates a bridge the ruleset
+    // has never heard of, and its traffic then missed every jump and was
+    // accepted by the chain's default. Docker's bridges are named `docker0`
+    // and `br-<id>`, and an interface pattern covers the ones that do not
+    // exist yet — which is the whole population that mattered.
+    //
+    // The discovered subnets stay as a second match: a user-defined network
+    // with a custom bridge name would otherwise escape the pattern.
+    let _ = writeln!(nft, "    iifname \"docker0\" jump {FORWARD_EGRESS}");
+    let _ = writeln!(nft, "    iifname \"br-*\" jump {FORWARD_EGRESS}");
     for prefix in &ctx.container_prefixes {
         let family = if prefix.contains(':') { "ip6" } else { "ip" };
         let _ = writeln!(nft, "    {family} saddr {prefix} jump {FORWARD_EGRESS}");
-    }
-    if ctx.container_prefixes.is_empty() {
-        let _ = writeln!(
-            nft,
-            "    # no container networks discovered: nothing forwarded is policed"
-        );
     }
     let _ = writeln!(nft, "  }}");
 
@@ -440,12 +446,24 @@ mod tests {
     }
 
     #[test]
-    fn a_box_without_containers_polices_nothing_forwarded() {
+    fn container_bridges_are_policed_before_they_exist() {
+        // A subnet snapshot is true only when it is taken: `docker compose up`
+        // after the policy was applied creates a bridge the ruleset has never
+        // seen, and its traffic then met no jump at all. Interface patterns
+        // cover the networks that do not exist yet, which was the entire
+        // population that mattered.
         let nft = ruleset(&policy(Posture::Isolated, &[]));
         let forward = nft.split("chain forward {").nth(1).unwrap();
         let forward = forward.split("  }").next().unwrap();
-        assert!(forward.contains("no container networks discovered"));
-        assert!(!forward.contains("jump forward_egress"));
+
+        assert!(forward.contains("iifname \"docker0\" jump forward_egress"));
+        assert!(
+            forward.contains("iifname \"br-*\" jump forward_egress"),
+            "user-defined networks get br-<id> bridges: {forward}"
+        );
+        // Inbound is still not egress.
+        assert!(forward.contains("policy accept;"));
+        assert!(forward.contains("ct state established,related accept"));
     }
 
     #[test]

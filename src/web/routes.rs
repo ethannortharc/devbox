@@ -140,12 +140,19 @@ async fn box_detail(
 ) -> Response {
     let tab = resolve_tab(q.tab.as_deref());
 
-    // Lazy start (§6.3): opening a view that needs a live box starts it.
-    if tab == "terminal"
-        && let Err(e) = service::ensure_running(&state.manager, &name).await
-    {
-        tracing::warn!(box_id = %name, error = %e, "lazy start failed");
-    }
+    // No lazy start here.
+    //
+    // §6.3 wants opening the terminal to start the box, and this was the
+    // obvious place — but it made a GET have a side effect, and the auth
+    // middleware permits a request with no `Origin` because that is what an
+    // ordinary top-level navigation looks like. A subresource or iframe GET
+    // from a hostile page on another 127.0.0.1 port also carries no Origin,
+    // is same-site enough for the browser to attach the session cookie, and
+    // could therefore start any box whose name it could guess.
+    //
+    // The terminal panel now starts the box through an origin-checked POST
+    // once it loads, so the behaviour §6.3 asks for survives without a
+    // side-effecting GET.
 
     let boxinfo = match service::get_box(&state.manager, &name).await {
         Ok(b) => b,
