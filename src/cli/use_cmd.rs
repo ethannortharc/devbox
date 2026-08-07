@@ -91,17 +91,26 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         {
             eprintln!("Warning: overlay mount setup failed: {e}");
         }
-
-        // Provisioning rebuilt the box's network stack, which takes devbox's
-        // nftables table with it — the same reason `reprovision` and the Sets
-        // paths restore the posture afterwards.
-        crate::policy::enforce::restore_after_rebuild(manager, &state, name).await?;
     }
 
-    // Update sandbox state
+    // Record the new project *before* restoring the posture, and restore once
+    // for every path.
+    //
+    // Two bugs sat here. The restore was inside the overlay branch, so
+    // `--writable` — which stops and restarts the VM on Lima — lost the
+    // firewall entirely. And in overlay mode it ran while `state.project_dir`
+    // still pointed at the *old* project, so it reinstalled the previous
+    // project's posture onto a box that had just been switched to a new one.
+    //
+    // The posture belongs to the project the box is now serving, so the state
+    // update has to come first.
     state.project_dir = cwd;
     state.mount_mode = mount_mode.to_string();
     state.save(&manager.state_dir)?;
+
+    // Unconditional: both branches disturb the box — one reprovisions, the
+    // other restarts the VM — and both take devbox's nftables table with them.
+    crate::policy::enforce::restore_after_rebuild(manager, &state, name).await?;
 
     println!("Sandbox '{}' updated. Attaching...", name);
     manager.attach(name).await

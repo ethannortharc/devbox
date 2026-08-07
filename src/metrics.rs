@@ -92,6 +92,13 @@ pub fn escape_label(value: &str) -> String {
 }
 
 /// Render the Prometheus text exposition format.
+/// Statuses emitted at zero on every scrape.
+///
+/// Must be the strings `web::service::status_label` produces; a test pins the
+/// two together, because a zero series under a name nothing emits is a
+/// dashboard that reads healthy forever.
+const ZEROED_STATUSES: &[&str] = &["running", "stopped", "missing", "unknown"];
+
 pub fn render(snapshot: &Snapshot) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -135,7 +142,11 @@ pub fn render(snapshot: &Snapshot) -> String {
     // emitted. A status series that only appears once a box is in that state
     // cannot be alerted on, and "no box is running" is exactly the condition
     // worth alerting on.
-    for status in ["running", "stopped", "not-found", "unknown"] {
+    // The labels `service::status_label` actually produces, spelled as it
+    // spells them. A zero series under a name nothing emits is worse than no
+    // series: a dashboard built on `not-found` reads healthy forever, because
+    // the number it watches is always zero and always will be.
+    for status in ZEROED_STATUSES {
         let n = snapshot
             .boxes_by_status
             .iter()
@@ -147,10 +158,7 @@ pub fn render(snapshot: &Snapshot) -> String {
     // Anything the runtime reports that is not in that list still gets a
     // series, so an unexpected state is visible rather than swallowed.
     for (status, n) in &snapshot.boxes_by_status {
-        if !matches!(
-            status.as_str(),
-            "running" | "stopped" | "not-found" | "unknown"
-        ) {
+        if !ZEROED_STATUSES.contains(&status.as_str()) {
             let _ = writeln!(
                 out,
                 "devbox_boxes{{status=\"{}\"}} {n}",
@@ -185,6 +193,26 @@ mod tests {
             events_by_type: vec![(EventType::Exec, 40), (EventType::Connect, 155)],
             boxes_by_status: vec![("running".into(), 1), ("stopped".into(), 2)],
             version: "0.1.3".into(),
+        }
+    }
+
+    #[test]
+    fn the_zeroed_statuses_match_what_the_console_emits() {
+        // A zero series under a label nothing produces is worse than none: the
+        // dashboard watching it reads healthy forever. `not-found` was such a
+        // label — `status_label` says `missing`.
+        use crate::runtime::SandboxStatus;
+        for status in [
+            SandboxStatus::Running,
+            SandboxStatus::Stopped,
+            SandboxStatus::NotFound,
+        ] {
+            let label = crate::web::service::status_label(&status);
+            assert!(
+                ZEROED_STATUSES.contains(&label),
+                "`{label}` is emitted but never zeroed, so it vanishes when \
+                 no box is in that state"
+            );
         }
     }
 

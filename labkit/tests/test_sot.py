@@ -176,3 +176,16 @@ def test_interface_names_match_the_kernel_and_the_rust_validator() -> None:
 
     for good in ["eth1", "eth-1", "eth_1", "eth.1", "e" * 15]:
         Interface(name=good, peer="b:eth1")
+
+
+def test_network_and_broadcast_addresses_are_rejected() -> None:
+    """A /31 uses both addresses; anything wider cannot."""
+    with pytest.raises(ValidationError, match="network address"):
+        Interface(name="eth1", peer="b:eth1", address="10.0.0.0/24")
+    with pytest.raises(ValidationError, match="broadcast address"):
+        Interface(name="eth1", peer="b:eth1", address="10.0.0.255/24")
+
+    # RFC 3021: both addresses of a /31 are usable, which is what every
+    # point-to-point link in these labs relies on.
+    Interface(name="eth1", peer="b:eth1", address="10.0.0.0/31")
+    Interface(name="eth1", peer="b:eth1", address="10.0.0.1/31")

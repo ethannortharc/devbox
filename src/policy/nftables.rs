@@ -41,6 +41,27 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
     let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
 
+    // The traffic that keeps the box on the network at all.
+    //
+    // DHCP renewal goes to the broadcast address, and router/neighbour
+    // discovery goes to `ff02::/16` — neither is unicast loopback or
+    // link-local, so neither matched the rules above. An enforcing posture
+    // therefore let the box's own DHCP lease expire and broke IPv6 neighbour
+    // discovery: the box drops off the network some hours after the policy is
+    // applied, which reads as anything except a firewall rule.
+    //
+    // Scoped to the protocols and ports, not opened generally, and only in the
+    // output chain — a nested container does not need to renew the host's
+    // lease.
+    let _ = writeln!(nft, "    udp sport 68 udp dport 67 accept");
+    let _ = writeln!(nft, "    udp sport 546 udp dport 547 accept");
+    let _ = writeln!(nft, "    ip6 daddr ff02::/16 accept");
+    let _ = writeln!(
+        nft,
+        "    icmpv6 type {{ nd-router-solicit, nd-router-advert, \
+         nd-neighbor-solicit, nd-neighbor-advert }} accept"
+    );
+
     // DNS must survive every posture except `isolated`: the allowlist is
     // resolved by name, so blocking resolution would make the allowlist
     // unenforceable rather than strict.
@@ -482,6 +503,39 @@ mod tests {
         // And the verdict chain really denies.
         let egress = nft.split("chain forward_egress {").nth(1).unwrap();
         assert!(egress.split("  }").next().unwrap().contains("drop"));
+    }
+
+    #[test]
+    fn network_control_traffic_survives_every_posture() {
+        // A box that cannot renew its DHCP lease drops off the network hours
+        // after the policy is applied, which looks like anything except a
+        // firewall rule. Neither renewal (broadcast) nor neighbour discovery
+        // (ff02::/16) matches the unicast loopback and link-local rules.
+        for posture in [Posture::Allowlist, Posture::MirrorOnly, Posture::Isolated] {
+            let nft = ruleset(&policy(posture, &[]));
+            let chain = nft.split("chain output {").nth(1).unwrap();
+            let chain = chain.split("  }").next().unwrap();
+
+            assert!(
+                chain.contains("udp sport 68 udp dport 67 accept"),
+                "{posture} must permit DHCPv4 renewal"
+            );
+            assert!(
+                chain.contains("udp sport 546 udp dport 547 accept"),
+                "{posture} must permit DHCPv6"
+            );
+            assert!(
+                chain.contains("nd-neighbor-solicit"),
+                "{posture} must permit IPv6 neighbour discovery"
+            );
+        }
+
+        // But not in the forward chain: a nested container has no business
+        // renewing the host's lease.
+        let forward = ruleset(&policy(Posture::Isolated, &[]));
+        let forward = forward.split("chain forward {").nth(1).unwrap();
+        let forward = forward.split("  }").next().unwrap();
+        assert!(!forward.contains("dport 67"));
     }
 
     #[test]

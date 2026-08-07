@@ -90,6 +90,22 @@ class Interface(Model):
         # instead of here where the message can name the field.
         if interface.version != 4:
             raise ValueError(f"{value} is IPv6; interfaces address IPv4 fabrics only")
+        # An interface cannot hold its own network or broadcast address. On a
+        # /31 both addresses are usable — that is the point of RFC 3021, and
+        # what every point-to-point link here uses — so the check only applies
+        # to wider prefixes, where assigning one produces a link that comes up
+        # and silently does not forward.
+        if interface.network.prefixlen < 31:
+            if interface.ip == interface.network.network_address:
+                raise ValueError(
+                    f"{value} is the network address of {interface.network}, "
+                    "which no interface can hold"
+                )
+            if interface.ip == interface.network.broadcast_address:
+                raise ValueError(
+                    f"{value} is the broadcast address of {interface.network}, "
+                    "which no interface can hold"
+                )
         return value
 
 

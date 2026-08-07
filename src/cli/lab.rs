@@ -755,7 +755,10 @@ async fn resolve_substrate(
 /// in the kernel is what decides, and it does not reread anything.
 async fn reapply_policy(manager: &SandboxManager, substrate: &str) -> Result<()> {
     let state = manager.get_sandbox(substrate)?;
-    crate::policy::enforce::apply_saved(manager, &state, substrate).await
+    // Strict: the lab's prefixes just changed, so a posture that fails to
+    // reload is either exempting a subnet that no longer exists or blocking
+    // one that does. Neither is something to print a success message over.
+    crate::policy::enforce::restore_after_rebuild(manager, &state, substrate).await
 }
 
 /// Write a file inside the substrate.

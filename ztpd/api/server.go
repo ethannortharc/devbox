@@ -163,7 +163,10 @@ func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
 set -eu
 
 ZTP="%s"
-SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || cat /etc/machine-id)"
+# "cat" on an empty DMI file succeeds, so "||" never fired — a board that
+# reports a blank serial produced an empty identity instead of falling back.
+SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null)"
+[ -n "$SERIAL" ] || SERIAL="$(cat /etc/machine-id 2>/dev/null)"
 # Stripped to what a serial can legitimately contain. It is interpolated into
 # the JSON bodies below, so a quote or a backslash from DMI — which is not a
 # trusted source; it is whatever the board vendor wrote — would produce a

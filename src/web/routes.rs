@@ -455,13 +455,21 @@ async fn apply_sets(
         let manager = bg.manager.clone();
         if let Err(e) = build::apply_selection(&manager, &bg, &box_name, &selection).await {
             tracing::warn!(box_id = %box_name, error = ?e, "rebuild failed");
-            bg.publish(crate::web::state::ConsoleEvent::new(
-                build::status_event(&box_name),
-                format!(
-                    "<span class=\"term-err\">{}</span>",
-                    build::escape_html(&e.to_string())
-                ),
-            ));
+            // `apply_selection` owns the terminal status: it knows whether the
+            // failure also left the firewall down, and publishes a message
+            // saying so. Publishing the same event key here overwrote that —
+            // `publish` retains only the last value and htmx replaces the same
+            // target — so the "this box is unrestricted" warning was replaced
+            // by the plainer rebuild error. Only publish if nothing did.
+            if bg.retained_build_status(&box_name).is_none() {
+                bg.publish(crate::web::state::ConsoleEvent::new(
+                    build::status_event(&box_name),
+                    format!(
+                        "<span class=\"term-err\">{}</span>",
+                        build::escape_html(&e.to_string())
+                    ),
+                ));
+            }
         }
     });
 

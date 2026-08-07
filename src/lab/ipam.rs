@@ -305,8 +305,28 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
         let asn = match node.asn {
             Some(explicit) => explicit,
             None => {
+                // Saturating, and bounded. `next_asn += 1` on a base near the
+                // top of a private range wrapped to zero and then allocated
+                // upward from there — every subsequent router got a public
+                // ASN, and the verifier's message named the number rather than
+                // the cause. Bailing here says which node ran out.
                 while claimed.contains(&next_asn) {
-                    next_asn += 1;
+                    next_asn = next_asn.checked_add(1).with_context(|| {
+                        format!(
+                            "ran out of AS numbers allocating for '{}'; \
+                             pick a lower `asn_base`",
+                            node.name
+                        )
+                    })?;
+                }
+                if !is_private_asn(next_asn) {
+                    bail!(
+                        "allocating for '{}' reached AS {next_asn}, which is outside \
+                         the private ranges; pick an `asn_base` with room for {} \
+                         router(s)",
+                        node.name,
+                        topology.nodes.iter().filter(|n| n.role.routes()).count()
+                    );
                 }
                 let derived = next_asn;
                 next_asn += 1;
