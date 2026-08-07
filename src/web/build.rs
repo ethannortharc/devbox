@@ -472,6 +472,17 @@ pub async fn apply_selection(
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;
     sandbox.save(&manager.state_dir)?;
 
+    // A Sets rebuild restarts the box's network stack — toggling `network` or
+    // `container` certainly does — which takes devbox's nftables table with
+    // it. Reprovision already re-applies the posture for exactly this reason;
+    // this path did not, so a box could finish a rebuild reporting `isolated`
+    // with open egress.
+    if let Err(e) = crate::policy::enforce::apply_saved(manager, &sandbox, box_name).await {
+        publish(&format!(
+            "devbox: WARNING — egress posture not restored: {e}"
+        ));
+    }
+
     state.publish(ConsoleEvent::new(
         status_event(box_name),
         "<span class=\"term-ok\">rebuild complete</span>".to_string(),

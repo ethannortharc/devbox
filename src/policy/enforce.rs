@@ -348,10 +348,20 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         .map(|r| parse_prefixes(&r.stdout))
         .unwrap_or_default();
 
+    // The lab's veth interfaces, whose forwarded traffic is internal routing
+    // rather than egress. Named `dvb*` by `lab::wiring`, so the pattern is
+    // ours rather than a guess about someone else's naming.
+    let internal_ifaces = if lab_prefixes.is_empty() {
+        Vec::new()
+    } else {
+        vec!["dvb*".to_string()]
+    };
+
     super::nftables::Context {
         resolvers,
         lab_prefixes,
         container_prefixes,
+        internal_ifaces,
     }
 }
 

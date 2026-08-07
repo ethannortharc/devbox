@@ -74,14 +74,32 @@ func New(registry *statemachine.Registry, catalog Catalog, bootURL string) *Serv
 	return &Server{registry: registry, catalog: catalog, bootURL: bootURL}
 }
 
-// Handler returns every route, including metrics.
+// Handler returns every route. Tests use it; neither listener does.
 //
-// Used for the dedicated metrics listener and by tests. The node-facing
-// listener must use ProvisioningHandler instead.
+// Serving this on the operator listener was an attempt to make the two route
+// sets "complementary by construction" — but a superset is not a complement.
+// It put `/identify`, `/config/{name}`, and `POST /status` on the management
+// network, so anything there could spoof a node's identity or its progress.
+// The two listeners each get their own handler, and a test asserts the routes
+// absent from each.
 func (s *Server) Handler() http.Handler {
 	mux := s.provisioningMux()
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /status", s.status)
+	return mux
+}
+
+// OperatorHandler returns the read-only inventory routes, and nothing else.
+//
+// Nothing here mutates state: a management-network client should be able to
+// read what the fabric is doing without being able to change it.
+func (s *Server) OperatorHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
 	return mux
 }
 
@@ -346,11 +364,39 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 		// identified, so a node that never boots is invisible to it — and 19
 		// healthy out of an expected 20 reported `converged: true`, which is
 		// the one answer a fabric-convergence signal must never get wrong.
-		"expected":  len(s.catalogSerials()),
-		"missing":   missing,
-		"converged": summary.Converged && len(missing) == 0,
+		"expected": len(s.catalogSerials()),
+		"missing":  missing,
+		// Over the *expected* serials, not every serial ever seen. A stray
+		// request from the provisioning network registers an unknown serial as
+		// failed, and counting it held convergence false forever — a fabric
+		// that is entirely healthy reporting otherwise because something
+		// knocked on the door once.
+		"converged": s.expectedConverged(summary) && len(missing) == 0,
 		"p95_secs":  summary.P95().Seconds(),
 	})
+}
+
+// expectedConverged reports whether every serial the catalog names is healthy.
+//
+// Distinct from `Summary.Converged`, which is over observed nodes: a serial the
+// source of truth does not know about is an operational signal worth surfacing
+// (it appears in the node list as failed) but it is not part of *this fabric's*
+// convergence, and letting it veto that answer means any stray request can
+// silence the signal permanently.
+func (s *Server) expectedConverged(summary statemachine.Summary) bool {
+	expected := s.catalogSerials()
+	if len(expected) == 0 {
+		// Nothing declared: fall back to what was observed, which is what the
+		// answer meant before a catalog existed.
+		return summary.Converged
+	}
+	for _, serial := range expected {
+		node, ok := s.registry.Get(serial)
+		if !ok || node.State != statemachine.Healthy {
+			return false
+		}
+	}
+	return true
 }
 
 // catalogSerials is every serial the source of truth expects to see.
@@ -413,7 +459,7 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	b.WriteString("# HELP ztp_fabric_converged 1 when every expected node is healthy.\n")
 	b.WriteString("# TYPE ztp_fabric_converged gauge\n")
 	converged := 0
-	if summary.Converged && len(missing) == 0 {
+	if s.expectedConverged(summary) && len(missing) == 0 {
 		converged = 1
 	}
 	fmt.Fprintf(&b, "ztp_fabric_converged %d\n", converged)

@@ -139,10 +139,16 @@ pub struct Context {
     pub lab_prefixes: Vec<String>,
     /// Networks nested containers send from.
     ///
-    /// Forwarded traffic is policed only when it *originates* here: everything
-    /// else crossing the forward hook is inbound or lab-internal routing, and
-    /// egress control is about where the box can reach, not who can reach it.
+    /// Retained for the allow-set seeding; the forward chain no longer keys on
+    /// them, because a snapshot cannot cover a network created later.
     pub container_prefixes: Vec<String>,
+    /// Interfaces whose forwarded traffic is internal, not egress.
+    ///
+    /// The forward chain policies everything *except* these, so the list has
+    /// to be the things that are genuinely not leaving the box — lab veths.
+    /// Getting this wrong fails closed (internal traffic judged as egress),
+    /// which is the right direction for a list that might be incomplete.
+    pub internal_ifaces: Vec<String>,
 }
 
 pub fn ruleset(policy: &Policy) -> String {
@@ -254,12 +260,22 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
     //
     // The discovered subnets stay as a second match: a user-defined network
     // with a custom bridge name would otherwise escape the pattern.
-    let _ = writeln!(nft, "    iifname \"docker0\" jump {FORWARD_EGRESS}");
-    let _ = writeln!(nft, "    iifname \"br-*\" jump {FORWARD_EGRESS}");
-    for prefix in &ctx.container_prefixes {
-        let family = if prefix.contains(':') { "ip6" } else { "ip" };
-        let _ = writeln!(nft, "    {family} saddr {prefix} jump {FORWARD_EGRESS}");
+    // Inverted: everything forwarded is egress *unless* it arrives on an
+    // interface the box owns.
+    //
+    // Enumerating container bridges cannot work. `docker0` and `br-*` cover
+    // Docker's defaults, but `--opt com.docker.network.bridge.name=foo` names
+    // a bridge anything at all, and it did not exist when the ruleset was
+    // generated — so a pattern list is a list of the cases someone thought of,
+    // and the default-accept behind it is a bypass for the rest.
+    //
+    // The complement is finite and known: the lab's veth interfaces, which are
+    // internal routing rather than egress. Everything else that this box
+    // forwards is something leaving it, and gets the posture.
+    for iface in &ctx.internal_ifaces {
+        let _ = writeln!(nft, "    iifname \"{iface}\" accept");
     }
+    let _ = writeln!(nft, "    jump {FORWARD_EGRESS}");
     let _ = writeln!(nft, "  }}");
 
     // The egress verdict for forwarded traffic, reached only from the jumps
@@ -411,18 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn container_egress_is_policed_but_inbound_is_not() {
-        // Two failures, one chain. An output-only ruleset let `docker run …
-        // curl` bypass every posture; filtering `forward` identically then
-        // dropped the first SYN of every inbound connection to a published
-        // container port, which arrives DNATed as `ct state new` toward an
-        // address no egress rule matches.
+    fn everything_forwarded_is_egress_unless_it_is_internal() {
+        // Enumerating container bridges cannot work: `docker0` and `br-*`
+        // cover Docker's defaults, but `--opt
+        // com.docker.network.bridge.name=foo` names a bridge anything at all,
+        // and it does not exist when the ruleset is generated. A pattern list
+        // is a list of the cases someone thought of, with default-accept
+        // behind it for the rest.
         //
-        // Egress control is about where the box can reach, not who can reach
-        // it — so only traffic *originating* in a container is judged.
+        // Inverted, the complement is finite and ours: the lab's own veths.
         let ctx = Context {
             resolvers: vec!["192.0.2.53".into()],
-            container_prefixes: vec!["172.17.0.0/16".into()],
+            lab_prefixes: vec!["10.99.0.0/16".into()],
+            internal_ifaces: vec!["dvb*".into()],
             ..Default::default()
         };
         let nft = ruleset_with(&policy(Posture::Allowlist, &["10.0.0.0/8"]), &ctx);
@@ -430,40 +447,31 @@ mod tests {
         let forward = nft.split("chain forward {").nth(1).unwrap();
         let forward = forward.split("  }").next().unwrap();
 
-        // The chain itself must not default-deny, or inbound dies.
-        assert!(forward.contains("policy accept;"));
+        // Inbound replies still flow.
         assert!(forward.contains("ct state established,related accept"));
-        // Container-sourced traffic is sent to the egress verdict.
-        assert!(forward.contains("ip saddr 172.17.0.0/16 jump forward_egress"));
-
-        // And that verdict really does deny: an allowlist that only accepts is
-        // not an allowlist.
-        let egress = nft.split("chain forward_egress {").nth(1).unwrap();
-        let egress = egress.split("  }").next().unwrap();
-        assert!(egress.contains("@static_v4 accept"));
-        assert!(egress.contains("@allow_v4 accept"));
-        assert!(egress.contains("drop"));
+        // Lab routing is not egress.
+        assert!(forward.contains("iifname \"dvb*\" accept"));
+        // Everything else is judged, including bridges that do not exist yet.
+        assert!(
+            forward.trim_end().ends_with("jump forward_egress"),
+            "the unconditional jump must be last: {forward}"
+        );
     }
 
     #[test]
-    fn container_bridges_are_policed_before_they_exist() {
-        // A subnet snapshot is true only when it is taken: `docker compose up`
-        // after the policy was applied creates a bridge the ruleset has never
-        // seen, and its traffic then met no jump at all. Interface patterns
-        // cover the networks that do not exist yet, which was the entire
-        // population that mattered.
+    fn a_box_with_no_lab_judges_all_forwarded_traffic() {
         let nft = ruleset(&policy(Posture::Isolated, &[]));
         let forward = nft.split("chain forward {").nth(1).unwrap();
         let forward = forward.split("  }").next().unwrap();
 
-        assert!(forward.contains("iifname \"docker0\" jump forward_egress"));
         assert!(
-            forward.contains("iifname \"br-*\" jump forward_egress"),
-            "user-defined networks get br-<id> bridges: {forward}"
+            !forward.contains("iifname"),
+            "nothing is internal: {forward}"
         );
-        // Inbound is still not egress.
-        assert!(forward.contains("policy accept;"));
-        assert!(forward.contains("ct state established,related accept"));
+        assert!(forward.contains("jump forward_egress"));
+        // And the verdict chain really denies.
+        let egress = nft.split("chain forward_egress {").nth(1).unwrap();
+        assert!(egress.split("  }").next().unwrap().contains("drop"));
     }
 
     #[test]

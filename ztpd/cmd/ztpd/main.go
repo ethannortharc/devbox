@@ -99,17 +99,15 @@ func run(args []string, out io.Writer) error {
 	// its config should not be able to reach the metrics surface by accident,
 	// and a scrape target of `:9090` that refuses connections is worse than
 	// no flag at all.
-	// Both operator routes, and only they. `server.Handler()` is the full set;
-	// dispatching a single path to it left `GET /status` reachable on neither
-	// listener — removed from the provisioning one, never registered here, and
-	// documented as available. Serve the operator handler wholesale so the two
-	// sets stay complementary by construction rather than by two lists
-	// happening to agree.
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/", server.Handler())
+	// The operator routes, and only they. Two earlier attempts got this wrong
+	// in opposite directions: dispatching one path to the full handler left
+	// `GET /status` on neither listener, and then serving the full handler
+	// here put every *provisioning* route on the management network, where
+	// anything could spoof a node's identity. Each listener has its own
+	// handler now, and tests assert what is absent from both.
 	metricsSrv := &http.Server{
 		Addr:              cfg.metrics,
-		Handler:           metricsMux,
+		Handler:           server.OperatorHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bound synchronously, before startup is declared a success. A detached

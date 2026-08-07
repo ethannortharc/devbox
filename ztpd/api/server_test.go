@@ -393,9 +393,35 @@ func TestOperatorListenerServesTheInventory(t *testing.T) {
 	for _, path := range []string{"/metrics", "/status"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rec, req)
+		s.OperatorHandler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s must serve on the operator listener: got %d", path, rec.Code)
+		}
+	}
+}
+
+// TestOperatorListenerTakesNoProvisioningInput is the other half again.
+//
+// Making the operator handler a *superset* of the provisioning one was an
+// earlier attempt at keeping the two sets complementary; a superset is not a
+// complement, and it put identity and status submission on the management
+// network. Neither listener may carry the other's routes.
+func TestOperatorListenerTakesNoProvisioningInput(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/identify"},
+		{http.MethodPost, "/status"},
+		{http.MethodGet, "/config/leaf1"},
+		{http.MethodGet, "/bootstrap.sh"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+		rec := httptest.NewRecorder()
+		s.OperatorHandler().ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			t.Errorf("%s %s must not serve on the operator listener", tc.method, tc.path)
 		}
 	}
 }

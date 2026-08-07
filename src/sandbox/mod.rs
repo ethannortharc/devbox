@@ -149,15 +149,17 @@ impl SandboxManager {
             &active_langs,
             image,
             mount_mode,
-            // Names only — the Ubuntu path installs from nixpkgs by
-            // attribute. A package whose configured source is a flake needs
-            // the NixOS path; passing the bare name there would install a
-            // *different* package that happens to share it.
+            // The installable reference for each package, not its key.
+            //
+            // `terraform = "nixpkgs"` means the nixpkgs attribute `terraform`;
+            // `my-tool = "github:user/flake#pkg"` means that flake output. An
+            // equality filter on the literal `"nixpkgs"` dropped both
+            // `nixpkgs#terraform` and every flake reference, so provisioning
+            // omitted packages that state.json went on reporting as selected.
             &config
                 .custom_packages
                 .iter()
-                .filter(|(_, source)| source.as_str() == "nixpkgs")
-                .map(|(name, _)| name.clone())
+                .map(|(name, source)| provision::installable(name, source))
                 .collect::<Vec<_>>(),
         )
         .await
@@ -175,6 +177,10 @@ impl SandboxManager {
             sets: config.active_sets(),
             languages: config.active_languages(),
             image: config.sandbox.image.clone(),
+            // Every declared package, whatever its source. This is devbox's
+            // record of what the box is *meant* to have; filtering by source
+            // here would make a flake-sourced package vanish from `devbox
+            // list` and from the Sets checklist.
             packages: config.custom_packages.keys().cloned().collect(),
         };
         state.save(&self.state_dir)?;

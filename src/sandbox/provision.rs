@@ -65,6 +65,27 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 // These map set names to nixpkgs attribute paths for `nix profile install`.
 // The names match the nix/sets/*.nix files exactly.
 
+/// The flake reference to install for a configured package.
+///
+/// The value in `[custom_packages]` says where the package comes from, and it
+/// takes three shapes in the wild:
+///
+/// * `"nixpkgs"` — the bare attribute name in nixpkgs, the common case;
+/// * `"nixpkgs#terraform"` — already a complete reference;
+/// * `"github:user/flake#pkg"` — some other flake.
+///
+/// Only the first needs the name attached; treating the other two as bare
+/// attribute names installed something else, or nothing.
+pub(crate) fn installable(name: &str, source: &str) -> String {
+    if source == "nixpkgs" || source.is_empty() {
+        format!("nixpkgs#{name}")
+    } else if source.contains('#') {
+        source.to_string()
+    } else {
+        format!("{source}#{name}")
+    }
+}
+
 pub(crate) fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
     match set {
         // Kept in step with `NIX_SETS`; the test below asserts it. The Ubuntu
@@ -393,7 +414,11 @@ fi"#;
     // key like `foo; touch /tmp/pwned; #` ran during provisioning. The NixOS
     // path validates via `Selection::validate`; this one had no equivalent.
     for name in extra {
-        if !crate::nix::compose::is_valid_attr_path(name) {
+        // A complete flake reference is validated by nix itself; a bare
+        // attribute path still has to pass, because it is interpolated into a
+        // shell command.
+        let bare = name.split('#').next_back().unwrap_or(name);
+        if !crate::nix::compose::is_valid_attr_path(bare) {
             bail!(
                 "custom package '{name}' is not a valid nixpkgs attribute path; \
                  names may contain letters, digits, '_', '-', and '.' only"
@@ -406,7 +431,19 @@ fi"#;
 
     if !packages.is_empty() {
         // 3. Install all packages via nix profile install
-        let pkg_args: Vec<String> = packages.iter().map(|p| format!("nixpkgs#{p}")).collect();
+        // Set packages are bare attribute names; the ad-hoc ones already
+        // arrive as complete references (see `installable`), so a blanket
+        // `nixpkgs#` prefix would corrupt every flake reference.
+        let pkg_args: Vec<String> = packages
+            .iter()
+            .map(|p| {
+                if p.contains('#') {
+                    p.clone()
+                } else {
+                    format!("nixpkgs#{p}")
+                }
+            })
+            .collect();
         let pkg_list = pkg_args.join(" ");
 
         println!(

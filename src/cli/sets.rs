@@ -178,6 +178,9 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;
     state.save(&manager.state_dir)?;
 
+    // Same as the console path: the rebuild can take the firewall with it.
+    crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+
     println!("Box '{name}' rebuilt with the new selection.");
     Ok(())
 }

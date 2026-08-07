@@ -127,7 +127,16 @@ pub fn daemons() -> &'static str {
 
 /// The command that checks whether BGP has converged on a node.
 pub fn convergence_check(lab: &str, node: &str) -> Vec<String> {
-    super::wiring::in_node(lab, node, &["vtysh", "-c", "show bgp summary json"])
+    // `-N <pathspace>`, matching what `start_commands` gave the daemons.
+    // Without it vtysh searches the default socket directory and either finds
+    // nothing or answers about an unrelated router — so a converged fabric
+    // reads as failed, or an unconverged one reads as fine.
+    let ns = super::wiring::netns(lab, node);
+    super::wiring::in_node(
+        lab,
+        node,
+        &["vtysh", "-N", &ns, "-c", "show bgp summary json"],
+    )
 }
 
 #[cfg(test)]
