@@ -336,6 +336,32 @@ pub async fn provision_vm_full(
         // installable reference. Ubuntu runs `nix profile install` and wants
         // the reference. Same input, different projection.
         _ => {
+            // A flake-sourced package cannot be expressed here, so say so
+            // rather than dropping it.
+            //
+            // The NixOS path writes `[custom_packages]` keys that
+            // `devbox-module.nix` resolves with `lib.attrByPath … pkgs`, and a
+            // name that is not a nixpkgs attribute resolves to null and is
+            // filtered out — silently, because filtering is what keeps one
+            // stale name from failing the whole rebuild. So a package like
+            // `my-tool = "github:user/flake#pkg"` was recorded as selected,
+            // reported as selected, and never installed. Supporting it means
+            // teaching the module about flake inputs, which is a real change;
+            // until then this refuses, which is the same call as ADR-0036.
+            let unsupported: Vec<&str> = packages
+                .iter()
+                .filter(|(_, source)| source != "nixpkgs" && !source.starts_with("nixpkgs#"))
+                .map(|(pkg, _)| pkg.as_str())
+                .collect();
+            if !unsupported.is_empty() {
+                bail!(
+                    "these packages come from a flake, which the NixOS image cannot \
+                     install yet: {}\n  \
+                     Point them at nixpkgs in devbox.toml, or use the ubuntu image \
+                     (`image = \"ubuntu\"`), which installs flake references directly.",
+                    unsupported.join(", ")
+                );
+            }
             let names: Vec<String> = packages.iter().map(|(n, _)| n.clone()).collect();
             provision_nixos(runtime, name, sets, languages, mount_mode, &names).await
         }
