@@ -260,6 +260,7 @@ fn write_command(ruleset: &str) -> String {
 /// The shell that removes devbox's table and its generated files.
 fn clear_command() -> String {
     let table = super::nftables::TABLE;
+    let removed = format!("{RULESET_PATH} {POLICY_PATH}");
     format!(
         // Two cases that look alike and must not be treated alike.
         //
@@ -280,12 +281,12 @@ fn clear_command() -> String {
          probe=$(nft list table inet {table} 2>&1) || {{ \
            case \"$probe\" in \
              *\"No such file or directory\"*|*\"does not exist\"*) \
-               rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; exit 0 ;; \
+               rm -f {removed} 2>/dev/null; exit 0 ;; \
              *) exit 1 ;; \
            esac; \
          }}; \
          nft destroy table inet {table} || exit 1; \
-         rm -f {RULESET_PATH} {POLICY_PATH} 2>/dev/null; \
+         rm -f {removed} 2>/dev/null; \
          exit 0"
     )
 }

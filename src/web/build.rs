@@ -430,11 +430,13 @@ pub async fn apply_selection(
     // config back over the original — so a syntax error anywhere in the file
     // would silently discard the user's mounts, resources, environment, and
     // policy.
-    let base = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
+    // The value is deliberately discarded: what this call is for is the
+    // refusal. The config the selection is projected onto is read again after
+    // the rebuild, because this one is about to go stale — see step 3.
+    DevboxConfig::load_for_edit(&sandbox.project_dir).context(
         "refusing to apply a selection: this box's devbox.toml cannot be read, and \
          applying would overwrite it with defaults",
     )?;
-    let config = selection.to_config(&base);
 
     // Every step past the snapshot rolls back on failure, not just the
     // rebuild. A write that fails partway leaves some modules replaced and
@@ -529,6 +531,25 @@ pub async fn apply_selection(
     // and failing here would leave devbox reporting the new selection with
     // the project file describing the old one, and a later recreate silently
     // reverting the box.
+    // Read the project file again, now, and project the selection onto *that*.
+    //
+    // The copy read before the rebuild is minutes old by this point and the
+    // console stayed live throughout, so a policy saved in the meantime is
+    // already in devbox.toml — and writing the old copy back would silently
+    // revert it. Not a general lost edit: specifically the posture, which
+    // `restore_after_rebuild` has just applied to the box from the *new*
+    // value a few lines above. The firewall would be enforcing what the user
+    // asked for while the file said the opposite, and the next thing to read
+    // the file would undo the firewall.
+    //
+    // Only the selection's own fields are projected, so anything else edited
+    // during the rebuild survives.
+    let latest = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
+        "rebuilt the box, but its devbox.toml can no longer be read, so the new \
+         selection could not be recorded",
+    )?;
+    let config = selection.to_config(&latest);
+
     let mut sandbox = sandbox;
     sandbox.sets = config.active_sets();
     sandbox.languages = config.active_languages();

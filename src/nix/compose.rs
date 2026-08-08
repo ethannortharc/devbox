@@ -118,15 +118,14 @@ impl Selection {
         self.packages.iter().map(|p| self.attr_path(p)).collect()
     }
 
-    /// The `[custom_packages]` table to write into `devbox-state.toml`:
-    /// attribute path → source.
+    /// Every package with the source it was declared under, defaulting to
+    /// plain nixpkgs.
     ///
-    /// Keyed by the attribute because `devbox-module.nix` builds its lookup
-    /// path from the key and never reads the value except to test it for
-    /// being a nested table. Pulled out of the writer so the mapping can be
-    /// tested without a box to write it into — the writer itself only runs
-    /// against a live guest.
-    pub fn custom_packages_table(&self) -> BTreeMap<String, String> {
+    /// Keyed by declared name, not by attribute: `generate_state_toml_with`
+    /// does the resolution, because it is the single place the guest's
+    /// `[custom_packages]` table is emitted and doing it there is what makes
+    /// every caller correct without knowing why.
+    pub fn declared_sources(&self) -> BTreeMap<String, String> {
         self.packages
             .iter()
             .map(|pkg| {
@@ -135,7 +134,7 @@ impl Selection {
                     .get(pkg)
                     .cloned()
                     .unwrap_or_else(|| "nixpkgs".to_string());
-                (self.attr_path(pkg).to_string(), source)
+                (pkg.clone(), source)
             })
             .collect()
     }
@@ -219,13 +218,23 @@ impl Selection {
         // on each set apply silently replaced the thing the user installed,
         // in the file that is their source of truth. Only genuinely new
         // packages get the default.
+        // The selection's own sources come first, then the project's.
+        //
+        // Consulting only the project file loses the alias exactly when it is
+        // least recoverable: `devbox use` points a box at a project that has
+        // never heard of `my-tf`, the rebuild resolves correctly because the
+        // selection still carries the source, and then this projection writes
+        // it back as plain `nixpkgs`. The next rebuild reads that and drops
+        // the package. The box knew; the file it was about to be described in
+        // did not; and the description won.
         config.custom_packages = self
             .packages
             .iter()
             .map(|p| {
-                let source = base
-                    .custom_packages
+                let source = self
+                    .sources
                     .get(p)
+                    .or_else(|| base.custom_packages.get(p))
                     .cloned()
                     .unwrap_or_else(|| "nixpkgs".to_string());
                 (p.clone(), source)
@@ -260,7 +269,18 @@ pub fn is_valid_attr_path(attr: &str) -> bool {
     !attr.is_empty()
         && attr.len() <= 128
         && attr.split('.').all(|seg| {
-            !seg.is_empty()
+            // A Nix identifier cannot begin with a digit or a dash, and
+            // `compose_configuration_nix` emits these bare inside
+            // `with pkgs; [ … ]`. `7zz` passed this check and then failed to
+            // *parse*, which fails the whole rebuild rather than the one
+            // package — and reads as a devbox bug, not a typo. The real
+            // nixpkgs attribute for that one is `_7zz`, which is still
+            // accepted here.
+            let starts_ok = seg
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            starts_ok
                 && seg
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -429,6 +449,46 @@ mod tests {
     }
 
     #[test]
+    fn an_attribute_that_nix_cannot_parse_is_refused_here() {
+        // `7zz` is alphanumeric, so it passed — and then `with pkgs; [ 7zz ]`
+        // failed to *parse*, which fails the whole rebuild rather than the one
+        // package and reads as a devbox bug rather than a typo. A Nix
+        // identifier cannot begin with a digit; the real nixpkgs attribute for
+        // that package is `_7zz`, which is still accepted.
+        for bad in ["7zz", "-foo", "python3.12Packages"] {
+            assert!(!is_valid_attr_path(bad), "{bad:?} must be refused");
+        }
+        for ok in ["_7zz", "ripgrep", "python312Packages.ipython", "gnumake"] {
+            assert!(is_valid_attr_path(ok), "{ok:?} is a real attribute");
+        }
+    }
+
+    #[test]
+    fn a_source_the_selection_carries_survives_a_project_that_never_knew_it() {
+        // `devbox use` points a box at a project whose devbox.toml has never
+        // heard of `my-tf`. The rebuild itself was right, because the
+        // selection still carried the source — but this projection consulted
+        // only the new project file, wrote the package back as plain
+        // `nixpkgs`, and the state update then dropped the source for good.
+        // The next rebuild resolved the alias to itself and lost the package.
+        // The box knew; the file it was about to be described in did not; and
+        // the description won.
+        let sel = Selection::new(["system".to_string()], ["my-tf".to_string()]).with_sources(
+            BTreeMap::from([("my-tf".to_string(), "nixpkgs#terraform".to_string())]),
+        );
+
+        let elsewhere = DevboxConfig::default();
+        assert!(elsewhere.custom_packages.is_empty());
+
+        let config = sel.to_config(&elsewhere);
+        assert_eq!(
+            config.custom_packages.get("my-tf").map(String::as_str),
+            Some("nixpkgs#terraform"),
+            "the selection's own source must outlive the project that lacks it"
+        );
+    }
+
+    #[test]
     fn composition_imports_only_selected_sets() {
         let nix = compose_configuration_nix(&sel(&["system", "git", "lang-go"]));
 
@@ -479,17 +539,33 @@ mod tests {
             "the alias is an undefined variable in `with pkgs`:\n{nix}"
         );
 
-        let table = sel.custom_packages_table();
+        // The selection hands on names and sources; the resolution to an
+        // attribute happens where the guest table is emitted, so that every
+        // writer gets it without knowing. Round 25 put the resolution in one
+        // caller and round 26 found the caller it had missed.
+        let declared = sel.declared_sources();
         assert_eq!(
-            table.get("terraform").map(String::as_str),
-            Some("nixpkgs#terraform")
+            declared.get("my-tf").map(String::as_str),
+            Some("nixpkgs#terraform"),
+            "the declared name is what carries the source: {declared:?}"
+        );
+        assert_eq!(declared.get("ripgrep").map(String::as_str), Some("nixpkgs"));
+
+        let toml = crate::nix::sets::generate_state_toml_with(
+            &Default::default(),
+            &Default::default(),
+            &declared.into_iter().collect(),
+            None,
+            None,
         );
         assert!(
-            !table.contains_key("my-tf"),
-            "the module builds its lookup path from the key: {table:?}"
+            toml.contains("\"terraform\" = \"nixpkgs#terraform\""),
+            "the module builds its lookup path from the key:\n{toml}"
         );
-        // And the ordinary case is untouched.
-        assert_eq!(table.get("ripgrep").map(String::as_str), Some("nixpkgs"));
+        assert!(
+            !toml.contains("my-tf"),
+            "the alias resolves to null and is filtered out in silence:\n{toml}"
+        );
     }
 
     #[test]

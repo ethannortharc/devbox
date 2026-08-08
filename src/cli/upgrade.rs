@@ -36,16 +36,25 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
         config.apply_tools(&[tool_name.to_string()]);
     }
 
-    // The box's ad-hoc packages, which `load_or_default` reads from the
-    // *current directory's* devbox.toml — not necessarily this box's project.
-    // Without them `apply_config` writes guest state with an empty
-    // custom-package map, so the rebuild removes every package added through
-    // the Sets tab while state.json goes on reporting them.
+    // The box's ad-hoc packages, and *only* the box's.
+    //
+    // `load_or_default` above read the current directory's devbox.toml, which
+    // is whatever project the operator happened to be standing in. Inserting
+    // the box's packages on top of that left the other project's still in the
+    // map — and since `apply_config` now writes the whole map into guest
+    // state, `devbox upgrade --name box-b` run from project A rebuilt A's
+    // packages into B, where nothing recorded them and nothing would remove
+    // them. Clearing first is what makes the box its own authority.
+    config.custom_packages.clear();
     let project = DevboxConfig::load_or_default(&state.project_dir);
     for pkg in &state.packages {
-        let source = project
-            .custom_packages
+        // The source the box recorded comes first. After `devbox use` the
+        // project file has never heard of an aliased package, and falling
+        // straight through to `nixpkgs` is how the alias is lost.
+        let source = state
+            .package_sources
             .get(pkg)
+            .or_else(|| project.custom_packages.get(pkg))
             .cloned()
             .unwrap_or_else(|| "nixpkgs".to_string());
         config.custom_packages.insert(pkg.clone(), source);

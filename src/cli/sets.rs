@@ -139,11 +139,14 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // box fails on the first exec. Every other live-box action starts it first.
     crate::web::service::ensure_running(manager, &name).await?;
 
-    // Validate the project config *before* touching the box. It is read again
-    // below to record the result, and discovering it is malformed after the
-    // rebuild has switched the generation would leave the guest on the new
-    // selection and the host unable to write down what happened.
-    let base = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
+    // Validate the project config *before* touching the box: discovering it is
+    // malformed after the rebuild has switched the generation would leave the
+    // guest on the new selection and the host unable to write down what
+    // happened. The value is discarded — it is read again below, after the
+    // rebuild, which is what this comment already claimed and the code did
+    // not: `to_config` was projecting onto this minutes-old copy and writing
+    // it back over anything the console had saved in between.
+    crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
 
     // Snapshot for the same reason the console path does: a failed rebuild
     // leaves the active generation alone but the generated *sources* already
@@ -184,6 +187,8 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // what it is running.
     crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await?;
 
+    let base = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
+        .context("rebuilt the box, but its devbox.toml can no longer be read")?;
     let config = after.to_config(&base);
     let mut state = state;
     state.sets = config.active_sets();

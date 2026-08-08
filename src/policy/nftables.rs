@@ -54,6 +54,32 @@ fn emit_host_control_rules(nft: &mut String) {
     );
 }
 
+/// How many refused connections a second may be logged, and the burst allowed
+/// above it.
+///
+/// A ceiling, not a target: ordinary use produces a handful of these, and the
+/// numbers exist so that pathological traffic cannot turn the journal into the
+/// problem. Losing a log line under a flood is the right trade — by then the
+/// first ones have already said what is happening.
+const BLOCK_LOG_RATE: u32 = 10;
+const BLOCK_LOG_BURST: u32 = 20;
+
+/// The rule that turns a refused connection into something reportable.
+///
+/// `ct state new` and a rate limit, because this chain sees packets and the
+/// contract next to it is one event per refused *connection*. A TCP client
+/// retransmits its SYN and a UDP flow simply keeps sending, so the unqualified
+/// rule logged the same refusal over and over — which is both a false event
+/// count downstream and, under sustained denied traffic, a way to fill the
+/// journal from a box that is behaving exactly as configured.
+fn emit_block_log(nft: &mut String) {
+    let _ = writeln!(
+        nft,
+        "    ct state new limit rate {BLOCK_LOG_RATE}/second burst {BLOCK_LOG_BURST} packets \
+         log prefix \"devbox-blocked \" level info"
+    );
+}
+
 /// The rules that implement a posture, emitted into whichever chain.
 ///
 /// Shared by `output` and `forward` so the two can never drift: a rule added
@@ -129,7 +155,7 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
             if ctx.lab_prefixes.is_empty() {
                 let _ = writeln!(nft, "    # no lab on this box: loopback only");
             }
-            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
+            emit_block_log(nft);
         }
         Posture::Allowlist | Posture::MirrorOnly => {
             let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
@@ -138,7 +164,7 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
             let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
             // Logging is what turns a dropped packet into a `policy` event:
             // the agent tails these and emits one per blocked connection.
-            let _ = writeln!(nft, "    log prefix \"devbox-blocked \" level info");
+            emit_block_log(nft);
         }
     }
 }
@@ -532,6 +558,34 @@ mod tests {
         // And the verdict chain really denies.
         let egress = nft.split("chain forward_egress {").nth(1).unwrap();
         assert!(egress.split("  }").next().unwrap().contains("drop"));
+    }
+
+    #[test]
+    fn a_refusal_is_logged_once_per_connection_not_once_per_packet() {
+        // The comment beside this rule promises the agent emits one event per
+        // blocked connection. The chain sees packets: a TCP client retransmits
+        // its SYN and a UDP flow just keeps sending, so an unqualified `log`
+        // fired for every one of them — a false event count downstream, and a
+        // way for a box behaving exactly as configured to fill the journal.
+        for posture in [Posture::Allowlist, Posture::MirrorOnly, Posture::Isolated] {
+            let nft = ruleset(&policy(posture, &[]));
+            let logged: Vec<&str> = nft
+                .lines()
+                .filter(|l| l.contains("devbox-blocked"))
+                .collect();
+            assert!(!logged.is_empty(), "{posture} must still report refusals");
+            for line in logged {
+                assert!(
+                    line.contains("ct state new"),
+                    "{posture}: a retransmission is not a new refusal: {line}"
+                );
+                assert!(
+                    line.contains("limit rate"),
+                    "{posture}: sustained denied traffic must not be able to \
+                     fill the journal: {line}"
+                );
+            }
+        }
     }
 
     #[test]

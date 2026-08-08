@@ -278,8 +278,39 @@ pub fn generate_state_toml_with(
 
     if !custom_packages.is_empty() {
         toml.push_str("\n[custom_packages]\n");
-        for (name, ref_str) in custom_packages {
-            toml.push_str(&format!("{name} = \"{ref_str}\"\n"));
+        // Keyed by the *attribute*, resolved here rather than by each caller.
+        //
+        // `devbox-module.nix` builds its lookup path from the key and reads the
+        // value only to see whether it is a nested table, so an alias like
+        // `my-tf = "nixpkgs#terraform"` written under its declared name
+        // resolves to null and is filtered out in silence — the package
+        // vanishes while state goes on reporting it selected.
+        //
+        // Round 25 fixed that in the Sets writer and left `apply_config`
+        // untouched, which is how `devbox upgrade` kept writing the alias. So
+        // it is done here instead: this is the one place the table is emitted,
+        // and every path that reaches it is now correct without its author
+        // having to know any of the above. The resolution is idempotent, so a
+        // caller that already resolved loses nothing.
+        //
+        // Sorted, because this map is a `HashMap` and its iteration order is
+        // not stable — the same selection produced a different file on each
+        // run, and a rebuild that always looks like a change is a rebuild
+        // nobody can read.
+        let mut resolved: Vec<(String, &String)> = custom_packages
+            .iter()
+            .map(|(name, source)| {
+                (
+                    crate::sandbox::provision::nixos_attr_path(name, source).to_string(),
+                    source,
+                )
+            })
+            .collect();
+        resolved.sort();
+        for (attr, source) in resolved {
+            // Quoted: a bare dotted key is a nested table, and while the module
+            // flattens both, one literal key is what this means.
+            toml.push_str(&format!("\"{attr}\" = \"{source}\"\n"));
         }
     }
 
@@ -288,6 +319,59 @@ pub fn generate_state_toml_with(
 
 #[cfg(test)]
 mod tests {
+    /// Every writer of the guest state file gets the attribute right, because
+    /// the file itself resolves it.
+    ///
+    /// Round 25 put the resolution in the Sets writer and round 26 found
+    /// `apply_config` — the `devbox upgrade` path — still writing the declared
+    /// name. Two writers, one already fixed, and the fix had not been asked
+    /// the only question that mattered: who else emits this table. So it lives
+    /// here now, at the single point the table is produced.
+    #[test]
+    fn the_guest_state_table_is_keyed_by_the_attribute() {
+        let packages = std::collections::HashMap::from([
+            ("my-tf".to_string(), "nixpkgs#terraform".to_string()),
+            ("ripgrep".to_string(), "nixpkgs".to_string()),
+        ]);
+        let toml = super::generate_state_toml(&Default::default(), &Default::default(), &packages);
+
+        assert!(
+            toml.contains("\"terraform\" = \"nixpkgs#terraform\""),
+            "the module builds its lookup path from the key:\n{toml}"
+        );
+        assert!(
+            !toml.contains("my-tf"),
+            "an alias as the key resolves to null and is dropped in silence:\n{toml}"
+        );
+        assert!(toml.contains("\"ripgrep\" = \"nixpkgs\""), "{toml}");
+    }
+
+    /// The same input must produce the same file, byte for byte.
+    ///
+    /// `custom_packages` is a `HashMap`, so this table came out in a different
+    /// order on each run and every rebuild looked like a change — against the
+    /// rule `Selection` states for exactly this reason. Nothing reported it
+    /// because nothing compares two runs; a sorted emitter is what makes the
+    /// comparison meaningful when someone finally does.
+    #[test]
+    fn the_guest_state_file_is_byte_identical_across_runs() {
+        let packages = std::collections::HashMap::from([
+            ("alpha".to_string(), "nixpkgs".to_string()),
+            ("beta".to_string(), "nixpkgs".to_string()),
+            ("gamma".to_string(), "nixpkgs".to_string()),
+            ("delta".to_string(), "nixpkgs".to_string()),
+            ("epsilon".to_string(), "nixpkgs".to_string()),
+        ]);
+        let once = super::generate_state_toml(&Default::default(), &Default::default(), &packages);
+        for _ in 0..16 {
+            assert_eq!(
+                once,
+                super::generate_state_toml(&Default::default(), &Default::default(), &packages),
+                "the same selection must produce the same file"
+            );
+        }
+    }
+
     /// The Ubuntu package mapping must carry everything the catalog does.
     ///
     /// Ubuntu provisioning does not read `NIX_SETS`; it uses a separate

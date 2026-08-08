@@ -136,8 +136,18 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
     }
 
     // 4. addresses
+    //
+    // Except on a node whose whole purpose is not to have one. A `ztp-blank`
+    // boots unconfigured and asks DHCP — that is the scenario, not a gap in
+    // it — so handing it a static address before it starts makes the fabric it
+    // is meant to demonstrate untestable, and collides with the lease when one
+    // arrives. Its links are still created and still brought up; what it does
+    // not get is an answer it was supposed to go and find.
     for link in &plan.links {
         for end in [&link.a, &link.b] {
+            if topology.node(&end.node).is_some_and(|n| n.role.blank()) {
+                continue;
+            }
             cmds.push(privileged(vec![
                 "ip".into(),
                 "netns".into(),
@@ -161,9 +171,16 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
     // unreachable however well BGP converges. Routers do not get one: they
     // learn everything from BGP, and a default would mask a fabric that has
     // not converged behind a route that always resolves.
+    //
+    // Nor does a blank node, for the same reason it gets no address: its
+    // default route is supposed to arrive with the lease, and giving it one
+    // here is the test answering its own question.
     for link in &plan.links {
         for (end, peer) in [(&link.a, &link.b), (&link.b, &link.a)] {
-            if topology.node(&end.node).is_none_or(|n| n.role.routes()) {
+            if topology
+                .node(&end.node)
+                .is_none_or(|n| n.role.routes() || n.role.blank())
+            {
                 continue;
             }
             cmds.push(privileged(vec![
@@ -346,6 +363,65 @@ mod tests {
             .iter()
             .map(|c| render(c))
             .collect()
+    }
+
+    #[test]
+    fn a_blank_node_is_left_for_dhcp_to_configure() {
+        // The whole point of a `ztp-blank` is that it boots knowing nothing and
+        // has to be told — by DHCP, by the ZTP server — what it is. Wiring gave
+        // every endpoint a static address and every non-router a default route,
+        // so the node came up already configured and the scenario it exists to
+        // demonstrate could not fail even when ZTP was broken. It also races
+        // the lease when one does arrive.
+        let mut t = clos();
+        t.nodes.push(Node {
+            name: "blank1".into(),
+            role: Role::ZtpBlank,
+            sets: vec![],
+            asn: None,
+        });
+        t.links.push(Link {
+            endpoints: vec!["blank1:eth1".into(), "spine1:eth3".into()],
+            subnet: None,
+        });
+
+        let plan = ipam::allocate(&t).unwrap();
+        let cmds: Vec<String> = up_commands(&t, &plan)
+            .unwrap()
+            .iter()
+            .map(|c| render(c))
+            .collect();
+
+        let ns = netns("clos", "blank1");
+        let touching_blank: Vec<&String> = cmds.iter().filter(|c| c.contains(&ns)).collect();
+        assert!(
+            !touching_blank.is_empty(),
+            "the node still needs a namespace and its link"
+        );
+        for cmd in &touching_blank {
+            assert!(
+                !cmd.contains("addr add"),
+                "a blank node must not be handed an address: {cmd}"
+            );
+            assert!(
+                !cmd.contains("route add"),
+                "nor a default route — that arrives with the lease: {cmd}"
+            );
+        }
+        // And its interface is still brought up, or DHCP has nothing to speak
+        // over: skipping the address must not skip the wiring.
+        assert!(
+            touching_blank.iter().any(|c| c.contains("link set")),
+            "the blank node's link must still come up: {touching_blank:?}"
+        );
+
+        // The ordinary nodes are unaffected.
+        let leaf = netns("clos", "leaf1");
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains(&leaf) && c.contains("addr add")),
+            "a normal node still gets its address"
+        );
     }
 
     #[test]
