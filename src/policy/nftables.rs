@@ -84,6 +84,26 @@ fn emit_host_control_rules(nft: &mut String) {
 const BLOCK_LOG_RATE: u32 = 10;
 const BLOCK_LOG_BURST: u32 = 20;
 
+/// Does this policy watch without blocking?
+///
+/// `open` with an allowlist and alerts on. An `open` posture with no allowlist
+/// has nothing to compare against, and one with alerts off has asked not to be
+/// told — in both cases there is nothing to install and the table is cleared.
+pub fn audits(policy: &Policy) -> bool {
+    policy.egress == Posture::Open && policy.alert_on_violation && !policy.allow.is_empty()
+}
+
+/// Prefixes the kernel stamps on a logged packet, and the agent reads back.
+///
+/// Two, because a refusal and an observation are different things and the
+/// console shows them differently. Deriving one from the other would mean the
+/// agent inferring the verdict from a posture it reads out of a separate file,
+/// and two places having to agree is how most of this file's defects happened.
+///
+/// Must match `capture.BlockedPrefix` / `capture.FlaggedPrefix` in the agent.
+pub const BLOCK_LOG_PREFIX: &str = "devbox-blocked";
+pub const FLAG_LOG_PREFIX: &str = "devbox-flagged";
+
 /// The rule that turns a refused connection into something reportable.
 ///
 /// `ct state new` and a rate limit, because this chain sees packets and the
@@ -93,10 +113,19 @@ const BLOCK_LOG_BURST: u32 = 20;
 /// count downstream and, under sustained denied traffic, a way to fill the
 /// journal from a box that is behaving exactly as configured.
 fn emit_block_log(nft: &mut String) {
+    emit_log(nft, BLOCK_LOG_PREFIX);
+}
+
+/// The same, for a posture that watches without blocking.
+fn emit_flag_log(nft: &mut String) {
+    emit_log(nft, FLAG_LOG_PREFIX);
+}
+
+fn emit_log(nft: &mut String, prefix: &str) {
     let _ = writeln!(
         nft,
         "    ct state new limit rate {BLOCK_LOG_RATE}/second burst {BLOCK_LOG_BURST} packets \
-         log prefix \"devbox-blocked \" level info"
+         log prefix \"{prefix} \" level info"
     );
 }
 
@@ -160,6 +189,22 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     }
 
     match policy.egress {
+        Posture::Open if audits(policy) => {
+            // Observe and warn — the step before enforcing, which the Policy
+            // tab offers and `Policy::evaluate` implements with a `Flag`
+            // verdict. Nothing produced a record of it: the table was cleared
+            // for every `open` posture, so the one mode whose entire purpose
+            // is to report reported nothing.
+            //
+            // The allowlist accepts come first so a permitted destination is
+            // not logged, and there is no `drop` anywhere below them. `open`
+            // blocks nothing; that is what makes auditing in it useful.
+            let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
+            let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
+            let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
+            let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
+            emit_flag_log(nft);
+        }
         Posture::Open => {
             let _ = writeln!(nft, "    # posture is open: nothing is blocked");
         }
@@ -578,6 +623,85 @@ mod tests {
         // And the verdict chain really denies.
         let egress = nft.split("chain forward_egress {").nth(1).unwrap();
         assert!(egress.split("  }").next().unwrap().contains("drop"));
+    }
+
+    #[test]
+    fn an_open_posture_with_alerts_watches_without_blocking() {
+        // Observe-and-warn is what the Policy tab offers as the step before
+        // enforcing, and what `Policy::evaluate` answers with a `Flag`
+        // verdict. Nothing produced a record of it: every `open` posture
+        // cleared the table, so the one mode whose entire purpose is to report
+        // reported nothing at all.
+        let mut p = policy(Posture::Open, &["github.com"]);
+        p.alert_on_violation = true;
+        assert!(audits(&p));
+
+        let nft = ruleset(&p);
+        let output = nft.split("chain output {").nth(1).unwrap();
+        let output = output.split("\n  }").next().unwrap();
+
+        assert!(
+            output.contains(FLAG_LOG_PREFIX),
+            "an audited posture must log what the allowlist does not cover:\n{output}"
+        );
+        assert!(
+            output.contains(&format!("@{SET_V4} accept")),
+            "an allowlisted destination must not be flagged:\n{output}"
+        );
+        // And nothing is blocked — that is what `open` means, and what makes
+        // auditing in it worth having.
+        assert!(
+            !output.contains("drop"),
+            "`open` must not block, however loudly it reports:\n{output}"
+        );
+        assert!(
+            !output.contains(BLOCK_LOG_PREFIX),
+            "nothing was blocked, so nothing may claim to have been:\n{output}"
+        );
+        assert!(
+            nft.contains("policy accept"),
+            "the chain's default must stay accept:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn an_open_posture_without_alerts_installs_nothing() {
+        // The other half. `open` with no allowlist has nothing to compare
+        // against, and `open` with alerts off has asked not to be told; both
+        // still mean "no table", which is what `enforce::apply` keys on.
+        assert!(!audits(&policy(Posture::Open, &[])));
+
+        let mut alerts_off = policy(Posture::Open, &["github.com"]);
+        alerts_off.alert_on_violation = false;
+        assert!(!audits(&alerts_off));
+
+        let mut no_list = policy(Posture::Open, &[]);
+        no_list.alert_on_violation = true;
+        assert!(!audits(&no_list));
+
+        assert!(!ruleset(&policy(Posture::Open, &[])).contains(FLAG_LOG_PREFIX));
+    }
+
+    #[test]
+    fn the_log_prefixes_match_what_the_agent_reads() {
+        // Two languages have to agree on a string, and every previous instance
+        // of that in this codebase has drifted: `not-found` against `missing`
+        // in round 21, the allow-set TTL, the Ubuntu package mapping. The
+        // failure is always silent — the kernel logs one thing, the agent
+        // watches for another, and violations simply never appear, which looks
+        // exactly like a box that behaved.
+        let src = include_str!("../../agent/capture/blocked.go");
+        for (name, value) in [
+            ("BlockedPrefix", BLOCK_LOG_PREFIX),
+            ("FlaggedPrefix", FLAG_LOG_PREFIX),
+        ] {
+            let expected = format!("{name} = \"{value}\"");
+            assert!(
+                src.contains(&expected),
+                "agent/capture/blocked.go must declare `{expected}`; the kernel \
+                 stamps what this file says and the agent reads what that one does"
+            );
+        }
     }
 
     #[test]

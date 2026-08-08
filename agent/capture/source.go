@@ -13,7 +13,10 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 
 	"github.com/ethannortharc/devbox/agent/event"
 )
@@ -57,4 +60,80 @@ type ErrUnsupported struct {
 
 func (e *ErrUnsupported) Error() string {
 	return fmt.Sprintf("%s capture is unavailable: %s", e.Source, e.Reason)
+}
+
+// Multi runs several sources into one stream.
+//
+// The policy feed needs this: refusals come from the kernel ring buffer while
+// execs and connections come from eBPF or /proc, and they are one timeline to
+// whoever reads them. Composing at this level keeps `cmd/obsd` from growing a
+// second pump and a second set of shutdown rules.
+type Multi struct {
+	sources []Source
+}
+
+// NewMulti composes sources, ignoring nils so a caller can pass an optional
+// one without a branch.
+func NewMulti(sources ...Source) *Multi {
+	kept := make([]Source, 0, len(sources))
+	for _, s := range sources {
+		if s != nil {
+			kept = append(kept, s)
+		}
+	}
+	return &Multi{sources: kept}
+}
+
+// Name implements Source, naming every source it runs.
+func (m *Multi) Name() string {
+	names := make([]string, 0, len(m.sources))
+	for _, s := range m.sources {
+		names = append(names, s.Name())
+	}
+	return strings.Join(names, "+")
+}
+
+// Domains implements Source, as the union of what its sources produce.
+func (m *Multi) Domains() []event.Type {
+	seen := make(map[event.Type]bool)
+	var all []event.Type
+	for _, s := range m.sources {
+		for _, d := range s.Domains() {
+			if !seen[d] {
+				seen[d] = true
+				all = append(all, d)
+			}
+		}
+	}
+	return all
+}
+
+// Run streams every source until all finish or ctx is cancelled.
+//
+// A source that reports [ErrUnsupported] is skipped rather than fatal: the
+// kernel ring buffer needs privileges the primary source does not, and losing
+// the whole capture because the supplementary feed is unavailable would be a
+// worse outcome than losing the feed. Any other error is returned, and the
+// first one wins.
+func (m *Multi) Run(ctx context.Context, out chan<- *event.Event) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, len(m.sources))
+
+	for _, s := range m.sources {
+		wg.Add(1)
+		go func(s Source) {
+			defer wg.Done()
+			if err := s.Run(ctx, out); err != nil {
+				var unsupported *ErrUnsupported
+				if errors.As(err, &unsupported) {
+					return
+				}
+				errs <- err
+			}
+		}(s)
+	}
+
+	wg.Wait()
+	close(errs)
+	return <-errs
 }

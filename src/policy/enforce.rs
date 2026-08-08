@@ -34,7 +34,10 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     // `open` is the absence of a policy, not a policy of its own. Loading a
     // ruleset for it would leave an empty devbox table sitting in the box
     // suggesting something is being enforced.
-    if policy.egress == Posture::Open {
+    // `open` with an allowlist and alerts on is not the absence of a policy:
+    // it is observe-and-warn, and it needs a table to do the observing. Every
+    // other `open` posture has nothing to install.
+    if policy.egress == Posture::Open && !super::nftables::audits(policy) {
         return clear(runtime, sandbox_name).await;
     }
 
@@ -63,7 +66,13 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     // default-deny ruleset* the agent cannot populate, which is the part that
     // strands traffic. With the policy written and no agent, the posture is
     // saved and inert, and the message says exactly that.
-    let needs_agent = !domains.is_empty() || policy.egress == Posture::MirrorOnly;
+    // Only where the ruleset denies. The refusal below exists because a
+    // default-deny table with an allow set nothing can fill strands exactly
+    // the traffic the user permitted — under an auditing `open` posture
+    // nothing is denied, so an unpopulated set means over-reporting rather
+    // than a box cut off, and refusing to install would be the worse answer.
+    let needs_agent =
+        policy.egress.enforces() && (!domains.is_empty() || policy.egress == Posture::MirrorOnly);
     let agent_ready = !needs_agent || agent_resolves_dns(runtime, sandbox_name).await;
 
     if !agent_ready {

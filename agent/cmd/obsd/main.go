@@ -93,8 +93,54 @@ func run(args []string, out io.Writer) error {
 	return stream(ctx, cfg, source, out)
 }
 
-// chooseSource picks the capture source with the highest fidelity available.
+// chooseSource picks the capture source with the highest fidelity available,
+// and adds the kernel's record of refused connections alongside it.
+//
+// The firewall has always logged what it dropped and nothing has ever read
+// those lines, so `policy` events had no producer at all — the Activity view,
+// the behaviour summary and the violation metrics each described a feed
+// nothing filled. That reader is `capture.Blocked`, and it belongs beside the
+// primary source rather than inside it: refusals come from the kernel ring
+// buffer while execs and connections come from eBPF or /proc, and they are one
+// timeline to whoever reads them.
 func chooseSource(cfg config) (capture.Source, error) {
+	primary, err := primarySource(cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Not for a fixture: a replay is a recording of one box and the ring
+	// buffer is live kernel state from another, and mixing them would put
+	// events in a timeline that never happened.
+	if cfg.fixture != "" || cfg.policy == "" {
+		return primary, nil
+	}
+	return capture.NewMulti(primary, &capture.Blocked{
+		BoxID: cfg.boxID,
+		Mode:  func() string { return posture(cfg.policy) },
+	}), nil
+}
+
+// posture reads the egress posture currently in force.
+//
+// Read per event rather than captured once: `devbox policy set` rewrites this
+// file under a running agent, and a label fixed at startup would describe the
+// posture that happened to be in force when capture began. Violations are rate
+// limited in the ruleset itself, so this is not a hot path.
+func posture(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var spec struct {
+		Egress string `json:"egress"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return ""
+	}
+	return spec.Egress
+}
+
+func primarySource(cfg config) (capture.Source, error) {
 	if cfg.fixture != "" {
 		return &capture.Fixture{
 			Path:     cfg.fixture,
