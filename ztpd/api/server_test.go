@@ -496,3 +496,49 @@ func TestBootstrapSourceHasNoBackticks(t *testing.T) {
 			"double quotes when naming a command.", n)
 	}
 }
+
+// TestBootstrapRetriesAnActivationThatFailed pins the idempotence of the push.
+//
+// The script cannot be executed here — it runs on a blank device against a
+// real FRR — so this asserts the ordering that makes a retry work, which is
+// the part that was wrong: the new config has to be compared against what was
+// last *activated*, and the marker recording that has to be written after the
+// restart succeeds, never before.
+//
+// Comparing against /etc/frr/frr.conf instead meant a failed restart left the
+// file already in place, so every later retry found no difference and skipped
+// the restart permanently. Nothing in this repository could have noticed: the
+// failure needs a node whose FRR will not start.
+func TestBootstrapRetriesAnActivationThatFailed(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	script := rec.Body.String()
+
+	if !strings.Contains(script, `cmp -s /tmp/frr.conf.new "$ACTIVATED"`) {
+		t.Error("the skip-restart test must compare against the activation " +
+			"marker; comparing against /etc/frr/frr.conf makes a failed " +
+			"restart permanent")
+	}
+
+	restart := strings.Index(script, "service frr restart")
+	marker := strings.Index(script, `cp /etc/frr/frr.conf "$ACTIVATED"`)
+	switch {
+	case restart < 0:
+		t.Fatal("could not find the FRR restart")
+	case marker < 0:
+		t.Fatal("the activation marker is never written, so every run restarts FRR")
+	case marker < restart:
+		t.Error("the activation marker is written before the restart, which " +
+			"records an activation that has not happened yet")
+	}
+
+	// And the failure path must still exit before reaching it.
+	fail := strings.Index(script, `report failed "frr restart failed`)
+	if fail < 0 || fail > marker {
+		t.Error("the restart failure must be reported before the marker is written")
+	}
+}

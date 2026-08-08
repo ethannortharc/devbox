@@ -87,6 +87,22 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 /// provisioning refuses, the box exists and the caller goes on to save state
 /// and report success, so the user gets a sandbox that reports a package it
 /// does not have.
+/// The attribute path the NixOS module will resolve for a declared package.
+///
+/// `my-tf = "nixpkgs#terraform"` names the attribute in its *source*; the key
+/// is only what the user calls it. Handing the module the key made
+/// `lib.attrByPath` resolve to null, and null is filtered out — silently, so
+/// that one stale name cannot fail a whole rebuild. The package was therefore
+/// accepted by the source check, recorded in state as selected, shown as
+/// selected in the checklist, and never installed.
+///
+/// Deliberately shared by the check and the projection. They worked this out
+/// separately before, and validating one string while writing a different one
+/// is not validation.
+pub(crate) fn nixos_attr_path<'a>(name: &'a str, source: &'a str) -> &'a str {
+    source.strip_prefix("nixpkgs#").unwrap_or(name)
+}
+
 pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> Result<()> {
     if image == "ubuntu" {
         return Ok(()); // `nix profile install` takes a flake reference directly
@@ -103,6 +119,24 @@ pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> R
              Point them at nixpkgs in devbox.toml, or use the ubuntu image \
              (`image = \"ubuntu\"`), which installs flake references directly.",
             unsupported.join(", ")
+        );
+    }
+    // The attribute path is written into the box's `devbox-state.toml` and
+    // resolved under `pkgs`. The web path has validated it since round 12; the
+    // `create` path reached `generate_state_toml` without ever checking, so
+    // this is the same guard arriving at the second entry point to the same
+    // file — the sibling-surface question, asked for once.
+    let invalid: Vec<&str> = packages
+        .iter()
+        .filter(|(name, source)| {
+            !crate::nix::compose::is_valid_attr_path(nixos_attr_path(name, source))
+        })
+        .map(|(pkg, _)| pkg.as_str())
+        .collect();
+    if !invalid.is_empty() {
+        bail!(
+            "these packages do not name a valid nixpkgs attribute path: {}",
+            invalid.join(", ")
         );
     }
     Ok(())
@@ -380,7 +414,10 @@ pub async fn provision_vm_full(
             // teaching the module about flake inputs, which is a real change;
             // until then this refuses, which is the same call as ADR-0036.
             check_packages_supported(image, packages)?;
-            let names: Vec<String> = packages.iter().map(|(n, _)| n.clone()).collect();
+            let names: Vec<String> = packages
+                .iter()
+                .map(|(n, s)| nixos_attr_path(n, s).to_string())
+                .collect();
             provision_nixos(runtime, name, sets, languages, mount_mode, &names).await
         }
     }
@@ -1554,6 +1591,46 @@ mod tests {
         ] {
             assert!(is_valid_attr_path(ok), "{ok:?} is a real package");
         }
+    }
+
+    #[test]
+    fn a_nixpkgs_fragment_is_what_the_module_gets_asked_for() {
+        // `my-tf = "nixpkgs#terraform"` passed the source check and then had
+        // its source discarded, so the module was asked for `my-tf`.
+        // `lib.attrByPath` resolved that to null and null is filtered out — on
+        // purpose, so one stale name cannot fail a whole rebuild — which is why
+        // nothing complained. The package was accepted, recorded as selected,
+        // displayed as selected, and never installed.
+        assert_eq!(nixos_attr_path("my-tf", "nixpkgs#terraform"), "terraform");
+        assert_eq!(
+            nixos_attr_path("ipython", "nixpkgs#python312Packages.ipython"),
+            "python312Packages.ipython"
+        );
+        // A plain nixpkgs package is still named by its key.
+        assert_eq!(nixos_attr_path("ripgrep", "nixpkgs"), "ripgrep");
+    }
+
+    #[test]
+    fn the_check_validates_the_string_that_gets_written() {
+        // The `create` path reached `generate_state_toml` without validating
+        // anything: only the web path ran `is_valid_attr_path`. Now that the
+        // fragment is what gets written, the fragment is what gets checked —
+        // validating the key while writing the fragment would be worse than
+        // not validating, because it reads like a guard.
+        let ok = [("tf".to_string(), "nixpkgs#terraform".to_string())];
+        assert!(check_packages_supported("nixos", &ok).is_ok());
+
+        for hostile in ["nixpkgs#a; touch /tmp/pwn", "nixpkgs#$(reboot)", "nixpkgs#"] {
+            let pkgs = [("tf".to_string(), hostile.to_string())];
+            assert!(
+                check_packages_supported("nixos", &pkgs).is_err(),
+                "{hostile:?} must be refused before it reaches the box"
+            );
+        }
+
+        // A hostile *key* is still caught when the source is plain nixpkgs.
+        let bad_key = [("a; touch /tmp/pwn".to_string(), "nixpkgs".to_string())];
+        assert!(check_packages_supported("nixos", &bad_key).is_err());
     }
 
     #[test]

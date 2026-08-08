@@ -91,6 +91,28 @@ impl SandboxManager {
             );
         }
 
+        // Refuse an unsupported package before anything exists to clean up.
+        //
+        // This check has now been moved twice. It began inside
+        // `provision_vm_full`, where the box was already made and `create` only
+        // printed the failure as a warning before saving state and reporting
+        // success. Round 23 moved it out — but to just above `provision_vm_full`
+        // and *below* `runtime.create`, while the comment claimed it ran "before
+        // the box exists". It did not: a refusal there left an orphan VM with no
+        // state file, and the retry then passed `sandbox_exists` and collided
+        // with the runtime object still sitting there.
+        //
+        // It depends on nothing but the config, so there was never a reason for
+        // it to run late. Here it is genuinely before the box exists.
+        crate::sandbox::provision::check_packages_supported(
+            &config.sandbox.image,
+            &config
+                .custom_packages
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+
         // Build mounts from config + extra
         let is_overlay = config.sandbox.mount_mode == "overlay";
         let mut mounts: Vec<Mount> = config
@@ -142,18 +164,6 @@ impl SandboxManager {
         let image = config.sandbox.image.as_str();
         // Provision tools — pass mount_mode so NixOS module sets up overlay
         let mount_mode = &config.sandbox.mount_mode;
-        // Validated before the box exists, so an unsupported package is a
-        // refusal rather than a warning printed over a created-but-broken
-        // sandbox. `provision_vm_full` also rejects it, but by then the box is
-        // made and the caller below saves state and prints success.
-        crate::sandbox::provision::check_packages_supported(
-            &config.sandbox.image,
-            &config
-                .custom_packages
-                .iter()
-                .map(|(n, s)| (n.clone(), s.clone()))
-                .collect::<Vec<_>>(),
-        )?;
 
         if let Err(e) = provision::provision_vm_full(
             runtime,
@@ -621,5 +631,168 @@ impl SandboxManager {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{ExecResult, SandboxInfo, SnapshotInfo};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A runtime that makes nothing and remembers whether it was asked to.
+    ///
+    /// The lifecycle in `create_sandbox` has never had a test, because every
+    /// implementation of this trait shells out to a real hypervisor. That is
+    /// the same "no test can reach it" pattern that has now produced a serious
+    /// defect in the nft path, the bootstrap script, and here — so this is the
+    /// smallest thing that makes the *ordering* observable, which is the part
+    /// that keeps being wrong.
+    struct RecordingRuntime {
+        created: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for RecordingRuntime {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn priority(&self) -> u32 {
+            0
+        }
+        async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
+            self.created.store(true, Ordering::SeqCst);
+            Ok(SandboxInfo {
+                name: opts.name.clone(),
+                status: SandboxStatus::Running,
+                runtime: "recording".into(),
+                created_at: Some("now".into()),
+                ip_address: None,
+            })
+        }
+        // Provisioning runs commands in the box it just made. There is no box,
+        // so this fails — which is the honest answer and the one `create`
+        // already knows how to handle: it prints the failure as a warning.
+        async fn exec_cmd(&self, _: &str, _: &[&str], _: bool) -> Result<ExecResult> {
+            bail!("no box to run commands in")
+        }
+        // Nothing below is reachable in these tests.
+        async fn start(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stop(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn status(&self, _: &str) -> Result<SandboxStatus> {
+            unimplemented!()
+        }
+        async fn list(&self) -> Result<Vec<SandboxInfo>> {
+            unimplemented!()
+        }
+        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_list(&self, _: &str) -> Result<Vec<SnapshotInfo>> {
+            unimplemented!()
+        }
+        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn update_mounts(&self, _: &str, _: &[Mount]) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_package_is_refused_before_the_box_is_made() {
+        // This check has been moved twice and been wrong twice. It started
+        // inside `provision_vm_full`, where `create` downgraded the failure to
+        // a printed warning and then saved state and reported success. Round 23
+        // moved it up — but to below `runtime.create`, while writing a comment
+        // that said "before the box exists". The comment was the only thing
+        // that made it look fixed.
+        //
+        // What that left behind is worse than the original warning: a VM with
+        // no state file, which `sandbox_exists` cannot see, so the obvious
+        // retry walks into a collision with a runtime object nobody is
+        // tracking. So the assertion here is not "it returns an error" — it
+        // did that before — but that nothing was created.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: tmp.path().to_path_buf(),
+        };
+        let runtime = RecordingRuntime {
+            created: AtomicBool::new(false),
+        };
+
+        let mut config = DevboxConfig::default();
+        config.sandbox.image = "nixos".into();
+        config.custom_packages.insert(
+            "my-tool".into(),
+            "github:someone/their-flake#my-tool".into(),
+        );
+
+        let err = manager
+            .create_sandbox("t", &runtime, &config, &[], &HashMap::new(), None, false)
+            .await
+            .expect_err("a flake package on the NixOS image must be refused");
+        assert!(
+            err.to_string().contains("flake"),
+            "the refusal should say why: {err}"
+        );
+        assert!(
+            !runtime.created.load(Ordering::SeqCst),
+            "the box was created before the package check ran, so the refusal \
+             leaves an orphan runtime object behind"
+        );
+        assert!(
+            !tmp.path().join("boxes").join("t").exists(),
+            "no state should be written for a box that was refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supported_package_still_reaches_the_runtime() {
+        // The other half of the same question. A check that runs early is only
+        // an improvement if it still lets the ordinary case through — the
+        // round-20 firewall guard refused every legitimate call and made the
+        // outcome it was preventing unreachable, which is the failure this
+        // asserts against.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: tmp.path().to_path_buf(),
+        };
+        let runtime = RecordingRuntime {
+            created: AtomicBool::new(false),
+        };
+
+        let mut config = DevboxConfig::default();
+        config.sandbox.image = "nixos".into();
+        config
+            .custom_packages
+            .insert("ripgrep".into(), "nixpkgs".into());
+
+        // Provisioning fails against this runtime, which `create` reports as a
+        // warning rather than an error — so the call succeeds and what matters
+        // is that it got as far as creating.
+        let _ = manager
+            .create_sandbox("t", &runtime, &config, &[], &HashMap::new(), None, false)
+            .await;
+        assert!(
+            runtime.created.load(Ordering::SeqCst),
+            "a package that NixOS can install must not be refused"
+        );
     }
 }

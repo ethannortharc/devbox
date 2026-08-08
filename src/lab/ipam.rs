@@ -291,6 +291,28 @@ pub fn allocate(topology: &Topology) -> Result<Plan> {
         .filter_map(|n| n.asn)
         .collect();
 
+    // Loopbacks start halfway up the base and walk forward one at a time, so
+    // there is room for exactly half the prefix. Past that, `offset_addr` just
+    // keeps adding — it wraps on a `u32` — and hands out loopbacks outside the
+    // base the topology declared. Nothing downstream noticed: `verify` checks
+    // that addresses are unique and that links do not overlap, and addresses
+    // outside the base are both. Every one of them is individually a valid
+    // address; what is invalid is the plan.
+    //
+    // Reachable on a `/24` with more than 128 routers, which is a real topology
+    // once links carry explicit subnets and stop consuming the base themselves.
+    let router_count = topology.nodes.iter().filter(|n| n.role.routes()).count();
+    if let Some(capacity) = host_capacity(base_len) {
+        let half = capacity / 2;
+        if router_count as u64 > u64::from(half) {
+            bail!(
+                "topology has {router_count} routing nodes but base '{}' has room \
+                 for {half} loopbacks; widen the base",
+                topology.lab.base
+            );
+        }
+    }
+
     let mut next_router: u32 = 0;
     let mut next_asn = topology.lab.asn_base;
     for node in &topology.nodes {
@@ -693,6 +715,50 @@ mod tests {
                     link.a.addr
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_base_too_small_for_its_routers_is_refused() {
+        // Loopbacks take the upper half of the base, one per router, so a /24
+        // holds 128 of them. The 129th walked straight past the end —
+        // `offset_addr` wraps on a `u32` — and every address it produced was
+        // individually valid, so `verify` had nothing to object to: it checks
+        // for duplicates and overlapping links, and addresses outside the base
+        // are neither. The plan was invalid without any single address in it
+        // being invalid, which is why this needed a check of its own.
+        let mut t = clos();
+        t.lab.base = "10.0.0.0/24".into();
+        t.nodes = (0..129)
+            .map(|i| Node {
+                name: format!("r{i}"),
+                role: Role::FrrRouter,
+                sets: vec![],
+                asn: None,
+            })
+            .collect();
+        // Explicit link subnets, because this density is only reachable when
+        // the links are not also eating the base.
+        t.links = vec![Link {
+            endpoints: vec!["r0:eth1".into(), "r1:eth1".into()],
+            subnet: Some("192.168.99.0/31".into()),
+        }];
+
+        let err = allocate(&t).unwrap_err().to_string();
+        assert!(
+            err.contains("129") && err.contains("128"),
+            "the refusal must name what was asked for and what fits: {err}"
+        );
+
+        // And the last one that fits is allocated, inside the base.
+        t.nodes.truncate(128);
+        let plan = allocate(&t).unwrap();
+        assert_eq!(plan.loopbacks.len(), 128);
+        for (node, addr) in &plan.loopbacks {
+            assert!(
+                crate::policy::match_cidr("10.0.0.0/24", &addr.to_string()),
+                "{node}'s loopback {addr} escaped the base"
+            );
         }
     }
 

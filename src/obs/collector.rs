@@ -76,6 +76,13 @@ pub struct Stats {
     pub stored: AtomicU64,
     /// Events dropped because the queue was full. Never silently zero.
     pub dropped: AtomicU64,
+    /// Events lost because the store would not take them.
+    ///
+    /// Separate from `dropped` because the causes are unrelated and so are the
+    /// responses: a full queue means the collector is behind, a failed insert
+    /// means the disk is full or the database is damaged. Sharing one counter
+    /// would have made the second look like the first.
+    pub persist_failed: AtomicU64,
     pub rejected: AtomicU64,
     pub agents_connected: AtomicU64,
 }
@@ -87,6 +94,7 @@ impl Stats {
             received: self.received.load(Ordering::Relaxed),
             stored: self.stored.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            persist_failed: self.persist_failed.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             agents_connected: self.agents_connected.load(Ordering::Relaxed),
         }
@@ -99,6 +107,7 @@ pub struct StatsSnapshot {
     pub received: u64,
     pub stored: u64,
     pub dropped: u64,
+    pub persist_failed: u64,
     pub rejected: u64,
     pub agents_connected: u64,
 }
@@ -435,7 +444,28 @@ impl Collector {
                     tracing::warn!(error = %e, "retention sweep failed");
                 }
             }
-            Err(e) => tracing::error!(error = %e, "failed to store an event batch"),
+            Err(e) => {
+                // The transaction rolled back, so these events are gone the
+                // moment the batch is cleared. Counting them is what keeps
+                // §7.3's "never silently dropped" true on this path: `dropped`
+                // only ever counted a full queue, so a disk that filled up
+                // left a hole in the timeline while `/metrics` went on
+                // reporting zero losses — and a gap in an event timeline is
+                // indistinguishable from a quiet box.
+                //
+                // Counted rather than retained: the failures that reach here
+                // are a full disk or a damaged database, neither of which the
+                // next flush fixes, and holding the batch to retry it would
+                // grow the queue behind it without bound.
+                self.stats
+                    .persist_failed
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    events = batch.len(),
+                    "failed to store an event batch; the events are lost"
+                );
+            }
         }
         batch.clear();
     }
@@ -592,10 +622,15 @@ mod tests {
         let stats = Stats::default();
         stats.received.store(10, Ordering::Relaxed);
         stats.dropped.store(2, Ordering::Relaxed);
+        stats.persist_failed.store(3, Ordering::Relaxed);
 
         let snap = stats.snapshot();
         assert_eq!(snap.received, 10);
         assert_eq!(snap.dropped, 2);
+        // Distinct from `dropped`: a full queue and a store that will not take
+        // the batch are different failures needing different responses, and
+        // one counter for both would have reported a full disk as backpressure.
+        assert_eq!(snap.persist_failed, 3);
         assert_eq!(snap.stored, 0);
     }
 }

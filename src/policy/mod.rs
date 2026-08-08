@@ -193,8 +193,9 @@ pub struct Target {
 impl Policy {
     /// Decide whether a connection is permitted.
     pub fn evaluate(&self, target: &Target) -> Decision {
-        // Loopback and link-local are never egress: blocking them would break
-        // the box's own services, and they cannot leave the host anyway.
+        // Loopback only. Blocking it would break the box's own services and it
+        // cannot leave the host anyway — which is exactly what stopped being
+        // true of the link-local range that used to be lumped in with it.
         if is_local(&target.addr) {
             return Decision::allow("local address");
         }
@@ -399,15 +400,24 @@ fn prefix_eq(a: &[u8], b: &[u8], bits: u8) -> bool {
     (a[whole] & mask) == (b[whole] & mask)
 }
 
-/// Loopback, link-local, and unspecified addresses — never egress.
+/// Addresses the generated ruleset accepts whatever the posture is.
+///
+/// Deliberately narrow, and it must stay in step with the unconditional
+/// accepts in `nftables::emit_policy_rules` — this function is what `devbox
+/// policy test` answers from, and the two disagreeing is how the tool ends up
+/// confidently wrong about what the box will do.
+///
+/// Link-local was here once, on the reasoning that it is "never egress". It is:
+/// it leaves the interface, and `169.254.169.254` in particular answers with
+/// cloud instance credentials. It is now judged by posture like any other
+/// destination, and only ICMPv6 neighbour discovery is exempted, in the
+/// output chain. Broadcast went the same way: DHCP is permitted by port in the
+/// host-control rules, not by destination, so a generic packet to
+/// `255.255.255.255` is dropped and "allowed" was the wrong answer.
 pub fn is_local(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(a)) => {
-            a.is_loopback() || a.is_link_local() || a.is_unspecified() || a.is_broadcast()
-        }
-        Ok(std::net::IpAddr::V6(a)) => {
-            a.is_loopback() || a.is_unspecified() || (a.segments()[0] & 0xffc0) == 0xfe80
-        }
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback() || a.is_unspecified(),
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.is_unspecified(),
         Err(_) => false,
     }
 }
@@ -752,10 +762,18 @@ mod tests {
     fn local_and_lab_ranges_are_classified() {
         assert!(is_local("127.0.0.1"));
         assert!(is_local("::1"));
-        assert!(is_local("169.254.1.1"));
         assert!(is_local("0.0.0.0"));
         assert!(!is_local("8.8.8.8"));
         assert!(!is_local("not-an-address"));
+
+        // Link-local is judged by posture, not waved through. The cloud
+        // metadata address is the one that matters: it hands out instance
+        // credentials, and it sat behind an unconditional accept.
+        assert!(!is_local("169.254.169.254"));
+        assert!(!is_local("169.254.1.1"));
+        assert!(!is_local("fe80::1"));
+        // Broadcast likewise: DHCP is exempted by port, not by destination.
+        assert!(!is_local("255.255.255.255"));
 
         assert!(is_lab_internal("10.0.0.1"));
         assert!(is_lab_internal("172.16.0.1"));

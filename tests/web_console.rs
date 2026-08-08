@@ -648,3 +648,107 @@ async fn stream_emits_a_heartbeat_tick() {
     assert!(text.contains("event: tick"), "got: {text}");
     assert!(text.contains("data: live · "), "got: {text}");
 }
+
+// ── escaping ─────────────────────────────────────────────
+
+/// The payload every one of these tests pushes through a different door.
+const HOSTILE: &str = "<script>alert(1)</script>";
+
+fn assert_not_executable(where_: &str, body: &str) {
+    assert!(
+        !body.contains("<script>"),
+        "{where_} returned an unescaped script tag, which htmx inserts into \
+         the console DOM:\n{body}"
+    );
+    assert!(
+        body.contains("&lt;script&gt;"),
+        "{where_} should still show the user what they typed, escaped:\n{body}"
+    );
+}
+
+// Round 22 configured htmx to swap 4xx bodies, because the console's actionable
+// errors are 4xx fragments and none of them were reaching the user. It did not
+// ask what those bodies contain. They quote the thing that was rejected —
+// a package name, an allowlist entry, a box name off the path — straight from
+// the input, so the swap turned every rejection into script execution in a page
+// holding an authenticated session.
+//
+// One test per door, because the escaping being right in the handler I was
+// looking at is exactly the assumption that has failed in this codebase before.
+
+#[tokio::test]
+async fn a_rejected_package_name_comes_back_escaped() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            "/api/boxes/alpha/sets",
+            &format!("packages={}", urlencode(HOSTILE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_not_executable("the selection validator", &body_string(res).await);
+}
+
+#[tokio::test]
+async fn a_rejected_set_name_comes_back_escaped() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            "/api/boxes/alpha/sets",
+            &format!("set={}", urlencode(HOSTILE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_not_executable("the set validator", &body_string(res).await);
+}
+
+#[tokio::test]
+async fn a_rejected_allowlist_entry_comes_back_escaped() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(put_form(
+            "/api/boxes/alpha/policy",
+            &format!("posture=allowlist&allow={}", urlencode(HOSTILE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_not_executable("the policy validator", &body_string(res).await);
+}
+
+#[tokio::test]
+async fn an_unknown_box_name_comes_back_escaped() {
+    // 404 is a 4xx too, and this one echoes a path segment. A `text/plain`
+    // body is no defence: htmx inserts the response text as HTML whatever the
+    // content type says.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_form(
+            &format!("/api/boxes/{}/sets", urlencode(HOSTILE)),
+            "set=system",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_not_executable("the unknown-box path", &body_string(res).await);
+}
+
+/// Percent-encode enough for these payloads to survive a form body and a path.
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}

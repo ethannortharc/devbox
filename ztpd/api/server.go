@@ -219,7 +219,21 @@ wget -q -O /tmp/frr.conf.new "$ZTP/config/$NAME" || {
 # the OS default hostname, which is what an operator reads in every log.
 hostname "$NAME"
 
-if [ -f /etc/frr/frr.conf ] && cmp -s /tmp/frr.conf.new /etc/frr/frr.conf; then
+# Compare against the config that was last successfully *activated*, not the
+# one sitting on disk.
+#
+# The file has to be moved into place before FRR can load it, so on a failed
+# restart the on-disk copy already equalled the new one. The next supervisor
+# retry then compared them, found no difference, and skipped the restart — for
+# good. The node was left either with no daemon at all or with a daemon still
+# running the previous configuration, and in the second case the verification
+# below finds established sessions and reports healthy.
+#
+# The marker is written only after a restart returns success, so a failure
+# leaves it stale and the retry does the work again. That is the whole
+# difference between "the file is in place" and "the daemon has read it".
+ACTIVATED=/etc/frr/.devbox-activated
+if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED"; then
   rm -f /tmp/frr.conf.new
   report verifying
 else
@@ -234,6 +248,7 @@ else
     report failed "frr restart failed; the new config was not loaded"
     exit 1
   fi
+  cp /etc/frr/frr.conf "$ACTIVATED"
   report verifying
 fi
 

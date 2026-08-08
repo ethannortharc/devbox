@@ -256,7 +256,7 @@ async fn box_behavior(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                format!("no events recorded for box '{name}' yet"),
+                error_notice(&format!("no events recorded for box '{name}' yet")),
             )
                 .into_response();
         }
@@ -411,16 +411,18 @@ async fn apply_sets(
     body: String,
 ) -> Response {
     if state.manager.get_sandbox(&name).is_err() {
-        return (StatusCode::NOT_FOUND, format!("no such box: {name}")).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            error_notice(&format!("no such box: {name}")),
+        )
+            .into_response();
     }
 
     let selection = service::parse_selection_form(&body);
     if let Err(e) = selection.validate() {
         return (
             StatusCode::BAD_REQUEST,
-            Html(format!(
-                "<div class=\"notice error\">Invalid selection: {e}</div>"
-            )),
+            error_notice(&format!("Invalid selection: {e}")),
         )
             .into_response();
     }
@@ -436,11 +438,7 @@ async fn apply_sets(
     let Some(guard) = state.claim_rebuild(&name) else {
         return (
             StatusCode::CONFLICT,
-            Html(
-                "<div class=\"notice error\">A rebuild is already running for this box. \
-                 Wait for it to finish.</div>"
-                    .to_string(),
-            ),
+            error_notice("A rebuild is already running for this box. Wait for it to finish."),
         )
             .into_response();
     };
@@ -513,9 +511,7 @@ async fn put_policy(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<div class=\"notice error\">Invalid policy: {e}</div>"
-                )),
+                error_notice(&format!("Invalid policy: {e}")),
             )
                 .into_response();
         }
@@ -712,7 +708,34 @@ fn server_error(context: &str, err: &anyhow::Error) -> Response {
 /// the detail is logged either way.
 fn not_found(name: &str, err: &anyhow::Error) -> Response {
     tracing::debug!(box_id = %name, error = ?err, "box lookup failed");
-    (StatusCode::NOT_FOUND, format!("no such box: {name}")).into_response()
+    // htmx swaps 4xx, and this one echoes a path segment, so it goes through
+    // the same escape as every other notice. A body being `text/plain` is no
+    // defence: htmx inserts the response text as HTML whatever the header says.
+    (
+        StatusCode::NOT_FOUND,
+        error_notice(&format!("no such box: {name}")),
+    )
+        .into_response()
+}
+
+/// An error notice for the console, with every dynamic part escaped.
+///
+/// Round 22 configured htmx to swap 4xx bodies, because the console's
+/// actionable errors are 4xx fragments and none of them were reaching the
+/// user. What that change did not ask is what those bodies *contain*: these
+/// messages quote things the project controls — a set or package name straight
+/// off the submitted form, an allowlist entry, a path out of `devbox.toml` —
+/// and `Selection::validate` interpolates them into its message verbatim. So
+/// turning on the swap turned every one of those quotes into script execution
+/// in a console holding an authenticated session.
+///
+/// The escape belongs here rather than at each call site: the reason a handler
+/// is safe must not be that whoever wrote it remembered.
+fn error_notice(message: &str) -> Html<String> {
+    Html(format!(
+        "<div class=\"notice error\">{}</div>",
+        build::escape_html(message)
+    ))
 }
 
 /// A failed lifecycle action. The message is shown to the user, so it carries
@@ -720,10 +743,14 @@ fn not_found(name: &str, err: &anyhow::Error) -> Response {
 /// that the person can actually act on.
 fn action_error(verb: &str, name: &str, err: &anyhow::Error) -> Response {
     tracing::warn!(box_id = %name, error = ?err, "failed to {verb} box");
+    // `verb` is a literal at every call site; the box name and the error are
+    // not, so both are escaped.
     (
         StatusCode::CONFLICT,
         Html(format!(
-            "<div class=\"notice error\">Could not {verb} <strong>{name}</strong>: {err}</div>"
+            "<div class=\"notice error\">Could not {verb} <strong>{}</strong>: {}</div>",
+            build::escape_html(name),
+            build::escape_html(&err.to_string())
         )),
     )
         .into_response()

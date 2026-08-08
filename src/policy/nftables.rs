@@ -20,11 +20,6 @@ use super::{Policy, Posture, parse_cidr};
 /// rules without touching anything the box's own configuration installed.
 pub const TABLE: &str = "devbox";
 
-/// The rules that implement a posture, emitted into whichever chain.
-///
-/// Shared by `output` and `forward` so the two can never drift: a rule added
-/// to one and forgotten in the other is a hole shaped exactly like the
-/// container-egress bypass this was factored out to fix.
 /// Rules that keep the *host* on the network, for the output chain only.
 ///
 /// DHCP renewal goes to broadcast and neighbour discovery to `ff02::/16`, so
@@ -48,23 +43,52 @@ fn emit_host_control_rules(nft: &mut String) {
          nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, \
          mld-listener-query, mld-listener-report }} accept"
     );
+    // Unicast neighbour discovery, by type rather than by prefix. A blanket
+    // `ip6 daddr fe80::/10 accept` used to sit in `emit_policy_rules` and
+    // permitted every protocol and port to the whole link-local range; what the
+    // box actually needs is to answer and solicit its neighbours.
+    let _ = writeln!(
+        nft,
+        "    ip6 daddr fe80::/10 icmpv6 type {{ nd-neighbor-solicit, \
+         nd-neighbor-advert }} accept"
+    );
 }
 
+/// The rules that implement a posture, emitted into whichever chain.
+///
+/// Shared by `output` and `forward` so the two can never drift: a rule added
+/// to one and forgotten in the other is a hole shaped exactly like the
+/// container-egress bypass this was factored out to fix.
+///
+/// The flip side is that anything emitted here applies to what the box
+/// *routes* as well as what it sends. A rule that exists for the host's own
+/// sake belongs in `emit_host_control_rules`, and getting that wrong is
+/// precisely how the DHCP exemptions became a way through an isolated posture.
 fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
     // Established traffic first: a reply to a connection we already allowed
     // must not be re-evaluated, and putting this rule anywhere but first costs
     // a lookup on every packet.
     let _ = writeln!(nft, "    ct state established,related accept");
 
-    // Loopback and link-local are never egress. Blocking them breaks the box's
-    // own services and its neighbour discovery — and `Policy::evaluate` already
-    // treats both as local, so omitting them here made `devbox policy test`
-    // report "allowed" for an address the box would then drop.
+    // Loopback only. It genuinely cannot leave the host, so exempting it
+    // constrains nothing.
+    //
+    // Link-local used to be exempted here alongside it, on the reasoning that
+    // both are "never egress". That is true of loopback and false of
+    // link-local: `169.254.0.0/16` and `fe80::/10` leave the interface and
+    // reach whatever answers on the segment. As unconditional accepts for
+    // every protocol and port they were a hole straight through `isolated`,
+    // `allowlist` and `mirror-only` — and on a cloud instance the hole has a
+    // well-known address, `169.254.169.254`, which hands out instance
+    // credentials to anything that asks.
+    //
+    // The box's own neighbour discovery is real and still needed, so it is
+    // permitted by ICMPv6 type in `emit_host_control_rules` — the output-only
+    // emitter, because a nested container has no business discovering the
+    // host's neighbours.
     let _ = writeln!(nft, "    oifname \"lo\" accept");
     let _ = writeln!(nft, "    ip daddr 127.0.0.0/8 accept");
     let _ = writeln!(nft, "    ip6 daddr ::1 accept");
-    let _ = writeln!(nft, "    ip daddr 169.254.0.0/16 accept");
-    let _ = writeln!(nft, "    ip6 daddr fe80::/10 accept");
 
     // DNS must survive every posture except `isolated`: the allowlist is
     // resolved by name, so blocking resolution would make the allowlist
@@ -562,6 +586,72 @@ mod tests {
         let output = output.split("\n  }").next().unwrap();
         assert!(!output.contains("ff02::/16 accept"));
         assert!(output.contains("ff02::/16 icmpv6 type"));
+    }
+
+    #[test]
+    fn link_local_is_judged_by_posture_not_waved_through() {
+        // `ip daddr 169.254.0.0/16 accept` and `ip6 daddr fe80::/10 accept`
+        // sat with the loopback exemptions under the heading "never egress".
+        // Loopback cannot leave the host; link-local leaves the interface and
+        // reaches whatever answers on the segment. As unconditional accepts
+        // they were a bypass of every enforcing posture for every protocol and
+        // port — and on a cloud instance the bypass has a famous address that
+        // serves instance credentials to anything that connects.
+        for posture in [Posture::Allowlist, Posture::MirrorOnly, Posture::Isolated] {
+            let nft = ruleset(&policy(posture, &[]));
+            for chain in [
+                "chain output {",
+                "chain forward {",
+                "chain forward_egress {",
+            ] {
+                let body = nft.split(chain).nth(1).unwrap();
+                let body = body.split("\n  }").next().unwrap();
+                assert!(
+                    !body.contains("169.254.0.0/16 accept"),
+                    "{posture}/{chain} must not exempt IPv4 link-local — that \
+                     reaches cloud metadata:\n{body}"
+                );
+                assert!(
+                    !body.contains("fe80::/10 accept"),
+                    "{posture}/{chain} must not exempt all of IPv6 link-local:\n{body}"
+                );
+            }
+        }
+
+        // Neighbour discovery still works, by type, and only for the host.
+        let nft = ruleset(&policy(Posture::Isolated, &[]));
+        let output = nft.split("chain output {").nth(1).unwrap();
+        let output = output.split("\n  }").next().unwrap();
+        assert!(
+            output.contains("fe80::/10 icmpv6 type"),
+            "the box must still discover its neighbours:\n{output}"
+        );
+        for chain in ["chain forward {", "chain forward_egress {"] {
+            let body = nft.split(chain).nth(1).unwrap();
+            let body = body.split("\n  }").next().unwrap();
+            assert!(
+                !body.contains("fe80::/10"),
+                "{chain} must not carry the host's neighbour discovery:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_test_agrees_with_the_ruleset_about_link_local() {
+        // The two have to answer the same question the same way. `devbox policy
+        // test` reads `is_local`; the box reads this ruleset. When the ruleset
+        // stopped exempting link-local, an `is_local` that still did would have
+        // reported "allowed" for traffic the box drops — the failure mode the
+        // comment on `emit_policy_rules` has warned about since round 5, in the
+        // opposite direction.
+        for addr in ["169.254.169.254", "169.254.1.1", "fe80::1"] {
+            assert!(
+                !crate::policy::is_local(addr),
+                "{addr} is judged by posture in the ruleset, so is_local must \
+                 not short-circuit it to allowed"
+            );
+        }
+        assert!(crate::policy::is_local("127.0.0.1"));
     }
 
     #[test]

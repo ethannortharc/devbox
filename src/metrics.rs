@@ -37,6 +37,11 @@ const FAMILIES: &[Family] = &[
         kind: "counter",
     },
     Family {
+        name: "devbox_events_persist_failed_total",
+        help: "Events lost because the store would not accept them.",
+        kind: "counter",
+    },
+    Family {
         name: "devbox_events_rejected_total",
         help: "Events refused because they did not decode or validate.",
         kind: "counter",
@@ -114,6 +119,7 @@ pub fn render(snapshot: &Snapshot) -> String {
         ("devbox_events_received_total", c.received),
         ("devbox_events_stored_total", c.stored),
         ("devbox_events_dropped_total", c.dropped),
+        ("devbox_events_persist_failed_total", c.persist_failed),
         ("devbox_events_rejected_total", c.rejected),
         ("devbox_agents_connected_total", c.agents_connected),
     ] {
@@ -187,6 +193,7 @@ mod tests {
                 received: 1200,
                 stored: 1195,
                 dropped: 5,
+                persist_failed: 0,
                 rejected: 0,
                 agents_connected: 2,
             },
@@ -225,6 +232,46 @@ mod tests {
         assert!(text.contains("devbox_events_received_total 1200"));
         assert!(text.contains("devbox_events_stored_total 1195"));
         assert!(text.contains("devbox_agents_connected_total 2"));
+    }
+
+    #[test]
+    fn every_collector_counter_reaches_the_exporter() {
+        // A counter that is incremented but never exported is the round-21
+        // defect exactly: the series a dashboard watches reads zero forever
+        // and nothing in the process looks wrong. That one was a spelling
+        // mismatch between two lists; `persist_failed` would have been a whole
+        // field nobody plumbed through, which is the same failure with more
+        // steps.
+        //
+        // So this is checked as a class rather than an instance: whatever
+        // counter is added next has to appear here too, and it fails on the
+        // commit that adds it rather than during the incident that needed it.
+        let mut s = snapshot();
+        s.collector = StatsSnapshot {
+            received: 11,
+            stored: 22,
+            dropped: 33,
+            persist_failed: 44,
+            rejected: 55,
+            agents_connected: 66,
+        };
+        let text = render(&s);
+
+        // Distinct values, so a field wired to the wrong metric fails too.
+        let json = serde_json::to_value(s.collector).unwrap();
+        for (field, value) in json.as_object().expect("a flat object of counters") {
+            let value = value.as_u64().expect("counters are unsigned");
+            let exported = text.lines().any(|line| {
+                line.starts_with("devbox_")
+                    && line.contains(field)
+                    && line.ends_with(&format!(" {value}"))
+            });
+            assert!(
+                exported,
+                "no exported series carries `{field}` = {value}; a counter \
+                 that never reaches /metrics cannot be alerted on:\n{text}"
+            );
+        }
     }
 
     #[test]
