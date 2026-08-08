@@ -67,6 +67,22 @@ impl Runtime for DockerRuntime {
             container.clone(),
             "--hostname".to_string(),
             format!("devbox-{}", opts.name),
+            // Without this the egress posture cannot be applied at all.
+            //
+            // A container gets no `CAP_NET_ADMIN`, so `nft` inside one fails
+            // with EPERM — and `devbox policy set` saved the posture first and
+            // discovered that second, leaving the box recorded as `isolated`
+            // and running wide open. Docker is a documented runtime, so the
+            // choice is to grant the capability or to admit the posture cannot
+            // be enforced there; granting it makes the documentation true.
+            //
+            // Scoped to the container's own network namespace, which is the
+            // one the rules are for. It does mean a process inside the box can
+            // also tear those rules down — but that is already true of every
+            // other runtime, where the box's user has passwordless sudo. The
+            // posture is a guard rail for what runs in the box, not a cage
+            // around someone actively trying to leave it.
+            "--cap-add=NET_ADMIN".to_string(),
         ];
 
         // CPU/memory limits

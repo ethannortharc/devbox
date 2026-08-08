@@ -32,8 +32,28 @@ pub const TABLE: &str = "devbox";
 /// send DHCP-shaped packets straight past an isolated posture. A rule that
 /// exists for the host has no business applying to what the host routes.
 fn emit_host_control_rules(nft: &mut String) {
-    let _ = writeln!(nft, "    udp sport 68 udp dport 67 accept");
-    let _ = writeln!(nft, "    udp sport 546 udp dport 547 accept");
+    // Scoped to where a lease actually comes from.
+    //
+    // Matching on the port pair alone accepted 68→67 to *any* address, and a
+    // box with passwordless sudo can bind port 68 — so the exemption was a
+    // general-purpose UDP tunnel out of `isolated` and out of every allowlist,
+    // sitting above the rules that were supposed to decide. The ports are what
+    // DHCP looks like; they are not what makes it DHCP.
+    //
+    // Discovery and rebinding are broadcast and multicast, so they still work.
+    // What this gives up is *unicast renewal* to a lease server whose address
+    // the ruleset does not know: a client in RENEWING gets no reply and falls
+    // back to broadcast REBINDING at T2, which is permitted here. A renewal
+    // that takes until T2 is a cost worth paying for closing an arbitrary
+    // egress path; a lease that never renews would not have been.
+    let _ = writeln!(
+        nft,
+        "    ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
+    );
+    let _ = writeln!(
+        nft,
+        "    ip6 daddr {{ ff02::1:2, ff05::1:3 }} udp sport 546 udp dport 547 accept"
+    );
     // Typed, not a blanket multicast accept. nftables rules are alternatives,
     // so `ip6 daddr ff02::/16 accept` on its own permitted *every* protocol to
     // link-local multicast and the ICMPv6 rule below constrained nothing.
@@ -599,14 +619,28 @@ mod tests {
             let chain = nft.split("chain output {").nth(1).unwrap();
             let chain = chain.split("  }").next().unwrap();
 
+            // Scoped to where a lease comes from, not to a pair of port
+            // numbers. Matching the ports alone accepted 68→67 to *any*
+            // address, and a box with passwordless sudo can bind port 68 — so
+            // the exemption was a general-purpose UDP way out of `isolated`,
+            // sitting above the rules meant to decide. The previous version of
+            // this assertion looked for the port pair, which the scoped rule
+            // still contains, so it would have passed either way.
             assert!(
-                chain.contains("udp sport 68 udp dport 67 accept"),
-                "{posture} must permit DHCPv4 renewal"
+                chain.contains("ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"),
+                "{posture} must permit DHCPv4 discovery and rebinding: {chain}"
             );
             assert!(
-                chain.contains("udp sport 546 udp dport 547 accept"),
-                "{posture} must permit DHCPv6"
+                chain.contains("ff02::1:2") && chain.contains("udp sport 546 udp dport 547 accept"),
+                "{posture} must permit DHCPv6 to the servers multicast group: {chain}"
             );
+            for line in chain.lines().filter(|l| l.contains("dport 67")) {
+                assert!(
+                    line.contains("daddr"),
+                    "{posture}: a DHCP exemption with no destination is an \
+                     arbitrary UDP egress path: {line}"
+                );
+            }
             assert!(
                 chain.contains("nd-neighbor-solicit"),
                 "{posture} must permit IPv6 neighbour discovery"

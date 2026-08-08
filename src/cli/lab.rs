@@ -276,9 +276,13 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
             .await;
         if !probe.is_ok_and(|r| r.exit_code == 0) {
             bail!(
+                // `sets apply` replaces the selection: naming one set there
+                // disables every set and package not listed, so the old advice
+                // to add `network` "keeping your other sets" described
+                // something the command it gave could not do. `upgrade` adds.
                 "this topology has {} router(s), but substrate '{substrate}' has no FRR.\n  \
-                 Add it with `devbox sets apply --name {substrate} --set network` \
-                 (keeping your other sets), then re-run `devbox lab up`.",
+                 Add it with `devbox upgrade --name {substrate} --tools network`, \
+                 then re-run `devbox lab up`.",
                 lab.topology.routers().len()
             );
         }
@@ -403,15 +407,23 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
     // that is already gone is not an error. A command that could not be *run*
     // is a different thing — the substrate is unreachable, and reporting a
     // clean teardown then would be a lie.
+    // Counted per *namespace*, not per command. Each node contributes two
+    // commands — kill what is running inside it, then delete it — and counting
+    // both reported a clean three-node teardown as "6 of 6 namespaces
+    // removed". The number was always exactly twice the truth, which is the
+    // kind of wrong that looks right.
     let mut removed = 0;
     for cmd in &commands {
         let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let deletes_namespace = argv.windows(2).any(|w| w == ["netns", "del"]);
         let result = runtime
             .exec_cmd(&substrate, &argv, false)
             .await
             .with_context(|| format!("could not reach substrate '{substrate}' to tear down"))?;
         if result.exit_code == 0 {
-            removed += 1;
+            if deletes_namespace {
+                removed += 1;
+            }
         } else if !result.stderr.contains("No such file or directory") {
             // A namespace that is already gone is the expected case after a
             // partial bring-up. One that is *busy*, or that permissions
@@ -465,7 +477,10 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
     println!(
         "Lab '{}' torn down ({removed} of {} namespaces removed).",
         lab.name(),
-        commands.len()
+        commands
+            .iter()
+            .filter(|c| c.windows(2).any(|w| w == ["netns", "del"]))
+            .count()
     );
     Ok(())
 }

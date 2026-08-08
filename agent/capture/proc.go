@@ -207,6 +207,19 @@ func connKey(conn Conn) string {
 }
 
 // TCPListen is the state value for a listening socket.
+// UnattributedPID marks a flow whose owning process is not knowable.
+//
+// `/proc/net/tcp` lists sockets by inode, not by pid, so the poller sees the
+// connection and not who made it. The event still has to carry a pid — the
+// collector rejects zero — so it carries one no process can have: `pid_max`
+// tops out at 4194304 even at its ceiling, several orders below this.
+//
+// The point is that it must not be *plausible*. A placeholder that collides
+// with a real pid does not read as "unknown"; it reads as a confident and
+// wrong answer, which is how every unattributed flow ended up attributed to
+// init.
+const UnattributedPID uint32 = 0xFFFF_FFFF
+
 const TCPListen uint8 = 10
 
 // flowEvent builds a `connect` or `accept` event from a /proc/net/tcp row.
@@ -220,12 +233,18 @@ func (p *Proc) flowEvent(conn Conn, inbound bool) *event.Event {
 		kind = event.TypeAccept
 	}
 	return p.stamp(&event.Event{
-		// No pid: /proc/net/tcp does not carry one, and inventing one would
-		// be worse than leaving it absent. The collector requires a non-zero
-		// pid, so this uses the agent's own — the event is about the box, and
-		// claiming it belongs to some process would be a lie.
-		PID:  1,
-		TID:  1,
+		// No pid: /proc/net/tcp does not carry one, and inventing one would be
+		// worse than leaving it absent. The collector requires a non-zero pid,
+		// so this carries a sentinel that cannot be a real one.
+		//
+		// It used to carry 1, which is not a placeholder — it is init. The
+		// initial process scan records init's own exec, correlation groups by
+		// pid, and so every unattributed flow on the box was folded into
+		// systemd's process chain and displayed as though init had made the
+		// connections. The comment above said inventing a pid would be a lie
+		// and the code then told the most confusing one available.
+		PID:  UnattributedPID,
+		TID:  UnattributedPID,
 		Comm: "proc-poll",
 		Type: kind,
 		Net: &event.Net{

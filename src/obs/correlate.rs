@@ -98,9 +98,21 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
         let pid = event.pid;
         let generation = incarnation.entry(pid).or_insert(0);
 
-        let gap = last_ts
-            .get(&pid)
-            .is_some_and(|prev| event.ts_mono_ns.saturating_sub(*prev) > PID_REUSE_GAP_NS);
+        let gap = last_ts.get(&pid).is_some_and(|prev| {
+            // A clock that went *backwards* is not a small gap.
+            //
+            // `ts_mono_ns` is monotonic within a boot and restarts with the
+            // guest, so a window spanning a reboot sees the new boot's
+            // timestamps as smaller than the old boot's. `saturating_sub`
+            // turned that into zero — the one value that most certainly means
+            // "the same process, moments later" — so two unrelated processes
+            // sharing a pid across the reboot were merged into one chain, and
+            // their events then sorted into each other.
+            //
+            // A rollback is the strongest evidence available that this is a
+            // different incarnation, so it says so directly.
+            event.ts_mono_ns < *prev || event.ts_mono_ns - *prev > PID_REUSE_GAP_NS
+        });
         let re_exec = event.kind == EventType::Exec && *has_exec.get(&pid).unwrap_or(&false);
 
         if gap || re_exec {
@@ -432,6 +444,35 @@ mod tests {
         let chains = chains(&events);
         assert_eq!(chains[0].pid, 812, "the earlier process comes first");
         assert_eq!(chains[1].pid, 900);
+    }
+
+    #[test]
+    fn a_monotonic_rollback_starts_a_new_incarnation() {
+        // `ts_mono_ns` restarts with the guest, so a window spanning a reboot
+        // sees the new boot's timestamps as *smaller* than the old boot's.
+        // `saturating_sub` turned that into a zero gap — the value that most
+        // certainly means "the same process, moments later" — so two unrelated
+        // processes that happened to share a pid across the reboot were merged
+        // into one chain and their events sorted into each other.
+        //
+        // No exec or exit in the window to give the split away: that is the
+        // case the gap heuristic exists for, and the case it got backwards.
+        let events = vec![
+            base(812, 640, 900_000_000_000, EventType::Syscall),
+            base(812, 640, 1_000_000_000, EventType::Syscall),
+        ];
+        assert_eq!(
+            chains(&events).len(),
+            2,
+            "a clock that went backwards is a different boot, not a 0ns gap"
+        );
+
+        // And the ordinary forward step still keeps one chain.
+        let same = vec![
+            base(812, 640, 1_000_000_000, EventType::Syscall),
+            base(812, 640, 1_500_000_000, EventType::Syscall),
+        ];
+        assert_eq!(chains(&same).len(), 1);
     }
 
     #[test]

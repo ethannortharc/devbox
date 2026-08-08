@@ -351,6 +351,24 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             "exec".to_string(),
             ns.clone(),
             name.to_string(),
+            // As root, explicitly.
+            //
+            // FRR is built to drop privileges to `frr:frr`, and those accounts
+            // come from `services.frr` — which a devbox box does not run. The
+            // network set puts `pkgs.frr` on the box and can do no more than
+            // that: it is a package list, not a module, so it cannot declare a
+            // user. So the daemons dropped to an account that did not exist,
+            // or existed and could not write the root-owned runtime directory
+            // created two lines below, and `lab up` failed after following the
+            // instruction it had just printed.
+            //
+            // Staying root is right for what these are: short-lived daemons in
+            // a throwaway namespace, already started through sudo, with no
+            // service manager to hand them to.
+            "-u".to_string(),
+            "root".to_string(),
+            "-g".to_string(),
+            "root".to_string(),
             "-d".to_string(),
             "-f".to_string(),
             format!("{dir}/frr.conf"),
@@ -377,6 +395,10 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             "mkdir".to_string(),
             "-p".to_string(),
             run.clone(),
+            // The VTY pathspace `-N` selects. FRR derives it from its own
+            // state directory rather than from `-z`, and creates neither — on
+            // a box without `services.frr` nothing else ever has.
+            format!("/run/frr/{ns}"),
         ],
         daemon("zebra", &[]),
         daemon("bgpd", &[]),
@@ -415,6 +437,28 @@ mod start_tests {
         assert!(
             flat.iter()
                 .any(|c| c.contains("/run/devbox/lab/clos/leaf1/zserv.api"))
+        );
+
+        // Explicitly root, and explicitly not `frr`.
+        //
+        // FRR is built to drop privileges to an `frr:frr` that `services.frr`
+        // creates — and devbox does not run that module: the network set is a
+        // package list and cannot declare a user. So the daemons dropped to an
+        // account that did not exist, or to one that could not write the
+        // root-owned runtime directory created a line earlier, and `lab up`
+        // failed on a substrate prepared exactly as the docs said to prepare
+        // it. Nothing here could catch it: the failure needs a real FRR.
+        for daemon in ["zebra", "bgpd"] {
+            let cmd = flat.iter().find(|c| c.contains(daemon)).unwrap();
+            assert!(
+                cmd.contains("-u root") && cmd.contains("-g root"),
+                "{daemon} must not drop to an account nothing creates: {cmd}"
+            );
+        }
+        // And the VTY pathspace directory, which FRR does not create itself.
+        assert!(
+            flat.iter().any(|c| c.contains(&format!("/run/frr/{ns}"))),
+            "the vty pathspace directory must exist before the daemons start: {flat:?}"
         );
         assert!(
             flat.iter()

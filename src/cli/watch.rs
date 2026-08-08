@@ -67,24 +67,50 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         .context("unknown --type; valid values: exec, exit, connect, accept, dns, tls, file, syscall, api, policy")?;
 
     let store = Store::open(&path)?;
+
+    // `--peer` is applied after correlation, not in SQL.
+    //
+    // A connect event records the address it dialled; the *name* is in a
+    // separate DNS event, and only correlation brings the two together. So
+    // pushing `--peer pypi.org` into the query dropped precisely the connect
+    // rows the flag exists to find — the DNS row matched, the connections it
+    // explained did not — and the enrichment then ran on what was left. The
+    // filter has to see the rows the way the user does: after the addresses
+    // have names.
+    //
+    // The scan widens when the flag is used, so `--limit` still counts matches
+    // shown rather than rows examined. That costs a bigger read on a filtered
+    // query and nothing at all on an unfiltered one.
+    let peer = args.peer.clone();
     let mut events = store.query(&Query {
         since: args.since.clone(),
         until: None,
         pid: args.pid,
         kinds,
-        peer: args.peer.clone(),
+        peer: None,
         path: args.path.clone(),
-        limit: Some(args.limit),
+        limit: Some(if peer.is_some() {
+            Query::MAX_LIMIT
+        } else {
+            args.limit
+        }),
         // Query newest-first so the limit keeps the *recent* events, then
         // present oldest-first so the output reads forwards.
         newest_first: true,
     })?;
-    events.reverse();
 
     // Label addresses with the name that resolved them, so the output says
     // `pypi.org` rather than an address nobody recognizes (§7.3).
     let map = correlate::dns_map(&events);
     correlate::apply_dns_map(&mut events, &map);
+
+    if let Some(peer) = &peer {
+        let needle = peer.to_lowercase();
+        events.retain(|event| matches_peer(event, &needle));
+        // Still newest-first here, so this keeps the most recent matches.
+        events.truncate(args.limit);
+    }
+    events.reverse();
 
     if args.json {
         for event in &events {
@@ -114,6 +140,21 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
 
     println!("\n{} event(s).", events.len());
     Ok(())
+}
+
+/// Does this event name the peer the user asked for?
+///
+/// Substring, case-insensitive, against every name an event can carry — the
+/// same shape the SQL `LIKE` had, applied to the enriched row rather than the
+/// stored one. `domain` is the field correlation fills in, and it is the whole
+/// reason this cannot be done in the query.
+fn matches_peer(event: &crate::obs::Event, needle: &str) -> bool {
+    let Some(net) = event.net.as_ref() else {
+        return false;
+    };
+    [&net.domain, &net.sni, &net.daddr, &net.qname]
+        .iter()
+        .any(|field| field.to_lowercase().contains(needle))
 }
 
 fn print_tree(events: &[crate::obs::Event]) {

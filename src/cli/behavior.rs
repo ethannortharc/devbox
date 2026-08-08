@@ -131,10 +131,15 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
     // default here, so ask for one.
     let Some(boundary) = args.at.clone() else {
         bail!(
+            // `devbox behavior list` was never a command — `behavior` has only
+            // `summary` and `diff` — so following this produced an
+            // unknown-command error and still no timestamp. `watch` prints the
+            // wall clock beside every event, which is where a boundary
+            // actually comes from.
             "`devbox behavior diff` needs `--at <timestamp>`: the boundary between \
              the run you are comparing against and the run you are judging.\n\n  \
-             Find one with `devbox behavior list` — the start of a run is a good \
-             boundary — then:\n    \
+             Find one with `devbox watch` — it prints the timestamp of every \
+             event, and the first event of a run is a good boundary — then:\n    \
              devbox behavior diff --at 2026-08-06T14:30:00Z"
         );
     };

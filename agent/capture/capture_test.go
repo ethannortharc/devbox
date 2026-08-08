@@ -404,3 +404,42 @@ func TestProcConnectionPollingToleratesAMissingTcp6(t *testing.T) {
 		t.Errorf("pollConnections: %v", err)
 	}
 }
+
+// TestUnattributedFlowsAreNotBlamedOnInit pins the sentinel pid.
+//
+// `/proc/net/tcp` lists sockets by inode and not by pid, so the poller knows a
+// connection happened and not who made it. The event still needs a pid — the
+// collector rejects zero — and it used to carry 1. One is not a placeholder:
+// it is init, the initial process scan records init's own exec, and
+// correlation groups by pid. So every unattributed flow on a `-no-ebpf` box
+// was folded into systemd's process chain and displayed as though init had
+// dialled out.
+//
+// The requirement is not just "not 1" but "not anything a process could be",
+// so an unknown owner reads as unknown rather than as a confident wrong answer.
+func TestUnattributedFlowsAreNotBlamedOnInit(t *testing.T) {
+	t.Parallel()
+
+	p := &Proc{}
+	ev := p.flowEvent(Conn{
+		LocalAddr:  "10.0.0.2",
+		LocalPort:  54321,
+		RemoteAddr: "93.184.216.34",
+		RemotePort: 443,
+	}, false)
+
+	if ev.PID == 1 || ev.TID == 1 {
+		t.Fatal("an unattributed flow must not be attributed to init")
+	}
+	if ev.PID == 0 {
+		t.Fatal("the collector rejects a zero pid")
+	}
+	// pid_max tops out at 4194304 even at its ceiling.
+	if ev.PID <= 4194304 {
+		t.Errorf("pid %d is in the range a real process can occupy, so it "+
+			"reads as an answer rather than as 'unknown'", ev.PID)
+	}
+	if ev.PID != UnattributedPID || ev.TID != UnattributedPID {
+		t.Errorf("both pid and tid must carry the sentinel, got %d/%d", ev.PID, ev.TID)
+	}
+}
