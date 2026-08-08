@@ -184,6 +184,14 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     state.sets = config.active_sets();
     state.languages = config.active_languages();
     state.packages = after.packages.iter().cloned().collect();
+    // And their sources, from the config this selection was composed against.
+    // Keeping them on the box is what survives a later `devbox use`.
+    state.package_sources = config
+        .custom_packages
+        .iter()
+        .filter(|(_, source)| source.as_str() != "nixpkgs")
+        .map(|(name, source)| (name.clone(), source.clone()))
+        .collect();
     // devbox.toml first, then state — the order the console path uses, and for
     // the same reason: a failure here leaves the two agreeing on the old
     // selection, which the user can see and re-apply. The other order leaves

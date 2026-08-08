@@ -347,13 +347,38 @@ fn load_command() -> String {
 /// direction matters — the failure mode of a wrong guess here is a policy that
 /// silently does not enforce.
 async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::nftables::Context {
-    let resolvers = runtime
+    let mut resolvers = runtime
         .exec_cmd(sandbox_name, &["cat", "/etc/resolv.conf"], false)
         .await
         .ok()
         .filter(|r| r.exit_code == 0)
         .map(|r| parse_resolvers(&r.stdout))
         .unwrap_or_default();
+
+    // Behind a local stub, the address in resolv.conf is not the one that
+    // leaves the box.
+    //
+    // Ubuntu with systemd-resolved lists only `127.0.0.53`. The query to the
+    // stub is loopback and always permitted, but resolved's onward query to
+    // the *real* server hits the output chain's default drop — so DNS breaks
+    // under an enforcing posture while resolv.conf looks exempted. The stub's
+    // own configuration lists the upstreams.
+    if resolvers.iter().all(|r| is_loopback_resolver(r)) {
+        let upstream = runtime
+            .exec_cmd(
+                sandbox_name,
+                &["cat", "/run/systemd/resolve/resolv.conf"],
+                false,
+            )
+            .await
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| parse_resolvers(&r.stdout))
+            .unwrap_or_default();
+        // Keep the stub too: something may query it directly, and loopback is
+        // permitted anyway, so listing it costs nothing and documents intent.
+        resolvers.extend(upstream.into_iter().filter(|r| !is_loopback_resolver(r)));
+    }
 
     // Labs record their prefixes under /etc/devbox/lab/<name>/prefixes when
     // they come up, and remove them on teardown. Reading the directory here is
@@ -423,6 +448,12 @@ fn parse_prefixes(text: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+/// Is this a local stub rather than a real upstream?
+fn is_loopback_resolver(addr: &str) -> bool {
+    addr.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Pull nameserver addresses out of a resolv.conf.
@@ -617,6 +648,19 @@ mod tests {
         assert!(parse_prefixes("$(reboot)").is_empty());
         assert!(parse_prefixes("10.0.0.0").is_empty());
         assert!(parse_prefixes("10.0.0.0/999").is_empty());
+    }
+
+    #[test]
+    fn a_local_stub_is_recognised_as_needing_an_upstream() {
+        // Ubuntu with systemd-resolved lists only 127.0.0.53. Exempting that
+        // and stopping there breaks DNS under an enforcing posture: the stub's
+        // onward query is what actually leaves the box.
+        assert!(is_loopback_resolver("127.0.0.53"));
+        assert!(is_loopback_resolver("127.0.0.1"));
+        assert!(is_loopback_resolver("::1"));
+        assert!(!is_loopback_resolver("8.8.8.8"));
+        assert!(!is_loopback_resolver("192.168.1.1"));
+        assert!(!is_loopback_resolver("not-an-address"));
     }
 
     #[test]

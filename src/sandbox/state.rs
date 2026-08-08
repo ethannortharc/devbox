@@ -23,6 +23,19 @@ pub struct SandboxState {
     /// removed by the next rebuild.
     #[serde(default)]
     pub packages: Vec<String>,
+    /// Where each package in `packages` comes from, when it is not nixpkgs.
+    ///
+    /// `packages` holds names because that is what the checklist and the NixOS
+    /// module need. But `devbox use` moves a box to another project, and
+    /// `package_pairs` then reads the *new* project's devbox.toml — which has
+    /// never heard of a flake package the old one declared, so the source was
+    /// silently replaced with `nixpkgs` and reprovisioning installed a
+    /// different package under the same name.
+    ///
+    /// Absent for boxes created before this field existed, which is why
+    /// `package_pairs` still falls back to the project config.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub package_sources: std::collections::BTreeMap<String, String>,
 }
 
 fn default_image() -> String {
@@ -147,6 +160,7 @@ mod tests {
 
     fn test_state() -> SandboxState {
         SandboxState {
+            package_sources: Default::default(),
             name: "myapp".to_string(),
             runtime: "lima".to_string(),
             project_dir: PathBuf::from("/Users/test/projects/myapp"),

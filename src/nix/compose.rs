@@ -419,6 +419,7 @@ mod tests {
     #[test]
     fn round_trips_through_sandbox_state() {
         let state = SandboxState {
+            package_sources: Default::default(),
             name: "x".into(),
             runtime: "docker".into(),
             project_dir: "/tmp".into(),

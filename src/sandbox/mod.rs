@@ -142,6 +142,19 @@ impl SandboxManager {
         let image = config.sandbox.image.as_str();
         // Provision tools — pass mount_mode so NixOS module sets up overlay
         let mount_mode = &config.sandbox.mount_mode;
+        // Validated before the box exists, so an unsupported package is a
+        // refusal rather than a warning printed over a created-but-broken
+        // sandbox. `provision_vm_full` also rejects it, but by then the box is
+        // made and the caller below saves state and prints success.
+        crate::sandbox::provision::check_packages_supported(
+            &config.sandbox.image,
+            &config
+                .custom_packages
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+
         if let Err(e) = provision::provision_vm_full(
             runtime,
             name,
@@ -183,6 +196,13 @@ impl SandboxManager {
             // here would make a flake-sourced package vanish from `devbox
             // list` and from the Sets checklist.
             packages: config.custom_packages.keys().cloned().collect(),
+            // Recorded on the box, so a later `devbox use` cannot lose it.
+            package_sources: config
+                .custom_packages
+                .iter()
+                .filter(|(_, source)| source.as_str() != "nixpkgs")
+                .map(|(name, source)| (name.clone(), source.clone()))
+                .collect(),
         };
         state.save(&self.state_dir)?;
 

@@ -329,6 +329,7 @@ async fn console_drives_a_real_docker_box_end_to_end() {
     // Registering the box is what `create_sandbox` does after provisioning;
     // this test is about the console, not about Nix provisioning.
     SandboxState {
+        package_sources: Default::default(),
         name: BOX.to_string(),
         runtime: "docker".to_string(),
         project_dir: project.path().to_path_buf(),

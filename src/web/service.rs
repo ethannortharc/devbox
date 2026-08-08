@@ -576,6 +576,7 @@ mod tests {
 
     fn state() -> SandboxState {
         SandboxState {
+            package_sources: Default::default(),
             name: "myapp".into(),
             runtime: "lima".into(),
             project_dir: PathBuf::from("/Users/test/code/myapp"),

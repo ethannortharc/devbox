@@ -526,6 +526,14 @@ pub async fn apply_selection(
     sandbox.sets = config.active_sets();
     sandbox.languages = config.active_languages();
     sandbox.packages = selection.packages.iter().cloned().collect();
+    // And their sources, from the config this selection was composed against.
+    // Keeping them on the box is what survives a later `devbox use`.
+    sandbox.package_sources = config
+        .custom_packages
+        .iter()
+        .filter(|(_, source)| source.as_str() != "nixpkgs")
+        .map(|(name, source)| (name.clone(), source.clone()))
+        .collect();
     config
         .save(&sandbox.project_dir.join("devbox.toml"))
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;

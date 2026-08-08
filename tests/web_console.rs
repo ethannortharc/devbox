@@ -31,6 +31,7 @@ fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
         std::fs::create_dir_all(&project).expect("project dir");
 
         SandboxState {
+            package_sources: Default::default(),
             name: (*name).to_string(),
             runtime: "test-null".to_string(),
             project_dir: project,

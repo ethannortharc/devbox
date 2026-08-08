@@ -178,20 +178,51 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 // The socket's destination and local port are only filled in *by* the connect
 // call. Reading them at entry — which the first version did — yields zeroes or
 // the previous connection's values, so every outbound flow decoded wrong.
+// Who opened each in-flight connection, keyed by the socket.
+//
+// `tcp_finish_connect` runs on the SYN-ACK, in softirq — the current pid and
+// cgroup there are whatever the CPU happened to be doing, not the process that
+// called connect(). So the identity is captured at connect time, when the
+// process is on-CPU, and looked up when the handshake completes.
+//
+// LRU rather than a plain hash: a connect that never completes leaves an
+// entry, and there is no reliable hook to clean up every one of them. LRU
+// bounds the map by construction instead of leaking on a box that dials a lot
+// of dead peers.
+struct conn_owner {
+	__u64 cgroup_id;
+	__u32 pid;
+	__u32 tid;
+	__u32 ppid;
+	__u32 uid;
+	char comm[COMM_LEN];
+};
+
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 4096);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
 	__type(key, __u64);
-	__type(value, __u64);
+	__type(value, struct conn_owner);
 } connecting SEC(".maps");
 
 static __always_inline int connect_enter(struct sock *sk)
 {
-	if (!cgroup_is_traced(bpf_get_current_cgroup_id()))
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
+	if (!cgroup_is_traced(cgroup_id))
 		return 0;
-	__u64 tid = bpf_get_current_pid_tgid();
-	__u64 addr = (__u64)sk;
-	bpf_map_update_elem(&connecting, &tid, &addr, BPF_ANY);
+
+	struct conn_owner owner = {};
+	__u64 id = bpf_get_current_pid_tgid();
+	owner.cgroup_id = cgroup_id;
+	owner.pid = id >> 32;
+	owner.tid = (__u32)id;
+	owner.uid = (__u32)bpf_get_current_uid_gid();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	owner.ppid = BPF_CORE_READ(task, real_parent, tgid);
+	bpf_get_current_comm(&owner.comm, sizeof(owner.comm));
+
+	__u64 key = (__u64)sk;
+	bpf_map_update_elem(&connecting, &key, &owner, BPF_ANY);
 	return 0;
 }
 
@@ -233,49 +264,10 @@ static __always_inline void fill_net(struct net_event *rec, struct sock *sk,
 	rec->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
 }
 
-static __always_inline int connect_return(int ret)
-{
-	__u64 tid = bpf_get_current_pid_tgid();
-	__u64 *addr = bpf_map_lookup_elem(&connecting, &tid);
-	if (!addr)
-		return 0;
-	struct sock *sk = (struct sock *)*addr;
-	bpf_map_delete_elem(&connecting, &tid);
-
-	// A failed connect never established anything; reporting it as a flow
-	// would put destinations in the timeline that were never reached.
-	//
-	// `tcp_v*_connect` returning 0 only means the SYN went out — a refusal or
-	// a timeout arrives later, higher in the stack — so the socket state is
-	// checked as well. TCP_SYN_SENT here means "still trying", and the
-	// timeline claims reachability it cannot know.
-	if (ret != 0)
-		return 0;
-	__u8 state = BPF_CORE_READ(sk, __sk_common.skc_state);
-	if (state != 1 /* TCP_ESTABLISHED */)
-		return 0;
-
-	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
-	if (!rec)
-		return 0;
-
-	FILL_COMMON(rec);
-	fill_net(rec, sk, 0 /* outbound */);
-
-	bpf_ringbuf_submit(rec, 0);
-	return 0;
-}
-
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(handle_tcp_v4_connect, struct sock *sk)
 {
 	return connect_enter(sk);
-}
-
-SEC("kretprobe/tcp_v4_connect")
-int BPF_KRETPROBE(handle_tcp_v4_connect_ret, int ret)
-{
-	return connect_return(ret);
 }
 
 SEC("kprobe/tcp_v6_connect")
@@ -284,10 +276,41 @@ int BPF_KPROBE(handle_tcp_v6_connect, struct sock *sk)
 	return connect_enter(sk);
 }
 
-SEC("kretprobe/tcp_v6_connect")
-int BPF_KRETPROBE(handle_tcp_v6_connect_ret, int ret)
+// Handshake completion, which is when an outbound connection is real.
+//
+// `tcp_finish_connect` runs on the SYN-ACK path, so reaching it means the peer
+// answered — which is the only point at which an outbound connection is real.
+// The entry probe recorded who dialled; this reports it and clears the entry.
+// A connect that never completes leaves no event, and its map entry ages out.
+SEC("kprobe/tcp_finish_connect")
+int BPF_KPROBE(handle_tcp_finish_connect, struct sock *sk)
 {
-	return connect_return(ret);
+	__u64 key = (__u64)sk;
+	struct conn_owner *owner = bpf_map_lookup_elem(&connecting, &key);
+	if (!owner)
+		return 0; // not a socket we are tracing
+
+	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
+	if (!rec) {
+		bpf_map_delete_elem(&connecting, &key);
+		return 0;
+	}
+
+	// The identity from connect time, not from here: this runs in softirq on
+	// the SYN-ACK, where the current process is unrelated to the one that
+	// dialled.
+	rec->ts_mono_ns = bpf_ktime_get_ns();
+	rec->cgroup_id = owner->cgroup_id;
+	rec->pid = owner->pid;
+	rec->tid = owner->tid;
+	rec->ppid = owner->ppid;
+	rec->uid = owner->uid;
+	__builtin_memcpy(rec->comm, owner->comm, COMM_LEN);
+	fill_net(rec, sk, 0 /* outbound */);
+
+	bpf_ringbuf_submit(rec, 0);
+	bpf_map_delete_elem(&connecting, &key);
+	return 0;
 }
 
 SEC("kretprobe/inet_csk_accept")

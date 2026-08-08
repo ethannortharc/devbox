@@ -81,6 +81,33 @@ const NIX_SET_FILES: &[(&str, &str)] = &[
 /// Deliberately narrower than what nix accepts. Everything devbox generates
 /// satisfies it, a hand-written `devbox.toml` entry that does not is a typo or
 /// an attack, and the value ends up in a root command either way.
+/// Can this image install every configured package?
+///
+/// Called before a box is created as well as during provisioning: by the time
+/// provisioning refuses, the box exists and the caller goes on to save state
+/// and report success, so the user gets a sandbox that reports a package it
+/// does not have.
+pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> Result<()> {
+    if image == "ubuntu" {
+        return Ok(()); // `nix profile install` takes a flake reference directly
+    }
+    let unsupported: Vec<&str> = packages
+        .iter()
+        .filter(|(_, source)| source != "nixpkgs" && !source.starts_with("nixpkgs#"))
+        .map(|(pkg, _)| pkg.as_str())
+        .collect();
+    if !unsupported.is_empty() {
+        bail!(
+            "these packages come from a flake, which the NixOS image cannot install \
+             yet: {}\n  \
+             Point them at nixpkgs in devbox.toml, or use the ubuntu image \
+             (`image = \"ubuntu\"`), which installs flake references directly.",
+            unsupported.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn is_safe_installable(reference: &str) -> bool {
     if reference.is_empty() || reference.len() > 256 {
         return false;
@@ -130,9 +157,13 @@ pub fn package_pairs(state: &crate::sandbox::state::SandboxState) -> Vec<(String
         .packages
         .iter()
         .map(|name| {
-            let source = config
-                .custom_packages
+            // What the box recorded wins over what the current directory
+            // declares: after `devbox use` the two are different projects, and
+            // the box's own record is the one that describes the box.
+            let source = state
+                .package_sources
                 .get(name)
+                .or_else(|| config.custom_packages.get(name))
                 .cloned()
                 .unwrap_or_else(|| "nixpkgs".to_string());
             (name.clone(), source)
@@ -348,20 +379,7 @@ pub async fn provision_vm_full(
             // reported as selected, and never installed. Supporting it means
             // teaching the module about flake inputs, which is a real change;
             // until then this refuses, which is the same call as ADR-0036.
-            let unsupported: Vec<&str> = packages
-                .iter()
-                .filter(|(_, source)| source != "nixpkgs" && !source.starts_with("nixpkgs#"))
-                .map(|(pkg, _)| pkg.as_str())
-                .collect();
-            if !unsupported.is_empty() {
-                bail!(
-                    "these packages come from a flake, which the NixOS image cannot \
-                     install yet: {}\n  \
-                     Point them at nixpkgs in devbox.toml, or use the ubuntu image \
-                     (`image = \"ubuntu\"`), which installs flake references directly.",
-                    unsupported.join(", ")
-                );
-            }
+            check_packages_supported(image, packages)?;
             let names: Vec<String> = packages.iter().map(|(n, _)| n.clone()).collect();
             provision_nixos(runtime, name, sets, languages, mount_mode, &names).await
         }
