@@ -9,7 +9,7 @@
 //! a wrong import list silently ships the wrong box — so it is separated from
 //! the I/O that pushes files and runs the rebuild.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
@@ -35,8 +35,25 @@ pub const LOCKED_SETS: &[&str] = &["system"];
 pub struct Selection {
     /// Canonical set names, e.g. `system`, `git`, `lang-go`.
     pub sets: BTreeSet<String>,
-    /// Extra nixpkgs attribute paths, e.g. `hyperfine`, `python312Packages.ipython`.
+    /// Ad-hoc packages, by the name `[custom_packages]` declares them under.
+    ///
+    /// Usually that name *is* the nixpkgs attribute — `hyperfine`,
+    /// `python312Packages.ipython` — which is why this was documented as
+    /// holding attribute paths. It is not one for an aliased entry like
+    /// `my-tf = "nixpkgs#terraform"`, where the attribute is `terraform` and
+    /// `my-tf` is only what the user calls it. Use [`Selection::attr_path`]
+    /// wherever the string is going to be handed to Nix.
     pub packages: BTreeSet<String>,
+    /// Where each package comes from, for the entries that are not plain
+    /// nixpkgs. Keyed as `packages` is.
+    ///
+    /// Carried on the selection because the two writers that consume one both
+    /// need it and neither can recover it: `devbox.nix` emits `with pkgs;
+    /// [ … ]`, where a name that is not an attribute is an undefined variable
+    /// and fails the entire rebuild, and `devbox-state.toml` emits a key that
+    /// `attrByPath` resolves to null and drops without a word. Same alias,
+    /// two different wrong answers.
+    pub sources: BTreeMap<String, String>,
 }
 
 impl Selection {
@@ -54,6 +71,7 @@ impl Selection {
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
                 .collect(),
+            sources: BTreeMap::new(),
         };
         for locked in LOCKED_SETS {
             sel.sets.insert((*locked).to_string());
@@ -71,6 +89,55 @@ impl Selection {
             state.sets.iter().cloned().chain(langs),
             state.packages.iter().cloned(),
         )
+        .with_sources(state.package_sources.clone())
+    }
+
+    /// Attach the sources for packages this selection names.
+    ///
+    /// The Sets form posts names only — it shows the user what they wrote in
+    /// `devbox.toml` and takes it back the same way — so a selection parsed
+    /// from a form has to be told where those packages come from before
+    /// anything writes a Nix file from it.
+    pub fn with_sources(mut self, sources: BTreeMap<String, String>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// The nixpkgs attribute path for a package this selection names.
+    ///
+    /// One resolution, used by every writer. The create path learned this in
+    /// round 24 and the Sets path did not, which is how the same alias came to
+    /// fail two different ways depending on which door it went through.
+    pub fn attr_path<'a>(&'a self, package: &'a str) -> &'a str {
+        let source = self.sources.get(package).map(String::as_str);
+        crate::sandbox::provision::nixos_attr_path(package, source.unwrap_or("nixpkgs"))
+    }
+
+    /// Every package as the attribute Nix will be asked for, in the same order.
+    pub fn attr_paths(&self) -> Vec<&str> {
+        self.packages.iter().map(|p| self.attr_path(p)).collect()
+    }
+
+    /// The `[custom_packages]` table to write into `devbox-state.toml`:
+    /// attribute path → source.
+    ///
+    /// Keyed by the attribute because `devbox-module.nix` builds its lookup
+    /// path from the key and never reads the value except to test it for
+    /// being a nested table. Pulled out of the writer so the mapping can be
+    /// tested without a box to write it into — the writer itself only runs
+    /// against a live guest.
+    pub fn custom_packages_table(&self) -> BTreeMap<String, String> {
+        self.packages
+            .iter()
+            .map(|pkg| {
+                let source = self
+                    .sources
+                    .get(pkg)
+                    .cloned()
+                    .unwrap_or_else(|| "nixpkgs".to_string());
+                (self.attr_path(pkg).to_string(), source)
+            })
+            .collect()
     }
 
     /// Reject anything that would produce a `configuration.nix` Nix cannot
@@ -82,8 +149,16 @@ impl Selection {
             }
         }
         for pkg in &self.packages {
+            // Both halves: the name becomes a key in `devbox.toml` and in the
+            // generated state file, and the resolved attribute is what Nix is
+            // asked to evaluate. Checking only the one in front of me is how
+            // round 17 reopened an injection hole that round 12 had closed.
             if !is_valid_attr_path(pkg) {
                 bail!("'{pkg}' is not a valid nixpkgs attribute path");
+            }
+            let attr = self.attr_path(pkg);
+            if !is_valid_attr_path(attr) {
+                bail!("'{pkg}' resolves to '{attr}', which is not a valid nixpkgs attribute path");
             }
         }
         for locked in LOCKED_SETS {
@@ -237,8 +312,11 @@ pub fn compose_configuration_nix(selection: &Selection) -> String {
 
     if !selection.packages.is_empty() {
         nix.push_str("    ++ (with pkgs; [\n");
-        for pkg in &selection.packages {
-            let _ = writeln!(nix, "      {pkg}");
+        // The attribute, not the name it is declared under. `with pkgs; [ … ]`
+        // resolves each entry as a variable, so an alias here is not a missing
+        // package — it is an undefined variable that fails the whole rebuild.
+        for attr in selection.attr_paths() {
+            let _ = writeln!(nix, "      {attr}");
         }
         nix.push_str("    ])\n");
     }
@@ -362,6 +440,70 @@ mod tests {
         assert!(!nix.contains("sets.ai_infra"));
         assert!(!nix.contains("sets.lang_rust"));
         assert!(!nix.contains("sets.network"));
+    }
+
+    #[test]
+    fn an_aliased_package_reaches_both_writers_as_its_attribute() {
+        // `my-tf = "nixpkgs#terraform"` is the user's name for terraform, not
+        // an attribute. Both writers used to emit the name, and each failed
+        // its own way — which is why this checks both rather than the one that
+        // was reported.
+        //
+        // `devbox.nix` emits `with pkgs; [ my-tf ]`, and `with` resolves each
+        // entry as a variable, so an alias is an *undefined variable* that
+        // fails the entire rebuild. `devbox-state.toml` emits `my-tf` as a
+        // key, which `attrByPath` resolves to null and the module filters out
+        // deliberately and silently, so the package simply vanishes while
+        // state goes on reporting it selected. Same alias, one loud failure
+        // and one silent one.
+        let sel = Selection::new(
+            ["system".to_string(), "git".to_string()],
+            ["my-tf".to_string(), "ripgrep".to_string()],
+        )
+        .with_sources(BTreeMap::from([(
+            "my-tf".to_string(),
+            "nixpkgs#terraform".to_string(),
+        )]));
+
+        assert_eq!(sel.attr_path("my-tf"), "terraform");
+        assert_eq!(
+            sel.attr_path("ripgrep"),
+            "ripgrep",
+            "no source means the name"
+        );
+
+        let nix = compose_configuration_nix(&sel);
+        assert!(nix.contains("      terraform\n"), "devbox.nix:\n{nix}");
+        assert!(
+            !nix.contains("my-tf"),
+            "the alias is an undefined variable in `with pkgs`:\n{nix}"
+        );
+
+        let table = sel.custom_packages_table();
+        assert_eq!(
+            table.get("terraform").map(String::as_str),
+            Some("nixpkgs#terraform")
+        );
+        assert!(
+            !table.contains_key("my-tf"),
+            "the module builds its lookup path from the key: {table:?}"
+        );
+        // And the ordinary case is untouched.
+        assert_eq!(table.get("ripgrep").map(String::as_str), Some("nixpkgs"));
+    }
+
+    #[test]
+    fn an_alias_cannot_smuggle_syntax_through_its_source() {
+        // The name is validated because it becomes a TOML key; the resolved
+        // attribute is validated because it is what Nix evaluates. Checking
+        // only the one in front of me is how round 17 reopened the injection
+        // hole round 12 closed — by teaching a validated path about flake
+        // references without extending the validation to the new half.
+        let sel = Selection::new(["system".to_string()], ["tf".to_string()]).with_sources(
+            BTreeMap::from([("tf".to_string(), "nixpkgs#a; touch /tmp/pwn".to_string())]),
+        );
+        let err = sel.validate().unwrap_err().to_string();
+        assert!(err.contains("resolves to"), "{err}");
     }
 
     #[test]

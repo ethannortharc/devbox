@@ -147,10 +147,12 @@ pub async fn write_set_modules(
     // the first would let `sets apply` report success while the installed
     // closure never changed — so both are written, from the same selection.
     let config = selection.to_config(&DevboxConfig::default());
-    let mut extra = HashMap::new();
-    for pkg in &selection.packages {
-        extra.insert(pkg.clone(), "nixpkgs".to_string());
-    }
+    // Keyed by the attribute, because that is what the module resolves: it
+    // builds the lookup path from the *key* and never reads the value except
+    // to see whether it is a nested table. So an aliased package written under
+    // its declared name resolved to null and was filtered out silently — the
+    // box lost it while state went on reporting it selected.
+    let extra: HashMap<String, String> = selection.custom_packages_table().into_iter().collect();
     let state_toml = crate::nix::sets::generate_state_toml_with(
         &sets_map(&config),
         &languages_map(&config),

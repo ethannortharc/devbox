@@ -56,17 +56,32 @@ class Interface(Model):
         newline produces an invalid — or injected — statement a long way from
         where it was written. IFNAMSIZ is 16 including the NUL, and `.`/`..`
         are rejected by the kernel outright.
+
+        The limit is in *bytes* and the alphabet is ASCII, because that is
+        what the kernel measures and what the Rust validator this claims to
+        mirror actually does — `str::len` there is a byte count and the test
+        is `is_ascii_alphanumeric`. Here `len()` counts code points and
+        `str.isalnum()` is true for CJK and every other Unicode letter, so
+        fifteen Chinese characters were forty-five bytes that passed this
+        check and failed at `ip link`, in a different process, much later.
+        Two validators described as the same rule were not the same rule.
         """
-        if value in {".", ".."} or len(value) > 15:
-            raise ValueError(
-                f"interface name {value!r} must be 1-15 characters and not '.' or '..'"
-            )
-        if value and not all(c.isalnum() or c in "-_." for c in value):
-            raise ValueError(
-                f"interface name {value!r} may contain letters, digits, '-', '_', and '.' only"
-            )
         if not value:
             raise ValueError("an interface needs a name")
+        encoded = len(value.encode("utf-8"))
+        if value in {".", ".."} or encoded > 15:
+            raise ValueError(
+                f"interface name {value!r} must be 1-15 bytes and not '.' or '..' "
+                f"(it is {encoded} bytes)"
+            )
+        if not all(
+            ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "-_."
+            for c in value
+        ):
+            raise ValueError(
+                f"interface name {value!r} may contain ASCII letters, digits, "
+                "'-', '_', and '.' only"
+            )
         return value
 
     @field_validator("peer")

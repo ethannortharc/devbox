@@ -99,14 +99,6 @@ pub fn is_public(path: &str) -> bool {
         || path == "/metrics"
 }
 
-/// Whether a `Host` header names this machine's loopback interface.
-///
-/// This is the DNS-rebinding guard. An attacker's page cannot read our
-/// responses cross-origin and cannot send our `SameSite=Strict` cookie, but it
-/// *can* point its own hostname at `127.0.0.1` and issue requests that the
-/// browser considers same-origin with the attacker. Requiring a loopback
-/// `Host` closes that door: `evil.example` never appears here, whatever it
-/// resolves to.
 /// Does this request originate from the console's own origin?
 ///
 /// `Origin` is set by the browser and cannot be forged by page script, so it
@@ -140,6 +132,56 @@ fn origin_is_self<B>(req: &axum::http::Request<B>) -> bool {
         .is_some_and(|host| host.eq_ignore_ascii_case(authority))
 }
 
+/// Did something other than the user or the console itself cause this request?
+///
+/// `origin_is_self` has to allow a missing `Origin`, because that is what an
+/// ordinary top-level navigation looks like — and that allowance is a hole a
+/// GET cannot be trusted through. A hostile page on another loopback port can
+/// navigate or frame the browser at any console URL; the navigation carries no
+/// `Origin`, so it is served, and any request the rendered page then makes on
+/// its own carries a perfectly correct one. Moving the side effect from the
+/// GET to a POST does not help when the page fires that POST on load.
+///
+/// `Sec-Fetch-Site` is the header that can tell these apart, because the
+/// browser sets it from what *initiated* the request rather than from who is
+/// sending it: `none` when the user typed or bookmarked the URL,
+/// `same-origin` when the console navigated itself, `same-site` or
+/// `cross-site` when another page did.
+///
+/// `same-site` is rejected deliberately. A site ignores the port, so a page
+/// served from another `127.0.0.1` port is same-site with this console — which
+/// is the entire threat model here, not a hypothetical.
+///
+/// Absent means a client that does not send it: an older browser, `curl`, the
+/// test suite. Those fall back to the checks above rather than being locked
+/// out, and the fallback is not a weakness — a browser modern enough to be
+/// steered into this attack is modern enough to send the header.
+fn foreign_initiated<B>(req: &axum::http::Request<B>) -> bool {
+    req.headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| !matches!(site, "none" | "same-origin"))
+}
+
+/// Is this request for an embedded context rather than the page itself?
+///
+/// Framing the console is never legitimate, and it is how a hostile page would
+/// read a navigation it caused instead of merely triggering its side effects.
+fn embedded<B>(req: &axum::http::Request<B>) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|dest| matches!(dest, "iframe" | "frame" | "embed" | "object"))
+}
+
+/// Whether a `Host` header names this machine's loopback interface.
+///
+/// This is the DNS-rebinding guard. An attacker's page cannot read our
+/// responses cross-origin and cannot send our `SameSite=Strict` cookie, but it
+/// *can* point its own hostname at `127.0.0.1` and issue requests that the
+/// browser considers same-origin with the attacker. Requiring a loopback
+/// `Host` closes that door: `evil.example` never appears here, whatever it
+/// resolves to.
 pub fn is_loopback_host(host: &str) -> bool {
     // Strip the port, tolerating a bracketed IPv6 literal.
     let name = match host.strip_prefix('[') {
@@ -171,7 +213,7 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
 
     let path = req.uri().path();
     if is_public(path) {
-        return next.run(req).await;
+        return no_framing(next.run(req).await);
     }
 
     // Already authenticated for this browser session?
@@ -192,10 +234,16 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         // So a cookie-authenticated request must also prove where it came
         // from. A same-origin request either sends a matching Origin or, for
         // plain top-level navigations, none at all.
-        if !origin_is_self(&req) {
+        //
+        // And the navigation itself has to be accounted for: the `Origin`
+        // check must permit its absence, which leaves a hostile page free to
+        // push the browser at a console URL and let the rendered page do the
+        // rest. `foreign_initiated` is what closes that, and `embedded` stops
+        // the framed variant.
+        if !origin_is_self(&req) || foreign_initiated(&req) || embedded(&req) {
             return unauthorized();
         }
-        return next.run(req).await;
+        return no_framing(next.run(req).await);
     }
 
     // First navigation: `?t=…` is exchanged for the session cookie.
@@ -224,6 +272,28 @@ fn wrong_host() -> Response {
         "the devbox console only answers to a loopback host name",
     )
         .into_response()
+}
+
+/// Refuse to be embedded, for browsers that will not tell us who asked.
+///
+/// `embedded` reads `Sec-Fetch-Dest`, which a client is free not to send; this
+/// says the same thing in the other direction, where the browser enforces it
+/// without being asked. Both are cheap and they fail independently.
+///
+/// `frame-ancestors` is the modern spelling and `X-Frame-Options` the one
+/// older browsers obey — the pair is deliberate, not redundancy left in by
+/// accident.
+fn no_framing(mut res: Response) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    res
 }
 
 fn unauthorized() -> Response {
@@ -375,6 +445,56 @@ mod tests {
             "",
         ] {
             assert!(!is_loopback_host(host), "{host} must not pass");
+        }
+    }
+
+    fn nav(site: Option<&str>, dest: Option<&str>) -> Request<()> {
+        let mut b = Request::builder().header(header::HOST, "127.0.0.1:7878");
+        if let Some(s) = site {
+            b = b.header("sec-fetch-site", s);
+        }
+        if let Some(d) = dest {
+            b = b.header("sec-fetch-dest", d);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn a_navigation_another_page_caused_is_refused() {
+        // The hole `origin_is_self` cannot close on its own: it has to permit
+        // a missing `Origin`, because that is what an ordinary top-level
+        // navigation looks like. So a hostile page could point the browser at
+        // `/boxes/<name>?tab=terminal`, the navigation would be served, and
+        // the rendered page's own load-triggered POST — carrying an entirely
+        // correct Origin — would start the box. Moving the side effect off the
+        // GET did not help, because the page itself performs the POST.
+        assert!(foreign_initiated(&nav(Some("cross-site"), None)));
+        // `same-site` is refused too, and it is the one that matters: a site
+        // ignores the port, so another page on 127.0.0.1 is same-site with
+        // this console. That is the actual attacker, not a hypothetical one.
+        assert!(foreign_initiated(&nav(Some("same-site"), None)));
+    }
+
+    #[test]
+    fn the_user_and_the_console_are_still_allowed_in() {
+        // Typed, bookmarked, or opened by `devbox web`.
+        assert!(!foreign_initiated(&nav(Some("none"), None)));
+        // The console navigating or fetching within itself.
+        assert!(!foreign_initiated(&nav(Some("same-origin"), None)));
+        // Absent: an older browser, curl, the test suite. Falling back rather
+        // than locking them out is deliberate — a browser new enough to be
+        // steered into this attack is new enough to send the header.
+        assert!(!foreign_initiated(&nav(None, None)));
+    }
+
+    #[test]
+    fn the_console_refuses_to_be_framed() {
+        for dest in ["iframe", "frame", "embed", "object"] {
+            assert!(embedded(&nav(Some("same-origin"), Some(dest))), "{dest}");
+        }
+        // The ordinary destinations a console produces.
+        for dest in ["document", "empty", "script", "style", "image"] {
+            assert!(!embedded(&nav(Some("same-origin"), Some(dest))), "{dest}");
         }
     }
 }

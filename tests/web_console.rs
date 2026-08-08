@@ -752,3 +752,121 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+// ── template selectors ───────────────────────────────────
+
+#[test]
+fn no_template_builds_a_css_selector_from_a_box_name() {
+    // `#box-{{ b.name }}` reads as obviously correct and breaks on a name the
+    // console itself accepts. A box name is a directory name, and
+    // `is_safe_name` permits dots and spaces — both of which mean something
+    // else in a selector. `#box-a_b.c` parses as the id `box-a_b` carrying the
+    // class `c`, matches nothing, and every lifecycle button on that card
+    // silently does nothing at all.
+    //
+    // Checked against the template source rather than a rendered page, because
+    // there is nothing wrong with the rendered page: the markup is well-formed
+    // and only the browser's selector parser disagrees. Nothing that renders
+    // HTML can see this.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/templates");
+    let mut offenders = Vec::new();
+
+    for entry in std::fs::read_dir(&dir).expect("templates directory") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("html") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable template");
+        for (n, line) in text.lines().enumerate() {
+            let targets = line.contains("hx-target=") || line.contains("hx-indicator=");
+            if targets && line.contains("#box-{{") {
+                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these build a CSS selector out of a box name; use a relative target \
+         such as `closest .card`, which cannot be got wrong:\n{}",
+        offenders.join("\n")
+    );
+}
+
+// ── fetch metadata ───────────────────────────────────────
+
+/// An authenticated request, with the browser's account of who initiated it.
+fn get_initiated(uri: &str, site: &str, dest: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header("sec-fetch-site", site)
+        .header("sec-fetch-dest", dest)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_navigation_another_page_caused_is_refused() {
+    // The gap the Origin check cannot close by itself. It has to allow a
+    // missing `Origin`, since that is what a top-level navigation looks like —
+    // so a page on another 127.0.0.1 port could send the browser to
+    // `/boxes/alpha?tab=terminal` and let the rendered page's own load-fired
+    // POST start the box. `same-site` is the case that matters, because a site
+    // ignores the port: that other page *is* same-site with this console.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    for site in ["same-site", "cross-site"] {
+        let res = app
+            .clone()
+            .oneshot(get_initiated("/boxes/alpha?tab=terminal", site, "document"))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "a {site} navigation must not be served"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_user_opening_the_console_is_still_served() {
+    // Typed, bookmarked, or opened by `devbox web`: `none`. And the console
+    // navigating within itself: `same-origin`. Refusing these would make the
+    // guard worse than the hole.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    for site in ["none", "same-origin"] {
+        let res = app
+            .clone()
+            .oneshot(get_initiated("/boxes/alpha", site, "document"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{site} must be served");
+    }
+}
+
+#[tokio::test]
+async fn the_console_refuses_to_be_framed() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(get_initiated("/boxes/alpha", "same-origin", "iframe"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn every_served_response_forbids_framing() {
+    // The other half, for a browser that does not send Fetch Metadata: say it
+    // in the response instead, where the browser enforces it unprompted.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app.oneshot(get_authed("/boxes/alpha")).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "frame-ancestors 'none'"
+    );
+    assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+}

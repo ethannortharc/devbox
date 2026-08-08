@@ -8,20 +8,29 @@
 
 {#- Lifecycle buttons. Every action posts and swaps the whole card, so the
     button states can never disagree with the status they sit next to. -#}
+{#- Targets are relative, not `#box-<name>`.
+
+    A box name is a directory name, and the rule that admits one (`is_safe_name`)
+    permits dots and spaces — both of which mean something else in a CSS
+    selector. `#box-a_b.c` is read as the id `box-a_b` carrying the class `c`,
+    matches nothing, and every lifecycle button on that card silently does
+    nothing. Escaping the name here would work and would have to be got right
+    in five places; `closest .card` cannot be got wrong, and needs no
+    agreement with whatever the id happens to be. -#}
 {% macro box_actions(b) %}
 <div class="actions">
   <button class="btn btn-primary"
           hx-post="/api/boxes/{{ b.name }}/start"
-          hx-target="#box-{{ b.name }}"
+          hx-target="closest .card"
           hx-swap="outerHTML"
-          hx-indicator="#box-{{ b.name }}"
+          hx-indicator="closest .card"
           {% if b.status == "running" %}disabled{% endif %}>Start</button>
 
   <button class="btn"
           hx-post="/api/boxes/{{ b.name }}/stop"
-          hx-target="#box-{{ b.name }}"
+          hx-target="closest .card"
           hx-swap="outerHTML"
-          hx-indicator="#box-{{ b.name }}"
+          hx-indicator="closest .card"
           {% if b.status != "running" %}disabled{% endif %}>Stop</button>
 
   <a class="btn" href="/boxes/{{ b.name }}?tab=terminal">Terminal</a>
@@ -29,7 +38,7 @@
   <button class="btn btn-danger"
           hx-post="/api/boxes/{{ b.name }}/destroy"
           hx-confirm="Destroy box &quot;{{ b.name }}&quot;? The box and its overlay are removed. Your project directory on the host is untouched."
-          hx-target="#box-{{ b.name }}"
+          hx-target="closest .card"
           hx-swap="outerHTML">Destroy</button>
 </div>
 {% endmacro %}

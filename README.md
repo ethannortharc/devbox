@@ -168,7 +168,7 @@ ssh yourserver -t "devbox shell --name shared-api"
 curl -fsSL https://raw.githubusercontent.com/ethannortharc/devbox/main/install.sh | sh
 ```
 
-Or build from source (requires Rust 1.85+):
+Or build from source (requires Rust 1.88+):
 
 ```bash
 git clone https://github.com/ethannortharc/devbox.git

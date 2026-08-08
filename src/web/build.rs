@@ -374,9 +374,16 @@ pub async fn apply_selection(
     box_name: &str,
     selection: &Selection,
 ) -> Result<()> {
-    selection.validate()?;
-
     let sandbox = manager.get_sandbox(box_name)?;
+
+    // The form posts names, because names are what the field shows. Where an
+    // aliased package comes from lives on the box, so it is reattached before
+    // anything is validated or written — validating the selection first would
+    // check the alias against itself and pass.
+    let selection = &selection
+        .clone()
+        .with_sources(sandbox.package_sources.clone());
+    selection.validate()?;
 
     // The same guard the CLI applies. Without it the Sets tab pushes new files
     // into the box and only then discovers there is no `nixos-rebuild` — a

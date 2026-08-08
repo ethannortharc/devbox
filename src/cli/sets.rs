@@ -100,7 +100,12 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     let state = manager.get_sandbox(&name)?;
 
     let before = Selection::from_state(&state);
-    let after = Selection::new(args.sets.clone(), args.packages.clone());
+    // Sources come off the box, not off the command line: `--packages` names
+    // what to have, and where an aliased package comes from is already
+    // recorded. Without this the alias resolves to itself and the rebuild
+    // fails on an undefined variable.
+    let after = Selection::new(args.sets.clone(), args.packages.clone())
+        .with_sources(state.package_sources.clone());
     after.validate()?;
 
     println!("Selection change: {}", describe_change(&before, &after));

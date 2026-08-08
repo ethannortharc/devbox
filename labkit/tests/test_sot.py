@@ -189,3 +189,33 @@ def test_network_and_broadcast_addresses_are_rejected() -> None:
     # point-to-point link in these labs relies on.
     Interface(name="eth1", peer="b:eth1", address="10.0.0.0/31")
     Interface(name="eth1", peer="b:eth1", address="10.0.0.1/31")
+
+
+def test_an_interface_name_is_measured_in_bytes_not_code_points() -> None:
+    """The kernel's IFNAMSIZ is a byte budget, and this used to count characters.
+
+    ``len()`` counts code points and ``str.isalnum()`` is true for CJK and
+    every other Unicode letter, so fifteen Chinese characters were forty-five
+    UTF-8 bytes that passed here and failed later at ``ip link`` — in another
+    process, long after the source of truth had declared the fabric valid.
+
+    The docstring on the validator claimed it applied "the same rule the Rust
+    topology validator applies". It did not: ``str::len`` in Rust is a byte
+    count and the test there is ``is_ascii_alphanumeric``. Two validators
+    described as one rule were two rules.
+    """
+    fifteen_cjk = "一二三四五六七八九十一二三四五"
+    assert len(fifteen_cjk) == 15
+    assert len(fifteen_cjk.encode("utf-8")) == 45
+    with pytest.raises(ValidationError, match="bytes"):
+        Interface(name=fifteen_cjk, peer="b:eth1")
+
+    # Non-ASCII is refused outright, whatever its length: these names are
+    # interpolated into FRR configuration and `ip link` arguments.
+    with pytest.raises(ValidationError):
+        Interface(name="ethé", peer="b:eth1")
+
+    # Fifteen ASCII bytes is still the limit, and still allowed.
+    assert Interface(name="e" * 15, peer="b:eth1").name == "e" * 15
+    with pytest.raises(ValidationError, match="bytes"):
+        Interface(name="e" * 16, peer="b:eth1")

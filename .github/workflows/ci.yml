@@ -38,6 +38,26 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+  # The declared MSRV, actually built.
+  #
+  # `rust-version` in Cargo.toml makes cargo refuse an older toolchain with a
+  # clear message, but it does not stop the floor drifting: nothing noticed
+  # when let-chains raised the real minimum to 1.88 while README and
+  # CONTRIBUTING went on promising 1.85, because every build here ran on
+  # stable. This job is what turns that promise into something checked.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check on the declared minimum
+        run: cargo check --all-targets
+
   go:
     name: Go
     runs-on: ubuntu-latest
