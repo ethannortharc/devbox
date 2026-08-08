@@ -98,3 +98,40 @@ fn walk(dir: &str) -> Vec<String> {
     }
     out
 }
+
+/// Only `apply` decides whether an `open` posture installs a table.
+///
+/// The same shape as the guard above, for the same reason. `open` used to mean
+/// "no table" without exception, so three places tested `Posture::Open` and
+/// cleared. Then `open` with an allowlist and alerts started meaning
+/// observe-and-warn, `apply` learned that, and the other two did not — so
+/// start, attach, access and every rebuild silently switched observing off
+/// until someone set the policy again.
+///
+/// A rule restated in a second place is a rule that goes stale. This insists
+/// there is one statement of it.
+#[test]
+fn only_apply_decides_what_an_open_posture_installs() {
+    let source = std::fs::read_to_string("src/policy/enforce.rs").expect("enforce.rs");
+
+    let mut offenders = Vec::new();
+    for (n, line) in source.lines().enumerate() {
+        if !line.contains("Posture::Open") {
+            continue;
+        }
+        // The one place allowed to test it is the decision itself, which is
+        // recognisable by consulting `audits`.
+        if line.contains("audits(") {
+            continue;
+        }
+        offenders.push(format!("src/policy/enforce.rs:{}: {}", n + 1, line.trim()));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these decide for themselves what `open` means instead of calling \
+         `apply`, which is how observe-and-warn came to be disabled by every \
+         routine lifecycle operation:\n{}",
+        offenders.join("\n")
+    );
+}

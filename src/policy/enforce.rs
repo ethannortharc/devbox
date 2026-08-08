@@ -594,9 +594,9 @@ pub async fn restore_after_rebuild(
         })?;
     let runtime = manager.runtime_for_sandbox(state)?;
 
-    if config.policy.egress == Posture::Open {
-        return clear(runtime.as_ref(), name).await;
-    }
+    // `apply` decides between installing and clearing: an `open` posture that
+    // audits still needs its table, and duplicating that test here is what
+    // turned every rebuild into a silent way to switch observing off.
     apply(runtime.as_ref(), name, &config.policy)
         .await
         .with_context(|| {
@@ -634,15 +634,15 @@ pub async fn apply_saved(
         }
     };
     let runtime = manager.runtime_for_sandbox(state)?;
-    let outcome = if config.policy.egress == Posture::Open {
-        // Not a no-op. A box that was `isolated` and is now `open` still has
-        // devbox's table in whatever state the guest kept across the restart;
-        // returning early left those rules in force while every surface
-        // reported the box unrestricted.
-        clear(runtime.as_ref(), name).await
-    } else {
-        apply(runtime.as_ref(), name, &config.policy).await
-    };
+    // Straight to `apply`, which already knows that an `open` posture clears
+    // unless it audits.
+    //
+    // This branched on `Open` itself and cleared, which was right until `open`
+    // stopped always meaning "no table". Then it silently disabled
+    // observe-and-warn on start, on attach, and on access — every routine
+    // operation — until someone set the policy again. Restating a rule in a
+    // second place is how it goes stale; there is one statement of it now.
+    let outcome = apply(runtime.as_ref(), name, &config.policy).await;
 
     if let Err(e) = outcome {
         let posture = config.policy.egress;

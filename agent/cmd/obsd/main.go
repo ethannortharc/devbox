@@ -114,10 +114,26 @@ func chooseSource(cfg config) (capture.Source, error) {
 	if cfg.fixture != "" || cfg.policy == "" {
 		return primary, nil
 	}
-	return capture.NewMulti(primary, &capture.Blocked{
+	blocked := &capture.Blocked{
 		BoxID: cfg.boxID,
 		Mode:  func() string { return posture(cfg.policy) },
-	}), nil
+	}
+	// Probed before the handshake, not discovered during the run.
+	//
+	// `Multi` skips a source that reports itself unsupported, and the
+	// handshake would already have advertised `policy` capture and named
+	// `netfilter` as active — so the collector recorded the feed as healthy
+	// while nothing produced it. Reading /dev/kmsg needs CAP_SYSLOG wherever
+	// `kernel.dmesg_restrict` is set, which is most places, and the symptom of
+	// lacking it is a box that appears never to have violated its policy.
+	if err := blocked.Available(); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"devbox-obsd: no policy events — cannot read %s (%v). "+
+				"The posture is still enforced by the kernel; only the record of "+
+				"refusals is missing.\n", capture.KmsgPath, err)
+		return primary, nil
+	}
+	return capture.NewMulti(primary, blocked), nil
 }
 
 // posture reads the egress posture currently in force.

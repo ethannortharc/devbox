@@ -105,7 +105,29 @@ pub(crate) fn nixos_attr_path<'a>(name: &'a str, source: &'a str) -> &'a str {
 
 pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> Result<()> {
     if image == "ubuntu" {
-        return Ok(()); // `nix profile install` takes a flake reference directly
+        // `nix profile install` takes a flake reference directly, so any
+        // *source* is supported here — but the reference still has to be one
+        // the installer will accept. `provision_ubuntu` checks that, after the
+        // box exists, where the failure is downgraded to a warning and state
+        // is saved anyway: `devbox create` reported a box it had made, with a
+        // package it had not installed and no error the user would see.
+        //
+        // Round 24 moved this whole check ahead of `runtime.create` for the
+        // NixOS path and left the Ubuntu path returning `Ok` on the way past.
+        let malformed: Vec<&str> = packages
+            .iter()
+            .filter(|(_, source)| !is_safe_installable(source))
+            .map(|(pkg, _)| pkg.as_str())
+            .collect();
+        if !malformed.is_empty() {
+            bail!(
+                "these packages do not name an installable nix reference: {}\n  \
+                 Expected `nixpkgs#name`, `github:owner/repo#name`, or a bare \
+                 attribute path.",
+                malformed.join(", ")
+            );
+        }
+        return Ok(());
     }
     let unsupported: Vec<&str> = packages
         .iter()
@@ -1608,6 +1630,32 @@ mod tests {
         );
         // A plain nixpkgs package is still named by its key.
         assert_eq!(nixos_attr_path("ripgrep", "nixpkgs"), "ripgrep");
+    }
+
+    #[test]
+    fn an_ubuntu_box_refuses_a_malformed_reference_before_it_exists() {
+        // Ubuntu installs a flake reference directly, so any *source* is
+        // supported — but it still has to be one `nix profile install` will
+        // take. That was checked only in `provision_ubuntu`, after
+        // `runtime.create`, where the failure is downgraded to a warning and
+        // state is saved anyway: `devbox create` reported a box it had made,
+        // carrying a package it had not installed, with nothing the user would
+        // see. Round 24 moved this check ahead of creation for NixOS and left
+        // the Ubuntu path returning `Ok` on the way past.
+        let hostile = [("tool".to_string(), "github:user/repo;touch#pkg".to_string())];
+        assert!(
+            check_packages_supported("ubuntu", &hostile).is_err(),
+            "a reference with shell syntax must not reach the box"
+        );
+
+        // The references Ubuntu really does take still pass.
+        for ok in ["nixpkgs#ripgrep", "github:owner/repo#tool", "ripgrep"] {
+            let pkgs = [("tool".to_string(), ok.to_string())];
+            assert!(
+                check_packages_supported("ubuntu", &pkgs).is_ok(),
+                "{ok:?} is a real installable reference"
+            );
+        }
     }
 
     #[test]

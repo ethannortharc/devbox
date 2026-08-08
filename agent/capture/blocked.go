@@ -66,8 +66,19 @@ func (p BlockedPacket) Target() string {
 }
 
 // Flow identifies one connection, for suppressing repeats of it.
+//
+// The verdict is part of the identity. A UDP socket kept across a policy
+// change keeps its five-tuple, so a flow that was flagged under an audited
+// `open` and is then genuinely blocked once the posture tightens would have
+// been suppressed as a repeat — hiding the first real denial, which is the one
+// worth seeing.
 func (p BlockedPacket) Flow() string {
+	verdict := "block"
+	if p.Flagged {
+		verdict = "flag"
+	}
 	return strings.Join([]string{
+		verdict,
 		p.Proto,
 		p.Src, strconv.FormatUint(uint64(p.SPort), 10),
 		p.Dst, strconv.FormatUint(uint64(p.DPort), 10),
@@ -82,9 +93,18 @@ func (p BlockedPacket) Flow() string {
 // the journal but not the event count, and the contract these events are read
 // under — one per refused connection — is the agent's to keep.
 //
-// A minute is longer than a TCP SYN retry sequence and short enough that a
-// genuine retry later is reported as what it is.
-const DedupeWindow = time.Minute
+// It has to outlast the whole handshake, not most of it. With Linux's default
+// `tcp_syn_retries=6` the retransmissions go out at 1, 3, 7, 15, 31 and 63
+// seconds and the attempt is abandoned around 127 — so a one-minute window let
+// the 63-second SYN through as a second event for the same connection, which
+// is precisely the duplicate this exists to prevent, arriving late enough to
+// look like a separate refusal.
+//
+// Three minutes covers the sequence with room for a slower configuration.
+// Suppressing a genuinely new connection for that long is not a real risk:
+// a new connection takes a new ephemeral source port, so its five-tuple —
+// and its key — differ.
+const DedupeWindow = 3 * time.Minute
 
 // ParseBlocked pulls a devbox log line out of the kernel ring buffer.
 //
@@ -231,6 +251,27 @@ const maxTrackedFlows = 4096
 
 // Name implements Source.
 func (b *Blocked) Name() string { return "netfilter" }
+
+// Available reports whether the kernel ring buffer can actually be read.
+//
+// Checked before the handshake rather than discovered during it. `Multi` skips
+// a source that reports itself unsupported, but the handshake has by then
+// already advertised `policy` capture and printed `netfilter` as active — so
+// the collector recorded the feed as healthy while nothing produced it, and a
+// box whose agent lacks CAP_SYSLOG looked exactly like a box that never
+// violated its policy. Advertising a capability is a claim, and this is what
+// makes the claim true before it is made.
+func (b *Blocked) Available() error {
+	open := b.Open
+	if open == nil {
+		open = func() (io.ReadCloser, error) { return os.Open(KmsgPath) }
+	}
+	r, err := open()
+	if err != nil {
+		return err
+	}
+	return r.Close()
+}
 
 // Domains implements Source.
 func (b *Blocked) Domains() []event.Type { return []event.Type{event.TypePolicy} }

@@ -160,6 +160,25 @@ impl Selection {
                 bail!("'{pkg}' resolves to '{attr}', which is not a valid nixpkgs attribute path");
             }
         }
+        // Two names, one attribute. `terraform = "nixpkgs"` beside `my-tf =
+        // "nixpkgs#terraform"` both ask for `pkgs.terraform`, and the guest
+        // state file would carry the key twice — invalid TOML, so the rebuild
+        // fails on a config that reads as perfectly sensible. Saying which two
+        // collided is the difference between a fixable message and a parse
+        // error from a generated file the user never wrote.
+        let mut by_attr: BTreeMap<&str, &str> = BTreeMap::new();
+        for pkg in &self.packages {
+            let attr = self.attr_path(pkg);
+            if let Some(first) = by_attr.insert(attr, pkg)
+                && first != pkg
+            {
+                bail!(
+                    "'{first}' and '{pkg}' both resolve to the nixpkgs attribute \
+                     '{attr}'; drop one of them"
+                );
+            }
+        }
+
         for locked in LOCKED_SETS {
             if !self.sets.contains(*locked) {
                 bail!("set '{locked}' cannot be disabled");
@@ -565,6 +584,46 @@ mod tests {
         assert!(
             !toml.contains("my-tf"),
             "the alias resolves to null and is filtered out in silence:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn two_names_for_one_attribute_are_refused() {
+        // `terraform = "nixpkgs"` beside `my-tf = "nixpkgs#terraform"` both ask
+        // for `pkgs.terraform`. The guest state file would carry that key
+        // twice, which is invalid TOML — so the rebuild fails to parse a file
+        // the user never wrote, over a config that reads as entirely sensible.
+        // Naming both halves is the difference between a fixable message and a
+        // parse error from generated output.
+        let sel = Selection::new(
+            ["system".to_string()],
+            ["terraform".to_string(), "my-tf".to_string()],
+        )
+        .with_sources(BTreeMap::from([(
+            "my-tf".to_string(),
+            "nixpkgs#terraform".to_string(),
+        )]));
+
+        let err = sel.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("my-tf") && err.contains("terraform"),
+            "the message must name both declarations: {err}"
+        );
+
+        // And the emitter cannot produce an unparseable file even if something
+        // reaches it without validating: a dropped duplicate beats a rebuild
+        // that fails on a syntax error.
+        let toml = crate::nix::sets::generate_state_toml_with(
+            &Default::default(),
+            &Default::default(),
+            &sel.declared_sources().into_iter().collect(),
+            None,
+            None,
+        );
+        assert_eq!(
+            toml.matches("\"terraform\" =").count(),
+            1,
+            "a key emitted twice is invalid TOML:\n{toml}"
         );
     }
 

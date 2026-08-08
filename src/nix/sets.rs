@@ -307,6 +307,14 @@ pub fn generate_state_toml_with(
             })
             .collect();
         resolved.sort();
+        // Two declarations can resolve to one attribute — `terraform =
+        // "nixpkgs"` beside `my-tf = "nixpkgs#terraform"` — and emitting the
+        // key twice is not merely redundant, it is invalid TOML: the file
+        // fails to parse and the rebuild fails with it, for a config that
+        // looked reasonable. `Selection::validate` refuses the collision with
+        // an explanation; this coalesces, because an emitter that can produce
+        // an unparseable file is a worse failure than a dropped duplicate.
+        resolved.dedup_by(|a, b| a.0 == b.0);
         for (attr, source) in resolved {
             // Quoted: a bare dotted key is a nested table, and while the module
             // flattens both, one literal key is what this means.
