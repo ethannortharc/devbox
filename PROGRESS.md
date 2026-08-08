@@ -1139,3 +1139,86 @@ written. That is the first time one of these has paid for itself immediately.
 
 **Gate** — 403 Rust unit + 53 integration/e2e, 10 Go packages, 68 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean.
+
+## 2026-08-08T04:30Z — Rounds 21–23, and where the P1s are coming from now
+
+```
+round   findings   P1
+  21        9      not recorded
+  22        8       5
+  23        4       3
+```
+
+The count is falling. That is the least interesting thing about this stretch.
+
+What changed is the *source* of the P1s. Through round 13 they were defects in
+code written before the review started — the original work, found. In rounds 22
+and 23 they are almost entirely defects introduced by the previous round's fix.
+Round 22's commit says all five P1s were round 21's fixes, and that checks out
+finding by finding: the DHCP and neighbour-discovery exemptions, the
+`ff02::/16` rule, the DMI fallback, the state-before-restore ordering, and the
+status-event ownership were every one of them round 21's work. Round 23's
+leading P1 was round 22's eBPF probe.
+
+So the loop is no longer measuring the quality of the original code. It is
+measuring the quality of my edits, at a rate of roughly one P1 per two fixes.
+That reframes the fixed-point argument from round 13: the process does not
+terminate not because the codebase is deep, but because the fixing is itself a
+defect source of comparable rate, and there is no round in which that stops
+being true.
+
+**The worst single finding in these three rounds is a test that passed while
+the bug it was written for was live.** Round 21 put the DHCP and ND exemptions
+in `emit_policy_rules`, which is shared with the chain that judges *forwarded*
+traffic — so a nested container could send DHCP-shaped packets straight past an
+isolated posture. The test asserted the rules were absent from `chain forward`.
+They were. They always had been; `chain forward` never carried them. The leak
+was into `forward_egress`, and the test never looked there.
+
+That is worth stating as a rule, because it is a different failure from an
+absent test: **a test that asserts on the wrong object is worse than no test,
+because it converts an open question into a false answer.** An untested path is
+a known unknown and stays on the list. A wrongly-tested path is retired. The
+mechanism to watch for is specific and recognisable — when a fix lands in a
+shared emitter, the test has to name *every* chain that consumes it, not the
+one that was in my head when I wrote the fix. The rules now live in an
+output-only emitter and the test checks both chains.
+
+**Second: narrowing a predicate to kill false positives can kill the true ones
+too.** Round 22 tried to stop the eBPF probe reporting destinations that were
+never reached, by requiring `TCP_ESTABLISHED` when `tcp_v*_connect` returns.
+But a successful connect returns in `TCP_SYN_SENT` — the handshake finishes
+later. The check would have dropped nearly every ordinary outbound connection
+from the timeline. Trying to stop the probe reporting unreached destinations, I
+would have stopped it reporting anything.
+
+The question I did not ask: *what fraction of the legitimate cases does the
+narrower condition also exclude?* Here it was substantially all of them. That
+question is cheap and I have never once asked it unprompted. Completion is now
+observed at `tcp_finish_connect`, with identity captured at connect time and
+looked up on completion through an LRU map, because the softirq context has no
+useful pid or cgroup of its own.
+
+Both of these are in paths no test reaches — a shared nftables emitter whose
+output only matters in a kernel, and an eBPF program needing BTF to load. That
+is the round 16–20 lesson repeating rather than a new one: the untestable paths
+keep producing the serious defects, and the reviewer keeps being the only thing
+that reads them.
+
+**On the stopping rule, one honest caveat.** Round 23 was the smallest round of
+the exercise and returned the fewest findings, and rounds 19–20 did the same
+thing earlier. A round that changes less has fewer things to be wrong about. So
+the severity floor is partly under my own control, and I could reach it by
+making the next round trivial rather than by running out of defects. That would
+satisfy the rule and mean nothing. The floor is a stopping condition for a
+round of *real* work, and the moment it starts shaping how much work a round
+contains, it has stopped measuring anything.
+
+**A gap worth naming:** round 21's P1 count is simply not recoverable. The
+review output was read, acted on, and discarded, and the commit message records
+the finding count but not the split. The reviews are the primary evidence in
+this whole exercise and they are the one artefact not being kept.
+
+**Gate** — 406 Rust unit + 53 integration/e2e, 10 Go packages, 69 Python;
+fmt/clippy/vet/gofmt/ruff/mypy all clean. Verified by running each, not by
+reading the previous commit message.
