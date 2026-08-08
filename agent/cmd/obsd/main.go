@@ -368,7 +368,18 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 	if err := json.Unmarshal(raw, &spec); err != nil {
 		return nil, fmt.Errorf("parse the policy at %s: %w", cfg.policy, err)
 	}
-	if spec.Egress == "open" {
+	// `open` usually means there is nothing to enforce — but an `open` posture
+	// that audits gets a table too, and that table decides what to flag by
+	// consulting the same allow sets. Only the agent can fill them, from the
+	// DNS it captures. Returning nil here left them empty, so every connection
+	// to an allowlisted domain fell through to `devbox-flagged` and the audit
+	// reported the entire allowlist as a violation of itself.
+	//
+	// The ruleset is the signal, because the control plane writes one only for
+	// the postures that have something to enforce or observe. That keeps the
+	// two sides agreeing on a fact rather than on a second flag they would
+	// each have to interpret.
+	if spec.Egress == "open" && spec.Ruleset == "" {
 		return nil, nil
 	}
 

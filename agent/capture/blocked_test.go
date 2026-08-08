@@ -177,3 +177,112 @@ func asErrUnsupported(err error, target **ErrUnsupported) bool {
 	}
 	return ok
 }
+
+func TestRepeatedRefusalsOfOneFlowAreOneEvent(t *testing.T) {
+	t.Parallel()
+
+	// `ct state new` is not once per connection. A refused TCP handshake is
+	// never answered, so the client retransmits its SYN and conntrack still
+	// calls each one new — the kernel logs every attempt. The rate limit in
+	// the ruleset bounds the journal, not the event count, and the contract
+	// these events are read under is one per refused connection.
+	ring := strings.Join([]string{kmsgBlocked, kmsgBlocked, kmsgBlocked}, "\n")
+
+	clock := time.Unix(1_700_000_000, 0)
+	src := &Blocked{
+		BoxID: "myapp",
+		Mode:  func() string { return "allowlist" },
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(ring)), nil
+		},
+		now: func() time.Time { return clock },
+	}
+
+	out := make(chan *event.Event, 8)
+	if err := src.Run(context.Background(), out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	close(out)
+
+	n := 0
+	for range out {
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("three retransmissions of one flow are one refusal, got %d events", n)
+	}
+}
+
+func TestTheSameFlowIsReportedAgainAfterTheWindow(t *testing.T) {
+	t.Parallel()
+
+	// Suppression must not become silence: a connection refused again ten
+	// minutes later is a new fact about the box, not a repeat of an old one.
+	ring := strings.Join([]string{kmsgBlocked, kmsgBlocked}, "\n")
+
+	clock := time.Unix(1_700_000_000, 0)
+	calls := 0
+	src := &Blocked{
+		BoxID: "myapp",
+		Mode:  func() string { return "allowlist" },
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(ring)), nil
+		},
+		now: func() time.Time {
+			calls++
+			if calls > 1 {
+				return clock.Add(2 * DedupeWindow)
+			}
+			return clock
+		},
+	}
+
+	out := make(chan *event.Event, 8)
+	if err := src.Run(context.Background(), out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	close(out)
+
+	n := 0
+	for range out {
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("a refusal after the window is a new event, got %d", n)
+	}
+}
+
+func TestAnIPv6TargetIsUnambiguous(t *testing.T) {
+	t.Parallel()
+
+	// `2001:db8::1` + `:443` parses as another IPv6 address. These strings are
+	// displayed and compared as violation identities, so the ambiguous form is
+	// both unreadable and unequal to itself across anything that normalises it.
+	pkt := BlockedPacket{Dst: "2001:db8::1", DPort: 443}
+	if got := pkt.Target(); got != "[2001:db8::1]:443" {
+		t.Errorf("target: got %q", got)
+	}
+	// IPv4 is unchanged.
+	if got := (BlockedPacket{Dst: "10.0.0.1", DPort: 80}).Target(); got != "10.0.0.1:80" {
+		t.Errorf("target: got %q", got)
+	}
+}
+
+func TestTheReasonMatchesThePostureThatRefused(t *testing.T) {
+	t.Parallel()
+
+	// "outside the allowlist" was said for every posture and is true of one.
+	// `isolated` consults no allowlist at all, and `mirror-only` also consults
+	// the curated mirrors — so both explanations sent the reader looking for a
+	// list entry that was never examined.
+	for mode, want := range map[string]string{
+		"isolated":    "isolated",
+		"mirror-only": "mirrors",
+		"allowlist":   "allowlist",
+	} {
+		got := (BlockedPacket{Dst: "1.2.3.4"}).Event("myapp", mode).Policy.Reason
+		if !strings.Contains(got, want) {
+			t.Errorf("%s: reason %q should mention %q", mode, got, want)
+		}
+	}
+}

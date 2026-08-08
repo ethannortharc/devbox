@@ -116,6 +116,17 @@ func (m *Multi) Domains() []event.Type {
 // worse outcome than losing the feed. Any other error is returned, and the
 // first one wins.
 func (m *Multi) Run(ctx context.Context, out chan<- *event.Event) error {
+	// Its own cancellable context, so the first fatal error stops the others.
+	//
+	// Waiting on the group alone deadlocked the promise this function makes: a
+	// source that fails queues its error and returns, the sibling keeps
+	// running because a live capture source runs until cancelled, and the
+	// error is never delivered. Half the capture would be dead and the agent
+	// would report nothing at all — the failure hidden by the part still
+	// working.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	errs := make(chan error, len(m.sources))
 
@@ -129,11 +140,19 @@ func (m *Multi) Run(ctx context.Context, out chan<- *event.Event) error {
 					return
 				}
 				errs <- err
+				cancel()
 			}
 		}(s)
 	}
 
 	wg.Wait()
 	close(errs)
-	return <-errs
+	// The first error, and only if it is not the cancellation this function
+	// caused: a sibling stopped on purpose is not a second failure to report.
+	for err := range errs {
+		if !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return nil
 }

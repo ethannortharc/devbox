@@ -31,12 +31,12 @@ pub const POLICY_PATH: &str = "/etc/devbox/policy.json";
 /// Idempotent, because the generated ruleset destroys the devbox table before
 /// recreating it: applying twice leaves what applying once leaves.
 pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -> Result<()> {
-    // `open` is the absence of a policy, not a policy of its own. Loading a
-    // ruleset for it would leave an empty devbox table sitting in the box
-    // suggesting something is being enforced.
-    // `open` with an allowlist and alerts on is not the absence of a policy:
-    // it is observe-and-warn, and it needs a table to do the observing. Every
-    // other `open` posture has nothing to install.
+    // `open` is usually the absence of a policy rather than a policy of its
+    // own, and loading a ruleset for it would leave an empty devbox table in
+    // the box suggesting something is being enforced.
+    //
+    // Unless it audits. `open` with an allowlist and alerts on is
+    // observe-and-warn, and it needs a table to do the observing with.
     if policy.egress == Posture::Open && !super::nftables::audits(policy) {
         return clear(runtime, sandbox_name).await;
     }
@@ -66,11 +66,10 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     // default-deny ruleset* the agent cannot populate, which is the part that
     // strands traffic. With the policy written and no agent, the posture is
     // saved and inert, and the message says exactly that.
-    // Only where the ruleset denies. The refusal below exists because a
-    // default-deny table with an allow set nothing can fill strands exactly
-    // the traffic the user permitted — under an auditing `open` posture
-    // nothing is denied, so an unpopulated set means over-reporting rather
-    // than a box cut off, and refusing to install would be the worse answer.
+    //
+    // And only where the ruleset denies at all: under an auditing `open`
+    // posture an unpopulated allow set means over-reporting rather than a box
+    // cut off, so refusing to install would be the worse answer.
     let needs_agent =
         policy.egress.enforces() && (!domains.is_empty() || policy.egress == Posture::MirrorOnly);
     let agent_ready = !needs_agent || agent_resolves_dns(runtime, sandbox_name).await;
@@ -172,7 +171,11 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     let load = runtime
         .exec_cmd(
             sandbox_name,
-            &["sh", "-c", &elevated(&load_command())],
+            &[
+                "sh",
+                "-c",
+                &elevated(&load_command(policy.egress.enforces())),
+            ],
             false,
         )
         .await?;
@@ -343,7 +346,19 @@ async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
 /// connections are judged against. `conntrack` is best-effort: not every box
 /// has the tool, and a ruleset that loaded is worth more than one that failed
 /// because a helper was missing.
-fn load_command() -> String {
+fn load_command(enforcing: bool) -> String {
+    // Only where the new rules can refuse something.
+    //
+    // Flushing exists so that connections opened under a looser posture are
+    // re-judged by a stricter one. An auditing `open` posture judges nothing —
+    // it accepts everything and logs what the allowlist misses — so tearing
+    // down conntrack there would drop established NAT state, and a nested
+    // container's flows with it, in the one posture that promises not to
+    // interrupt traffic. Turning on observe-only would have been more
+    // disruptive than turning on enforcement.
+    if !enforcing {
+        return format!("nft -f {RULESET_PATH}");
+    }
     format!(
         "nft -f {RULESET_PATH} && \
          (conntrack -F 2>/dev/null || true)"
@@ -762,7 +777,7 @@ mod tests {
 
     #[test]
     fn tightening_a_policy_drops_the_connections_it_no_longer_allows() {
-        let cmd = load_command();
+        let cmd = load_command(true);
         // Order matters: flush after the load, so what reconnects is judged
         // against the new rules rather than the old ones.
         let load = cmd.find("nft -f").expect("the ruleset must load");

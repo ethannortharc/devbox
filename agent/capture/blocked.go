@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -28,7 +29,11 @@ const (
 	FlaggedPrefix = "devbox-flagged"
 )
 
-// KmsgPath is the kernel ring buffer, read from the start of what is retained.
+// KmsgPath is the kernel ring buffer.
+//
+// Opened and then seeked to the end: a fresh descriptor starts at the oldest
+// retained record, and replaying those on every restart would report refusals
+// that already happened as though they had just happened.
 const KmsgPath = "/dev/kmsg"
 
 // BlockedPacket is what one nftables log line says about a refused connection.
@@ -47,12 +52,39 @@ type BlockedPacket struct {
 }
 
 // Target renders the destination the way a person would name it.
+//
+// `net.JoinHostPort` rather than concatenation: an IPv6 address contains
+// colons, so `2001:db8::1` + `:443` reads as another IPv6 address rather than
+// as an address and a port. These strings are displayed and used as violation
+// identities, so an ambiguous one is both unreadable and unequal to itself
+// across any code that normalises it.
 func (p BlockedPacket) Target() string {
 	if p.DPort == 0 {
 		return p.Dst
 	}
-	return p.Dst + ":" + strconv.FormatUint(uint64(p.DPort), 10)
+	return net.JoinHostPort(p.Dst, strconv.FormatUint(uint64(p.DPort), 10))
 }
+
+// Flow identifies one connection, for suppressing repeats of it.
+func (p BlockedPacket) Flow() string {
+	return strings.Join([]string{
+		p.Proto,
+		p.Src, strconv.FormatUint(uint64(p.SPort), 10),
+		p.Dst, strconv.FormatUint(uint64(p.DPort), 10),
+	}, "|")
+}
+
+// DedupeWindow is how long one refused flow stays reported.
+//
+// The ruleset logs with `ct state new`, which is not the same as once per
+// connection: a refused TCP handshake never completes, so every retransmitted
+// SYN is still `new` and the kernel logs it again. The rate limit there bounds
+// the journal but not the event count, and the contract these events are read
+// under — one per refused connection — is the agent's to keep.
+//
+// A minute is longer than a TCP SYN retry sequence and short enough that a
+// genuine retry later is reported as what it is.
+const DedupeWindow = time.Minute
 
 // ParseBlocked pulls a devbox log line out of the kernel ring buffer.
 //
@@ -110,6 +142,29 @@ func ParseBlocked(line string) (BlockedPacket, bool) {
 	return pkt, true
 }
 
+// reasonFor explains the refusal in the terms of the posture that caused it.
+//
+// "outside the allowlist" was said for every posture, and it is only true of
+// one. `isolated` makes no allowlist decision at all — it refuses egress, full
+// stop — and `mirror-only` also consults the curated mirrors, so a user
+// reading either explanation would go looking for a list entry that was never
+// consulted.
+func reasonFor(mode string, flagged bool) string {
+	if flagged {
+		return "outside the declared allowlist (posture is open, so not blocked)"
+	}
+	switch mode {
+	case "isolated":
+		return "posture is isolated: no egress"
+	case "mirror-only":
+		return "not in the allowlist or the curated package mirrors"
+	case "":
+		return "refused by the egress policy"
+	default:
+		return "not in the allowlist"
+	}
+}
+
 func parsePort(s string) uint16 {
 	n, err := strconv.ParseUint(s, 10, 16)
 	if err != nil {
@@ -123,12 +178,7 @@ func parsePort(s string) uint16 {
 // `mode` is the posture in force, which the kernel log does not carry — the
 // agent knows it from the policy file it already reads.
 func (p BlockedPacket) Event(boxID, mode string) *event.Event {
-	reason := "outside the allowlist"
-	if p.Flagged {
-		reason = "outside the declared allowlist (posture is open, so not blocked)"
-	}
-
-	ev := policy.Violation(boxID, mode, p.Target(), reason, nil)
+	ev := policy.Violation(boxID, mode, p.Target(), reasonFor(mode, p.Flagged), nil)
 	if p.Flagged {
 		ev.Policy.Verdict = "flag"
 	}
@@ -167,7 +217,17 @@ type Blocked struct {
 	// Open returns the kernel ring buffer. Injectable so the loop can be run
 	// against a fixture; defaults to /dev/kmsg.
 	Open func() (io.ReadCloser, error)
+
+	// now is injectable so the dedupe window is testable without sleeping.
+	now func() time.Time
 }
+
+// maxTrackedFlows caps the dedupe table.
+//
+// Reached only under sustained refusals from many distinct flows, where the
+// sweep below drops everything already outside the window. A cap rather than a
+// hard limit on reporting: the events still go out, only the memory is bounded.
+const maxTrackedFlows = 4096
 
 // Name implements Source.
 func (b *Blocked) Name() string { return "netfilter" }
@@ -192,6 +252,18 @@ func (b *Blocked) Run(ctx context.Context, out chan<- *event.Event) error {
 	}
 	defer r.Close()
 
+	// Start at the end, not at the oldest record the ring buffer still holds.
+	//
+	// A fresh `/dev/kmsg` descriptor begins at the start of what is retained,
+	// so every agent restart re-emitted every refusal still in the buffer.
+	// Neither the time nor the posture is in the log line — both are stamped
+	// on at read — so those replays arrived dated now, labelled with today's
+	// posture, and indistinguishable from fresh ones. A box would appear to
+	// re-violate its policy every time the agent came back.
+	if seeker, ok := r.(io.Seeker); ok {
+		_, _ = seeker.Seek(0, io.SeekEnd)
+	}
+
 	// Reading blocks, and a blocked read does not notice a cancelled context.
 	// Closing the file from the watcher is what unblocks it.
 	go func() {
@@ -199,12 +271,38 @@ func (b *Blocked) Run(ctx context.Context, out chan<- *event.Event) error {
 		_ = r.Close()
 	}()
 
+	// One event per refused connection, which `ct state new` alone does not
+	// give: a handshake that is never answered keeps retransmitting, and every
+	// retransmission is still `new` to conntrack.
+	seen := make(map[string]time.Time)
+	now := b.now
+	if now == nil {
+		now = time.Now
+	}
+
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		pkt, ok := ParseBlocked(scanner.Text())
 		if !ok {
 			continue
 		}
+
+		at := now()
+		flow := pkt.Flow()
+		if last, ok := seen[flow]; ok && at.Sub(last) < DedupeWindow {
+			continue
+		}
+		seen[flow] = at
+		// Bounded: a box under sustained refusal would otherwise accumulate a
+		// map entry per flow for as long as the agent runs.
+		if len(seen) > maxTrackedFlows {
+			for k, t := range seen {
+				if at.Sub(t) >= DedupeWindow {
+					delete(seen, k)
+				}
+			}
+		}
+
 		mode := ""
 		if b.Mode != nil {
 			mode = b.Mode()

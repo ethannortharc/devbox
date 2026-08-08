@@ -123,12 +123,28 @@ in
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
           "CAP_NET_ADMIN"
+          # Reading /dev/kmsg, which is where the firewall's record of a
+          # refused connection lives. Under `kernel.dmesg_restrict=1` — the
+          # default on most distributions — that read needs CAP_SYSLOG, and
+          # without it the netfilter source reports itself unsupported and is
+          # skipped. Silently: the agent keeps running, capture keeps working,
+          # and policy events simply never appear, which looks exactly like a
+          # box that never violated its policy.
+          "CAP_SYSLOG"
         ];
         CapabilityBoundingSet = lib.mkIf cfg.enableEbpf [
           "CAP_BPF"
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
           "CAP_NET_ADMIN"
+          # Reading /dev/kmsg, which is where the firewall's record of a
+          # refused connection lives. Under `kernel.dmesg_restrict=1` — the
+          # default on most distributions — that read needs CAP_SYSLOG, and
+          # without it the netfilter source reports itself unsupported and is
+          # skipped. Silently: the agent keeps running, capture keeps working,
+          # and policy events simply never appear, which looks exactly like a
+          # box that never violated its policy.
+          "CAP_SYSLOG"
         ];
 
         # The agent observes; it has no business writing anywhere except its
