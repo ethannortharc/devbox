@@ -93,6 +93,28 @@ pub fn audits(policy: &Policy) -> bool {
     policy.egress == Posture::Open && policy.alert_on_violation && !policy.allow.is_empty()
 }
 
+/// Does this posture need the agent to turn names into addresses?
+///
+/// Beside [`audits`] because it answers the same kind of question — what a
+/// posture requires — and because `enforce` must not decide it inline: a guard
+/// insists that nothing outside this module interprets `Posture::Open` for
+/// itself, which is what kept observe-and-warn switched on.
+///
+/// `enforces()` is the wrong test, and using it was a regression. `isolated`
+/// enforces and ignores the allowlist entirely, but a policy switched to
+/// `isolated` keeps its old domain entries in `devbox.toml` — so the guard
+/// demanded an agent for a posture with no use for one, aborted on a box
+/// without it, and left the *previous* egress policy in force. Refusing to
+/// tighten a box because a list it will never read is non-empty is the
+/// opposite of what the guard is for.
+pub fn needs_dns_agent(policy: &Policy, domains: &[&str]) -> bool {
+    match policy.egress {
+        Posture::Allowlist => !domains.is_empty(),
+        Posture::MirrorOnly => true,
+        Posture::Isolated | Posture::Open => false,
+    }
+}
+
 /// Prefixes the kernel stamps on a logged packet, and the agent reads back.
 ///
 /// Two, because a refusal and an observation are different things and the
@@ -663,6 +685,36 @@ mod tests {
         // And the verdict chain really denies.
         let egress = nft.split("chain forward_egress {").nth(1).unwrap();
         assert!(egress.split("  }").next().unwrap().contains("drop"));
+    }
+
+    #[test]
+    fn isolated_does_not_wait_on_an_agent_it_will_never_consult() {
+        // Switching a box to `isolated` leaves its old domain entries in
+        // `devbox.toml` — nothing removes them, and `isolated` ignores the
+        // allowlist entirely. Testing `enforces()` therefore demanded a
+        // DNS-capturing agent for a posture with no use for one, so the
+        // command aborted on a box without it and left the *previous*, looser
+        // policy in force. Refusing to tighten a box is the opposite of what
+        // that guard exists to do.
+        let leftovers = ["github.com"];
+        assert!(!needs_dns_agent(
+            &policy(Posture::Isolated, &leftovers),
+            &leftovers
+        ));
+        assert!(!needs_dns_agent(
+            &policy(Posture::Open, &leftovers),
+            &leftovers
+        ));
+
+        // The postures that do read the sets still wait for it.
+        assert!(needs_dns_agent(
+            &policy(Posture::Allowlist, &leftovers),
+            &leftovers
+        ));
+        // mirror-only always does: the curated hosts are domains too.
+        assert!(needs_dns_agent(&policy(Posture::MirrorOnly, &[]), &[]));
+        // An allowlist of CIDRs only needs nobody.
+        assert!(!needs_dns_agent(&policy(Posture::Allowlist, &[]), &[]));
     }
 
     #[test]

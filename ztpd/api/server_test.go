@@ -589,3 +589,47 @@ func TestBootstrapRetriesAnActivationThatFailed(t *testing.T) {
 		t.Error("the restart failure must be reported before the marker is written")
 	}
 }
+
+func TestActivationRecordsTheConfigurationHash(t *testing.T) {
+	t.Parallel()
+
+	// `RecordPush` existed and nothing called it, so every real node kept an
+	// empty ConfigHash: `/status` could not say which configuration a node was
+	// running, and `NeedsPush` had nothing to compare against — the re-push
+	// decision it exists to make was never available.
+	s, h := server(t)
+	walk(t, h, "SN-LEAF-001")
+
+	node, ok := s.registry.Get("SN-LEAF-001")
+	if !ok {
+		t.Fatal("the node should be registered")
+	}
+	want := Hash("hostname leaf1\nrouter bgp 65000\n")
+	if node.ConfigHash != want {
+		t.Errorf("ConfigHash = %q, want the hash of what the server served", node.ConfigHash)
+	}
+
+	// And that is what makes the idempotence decision answerable.
+	if s.registry.NeedsPush("SN-LEAF-001", want) {
+		t.Error("the same configuration must not need re-pushing")
+	}
+	if !s.registry.NeedsPush("SN-LEAF-001", Hash("something else")) {
+		t.Error("a changed configuration must need re-pushing")
+	}
+}
+
+func TestFetchingAConfigIsNotActivatingIt(t *testing.T) {
+	t.Parallel()
+
+	// A node can pull a config and then fail to load it. Recording at the
+	// fetch would claim an activation that never happened, which is the same
+	// class of error as the FRR restart that reported success without one.
+	s, h := server(t)
+	do(t, h, "POST", "/identify", `{"serial":"SN-LEAF-001"}`)
+	do(t, h, "GET", "/config/leaf1", "")
+
+	node, _ := s.registry.Get("SN-LEAF-001")
+	if node.ConfigHash != "" {
+		t.Errorf("ConfigHash = %q after a fetch alone", node.ConfigHash)
+	}
+}

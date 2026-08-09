@@ -37,7 +37,12 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // about. ADR-0012 made those sets optional precisely so unchecking them
     // means something.
     let mut config = DevboxConfig::load_or_default(&state.project_dir);
-    config.sets = Default::default();
+    // Cleared, not defaulted. `SetsSection::default()` *enables* shell, tools,
+    // editor, git, container and ai-code — it is the selection a new box
+    // starts from — so using it to mean "start from nothing" re-enabled every
+    // set the box had turned off. That is the bug this block exists to fix,
+    // implemented by the fix itself.
+    config.sets = crate::sandbox::config::SetsSection::none();
     config.languages = Default::default();
     for set_name in &state.sets {
         let tool_name = set_name.strip_prefix("lang-").unwrap_or(set_name);

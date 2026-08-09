@@ -55,6 +55,21 @@ impl SandboxState {
 
     /// Save state to the sandbox directory.
     pub fn save(&self, state_dir: &Path) -> Result<()> {
+        // The same rule `remove` applies, applied on the way in.
+        //
+        // Guarding only the removal made the two ends disagree: Docker takes a
+        // 65-character name, devbox persisted it, and `destroy` then removed
+        // the container and refused to remove the state — leaving a box that
+        // no longer exists, recorded as existing, blocking recreation under
+        // its own name. A name that cannot be cleaned up must not be written.
+        if !is_safe_name(&self.name) {
+            bail!(
+                "refusing to save sandbox state for {:?}: a box name must be 1-64 \
+                 characters, not a path component, and free of control characters \
+                 — otherwise `devbox destroy` cannot remove it again",
+                self.name
+            );
+        }
         let dir = state_dir.join("sandboxes").join(&self.name);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create state dir: {}", dir.display()))?;

@@ -163,6 +163,11 @@ impl AppState {
         let idle = self.rebuilds_idle.clone();
         let notified = idle.notified();
         tokio::pin!(notified);
+        // Pinning is not registering. `Notify` only holds a permit for a
+        // waiter that has been polled at least once, so a rebuild finishing
+        // between the check below and the first poll notified nobody — and
+        // shutdown then sat out the whole timeout with nothing running.
+        notified.as_mut().enable();
 
         if self.rebuilding.lock().is_ok_and(|s| s.is_empty()) {
             return true;

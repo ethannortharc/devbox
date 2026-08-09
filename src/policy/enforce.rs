@@ -70,8 +70,9 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
     // And only where the ruleset denies at all: under an auditing `open`
     // posture an unpopulated allow set means over-reporting rather than a box
     // cut off, so refusing to install would be the worse answer.
-    let needs_agent =
-        policy.egress.enforces() && (!domains.is_empty() || policy.egress == Posture::MirrorOnly);
+    // Only the postures that actually consult the DNS-derived sets — a
+    // question about what a posture requires, answered where the others are.
+    let needs_agent = super::nftables::needs_dns_agent(policy, &domains);
     let agent_ready = !needs_agent || agent_resolves_dns(runtime, sandbox_name).await;
 
     if !agent_ready {

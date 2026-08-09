@@ -77,6 +77,29 @@ pub struct SetsSection {
     pub ai_infra: bool,
 }
 
+impl SetsSection {
+    /// Every set off.
+    ///
+    /// `Default` is not this: it is the *starting* selection for a new box,
+    /// with shell, tools, editor, git, container and ai-code on. Reaching for
+    /// `Default::default()` to mean "clear" therefore turns them all back on —
+    /// which is how a fix for `devbox upgrade` re-enabling a disabled set came
+    /// to re-enable every disabled set. The two meanings need two names.
+    pub fn none() -> Self {
+        Self {
+            system: false,
+            shell: false,
+            tools: false,
+            editor: false,
+            git: false,
+            container: false,
+            network: false,
+            ai_code: false,
+            ai_infra: false,
+        }
+    }
+}
+
 impl Default for SetsSection {
     fn default() -> Self {
         Self {

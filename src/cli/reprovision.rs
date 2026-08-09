@@ -95,13 +95,26 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Unconditionally: `apply` clears or installs as the posture requires, and
     // an `open` posture that audits requires a table. Testing the posture here
     // meant a reprovision silently dropped observe-and-warn.
-    {
+    let restored = {
         let runtime = manager.runtime_for_sandbox(&updated_state)?;
-        crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await?;
-        println!("Egress posture '{}' re-applied.", saved_policy.egress);
-    }
+        let outcome = crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await;
+        if outcome.is_ok() {
+            println!("Egress posture '{}' re-applied.", saved_policy.egress);
+        }
+        outcome
+    };
 
+    // The bookkeeping happens whether or not the firewall came back.
+    //
+    // The rebuild already ran, and it migrated legacy set names — `ai` became
+    // `ai-code` — so returning the restore error first left `state.json`
+    // naming a set the catalog no longer has, for a box whose active
+    // generation had already changed. Later set operations then reject the
+    // stale name or report a selection the box does not have. The posture
+    // failure is the more urgent news, so it is still what the command exits
+    // with; it is just no longer a reason to lose the record.
     updated_state.save(&manager.state_dir)?;
+    restored?;
 
     // Re-apply the posture read before the rebuild. Provisioning rebuilds the
     // box's network stack, so whatever was enforced is gone; without this the

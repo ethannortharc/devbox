@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::runtime::Mount;
@@ -46,6 +46,23 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
             return manager.attach(name).await;
         }
     }
+
+    // Read the target project's config before anything is disturbed.
+    //
+    // `restore_after_rebuild` at the end is the first thing that opens it, and
+    // by then the box has been reprovisioned or — on Lima — stopped and
+    // restarted, which takes devbox's nftables table with it. A malformed
+    // `devbox.toml` in the directory being moved to therefore failed *after*
+    // the firewall was already gone, leaving a live box with no posture and a
+    // command that reported an error about a file. Discovering it here costs
+    // nothing and changes nothing.
+    crate::sandbox::config::DevboxConfig::load_for_edit(&cwd).with_context(|| {
+        format!(
+            "refusing to move box '{name}' to {}: its devbox.toml cannot be read, \
+             and the move would restart the box before finding that out",
+            cwd.display()
+        )
+    })?;
 
     // Build new mounts for this directory
     let is_overlay = mount_mode == "overlay";

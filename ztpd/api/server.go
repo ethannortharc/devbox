@@ -452,6 +452,41 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, "%v", err)
 		return
 	}
+
+	// Record what was activated, once the node says it took.
+	//
+	// `RecordPush` existed and nothing ever called it, so every real node kept
+	// an empty `ConfigHash`: `/status` could not say which configuration a node
+	// was actually running, and `NeedsPush` had nothing to compare against, so
+	// the re-push decision it exists to make was never available.
+	//
+	// Recorded here rather than from the config fetch, because fetching is not
+	// activating — a node can pull a config and then fail to load it. `healthy`
+	// is the node's acknowledgement that FRR took it. And recorded from the
+	// config *this server served*, not from anything the node reports: the
+	// point is to know what was installed, which the node has no more authority
+	// over than the server does.
+	if state == statemachine.Healthy {
+		if name, _, ok := s.catalog.Lookup(req.Serial); ok {
+			if config, ok := s.catalog.Config(name); ok {
+				if err := s.registry.RecordPush(req.Serial, Hash(config)); err != nil {
+					// Not fatal to the report: the node *is* healthy, and
+					// saying otherwise would be a worse answer than a missing
+					// hash. Worth surfacing, because a registry that cannot
+					// persist is about to lose more than this.
+					httpError(w, http.StatusInternalServerError,
+						"node is healthy but its configuration hash could not be recorded: %v", err)
+					return
+				}
+				// Re-read, so the response carries the hash just stored rather
+				// than the snapshot taken before it.
+				if updated, ok := s.registry.Get(req.Serial); ok {
+					node = &updated
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, node)
 }
 
