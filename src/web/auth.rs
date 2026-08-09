@@ -305,10 +305,23 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         return no_framing(next.run(req).await);
     }
 
-    // The printed URL, spent on the one page that installs the key. Checked
-    // before the key so that re-opening it repairs a browser whose stored key
-    // has gone stale, which is the situation the user is in every time the
+    // The printed URL, spent on the one page that installs the key.
+    //
+    // Before the key check, so that re-opening it repairs a browser whose
+    // stored key has gone stale — the situation every user is in each time the
     // console is relaunched.
+    //
+    // And before the origin checks below, which is the ordering worth
+    // justifying rather than leaving to be re-derived. Those checks refuse a
+    // `cross-site` initiator, and clicking the printed URL out of a chat window
+    // or a webmail tab *is* a cross-site initiator; ordering them first would
+    // refuse the one navigation the whole flow depends on. What makes that safe
+    // is that this branch is already gated on the launch token, and anyone
+    // holding that can mint a key directly — so the guards protect nothing here
+    // that the token has not already given away.
+    //
+    // This is the check that has to be re-examined if the token ever becomes
+    // guessable, cacheable, or reusable across launches.
     if query_token(req.uri().query()).is_some_and(|t| tokens_match(t, &state.token)) {
         return bootstrap(&state.key, safe_target(&strip_token(req.uri())));
     }

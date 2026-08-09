@@ -1249,3 +1249,51 @@ async fn a_foreign_navigation_is_refused_before_it_can_be_shelled() {
         assert!(body_string(res).await.contains("/assets/js/shell.js"));
     }
 }
+
+#[tokio::test]
+async fn the_printed_url_still_works_when_clicked_from_another_site() {
+    // The bootstrap branch deliberately runs ahead of the origin checks, and
+    // this is the case that forces it. Clicking the URL `devbox web` printed
+    // out of a chat window or a webmail tab is a `cross-site` initiator —
+    // which those checks refuse — so ordering them first would refuse the one
+    // navigation the whole flow depends on, and the console would be
+    // unreachable for anyone who did not paste the URL by hand.
+    //
+    // Safe because the branch is already gated on the launch token, and anyone
+    // holding that can mint a key directly.
+    let (_dir, app) = console_with_boxes(&[]);
+
+    for site in ["cross-site", "same-site", "none"] {
+        let clicked = Request::builder()
+            .uri(&format!("/?t={TOKEN}"))
+            .header(header::HOST, "127.0.0.1:7878")
+            .header("sec-fetch-site", site)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(clicked).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "the printed URL must survive a {site} initiator"
+        );
+        assert!(
+            body_string(res)
+                .await
+                .contains(&format!(r#"content="{KEY}""#)),
+            "and must actually install the key"
+        );
+    }
+
+    // The guards still apply to everything the token does not cover: a
+    // cross-site navigation without it gets nothing.
+    let unprivileged = Request::builder()
+        .uri("/")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(unprivileged).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
