@@ -380,9 +380,17 @@ pub async fn apply_selection(
     // aliased package comes from lives on the box, so it is reattached before
     // anything is validated or written — validating the selection first would
     // check the alias against itself and pass.
-    let selection = &selection
-        .clone()
-        .with_sources(sandbox.package_sources.clone());
+    //
+    // Through the same fallback the page used to render the form, not from
+    // `sandbox.package_sources` directly. On a box predating those state
+    // fields the map is empty, so taking it raw discarded the sources the
+    // detail route had just recovered from `devbox.toml` — `my-tf` resolved to
+    // `pkgs.my-tf`, the module filtered it out, and the rebuild reported
+    // success while Terraform vanished from a box whose UI still showed it
+    // selected. Round 30 fixed this on the CLI path and left this one.
+    let project = DevboxConfig::load_or_default(&sandbox.project_dir);
+    let recovered = Selection::from_state_and_project(&sandbox, &project);
+    let selection = &selection.clone().with_sources(recovered.sources);
     selection.validate()?;
 
     // The same guard the CLI applies. Without it the Sets tab pushes new files

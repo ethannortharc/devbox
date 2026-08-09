@@ -67,7 +67,7 @@ fn get_authed(uri: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .body(Body::empty())
         .unwrap()
 }
@@ -77,7 +77,7 @@ fn post_authed(uri: &str) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .body(Body::empty())
         .unwrap()
 }
@@ -87,7 +87,7 @@ fn post_form(uri: &str, form: &str) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(form.to_string()))
         .unwrap()
@@ -131,7 +131,7 @@ async fn launch_token_is_exchanged_for_a_session_cookie() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(cookie.contains(&format!("devbox_console={TOKEN}")));
+    assert!(cookie.contains(&format!("devbox_console_7878={TOKEN}")));
     assert!(cookie.contains("HttpOnly"), "cookie must be HttpOnly");
     assert!(cookie.contains("SameSite=Strict"), "cookie must be strict");
 }
@@ -159,7 +159,7 @@ async fn a_rebound_host_name_is_refused() {
     let req = Request::builder()
         .uri("/")
         .header(header::HOST, "evil.example:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .body(Body::empty())
         .unwrap();
 
@@ -431,7 +431,7 @@ fn put_form(uri: &str, form: &str) -> Request<Body> {
         .method("PUT")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(form.to_string()))
         .unwrap()
@@ -800,7 +800,7 @@ fn get_initiated(uri: &str, site: &str, dest: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console={TOKEN}"))
+        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
         .header("sec-fetch-site", site)
         .header("sec-fetch-dest", dest)
         .body(Body::empty())
@@ -869,4 +869,63 @@ async fn every_served_response_forbids_framing() {
         "frame-ancestors 'none'"
     );
     assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+}
+
+#[tokio::test]
+async fn two_consoles_on_different_ports_do_not_evict_each_other() {
+    // Cookies are not scoped by port, so both consoles shared one name: the
+    // second to open overwrote the first's token, and every request from the
+    // first page came back 401 — a console that had been working and simply
+    // stopped, with nothing on the page able to say why.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    // A cookie minted by a console on another port is not this one's.
+    let other_port = Request::builder()
+        .uri("/")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(header::COOKIE, format!("devbox_console_9999={TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(other_port).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "a cookie for another console must not authenticate this one"
+    );
+
+    // And both can be held at once, because the names differ.
+    let both = Request::builder()
+        .uri("/")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header(
+            header::COOKIE,
+            format!("devbox_console_9999=other; devbox_console_7878={TOKEN}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(both).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "two consoles must be usable in one browser at the same time"
+    );
+}
+
+#[tokio::test]
+async fn the_launch_exchange_names_the_cookie_for_this_console() {
+    // The write side has to agree with the read side, or the exchange hands
+    // back a cookie the next request will not recognise.
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app.oneshot(get(&format!("/?t={TOKEN}"))).await.unwrap();
+
+    let cookie = res
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        cookie.starts_with(&format!("devbox_console_7878={TOKEN}")),
+        "got: {cookie}"
+    );
 }

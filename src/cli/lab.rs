@@ -363,12 +363,28 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
             let args: Vec<&str> = argv.iter().map(String::as_str).collect();
             let result = runtime.exec_cmd(&substrate, &args, false).await?;
             if result.exit_code != 0 {
+                // Two things this has to get right, and got wrong.
+                //
+                // `sets apply` *replaces* a selection, so telling the user to
+                // run it with one set — while parenthetically asking them to
+                // keep the others — hands them a command that removes their
+                // shell, tools, languages and packages. `upgrade` adds. The
+                // same wrong advice was corrected in the preflight message in
+                // round 27 and left standing here.
+                //
+                // And by this point the namespaces exist, so `lab up` cannot
+                // simply be re-run: it fails on the first `ip netns add`. The
+                // teardown has to come first, and saying so is the difference
+                // between a recoverable failure and a lab that has to be
+                // unpicked by hand.
                 bail!(
                     "could not start the routing daemons in namespace '{node}': {}\n\n  \
-                     A routed lab needs FRR on the substrate box — enable the \
-                     `network` set (`devbox sets apply --set network`, keeping \
-                     your other sets) and rebuild, \
-                     then re-run `devbox lab up`.",
+                     A routed lab needs FRR on the substrate box:\n    \
+                     devbox upgrade --name {substrate} --tools network\n\n  \
+                     Then tear this partial lab down before retrying — its \
+                     namespaces already exist, and `lab up` will not recreate \
+                     them:\n    \
+                     devbox lab down\n    devbox lab up",
                     result.stderr.trim()
                 );
             }

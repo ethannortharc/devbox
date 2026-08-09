@@ -114,9 +114,23 @@ pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> R
         //
         // Round 24 moved this whole check ahead of `runtime.create` for the
         // NixOS path and left the Ubuntu path returning `Ok` on the way past.
+        // The reference `nix profile install` is actually given, which is
+        // `installable(name, source)` and not the source alone.
+        //
+        // Checking the source was wrong in both directions. A key like
+        // `bad;name` with source `nixpkgs` passed, because `nixpkgs` is a fine
+        // source — and then provisioning built `nixpkgs#bad;name` and rejected
+        // it after the box existed. Meanwhile `tool = "github:owner/repo"` was
+        // refused here, because a bare flake URL is not an attribute path,
+        // even though provisioning would have appended the key and installed
+        // it happily.
+        //
+        // This is the sentence I wrote on `nixos_attr_path` in round 24 —
+        // validating one string while writing a different one is not
+        // validation — repeated in the branch I added five rounds later.
         let malformed: Vec<&str> = packages
             .iter()
-            .filter(|(_, source)| !is_safe_installable(source))
+            .filter(|(name, source)| !is_safe_installable(&installable(name, source)))
             .map(|(pkg, _)| pkg.as_str())
             .collect();
         if !malformed.is_empty() {
@@ -160,6 +174,30 @@ pub fn check_packages_supported(image: &str, packages: &[(String, String)]) -> R
             "these packages do not name a valid nixpkgs attribute path: {}",
             invalid.join(", ")
         );
+    }
+
+    // And no two of them may resolve to the same attribute.
+    //
+    // `Selection::validate` has refused that since round 29, which is exactly
+    // the problem: creation did not, so a box could be *made* carrying
+    // `terraform = "nixpkgs"` beside `my-tf = "nixpkgs#terraform"`. The guest
+    // table deduplicates, both names persist in state, and then every Sets
+    // operation on that box fails validation — a box created successfully and
+    // unmanageable from the moment it existed, repairable only by hand-editing
+    // its configuration.
+    //
+    // Same rule, both entry points, phrased the same way.
+    let mut by_attr: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for (name, source) in packages {
+        let attr = nixos_attr_path(name, source);
+        if let Some(first) = by_attr.insert(attr, name)
+            && first != name
+        {
+            bail!(
+                "'{first}' and '{name}' both resolve to the nixpkgs attribute \
+                 '{attr}'; drop one of them"
+            );
+        }
     }
     Ok(())
 }
@@ -1656,6 +1694,57 @@ mod tests {
                 "{ok:?} is a real installable reference"
             );
         }
+    }
+
+    #[test]
+    fn the_ubuntu_check_validates_the_reference_that_gets_installed() {
+        // The preflight checked the *source* while provisioning installs
+        // `installable(name, source)`, so it was wrong in both directions.
+        //
+        // This is the sentence written on `nixos_attr_path` in round 24 —
+        // validating one string while writing a different one is not
+        // validation — repeated in the branch added five rounds later.
+
+        // Passed, because `nixpkgs` is a fine source; then provisioning built
+        // `nixpkgs#bad;name` and refused it after the box existed, where the
+        // failure is a warning and state is saved anyway.
+        let smuggled = [("bad;name".to_string(), "nixpkgs".to_string())];
+        assert!(check_packages_supported("ubuntu", &smuggled).is_err());
+
+        // Refused, because a bare flake URL is not an attribute path — even
+        // though provisioning appends the key and installs it happily.
+        let legitimate = [("tool".to_string(), "github:owner/repo".to_string())];
+        assert!(
+            check_packages_supported("ubuntu", &legitimate).is_ok(),
+            "provisioning would install github:owner/repo#tool"
+        );
+    }
+
+    #[test]
+    fn a_box_is_not_created_with_two_names_for_one_attribute() {
+        // `Selection::validate` has refused this since round 29, which is
+        // exactly the problem: creation did not. So a box could be *made*
+        // carrying both — the guest table deduplicates, both names persist in
+        // state, and then every Sets operation on it fails validation. A box
+        // created successfully and unmanageable from the moment it existed.
+        let collide = [
+            ("terraform".to_string(), "nixpkgs".to_string()),
+            ("my-tf".to_string(), "nixpkgs#terraform".to_string()),
+        ];
+        let err = check_packages_supported("nixos", &collide)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("terraform") && err.contains("my-tf"),
+            "the message must name both: {err}"
+        );
+
+        // One name for one attribute is fine, however it is spelled.
+        let fine = [
+            ("ripgrep".to_string(), "nixpkgs".to_string()),
+            ("my-tf".to_string(), "nixpkgs#terraform".to_string()),
+        ];
+        assert!(check_packages_supported("nixos", &fine).is_ok());
     }
 
     #[test]

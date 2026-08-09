@@ -21,8 +21,36 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use super::state::AppState;
 
-/// Name of the session cookie holding the console token.
+/// Base name of the session cookie holding the console token.
 pub const COOKIE_NAME: &str = "devbox_console";
+
+/// The cookie name for the console reached at `host`.
+///
+/// Cookies are not scoped by port. Two consoles bound to different loopback
+/// ports therefore share one cookie under a single name, so opening the second
+/// overwrote the first's token and every request from the first page came back
+/// 401 — a console that had been working and simply stopped, for a reason
+/// nothing on the page could explain.
+///
+/// The port is the only thing that distinguishes them, so it goes in the name.
+/// Derived from the request's `Host` rather than carried in state, because the
+/// middleware already reads that header for the loopback check and the two
+/// answers must describe the same console.
+///
+/// What this does not do is stop the cookie being *sent* to other services on
+/// 127.0.0.1. Nothing can, short of abandoning cookies — and the SSE stream
+/// needs one, because `EventSource` cannot set a header. The token is useless
+/// without the console that minted it, and every other guard here still
+/// applies; this fixes the eviction and narrows the exposure to whatever else
+/// is listening on the very same port.
+pub fn cookie_name(host: &str) -> String {
+    match host.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{COOKIE_NAME}_{port}")
+        }
+        _ => COOKIE_NAME.to_string(),
+    }
+}
 
 /// Query parameter carrying the token on the initial navigation.
 pub const TOKEN_PARAM: &str = "t";
@@ -202,14 +230,17 @@ pub fn is_loopback_host(host: &str) -> bool {
 pub async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
     // Applies to public paths too: even a stylesheet should not be reachable
     // through a rebound hostname, and rejecting early keeps the rule simple.
-    let host_ok = req
+    let host = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(is_loopback_host);
-    if !host_ok {
+        .unwrap_or_default()
+        .to_string();
+    if !is_loopback_host(&host) {
         return wrong_host();
     }
+    // Scoped to this console's port; see `cookie_name`.
+    let cookie = cookie_name(&host);
 
     let path = req.uri().path();
     if is_public(path) {
@@ -221,7 +252,7 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         .headers()
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| cookie_value(h, COOKIE_NAME))
+        .and_then(|h| cookie_value(h, &cookie))
         .is_some_and(|t| tokens_match(t, &state.token));
 
     if cookie_ok {
@@ -250,7 +281,7 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
     if query_token(req.uri().query()).is_some_and(|t| tokens_match(t, &state.token)) {
         let target = strip_token(req.uri());
         let cookie = format!(
-            "{COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict",
+            "{cookie}={}; Path=/; HttpOnly; SameSite=Strict",
             state.token
         );
         return (
