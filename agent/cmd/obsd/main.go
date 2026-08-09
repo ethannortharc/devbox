@@ -228,9 +228,9 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	}
 	policyStamp := policyFingerprint(cfg.policy)
 
-	conn, err := net.Dial("unix", cfg.socket)
+	conn, err := dialCollector(ctx, cfg.socket, out)
 	if err != nil {
-		return fmt.Errorf("connect to the collector at %s: %w", cfg.socket, err)
+		return err
 	}
 	defer conn.Close()
 
@@ -429,6 +429,72 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 		}
 	}
 	return enforcer, nil
+}
+
+// dialCollector waits for the collector rather than letting the unit restart.
+//
+// Exiting here was destructive in a way that is invisible from this line. A
+// restart re-runs `loadEnforcer` with `loadRuleset` true, and that `Load`
+// destroys and rebuilds the nftables table — discarding every address DNS
+// capture had resolved into the allow sets. With the collector down nothing
+// repopulates them, because the agent never reaches its event loop. So systemd
+// restarting every two seconds re-blocked the entire allowlist every two
+// seconds, for as long as the outage lasted, and allowlisted domains simply
+// stopped resolving to anything permitted.
+//
+// The ordering above exists so enforcement does not depend on observability.
+// Reconnecting in-process is what makes that true across an outage instead of
+// only at the first instant of one: the table is loaded once and stays loaded
+// while this waits.
+func dialCollector(ctx context.Context, socket string, out io.Writer) (net.Conn, error) {
+	const (
+		firstWait   = 250 * time.Millisecond
+		longestWait = 5 * time.Second
+		// Long outages must not be silent, and must not be a log flood either.
+		reportEvery = time.Minute
+	)
+
+	wait := firstWait
+	started := time.Now()
+	lastReport := time.Time{}
+
+	for attempt := 1; ; attempt++ {
+		conn, err := net.Dial("unix", socket)
+		if err == nil {
+			if attempt > 1 {
+				fmt.Fprintf(out, "devbox-obsd: collector reachable again after %s\n",
+					time.Since(started).Round(time.Second))
+			}
+			return conn, nil
+		}
+
+		if lastReport.IsZero() || time.Since(lastReport) >= reportEvery {
+			fmt.Fprintf(out,
+				"devbox-obsd: collector at %s is not answering (%v); egress policy stays enforced, retrying\n",
+				socket, err)
+			lastReport = time.Now()
+		}
+
+		select {
+		case <-ctx.Done():
+			// Asked to stop, so report the reason we were waiting rather than
+			// the cancellation — the dial failure is the actionable half.
+			return nil, fmt.Errorf("connect to the collector at %s: %w", socket, err)
+		case <-time.After(wait):
+		}
+		wait = nextBackoff(wait, longestWait)
+	}
+}
+
+// nextBackoff doubles a wait up to a ceiling.
+//
+// Pulled out because `dialCollector` needs a socket nobody is listening on to
+// exercise, and this is the part that can be wrong on its own.
+func nextBackoff(current, ceiling time.Duration) time.Duration {
+	if next := current * 2; next < ceiling {
+		return next
+	}
+	return ceiling
 }
 
 // reloadState is what a reload produces: the new enforcer and the stamp that

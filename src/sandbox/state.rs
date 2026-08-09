@@ -36,7 +36,34 @@ pub struct SandboxState {
     /// `package_pairs` still falls back to the project config.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub package_sources: std::collections::BTreeMap<String, String>,
+    /// Which version of this file's schema wrote it. Zero means "before this
+    /// field existed".
+    ///
+    /// It exists to tell an *absent* field from a legitimately empty one, which
+    /// serde cannot: both arrive as an empty `Vec`. `from_state_and_project`
+    /// used emptiness as its migration signal and so mistook every box that
+    /// genuinely has no custom packages for one predating the field — then
+    /// substituted whatever `devbox.toml` happened to declare. Adding a package
+    /// to the file was enough to make the Sets tab report it as installed
+    /// before anything installed it, and `devbox use`, which repoints a box at
+    /// another project entirely, made the substituted list arbitrary.
+    ///
+    /// A version rather than a bool: the next field added after boxes exist
+    /// faces exactly this question, and answering it needs to know *when* a
+    /// file was written, not merely that it was written recently.
+    #[serde(default)]
+    pub schema: u32,
 }
+
+/// The schema every save stamps.
+///
+/// Bump when a field is added whose absence has to be distinguishable from its
+/// zero value, and record what each version means here.
+///
+/// - 0 — before this marker; `packages` and `package_sources` may be absent
+///   rather than empty.
+/// - 1 — every field written explicitly; empty means empty.
+pub const SCHEMA: u32 = 1;
 
 fn default_image() -> String {
     "nixos".to_string()
@@ -75,8 +102,13 @@ impl SandboxState {
             .with_context(|| format!("Failed to create state dir: {}", dir.display()))?;
 
         let path = dir.join("state.json");
+        // Stamped here rather than trusted from the caller: the guarantee is
+        // "this file was written by code that writes every field", which is a
+        // property of the writer and not of whatever the struct was holding.
+        let mut stamped = self.clone();
+        stamped.schema = SCHEMA;
         let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize sandbox state")?;
+            serde_json::to_string_pretty(&stamped).context("Failed to serialize sandbox state")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write sandbox state: {}", path.display()))?;
         Ok(())
@@ -175,6 +207,7 @@ mod tests {
 
     fn test_state() -> SandboxState {
         SandboxState {
+            schema: SCHEMA,
             package_sources: Default::default(),
             name: "myapp".to_string(),
             runtime: "lima".to_string(),

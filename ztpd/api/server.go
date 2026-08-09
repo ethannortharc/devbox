@@ -301,8 +301,24 @@ hostname "$NAME"
 # The marker is written only after a restart returns success, so a failure
 # leaves it stale and the retry does the work again. That is the whole
 # difference between "the file is in place" and "the daemon has read it".
+#
+# And the marker records that a restart once succeeded, not that FRR is running
+# now. A daemon that crashed or was stopped afterwards leaves the config still
+# matching, so this branch skipped the restart and went straight to
+# verification — which fails, after which every supervisor retry takes the same
+# branch and skips the same restart. The node stayed down permanently, and the
+# only thing that would have freed it was a config change nobody had a reason
+# to make.
+#
+# Liveness is asked in the same terms the verification below uses: whether
+# vtysh gets an answer. A daemon that cannot answer cannot be verified either,
+# so the two agree by construction rather than by two people remembering to
+# keep them in step.
 ACTIVATED=/etc/frr/.devbox-activated
-if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED"; then
+frr_answers() {
+  [ -n "$(vtysh -c 'show bgp summary' 2>/dev/null || true)" ]
+}
+if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED" && frr_answers; then
   rm -f /tmp/frr.conf.new
   report verifying
 else

@@ -591,6 +591,7 @@ mod tests {
 
     fn state() -> SandboxState {
         SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
             package_sources: Default::default(),
             name: "myapp".into(),
             runtime: "lima".into(),

@@ -98,16 +98,25 @@ impl Selection {
     /// checkbox uninstalled every custom package the box had, silently and
     /// permanently.
     ///
-    /// Empty state with a non-empty project file is the migration case and the
-    /// only case this covers. A box that genuinely has no packages and a
-    /// project that declares none look identical here and behave identically
-    /// either way; a box whose packages were deliberately removed has them
-    /// removed from `devbox.toml` too, because that is the file `apply` writes
-    /// back.
+    /// Only a file written before the fields existed is treated as migrating,
+    /// which `schema` is what makes knowable.
+    ///
+    /// Emptiness alone was the test, and it was wrong in both directions of the
+    /// ordinary case. This argued that a box whose packages were deliberately
+    /// removed has them removed from `devbox.toml` too, "because that is the
+    /// file `apply` writes back" — true only while the box and the file stay
+    /// paired and in step. Neither holds. Adding a package to `devbox.toml` and
+    /// not yet applying it is the normal way to install one, and in that window
+    /// a box with genuinely no packages met the test and the Sets tab reported
+    /// the new package as already installed. `devbox use` breaks the pairing
+    /// outright: it repoints a box at another project, whose `devbox.toml` the
+    /// box has never seen, and the substituted list then belongs to something
+    /// else entirely. Either way an unrelated Sets apply installs it.
     pub fn from_state_and_project(state: &SandboxState, project: &DevboxConfig) -> Self {
         let langs = state.languages.iter().map(|l| format!("lang-{l}"));
 
-        let migrating = state.packages.is_empty() && !project.custom_packages.is_empty();
+        let migrating =
+            state.schema < 1 && state.packages.is_empty() && !project.custom_packages.is_empty();
         let (packages, sources): (Vec<String>, BTreeMap<String, String>) = if migrating {
             (
                 project.custom_packages.keys().cloned().collect(),
@@ -638,6 +647,8 @@ mod tests {
             .insert("my-tf".into(), "nixpkgs#terraform".into());
 
         let legacy = SandboxState {
+            // Written before the marker: this is the migration case.
+            schema: 0,
             name: "old".into(),
             runtime: "docker".into(),
             project_dir: "/tmp/p".into(),
@@ -666,6 +677,27 @@ mod tests {
         };
         let sel = Selection::from_state_and_project(&current, &project);
         assert!(sel.packages.contains("fd"));
+
+        // And the case the marker exists to separate: a box written by current
+        // code that genuinely has no custom packages, whose project file does.
+        //
+        // Emptiness alone read this as a migration and handed back the
+        // project's list, so the everyday act of adding a package to
+        // `devbox.toml` before applying it made the Sets tab report it as
+        // already installed — and an unrelated apply then installed it. After
+        // `devbox use`, which repoints a box at a project it has never seen,
+        // the substituted list belonged to something else entirely.
+        let empty_but_current = SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
+            packages: vec![],
+            ..legacy.clone()
+        };
+        let sel = Selection::from_state_and_project(&empty_but_current, &project);
+        assert!(
+            sel.packages.is_empty(),
+            "a current box with no packages must not inherit the project's: {:?}",
+            sel.packages
+        );
         assert!(
             !sel.packages.contains("ripgrep"),
             "state wins once it has an answer: {:?}",
@@ -782,6 +814,7 @@ mod tests {
     #[test]
     fn round_trips_through_sandbox_state() {
         let state = SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
             package_sources: Default::default(),
             name: "x".into(),
             runtime: "docker".into(),

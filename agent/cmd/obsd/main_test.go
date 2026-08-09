@@ -126,3 +126,41 @@ func TestSourceSelection(t *testing.T) {
 		t.Error("eBPF capture should refuse rather than silently fall back")
 	}
 }
+
+// TestBackoffClimbsToACeiling covers the part of `dialCollector` that can be
+// wrong on its own.
+//
+// The loop itself needs a socket nobody is listening on and a clock, and the
+// defect it exists to prevent is not in the loop: it is that exiting on a dial
+// failure let systemd restart the agent, and a restart re-runs the ruleset
+// load, which destroys the table and every address DNS capture had resolved
+// into the allow sets. Nothing repopulated them, because the agent never
+// reached its event loop — so the whole allowlist was re-blocked every two
+// seconds for the length of the outage.
+func TestBackoffClimbsToACeiling(t *testing.T) {
+	t.Parallel()
+
+	const ceiling = 5 * time.Second
+	wait := 250 * time.Millisecond
+	seen := []time.Duration{wait}
+	for i := 0; i < 10; i++ {
+		wait = nextBackoff(wait, ceiling)
+		seen = append(seen, wait)
+	}
+
+	for i := 1; i < len(seen); i++ {
+		if seen[i] < seen[i-1] {
+			t.Errorf("backoff went backwards: %v then %v", seen[i-1], seen[i])
+		}
+		if seen[i] > ceiling {
+			t.Errorf("backoff %v exceeded the ceiling %v", seen[i], ceiling)
+		}
+	}
+	if got := seen[len(seen)-1]; got != ceiling {
+		t.Errorf("backoff should settle at the ceiling, got %v", got)
+	}
+	// A ceiling below the current wait must clamp down, not run away.
+	if got := nextBackoff(time.Hour, ceiling); got != ceiling {
+		t.Errorf("nextBackoff(1h, 5s) = %v, want the ceiling", got)
+	}
+}

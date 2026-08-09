@@ -633,3 +633,41 @@ func TestFetchingAConfigIsNotActivatingIt(t *testing.T) {
 		t.Errorf("ConfigHash = %q after a fetch alone", node.ConfigHash)
 	}
 }
+
+// TestActivationChecksTheDaemonIsActuallyRunning guards the difference between
+// "this config was activated once" and "FRR is running now".
+//
+// The marker records the former. A daemon that crashed afterwards left the
+// config still matching, so the restart was skipped and verification ran
+// against nothing — and every supervisor retry took the same branch and
+// skipped the same restart. The node stayed down permanently, and only a
+// config change nobody had a reason to make would have freed it.
+func TestActivationChecksTheDaemonIsActuallyRunning(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	script := rec.Body.String()
+
+	if !strings.Contains(script, "frr_answers") {
+		t.Error("the unchanged-config branch does not check that FRR is running")
+	}
+	// Liveness must be asked in the same terms the verification uses, or the
+	// two can disagree about what "up" means.
+	if !strings.Contains(script, "frr_answers() {") {
+		t.Error("frr_answers is referenced but never defined")
+	}
+	idx := strings.Index(script, "cmp -s /tmp/frr.conf.new")
+	if idx < 0 {
+		t.Fatal("the activation comparison is gone")
+	}
+	branch := script[idx:]
+	if end := strings.Index(branch, "\n"); end > 0 {
+		branch = branch[:end]
+	}
+	if !strings.Contains(branch, "frr_answers") {
+		t.Errorf("the skip-restart branch must also require a live daemon: %q", branch)
+	}
+}

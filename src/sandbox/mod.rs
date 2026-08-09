@@ -74,6 +74,29 @@ impl SandboxManager {
     ) -> Result<()> {
         let cwd = env::current_dir().context("Cannot determine current directory")?;
 
+        // Refuse a name that cannot be saved, before anything is made under it.
+        //
+        // `save` enforces this, and `save` runs after `runtime.create`. Docker
+        // accepts a 65-character name and devbox does not, so a name of that
+        // length built the container and then failed to record it — leaving a
+        // live runtime object with no state file. The retry then passed
+        // `sandbox_exists`, because nothing was written, and collided with the
+        // object still sitting there; `destroy` could not find it either,
+        // because it looks the name up in state. The box had to be removed with
+        // the runtime's own CLI.
+        //
+        // This is the third check to be moved above `runtime.create` for the
+        // same reason (see `check_packages_supported` below). The rule they all
+        // follow: anything that depends only on the arguments has no business
+        // running after the side effect.
+        if !crate::sandbox::state::is_safe_name(name) {
+            bail!(
+                "Refusing to create sandbox {name:?}: a box name must be 1-64 characters, \
+                 not a path component, and free of control characters — otherwise \
+                 `devbox destroy` cannot remove it again"
+            );
+        }
+
         // Check for name conflicts
         if self.sandbox_exists(name) {
             bail!(
@@ -193,6 +216,7 @@ impl SandboxManager {
 
         // Save state
         let state = SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
             name: name.to_string(),
             runtime: runtime.name().to_string(),
             project_dir: cwd,
@@ -774,6 +798,46 @@ mod tests {
         assert!(
             !tmp.path().join("boxes").join("t").exists(),
             "no state should be written for a box that was refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsaveable_name_is_refused_before_the_box_is_made() {
+        // The third check to need moving above `runtime.create`, and the same
+        // shape as the two before it: `save` enforces the 64-character limit
+        // and `save` runs last, so Docker happily built a container under a
+        // 65-character name that devbox then refused to record. That leaves a
+        // live runtime object with no state file — invisible to
+        // `sandbox_exists`, so the retry collides with it, and invisible to
+        // `destroy`, which looks names up in state.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: tmp.path().to_path_buf(),
+        };
+        let runtime = RecordingRuntime {
+            created: AtomicBool::new(false),
+        };
+
+        let too_long = "n".repeat(65);
+        let err = manager
+            .create_sandbox(
+                &too_long,
+                &runtime,
+                &DevboxConfig::default(),
+                &[],
+                &HashMap::new(),
+                None,
+                false,
+            )
+            .await
+            .expect_err("a name that cannot be saved must not be created");
+        assert!(
+            err.to_string().contains("1-64"),
+            "the refusal should say what the limit is: {err}"
+        );
+        assert!(
+            !runtime.created.load(Ordering::SeqCst),
+            "the runtime object was made under a name nothing can clean up"
         );
     }
 
