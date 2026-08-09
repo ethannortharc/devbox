@@ -228,28 +228,29 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	}
 	policyStamp := policyFingerprint(cfg.policy)
 
-	conn, err := dialCollector(ctx, cfg.socket, out)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	domains := make([]string, 0, len(source.Domains()))
 	for _, d := range source.Domains() {
 		domains = append(domains, string(d))
 	}
-
-	if err := transport.Handshake(conn, transport.Hello{
+	hello := transport.Hello{
 		Version: buildinfo.Version,
 		BoxID:   cfg.boxID,
 		Capture: domains,
 		EBPF:    !cfg.noEBPF && cfg.fixture == "",
-	}); err != nil {
-		return err
 	}
-	fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
-		cfg.socket, cfg.boxID, source.Name())
 
+	// Capture starts before the collector is reachable, and keeps running when
+	// it goes away.
+	//
+	// Waiting for the collector first was the remaining half of the same
+	// defect. Moving the ruleset load ahead of the dial stopped the restart
+	// loop from destroying the nftables table every two seconds, but the sets
+	// it creates start *empty* and only DNS answers fill them — and DNS answers
+	// arrive through this loop. An allowlist posture therefore still blocked
+	// every allowlisted domain for the length of any collector outage, which is
+	// precisely the harm the earlier fix was written to prevent.
+	//
+	// Enforcement depends on capture. Capture does not depend on the transport.
 	events := make(chan *event.Event, cfg.queue)
 	srcCtx, cancelSrc := context.WithCancel(ctx)
 	defer cancelSrc()
@@ -272,12 +273,116 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
 	}
 
+	// The transport is dialed off to one side, so a collector that is not
+	// listening cannot hold up the loop above.
+	var conn net.Conn
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	linked := make(chan link, 1)
+	dialing := false
+	connect := func() {
+		if dialing {
+			return
+		}
+		dialing = true
+		go func() {
+			c, err := dialCollector(ctx, cfg.socket, out)
+			if err != nil {
+				// Only returns an error once we are shutting down.
+				linked <- link{}
+				return
+			}
+			if err := transport.Handshake(c, hello); err != nil {
+				// Not an outage, and not retryable. A refused handshake is the
+				// collector saying this agent is not who it claims to be —
+				// wrong box id, wrong protocol version — and retrying that
+				// forever would turn a loud misconfiguration into a silent one.
+				c.Close()
+				linked <- link{fatal: fmt.Errorf("handshake with the collector: %w", err)}
+				return
+			}
+			fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
+				cfg.socket, cfg.boxID, source.Name())
+			linked <- link{conn: c}
+		}()
+	}
+	connect()
+
+	// Events captured while the collector is unreachable are held, not thrown
+	// away and not allowed to stall capture.
+	//
+	// Counting them instead lost the ordinary case to fix the rare one: the
+	// collector is normally listening at startup, and capture now begins before
+	// the dial completes, so every event in that window went missing. Bounded
+	// by the same queue depth as the channel — beyond that the oldest go, which
+	// is the honest trade for a box that has been talking to nothing for a long
+	// time — and blocking is not an option, because backpressure here reaches
+	// the source and takes enforcement down with the transport.
+	pending := make([][]byte, 0, cfg.queue)
+	dropped := 0
 	sent := 0
+	hold := func(payload []byte) {
+		if len(pending) >= cfg.queue {
+			pending = pending[1:]
+			dropped++
+		}
+		pending = append(pending, payload)
+	}
+	defer func() {
+		if dropped > 0 {
+			fmt.Fprintf(out, "devbox-obsd: %d event(s) dropped while the collector was away\n", dropped)
+		}
+	}()
+
+	// Deliver everything still held, waiting for the collector if need be.
+	//
+	// The source finishing is not a reason to discard what it produced, and
+	// with `-once` this is the only chance — the process is about to exit. A
+	// fixture replay drains in milliseconds, far quicker than a dial and a
+	// handshake, so without this the common case was an agent that captured
+	// every event and sent none of them.
+	drain := func() error {
+		for len(pending) > 0 {
+			if conn == nil {
+				select {
+				case l := <-linked:
+					dialing = false
+					if l.fatal != nil {
+						return l.fatal
+					}
+					if l.conn == nil {
+						return nil // shutting down; nothing to deliver to
+					}
+					conn = l.conn
+				case <-ctx.Done():
+					return nil
+				}
+				continue
+			}
+			if err := transport.WriteFrame(conn, pending[0]); err != nil {
+				conn.Close()
+				conn = nil
+				connect()
+				continue
+			}
+			pending = pending[1:]
+			sent++
+		}
+		return nil
+	}
+
 	for {
 		select {
 		case e, ok := <-events:
 			if !ok {
 				// Source finished and the channel drained.
+				if err := drain(); err != nil {
+					cancelSrc()
+					return err
+				}
 				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
 				err := <-srcDone
 				if err != nil || cfg.once {
@@ -320,11 +425,44 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				fmt.Fprintf(os.Stderr, "devbox-obsd: skipping an event: %v\n", err)
 				continue
 			}
+			if conn == nil {
+				// Enforcement already happened above; the reporting waits.
+				hold(payload)
+				continue
+			}
 			if err := transport.WriteFrame(conn, payload); err != nil {
-				cancelSrc()
-				return fmt.Errorf("stream to the collector: %w", err)
+				// Not fatal any more. Returning here ended the process, and
+				// systemd restarting it re-ran the ruleset load — which wipes
+				// the allow sets this agent had spent the session filling.
+				fmt.Fprintf(out, "devbox-obsd: lost the collector (%v); capture and enforcement continue\n", err)
+				conn.Close()
+				conn = nil
+				hold(payload)
+				connect()
+				continue
 			}
 			sent++
+
+		case l := <-linked:
+			dialing = false
+			if l.fatal != nil {
+				cancelSrc()
+				return l.fatal
+			}
+			conn = l.conn
+			// Deliver what was captured while it was away, oldest first, before
+			// anything newer.
+			for len(pending) > 0 && conn != nil {
+				if err := transport.WriteFrame(conn, pending[0]); err != nil {
+					fmt.Fprintf(out, "devbox-obsd: lost the collector again (%v)\n", err)
+					conn.Close()
+					conn = nil
+					connect()
+					break
+				}
+				pending = pending[1:]
+				sent++
+			}
 
 		case <-ctx.Done():
 			cancelSrc()
@@ -429,6 +567,17 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 		}
 	}
 	return enforcer, nil
+}
+
+// link is the result of one attempt to reach the collector.
+//
+// `fatal` separates "not listening yet" from "refused us". The first is an
+// outage and is retried; the second is a misconfiguration — a wrong box id, a
+// protocol version the collector will never accept — and retrying it forever
+// would turn a loud failure into a silent one.
+type link struct {
+	conn  net.Conn
+	fatal error
 }
 
 // dialCollector waits for the collector rather than letting the unit restart.

@@ -60,14 +60,31 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // them. Clearing first is what makes the box its own authority.
     config.custom_packages.clear();
     let project = DevboxConfig::load_or_default(&state.project_dir);
-    for pkg in &state.packages {
-        // The source the box recorded comes first. After `devbox use` the
-        // project file has never heard of an aliased package, and falling
-        // straight through to `nixpkgs` is how the alias is lost.
-        let source = state
-            .package_sources
+
+    // Read through the selection rather than off `state.packages` directly,
+    // because a v3 box has no `packages` at all and the difference is
+    // destructive here.
+    //
+    // The loop this replaces iterated an empty vector for such a box, so the
+    // rebuild dropped every custom package it had. That was survivable while
+    // the absence was still legible: `from_state_and_project` would read them
+    // back out of `devbox.toml` on the next render. It stopped being
+    // survivable when `save` below began stamping `schema`, which is the very
+    // signal that fallback keys on — an upgrade would have recorded "this file
+    // is current and has no packages" about a box whose packages it had just
+    // discarded, and nothing could have recovered them afterwards.
+    //
+    // The marker means "every field was written by code that writes them all".
+    // A path that does not populate them must not stamp it.
+    let selection = packages_to_carry(&state, &project);
+    for pkg in &selection.packages {
+        // The source the box recorded comes first, and the selection has
+        // already applied that precedence. After `devbox use` the project file
+        // has never heard of an aliased package, and falling straight through
+        // to `nixpkgs` is how the alias is lost.
+        let source = selection
+            .sources
             .get(pkg)
-            .or_else(|| project.custom_packages.get(pkg))
             .cloned()
             .unwrap_or_else(|| "nixpkgs".to_string());
         config.custom_packages.insert(pkg.clone(), source);
@@ -97,6 +114,14 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     let mut updated_state = state;
     updated_state.sets = config.active_sets();
     updated_state.languages = config.active_languages();
+    // And with the packages that were just built into the guest.
+    //
+    // Recovering them above only fixed the rebuild; the state file is what the
+    // next render reads. Saving the old, empty vector under a stamped schema
+    // would have told every later caller that a box with packages had none —
+    // authoritatively, which is worse than the silence it replaced.
+    updated_state.packages = selection.packages.iter().cloned().collect();
+    updated_state.package_sources = selection.sources.clone();
     updated_state.save(&manager.state_dir)?;
 
     // Now the restore result. State is recorded either way — the rebuild
@@ -106,4 +131,101 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
 
     println!("Upgrade complete.");
     Ok(())
+}
+
+/// The packages an upgrade must carry into the rebuild *and* back into state.
+///
+/// A named function because the defect it prevents is one of omission: the loop
+/// that reads them and the state that records them are seventy lines apart, and
+/// the version that read `state.packages` directly was correct-looking at both
+/// ends while silently discarding a v3 box's packages in between.
+fn packages_to_carry(
+    state: &crate::sandbox::state::SandboxState,
+    project: &DevboxConfig,
+) -> crate::nix::compose::Selection {
+    crate::nix::compose::Selection::from_state_and_project(state, project)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::state::{SCHEMA, SandboxState};
+
+    fn v3_box() -> SandboxState {
+        SandboxState {
+            // No `packages`, no `schema` — a box created before either existed.
+            schema: 0,
+            packages: vec![],
+            package_sources: Default::default(),
+            name: "old".into(),
+            runtime: "docker".into(),
+            project_dir: "/tmp/p".into(),
+            created_at: String::new(),
+            mount_mode: "overlay".into(),
+            sets: vec!["system".into()],
+            languages: vec![],
+            image: "nixos".into(),
+        }
+    }
+
+    #[test]
+    fn upgrading_a_v3_box_carries_the_packages_it_had() {
+        let mut project = DevboxConfig::default();
+        project
+            .custom_packages
+            .insert("ripgrep".into(), "nixpkgs".into());
+        project
+            .custom_packages
+            .insert("my-tf".into(), "nixpkgs#terraform".into());
+
+        let carried = packages_to_carry(&v3_box(), &project);
+        assert!(
+            carried.packages.contains("ripgrep"),
+            "{:?}",
+            carried.packages
+        );
+        assert_eq!(
+            carried.attr_path("my-tf"),
+            "terraform",
+            "the alias's source has to survive, or the rebuild fails"
+        );
+    }
+
+    #[test]
+    fn what_is_carried_is_what_gets_persisted() {
+        // The half that made this permanent. Reading the packages fixed the
+        // rebuild; writing the *old, empty* vector under a stamped schema still
+        // told every later caller that a box with packages had none — and the
+        // stamp is exactly what the migration fallback keys on, so nothing
+        // could recover them afterwards.
+        let mut project = DevboxConfig::default();
+        project
+            .custom_packages
+            .insert("ripgrep".into(), "nixpkgs".into());
+
+        let carried = packages_to_carry(&v3_box(), &project);
+
+        let mut updated = v3_box();
+        updated.packages = carried.packages.iter().cloned().collect();
+        updated.package_sources = carried.sources.clone();
+
+        let dir = tempfile::tempdir().unwrap();
+        updated.save(dir.path()).unwrap();
+        let reloaded = SandboxState::load(dir.path(), "old").unwrap();
+
+        assert_eq!(reloaded.schema, SCHEMA, "saving stamps the schema");
+        assert!(
+            reloaded.packages.contains(&"ripgrep".to_string()),
+            "so the packages must be there to be stamped over: {:?}",
+            reloaded.packages
+        );
+
+        // With the state now authoritative, the fallback correctly stops
+        // firing — which is only safe because the packages really are recorded.
+        let alone = crate::nix::compose::Selection::from_state_and_project(
+            &reloaded,
+            &DevboxConfig::default(),
+        );
+        assert!(alone.packages.contains("ripgrep"));
+    }
 }

@@ -824,6 +824,27 @@ fn project_key(path: &std::path::Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Take a lock from async code without blocking the runtime.
+///
+/// These are OS file locks, and acquiring a held one *blocks the calling
+/// thread* until it is released. In the console that thread is a Tokio worker
+/// and the holder is another request which is itself `await`ing — so a
+/// single-worker runtime deadlocks on the first overlap, and a multi-worker one
+/// starves into the same state once enough saves overlap. Neither recovers,
+/// because the holder can only finish on a worker that is now blocked waiting
+/// for it.
+///
+/// The CLI does not need this and does not use it: there, blocking the one
+/// command until the lock is free is exactly the intended behaviour.
+pub async fn lock_blocking<F>(acquire: F) -> Result<RebuildLock>
+where
+    F: FnOnce() -> Result<RebuildLock> + Send + 'static,
+{
+    tokio::task::spawn_blocking(acquire)
+        .await
+        .context("the task waiting for a devbox lock was cancelled")?
+}
+
 pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<RebuildLock> {
     let dir = state_dir.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;

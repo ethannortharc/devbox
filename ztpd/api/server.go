@@ -217,6 +217,16 @@ type StatusRequest struct {
 	Serial string `json:"serial"`
 	State  string `json:"state"`
 	Reason string `json:"reason,omitempty"`
+	// ConfigHash is the hash of the config the node actually activated.
+	//
+	// Reported by the node rather than re-read here, because "what this server
+	// would serve now" and "what that node installed" are different facts and
+	// only the second is being recorded. They diverge whenever the rendered
+	// source of truth changes between a fetch and the report that follows it —
+	// a ztpd restart with a node retrying its report is enough — and the
+	// server's answer is then confidently wrong: `/status` names a config the
+	// node never saw and `NeedsPush` says nothing needs pushing.
+	ConfigHash string `json:"config_hash,omitempty"`
 }
 
 // bootstrap serves the shell script DHCP option 67 points at.
@@ -254,7 +264,7 @@ SERIAL="$(echo "$SERIAL" | tr -cd 'A-Za-z0-9._:-' | cut -c1-128)"
 report() {
   _state="$1"; _reason="${2:-}"; _try=0
   while [ "$_try" -lt 12 ]; do
-    if wget -q -O- --post-data="{\"serial\":\"$SERIAL\",\"state\":\"$_state\",\"reason\":\"$_reason\"}" \
+    if wget -q -O- --post-data="{\"serial\":\"$SERIAL\",\"state\":\"$_state\",\"reason\":\"$_reason\",\"config_hash\":\"${CFG_HASH:-}\"}" \
       --header='Content-Type: application/json' "$ZTP/status" >/dev/null 2>&1; then
       return 0
     fi
@@ -336,6 +346,17 @@ else
   cp /etc/frr/frr.conf "$ACTIVATED"
   report verifying
 fi
+
+# What was actually activated, for the report below to carry.
+#
+# The server used to re-read its own catalog when the node said healthy, which
+# answers "what would I serve now" rather than "what did that node install".
+# The two differ across a source-of-truth change, and a node retrying its report
+# across a ztpd restart is exactly when they do.
+#
+# The server truncates sha256 to eight bytes, which is the first sixteen hex
+# characters of what sha256sum prints.
+CFG_HASH="$(sha256sum /etc/frr/frr.conf 2>/dev/null | cut -c1-16)"
 
 # Self-check, then phone home.
 #
@@ -483,9 +504,21 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 	// point is to know what was installed, which the node has no more authority
 	// over than the server does.
 	if state == statemachine.Healthy {
-		if name, _, ok := s.catalog.Lookup(req.Serial); ok {
-			if config, ok := s.catalog.Config(name); ok {
-				if err := s.registry.RecordPush(req.Serial, Hash(config)); err != nil {
+		activated := strings.TrimSpace(req.ConfigHash)
+		if activated == "" {
+			// A node from before the field existed. Re-reading the catalog is
+			// what this did unconditionally, and it is wrong exactly when it
+			// matters — but a missing hash is worse than a stale one, so it
+			// stays as the fallback and only as the fallback.
+			if name, _, ok := s.catalog.Lookup(req.Serial); ok {
+				if config, ok := s.catalog.Config(name); ok {
+					activated = Hash(config)
+				}
+			}
+		}
+		if activated != "" {
+			{
+				if err := s.registry.RecordPush(req.Serial, activated); err != nil {
 					// Not fatal to the report: the node *is* healthy, and
 					// saying otherwise would be a worse answer than a missing
 					// hash. Worth surfacing, because a registry that cannot

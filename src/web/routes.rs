@@ -576,10 +576,18 @@ async fn put_policy(
         Ok(s) => s.project_dir,
         Err(e) => return not_found(&name, &e),
     };
-    let _edit = match build::lock_project_config(&state.manager.state_dir, &project_dir) {
-        Ok(lock) => lock,
-        Err(e) => return server_error("failed to claim devbox.toml", &e),
-    };
+    // Off the worker. Holding this across the apply below is deliberate; taking
+    // it *on a Tokio worker* is what made two overlapping saves able to wedge
+    // the console permanently — see `build::lock_blocking`.
+    let lock_dir = state.manager.state_dir.clone();
+    let lock_project = project_dir.clone();
+    let _edit =
+        match build::lock_blocking(move || build::lock_project_config(&lock_dir, &lock_project))
+            .await
+        {
+            Ok(lock) => lock,
+            Err(e) => return server_error("failed to claim devbox.toml", &e),
+        };
 
     if let Err(e) = service::save_policy(&state.manager, &name, updated) {
         return server_error("failed to save the policy", &e);

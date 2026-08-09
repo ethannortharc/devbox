@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -669,5 +670,137 @@ func TestActivationChecksTheDaemonIsActuallyRunning(t *testing.T) {
 	}
 	if !strings.Contains(branch, "frr_answers") {
 		t.Errorf("the skip-restart branch must also require a live daemon: %q", branch)
+	}
+}
+
+// TestFrrLivenessCheckDistinguishesADeadDaemon runs the predicate, rather than
+// only asserting it is present in the script.
+//
+// The check is the difference between "this config was activated once" and "FRR
+// is running now", and getting it backwards is silent in the worst direction: a
+// predicate that always says yes restores the permanent-outage bug exactly,
+// with the guard sitting right there looking correct.
+//
+// `vtysh` is stubbed on PATH, so this exercises the real shell the nodes run
+// without needing FRR.
+func TestFrrLivenessCheckDistinguishesADeadDaemon(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	script := rec.Body.String()
+
+	start := strings.Index(script, "frr_answers() {")
+	if start < 0 {
+		t.Fatal("frr_answers is not in the bootstrap script")
+	}
+	end := strings.Index(script[start:], "\n}")
+	if end < 0 {
+		t.Fatal("frr_answers is never closed")
+	}
+	fn := script[start : start+end+2]
+
+	cases := []struct {
+		name string
+		stub string
+		want string
+	}{
+		{"a daemon that answers", "#!/bin/sh\necho 'BGP router identifier 10.0.0.1'\n", "UP"},
+		{"a daemon that is gone", "#!/bin/sh\nexit 1\n", "DOWN"},
+		// The one a naive `vtysh ... >/dev/null; echo $?` check gets wrong:
+		// exit 0 with no output is not a running daemon.
+		{"a vtysh that says nothing", "#!/bin/sh\nexit 0\n", "DOWN"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "vtysh"), []byte(tc.stub), 0o755); err != nil {
+				t.Fatalf("write stub: %v", err)
+			}
+			cmd := exec.Command("sh", "-c", fn+"\nif frr_answers; then echo UP; else echo DOWN; fi")
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("running frr_answers: %v\n%s", err, out)
+			}
+			if got := strings.TrimSpace(string(out)); got != tc.want {
+				t.Errorf("frr_answers reported %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthyRecordsWhatTheNodeActivated keeps the recorded hash tied to the
+// config that was installed, not to whatever the catalog holds at report time.
+//
+// Those are different facts. They come apart whenever the rendered source of
+// truth changes between a node's fetch and the report that follows it — a ztpd
+// restart with a node retrying its report is enough — and the server's answer
+// was then confidently wrong in both directions: `/status` named a config the
+// node had never seen, and `NeedsPush` said nothing needed pushing.
+func TestHealthyRecordsWhatTheNodeActivated(t *testing.T) {
+	t.Parallel()
+
+	s, h := server(t)
+	serial := "SN-LEAF-001"
+
+	activated := Hash("hostname leaf1\nrouter bgp 65000\n")
+
+	rec := do(t, h, "POST", "/identify", `{"serial":"`+serial+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("identify: %d %s", rec.Code, rec.Body)
+	}
+	for _, state := range []string{"rendering", "pushing", "verifying"} {
+		if rec := do(t, h, "POST", "/status",
+			`{"serial":"`+serial+`","state":"`+state+`"}`); rec.Code != http.StatusOK {
+			t.Fatalf("status %s: %d %s", state, rec.Code, rec.Body)
+		}
+	}
+
+	// The source of truth moves while the node is mid-report — the ztpd
+	// restart case, compressed.
+	s.catalog.(*MapCatalog).Configs["leaf1"] = "hostname leaf1\nrouter bgp 65999\n"
+	moved := Hash("hostname leaf1\nrouter bgp 65999\n")
+	if activated == moved {
+		t.Fatal("fixture is not exercising a change")
+	}
+
+	if rec := do(t, h, "POST", "/status",
+		`{"serial":"`+serial+`","state":"healthy","config_hash":"`+activated+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("healthy: %d %s", rec.Code, rec.Body)
+	}
+
+	node, ok := s.registry.Get(serial)
+	if !ok {
+		t.Fatal("node vanished")
+	}
+	if node.ConfigHash != activated {
+		t.Errorf("recorded %q, want the activated %q (the catalog now holds %q)",
+			node.ConfigHash, activated, moved)
+	}
+	// And the whole point of recording it: the server must now know a push is
+	// owed, rather than reporting the fabric converged on a config nobody ran.
+	if !s.registry.NeedsPush(serial, moved) {
+		t.Error("a node running the previous config must still need a push")
+	}
+}
+
+// TestAnOlderNodeStillRecordsSomething keeps the fallback honest: a node from
+// before the field exists reports no hash, and a stale hash beats none.
+func TestAnOlderNodeStillRecordsSomething(t *testing.T) {
+	t.Parallel()
+
+	s, h := server(t)
+	walk(t, h, "SN-LEAF-002") // walk() sends no config_hash
+
+	node, ok := s.registry.Get("SN-LEAF-002")
+	if !ok {
+		t.Fatal("node vanished")
+	}
+	if node.ConfigHash == "" {
+		t.Error("a node that reports no hash must still get the catalog's")
 	}
 }
