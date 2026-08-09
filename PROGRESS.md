@@ -1306,3 +1306,74 @@ console was additionally driven end to end in a real browser: bootstrap on a
 deep link, token stripped and `tab=terminal` preserved, no cookie set at any
 point, dashboard and detail rendered, SSE heartbeat live, xterm booted, and both
 credential-failure notices shown with the dead key cleared.
+
+## 2026-08-09T17:45Z — Codex review round 40: 7 findings, all addressed
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+```
+
+The first round whose findings split cleanly into "the change under review" and
+"everything else", and the split is the interesting part: **all three of mine
+were caused by the previous round's fix, and two of those were regressions of
+behaviour the codebase had already got right once.**
+
+**A fix that re-opened a CSRF, three lines below the comment explaining it.**
+The terminal tab starts its box with a POST rather than a GET precisely because
+a side-effecting GET can be provoked by a hostile page; that reasoning is
+written directly above the POST. Putting the shell branch ahead of the origin
+checks handed the attack back in a new shape. A foreign navigation carries no
+key, so it reached the shell before any check ran — and `shell.js` then fetched
+the page itself, same-origin and keyed, which is indistinguishable from a real
+request. **The shell laundered the foreign navigation into a local one.** The
+box started for a page the user never chose to visit.
+
+Worth naming as a mechanism rather than an instance: *introducing a new
+early-return reorders every check that used to run after it*. The shell was
+added as a fallback, which does not feel like touching the auth sequence. It is.
+
+**The credential change broke every download link and no test noticed.** The
+behaviour exports were plain anchors to `/api/`. A navigation cannot present the
+key and `/api/` is not shell-eligible, so all three returned 401 from the moment
+the cookie went. Nothing caught it because the console fixture has no event
+store, so the block those links live in never rendered — the assertion had to
+move to the template fixture that *does* have activity data. **A test that
+cannot reach the markup is not weaker than one that can; it is silent.** That is
+the round-21 lesson (a test asserting on the wrong object) with the object
+missing entirely rather than merely wrong.
+
+**And the storage choice was wrong for a reason I had argued away.** The key
+lived in `localStorage`, which every tab on an origin shares and whose writes
+are announced by the `storage` event. The console binds a predictable port, so a
+page served from that port earlier by something since stopped is same-origin
+with it and was handed the key on installation. Narrower preconditions than the
+cookie, identical category: a credential readable by something that is not the
+console. It is `sessionStorage` now.
+
+The part to keep: **the trade-off I presented for that choice was itself wrong.**
+`localStorage` was justified on surviving bookmarks and browser restarts — but
+the key is per-launch, so it never survived either. The advantage being paid for
+did not exist. Checking whether the stated benefit is real is a different
+question from weighing it, and only the second was asked.
+
+**The four pre-existing findings were all the same shape: a guard that proves
+the wrong proposition.** The FRR marker proves a restart once succeeded, not
+that the daemon runs now — so a crashed daemon skipped its own restart forever.
+`save` proves a name is storable, but runs after `runtime.create`, so an
+unstorable name built a box nothing could remove — the third check to need
+moving above that call. Serde proves a field is empty, not that it was absent,
+so "no custom packages" read as "written before packages existed" and the Sets
+tab reported packages nobody had installed. And the agent's enforcement, moved
+ahead of the collector dial so observability could not gate it, exited on a
+failed dial into a two-second restart loop that destroyed and rebuilt the
+nftables table every cycle — **re-blocking the entire allowlist for the length
+of the outage, because of a fix intended to keep enforcement up.**
+
+Two of those four are earlier fixes producing the defect they were meant to
+prevent, which puts the rate from rounds 22–23 — roughly one new P1 per two
+fixes — where it has stayed for eighteen rounds.
+
+**Gate** — 521 Rust, 10 Go packages, 71 Python; fmt/clippy/vet/gofmt/ruff/mypy
+clean. Driven in a real browser twice, once per credential change, which is the
+only reason two of round 39's silent defects were found at all.
