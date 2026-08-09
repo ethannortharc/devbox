@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>devbox</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/css/app.css" />
+    {# Attributes, not script text. `target` comes from a URI the caller
+       chose, and Askama escapes it here; interpolating it into a JavaScript
+       string literal would not have been escaping at all. #}
+    <meta name="devbox-key" content="{{ key }}" />
+    <meta name="devbox-target" content="{{ target }}" />
+  </head>
+  <body>
+    <noscript>
+      <main class="notice">
+        <h1>devbox</h1>
+        <p>The console needs JavaScript: its key is held by the browser and
+        presented per request, which a plain document load cannot do.</p>
+      </main>
+    </noscript>
+    <script src="/assets/js/key.js"></script>
+    <script src="/assets/js/bootstrap.js"></script>
+  </body>
+</html>

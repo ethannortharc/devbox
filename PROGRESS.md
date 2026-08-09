@@ -1222,3 +1222,87 @@ this whole exercise and they are the one artefact not being kept.
 **Gate** — 406 Rust unit + 53 integration/e2e, 10 Go packages, 69 Python;
 fmt/clippy/vet/gofmt/ruff/mypy all clean. Verified by running each, not by
 reading the previous commit message.
+
+## 2026-08-09T08:40Z — Round 40: the finding that took two rounds to fix
+
+Rounds 24–39 are not written up here, and that gap is itself the first thing to
+record. The commit messages carry the detail; this file stopped keeping pace at
+round 23 and nobody noticed, which is the same failure as round 21's missing P1
+split — the reviews are the primary evidence and they are the artefact least
+looked after. Round 39's output is the first that was kept as a file rather than
+read and discarded.
+
+**The finding.** Round 39 returned seven; six landed. The seventh was a P1 on
+the console's session cookie, and it is the most instructive defect of the whole
+exercise, because the code was *correct against the threat it was written for*.
+
+Cookies are scoped by host. A host has no port. So the browser attached the
+console's cookie to every request it made to any other service on `127.0.0.1` —
+including a project's own dev server, which could read the token straight out of
+its inbound `Cookie` header and then drive the console: start, stop, destroy, a
+terminal into any box. The header guards did not help and could not. They must
+tolerate a missing `Origin` and a missing `Sec-Fetch-Site`, because a genuine
+top-level navigation sends neither, and the replayer is not a browser — it omits
+them for free and can forge them just as cheaply.
+
+The comment in `auth.rs` defending that tolerance said: *a browser modern enough
+to be steered into this attack is modern enough to send the header.* True, and
+irrelevant. **There was no browser in the attack.** The guard was sound against
+the adversary it imagined and silent about the one it had.
+
+**Why round 39 did not fix it.** The write-up of the fix was itself wrong —
+`sessionStorage` plus a header covers API calls and not navigation, and
+navigation is why the cookie existed. Stopping there was right. What is worth
+recording is that the *second* sketch was also incomplete, and only fell apart
+when written out: keeping the cookie as a second credential requires a **third**
+secret, because the cookie's value was the token and `?t=` mints credentials, so
+a stolen cookie could simply re-bootstrap a fresh key. Three secrets to protect
+a shell that carries no data and discloses less than `/metrics`. Once that was
+on the page, the cookie stopped being half of the fix and became the thing to
+delete.
+
+**What landed.** Two per-launch secrets and no ambient credential at all
+(ADR-0048). `token` buys one bootstrap page; `key` lives in `localStorage`,
+which is scoped to a full origin *including the port*, and is presented
+explicitly — as a header, or as `?k=` on the two channels that cannot set one.
+A navigation can present nothing, so it gets a fixed data-free shell that
+fetches the real page itself. CSRF stops being a class of problem here, because
+forgery rides credentials the browser attaches by itself and there no longer is
+one.
+
+**Two defects found in a browser that no test could have caught.** Both were
+silent, and that is the point.
+
+The first: with the page delivered by `document.write`, `defer` does not mean
+what it means during a navigation. `htmx.min.js` won the race against `sse.js`,
+initialised `<body>` before the SSE extension was registered, and htmx marks a
+node initialised — so the stream could never be connected afterwards either. The
+page rendered, every button worked, the console logged nothing, and the
+heartbeat simply never arrived. Blocking scripts, ordered by the parser, in both
+paths; the terminal's scripts moved to the end of `<body>` where their element
+exists, because `defer` was what used to let them wait.
+
+The second: a key from a previous launch fell into the same branch as *no key at
+all*, so the shell's own fetch was answered with a second shell, wrote it over
+itself, and left a blank page — no notice, no error, the dead key still stored,
+every reload repeating it. Offering nothing is a navigation. Offering the wrong
+thing is the shell reporting back. Conflating them cost the entire recovery path.
+
+Both are now tested, and the second is a server-side test that would have caught
+it. The first still is not: nothing in the suite parses a document.
+
+**The lesson this stretch adds.** The standing one is that untestable paths
+produce the serious defects. This round sharpens it: *a guard can be sound and
+still be aimed at the wrong adversary, and it will not look wrong while it is*.
+The cookie comment was not sloppy — it was a correct argument about browsers,
+sitting in front of an attacker that was not one. Re-reading it teaches nothing.
+The only thing that surfaced it was asking who else receives this credential,
+and the only thing that surfaced the two follow-on defects was opening a browser
+and looking at the page.
+
+**Gate** — 446 Rust unit + 48 console + 22 integration/e2e, 10 Go packages, 71
+Python; fmt/clippy/vet/gofmt/ruff/mypy all clean. Verified by running each. The
+console was additionally driven end to end in a real browser: bootstrap on a
+deep link, token stripped and `tab=terminal` preserved, no cookie set at any
+point, dashboard and detail rendered, SSE heartbeat live, xterm booted, and both
+credential-failure notices shown with the dead key cleared.

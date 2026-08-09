@@ -105,7 +105,11 @@ pub fn open_browser(url: &str) -> Result<()> {
 /// Start the console and serve until interrupted.
 pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()> {
     let token = super::auth::generate_token();
-    let state = AppState::new(manager, token.clone());
+    // Two independent secrets, not one derived from the other: recovering the
+    // token must not recover the key, or the separation is decoration. See the
+    // module docs on `auth`.
+    let key = super::auth::generate_token();
+    let state = AppState::new(manager, token.clone(), key);
     let app = routes::router(state.clone());
 
     // Keeps open dashboards current; idles while no console is connected.

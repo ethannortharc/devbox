@@ -1,19 +1,55 @@
 //! Console authentication.
 //!
 //! The console governs local boxes, so the trust boundary is the local user.
-//! Two mechanisms enforce it (see `DECISIONS.md` ADR-0004):
+//! Two mechanisms enforce it (see `DECISIONS.md` ADR-0048, superseding 0004):
 //!
 //! 1. The listener binds `127.0.0.1` only — nothing off-host can reach it.
-//! 2. A per-launch random token, handed out once in the opened URL
-//!    (`?t=…`) and immediately exchanged for an `HttpOnly` session cookie.
+//! 2. A per-launch random key, held in the browser's origin-scoped storage and
+//!    presented explicitly on every request that carries data.
 //!
-//! The exchange matters: a token that lived only in the query string would be
-//! lost on the first internal link and would leak through `Referer`. After the
-//! exchange the token never appears in a URL again.
+//! ## Why the session cookie is gone
+//!
+//! It was the whole vulnerability. Cookies are scoped by *host*, and a host has
+//! no port — so the browser attached the console's cookie to every request it
+//! made to any other service on `127.0.0.1`. A project's own dev server on
+//! another port therefore read the console token straight out of its inbound
+//! `Cookie` header, and could then call the console directly.
+//!
+//! No header check can close that. The replayer is not a browser: it omits
+//! `Origin` and `Sec-Fetch-*` — which the guards below must tolerate, because a
+//! genuine top-level navigation omits them too — and it can equally forge them.
+//! Headers are not secrets. The only repair is a credential that never reaches
+//! the other port at all.
+//!
+//! `localStorage` is that credential. It is scoped to a full origin, *port
+//! included*, so `127.0.0.1:3000` cannot read what `127.0.0.1:7878` stored, and
+//! nothing attaches it automatically — page script must choose to send it. That
+//! second property is what retires CSRF here as a class: an ambient credential
+//! is the thing forgery rides, and there no longer is one.
+//!
+//! ## The two secrets, and why they are two
+//!
+//! [`AppState::token`] rides the URL `devbox web` prints (`?t=…`). It buys one
+//! thing: the bootstrap page that installs the key. [`AppState::key`] is what
+//! every other request is judged by.
+//!
+//! They must not be the same value. If the key were recoverable from the token,
+//! then recovering either would recover both, and the separation would be
+//! decoration — which is exactly how the cookie failed, its value having been
+//! the token itself.
+//!
+//! ## What a request without the key gets
+//!
+//! A top-level navigation cannot send a header, so the first hop to any page
+//! arrives bare. It is answered with [`SHELL`] — a fixed document holding no
+//! box data, which reads the key from storage and fetches the real page itself.
+//! The shell is served to anyone, and discloses strictly less than `/metrics`
+//! already does. Everything that carries data needs the key.
 
+use askama::Template;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -21,38 +57,21 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use super::state::AppState;
 
-/// Base name of the session cookie holding the console token.
-pub const COOKIE_NAME: &str = "devbox_console";
+/// Header carrying the console key on requests that can set one.
+pub const KEY_HEADER: &str = "x-devbox-key";
 
-/// The cookie name for the console reached at `host`.
+/// Query parameter carrying the console key on requests that cannot.
 ///
-/// Cookies are not scoped by port. Two consoles bound to different loopback
-/// ports therefore share one cookie under a single name, so opening the second
-/// overwrote the first's token and every request from the first page came back
-/// 401 — a console that had been working and simply stopped, for a reason
-/// nothing on the page could explain.
-///
-/// The port is the only thing that distinguishes them, so it goes in the name.
-/// Derived from the request's `Host` rather than carried in state, because the
-/// middleware already reads that header for the loopback check and the two
-/// answers must describe the same console.
-///
-/// What this does not do is stop the cookie being *sent* to other services on
-/// 127.0.0.1. Nothing can, short of abandoning cookies — and the SSE stream
-/// needs one, because `EventSource` cannot set a header. The token is useless
-/// without the console that minted it, and every other guard here still
-/// applies; this fixes the eviction and narrows the exposure to whatever else
-/// is listening on the very same port.
-pub fn cookie_name(host: &str) -> String {
-    match host.rsplit_once(':') {
-        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("{COOKIE_NAME}_{port}")
-        }
-        _ => COOKIE_NAME.to_string(),
-    }
-}
+/// `EventSource` and `WebSocket` accept no custom headers, so the two live
+/// channels present the key in the URL instead. That is a weaker place to put a
+/// secret in general — URLs reach logs and history in a way headers do not —
+/// but not here: both are subresource requests issued by script that already
+/// holds the key, so the URL is never navigated to, never recorded in history,
+/// and never sent as a `Referer` to anyone. The only reader is the console's
+/// own access log.
+pub const KEY_PARAM: &str = "k";
 
-/// Query parameter carrying the token on the initial navigation.
+/// Query parameter carrying the bootstrap token on the initial navigation.
 pub const TOKEN_PARAM: &str = "t";
 
 /// Generate a fresh 256-bit console token, URL-safe base64 encoded.
@@ -77,20 +96,53 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Extract a cookie value from a raw `Cookie` header.
-pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    header.split(';').find_map(|pair| {
+/// Pull a named parameter out of a query string.
+///
+/// No percent-decoding, deliberately. Both secrets this reads are URL-safe
+/// base64 — `[A-Za-z0-9_-]`, which every encoder leaves alone — so decoding
+/// would change nothing it is asked about while quietly widening what compares
+/// equal to a secret.
+pub fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k.trim() == name).then(|| v.trim())
+        (k == name).then_some(v)
     })
 }
 
-/// Pull the `t=` token out of a query string.
+/// Pull the `t=` bootstrap token out of a query string.
 pub fn query_token(query: Option<&str>) -> Option<&str> {
-    query?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == TOKEN_PARAM).then_some(v)
-    })
+    query_param(query, TOKEN_PARAM)
+}
+
+/// The console key this request presents, from wherever it is allowed to.
+///
+/// The header is the ordinary path. The query parameter is accepted only below
+/// `/api/`, where the live channels that cannot set headers live; a navigable
+/// page is excluded on purpose, so no URL a user can see, bookmark, or paste
+/// ever becomes a credential.
+fn presented_key<B>(req: &axum::http::Request<B>) -> Option<&str> {
+    if let Some(header) = req.headers().get(KEY_HEADER).and_then(|v| v.to_str().ok()) {
+        return Some(header);
+    }
+    if is_page_path(req.uri().path()) {
+        return None;
+    }
+    query_param(req.uri().query(), KEY_PARAM)
+}
+
+/// Can this path answer a browser navigation, and so be met with the shell?
+///
+/// Defined by exclusion, which makes the default safe in both directions: a
+/// page route added later gets a shell without anyone remembering to say so,
+/// and anything under `/api/` demands the key without anyone remembering
+/// either. Listing the four page routes here instead would mean a fifth added
+/// to the router and forgotten here answers navigations with a 401 no one can
+/// explain.
+///
+/// Serving a shell for a path that does not exist is harmless — the shell then
+/// fetches it with the key and gets the same 404 the navigation would have.
+fn is_page_path(path: &str) -> bool {
+    !path.starts_with("/api/")
 }
 
 /// Rebuild a URI with the token parameter stripped, so the redirect target is
@@ -239,62 +291,160 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
     if !is_loopback_host(&host) {
         return wrong_host();
     }
-    // Scoped to this console's port; see `cookie_name`.
-    let cookie = cookie_name(&host);
 
-    let path = req.uri().path();
-    if is_public(path) {
+    let path = req.uri().path().to_string();
+    if is_public(&path) {
         return no_framing(next.run(req).await);
     }
 
-    // Already authenticated for this browser session?
-    let cookie_ok = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| cookie_value(h, &cookie))
-        .is_some_and(|t| tokens_match(t, &state.token));
-
-    if cookie_ok {
-        // The cookie alone is not enough. `SameSite=Strict` compares *sites*,
-        // and a site ignores the port — so a hostile page served from another
-        // 127.0.0.1 port is same-site with the console, and the browser
-        // attaches this cookie to its requests. The Host check above does not
-        // help: the attacker aims at loopback on purpose.
-        //
-        // So a cookie-authenticated request must also prove where it came
-        // from. A same-origin request either sends a matching Origin or, for
-        // plain top-level navigations, none at all.
-        //
-        // And the navigation itself has to be accounted for: the `Origin`
-        // check must permit its absence, which leaves a hostile page free to
-        // push the browser at a console URL and let the rendered page do the
-        // rest. `foreign_initiated` is what closes that, and `embedded` stops
-        // the framed variant.
-        if !origin_is_self(&req) || foreign_initiated(&req) || embedded(&req) {
-            return unauthorized();
-        }
-        return no_framing(next.run(req).await);
-    }
-
-    // First navigation: `?t=…` is exchanged for the session cookie.
+    // The printed URL, spent on the one page that installs the key. Checked
+    // before the key so that re-opening it repairs a browser whose stored key
+    // has gone stale, which is the situation the user is in every time the
+    // console is relaunched.
     if query_token(req.uri().query()).is_some_and(|t| tokens_match(t, &state.token)) {
-        let target = strip_token(req.uri());
-        let cookie = format!(
-            "{cookie}={}; Path=/; HttpOnly; SameSite=Strict",
-            state.token
-        );
-        return (
-            StatusCode::SEE_OTHER,
-            [
-                (header::LOCATION, target.as_str()),
-                (header::SET_COOKIE, cookie.as_str()),
-            ],
-        )
-            .into_response();
+        return bootstrap(&state.key, safe_target(&strip_token(req.uri())));
     }
 
-    unauthorized()
+    let offered = presented_key(&req);
+    if !offered.is_some_and(|k| tokens_match(k, &state.key)) {
+        // Offering *nothing* is a navigation. It cannot do otherwise, so it is
+        // the ordinary first hop rather than an intrusion, and the shell it
+        // gets back holds nothing worth having.
+        //
+        // Offering a key that is wrong is a different event, and conflating
+        // the two produced a real failure: a browser holding a key from a
+        // previous launch got a second shell instead of a refusal, wrote it
+        // over itself, and showed a blank page — no notice, no error, and the
+        // dead key still stored, so every reload did it again. The shell only
+        // ever fetches when it holds a key, so answering a presented-but-wrong
+        // key with 401 also makes shell-into-shell structurally impossible.
+        if offered.is_none() && req.method() == Method::GET && is_page_path(&path) {
+            return shell();
+        }
+        return unauthorized();
+    }
+
+    // Belt and braces. These were load-bearing when a cookie was the
+    // credential, because the browser attached it to requests the user never
+    // made; a key that only page script can send is not forgeable that way, so
+    // CSRF is no longer the class of problem they defend against.
+    //
+    // They stay because one channel still needs them. A WebSocket upgrade is
+    // exempt from CORS, so `origin_is_self` is the standard guard there, and
+    // `embedded` refuses the framed read of any page a hostile site managed to
+    // provoke. Neither costs anything on a request that is already keyed.
+    if !origin_is_self(&req) || foreign_initiated(&req) || embedded(&req) {
+        return unauthorized();
+    }
+
+    no_framing(next.run(req).await)
+}
+
+/// A redirect target that cannot leave this origin.
+///
+/// [`strip_token`] rebuilds from `Uri::path`, and a request line is free to
+/// carry `//evil.example` there. `location.replace` reads that as
+/// protocol-relative and follows it off-host, which would turn the bootstrap
+/// page into an open redirect that runs with a fresh key in hand. A backslash
+/// is included because some URL parsers normalise it to a slash.
+fn safe_target(target: &str) -> &str {
+    let protocol_relative = target.starts_with("//") || target.starts_with("/\\");
+    if target.starts_with('/') && !protocol_relative {
+        target
+    } else {
+        "/"
+    }
+}
+
+/// The document a bare navigation receives.
+///
+/// Fixed and data-free by construction: it is served to anyone who asks, so
+/// nothing in it may depend on which box was requested or on any box existing.
+/// Its only input is `location`, which it already has.
+///
+/// It replaces itself with a whole document rather than swapping a fragment
+/// into a shared skeleton. The alternative would have meant splitting every
+/// template in two and re-deriving each page's `<head>` here — and the detail
+/// page's head loads `xterm.js` before `term.js`, an order htmx does not
+/// preserve for injected scripts. `term.js` gives up silently when `Terminal`
+/// is undefined, so getting that wrong produces a terminal tab that simply
+/// never connects. Handing the browser a document to parse keeps every page's
+/// head, and every script order, exactly as it already was.
+pub const SHELL: &str = r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>devbox</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/css/app.css" />
+  </head>
+  <body>
+    <noscript>
+      <main class="notice">
+        <h1>devbox</h1>
+        <p>The console needs JavaScript: its key is held by the browser and
+        presented per request, which a plain document load cannot do.</p>
+      </main>
+    </noscript>
+    <script src="/assets/js/key.js"></script>
+    <script src="/assets/js/shell.js"></script>
+  </body>
+</html>
+"#;
+
+/// Hand back the shell, uncached.
+///
+/// `no-store` and the `Vary` matter because one URL now has two answers that
+/// differ only by a request header. A cached shell would be replayed to the
+/// keyed fetch that is trying to replace it, and a cached page would be handed
+/// to a navigation that has no key — the second being the one that would
+/// actually leak.
+fn shell() -> Response {
+    no_framing(
+        (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::VARY, KEY_HEADER),
+            ],
+            SHELL,
+        )
+            .into_response(),
+    )
+}
+
+/// The page `?t=…` lands on: it installs the key, then leaves.
+///
+/// Both values reach the document as attributes rather than as script text.
+/// `target` is derived from a URI the caller controls, and the difference
+/// between an escaped attribute and an interpolated JavaScript string literal
+/// is the difference between a quoted path and a script of the caller's
+/// choosing. Askama escapes the attribute; nothing has to escape the script,
+/// because there is nothing in it to escape.
+#[derive(Template)]
+#[template(path = "bootstrap.html")]
+struct BootstrapTemplate<'a> {
+    key: &'a str,
+    target: &'a str,
+}
+
+fn bootstrap(key: &str, target: &str) -> Response {
+    match (BootstrapTemplate { key, target }).render() {
+        Ok(html) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            html,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "bootstrap render failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "template render failed").into_response()
+        }
+    }
 }
 
 fn wrong_host() -> Response {
@@ -405,15 +555,102 @@ mod tests {
     }
 
     #[test]
-    fn parses_cookie_values() {
-        let h = "foo=1; devbox_console=tok123; bar=2";
-        assert_eq!(cookie_value(h, COOKIE_NAME), Some("tok123"));
-        assert_eq!(cookie_value(h, "foo"), Some("1"));
-        assert_eq!(cookie_value(h, "missing"), None);
+    fn parses_query_params() {
+        assert_eq!(query_param(Some("k=abc"), KEY_PARAM), Some("abc"));
+        assert_eq!(query_param(Some("x=1&k=abc&y=2"), KEY_PARAM), Some("abc"));
+        assert_eq!(query_param(Some("x=1"), KEY_PARAM), None);
+        assert_eq!(query_param(None, KEY_PARAM), None);
+        // A prefix is not a name: `kk=` must not answer for `k=`.
+        assert_eq!(query_param(Some("kk=abc"), KEY_PARAM), None);
+    }
+
+    fn keyed(uri: &str, header_key: Option<&str>) -> Request<()> {
+        let mut b = Request::builder()
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:7878");
+        if let Some(k) = header_key {
+            b = b.header(KEY_HEADER, k);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn the_header_carries_the_key_anywhere() {
+        assert_eq!(presented_key(&keyed("/", Some("secret"))), Some("secret"));
         assert_eq!(
-            cookie_value("devbox_console=solo", COOKIE_NAME),
-            Some("solo")
+            presented_key(&keyed("/api/boxes", Some("secret"))),
+            Some("secret")
         );
+    }
+
+    #[test]
+    fn a_url_can_only_carry_the_key_where_a_header_is_impossible() {
+        // `EventSource` and `WebSocket` set no headers, so the two live
+        // channels present the key in the query.
+        assert_eq!(
+            presented_key(&keyed("/api/stream?k=secret", None)),
+            Some("secret")
+        );
+        assert_eq!(
+            presented_key(&keyed("/api/boxes/web/term?k=secret", None)),
+            Some("secret")
+        );
+
+        // A page must not, or the key becomes something a user can see in the
+        // address bar, bookmark, and paste into a chat window — which is the
+        // property that made the launch token worth replacing.
+        assert_eq!(presented_key(&keyed("/?k=secret", None)), None);
+        assert_eq!(presented_key(&keyed("/boxes/web?k=secret", None)), None);
+    }
+
+    #[test]
+    fn pages_may_be_shelled_and_data_routes_may_not() {
+        for path in ["/", "/boxes/web", "/help", "/help/zellij", "/nonsense"] {
+            assert!(is_page_path(path), "{path} answers navigations");
+        }
+        for path in ["/api/boxes", "/api/stream", "/api/boxes/web/term"] {
+            assert!(!is_page_path(path), "{path} must demand the key");
+        }
+    }
+
+    #[test]
+    fn a_bootstrap_target_cannot_leave_this_origin() {
+        assert_eq!(safe_target("/boxes/web"), "/boxes/web");
+        assert_eq!(
+            safe_target("/boxes/web?tab=terminal"),
+            "/boxes/web?tab=terminal"
+        );
+        assert_eq!(safe_target("/"), "/");
+
+        // `location.replace("//evil.example")` is protocol-relative and leaves
+        // the host. The bootstrap page runs with a fresh key in hand, so an
+        // open redirect there is a redirect that has just been authenticated.
+        assert_eq!(safe_target("//evil.example"), "/");
+        assert_eq!(safe_target("//evil.example/path"), "/");
+        // Some URL parsers normalise a backslash to a slash.
+        assert_eq!(safe_target("/\\evil.example"), "/");
+        // Anything not rooted at all.
+        assert_eq!(safe_target("https://evil.example"), "/");
+        assert_eq!(safe_target(""), "/");
+    }
+
+    #[test]
+    fn the_shell_carries_no_box_data_and_no_secret() {
+        // It is served to anyone who asks, so this is the property that makes
+        // that safe. Asserted on the constant rather than on a rendered page
+        // because there is nothing to render it *from* — which is the point.
+        assert!(SHELL.contains("/assets/js/shell.js"));
+        assert!(SHELL.contains("/assets/js/key.js"));
+        for forbidden in ["devbox.key", "sandbox", "runtime", "{{", "{%"] {
+            assert!(
+                !SHELL.contains(forbidden),
+                "the shell must not mention `{forbidden}`"
+            );
+        }
+        // `key.js` must be parsed before anything that reads it.
+        let key_at = SHELL.find("/assets/js/key.js").unwrap();
+        let shell_at = SHELL.find("/assets/js/shell.js").unwrap();
+        assert!(key_at < shell_at, "key.js has to come first");
     }
 
     #[test]
@@ -512,9 +749,15 @@ mod tests {
         assert!(!foreign_initiated(&nav(Some("none"), None)));
         // The console navigating or fetching within itself.
         assert!(!foreign_initiated(&nav(Some("same-origin"), None)));
-        // Absent: an older browser, curl, the test suite. Falling back rather
-        // than locking them out is deliberate — a browser new enough to be
-        // steered into this attack is new enough to send the header.
+        // Absent: an older browser, curl, the test suite.
+        //
+        // Tolerating absence used to be argued for — "a browser new enough to
+        // be steered into this attack is new enough to send the header" — and
+        // that argument was answering the wrong threat. The replayer was not a
+        // browser. It omitted this header precisely because omission was
+        // allowed, and could have forged it just as easily; a header is not a
+        // secret. Tolerance is not what makes this safe now, and never was.
+        // The key is. This check no longer stands between anyone and the box.
         assert!(!foreign_initiated(&nav(None, None)));
     }
 

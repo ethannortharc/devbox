@@ -81,6 +81,12 @@ alternative; the handler signatures would not change.
 
 **Date:** 2026-08-06
 
+**Superseded by [ADR-0048](#adr-0048-the-console-key-is-not-a-cookie-and-pages-are-shells).**
+The cookie below is the vulnerability that ADR was written to remove: cookies
+are scoped by host and not by port, so the browser handed this one to every
+other service on `127.0.0.1`. Kept as written, because the reasoning that
+follows is exactly the reasoning that was wrong.
+
 **Context.** §6.1 specifies "a per-launch random token in the opened URL (`?t=…`)
 plus loopback binding", but a token that lives only in the query string is lost
 on the first internal navigation and leaks into `Referer` headers.
@@ -1070,3 +1076,59 @@ something unrelated."
 activated and the box is genuinely untouched; different (or unreadable) means
 the switch may have happened and is reversed. Unreadable counts as changed
 because an unnecessary rollback is recoverable and a skipped one is not.
+
+---
+
+## ADR-0048: the console key is not a cookie, and pages are shells
+
+**Date:** 2026-08-09
+
+**Supersedes ADR-0004**, whose session cookie was the vulnerability.
+
+**Context.** A cookie is scoped by host, and a host has no port. Every request
+the browser made to any other service on `127.0.0.1` therefore carried the
+console's cookie — so a project's own dev server on `:3000` could read the
+console token out of its inbound `Cookie` header and drive the console with it:
+start, stop, destroy, and a terminal into any box.
+
+Round 39 named it and round 39's fix did not land, because the first sketch was
+wrong. "Store the token in `sessionStorage` and send it as a header" covers API
+calls and not page navigation — and navigation is the reason the cookie existed.
+
+No header check can close this either. The replayer is not a browser: it omits
+`Origin` and `Sec-Fetch-*`, which the guards must tolerate because a genuine
+navigation omits them too, and it can forge them just as cheaply. Headers are
+not secrets. The prior justification — "a browser new enough to be steered into
+this attack is new enough to send the header" — was answering a threat model
+with a browser in it.
+
+**Decision.** Two per-launch secrets, and no ambient credential at all.
+
+- `token` rides the printed URL (`?t=…`) and buys exactly one thing: a bootstrap
+  page that installs the key. It is never authority for anything else.
+- `key` lives in `localStorage`, which is scoped to a full origin — *port
+  included* — so another loopback service cannot read it. It is presented as
+  `X-Devbox-Key`, or as `?k=` on the two channels that cannot set a header
+  (`EventSource`, `WebSocket`), and never on a navigable page.
+- A navigation cannot present anything, so it is answered with a fixed,
+  data-free shell that fetches the real page itself. The shell is served to
+  anyone and discloses less than `/metrics` already does.
+
+The two secrets must stay independent. A cookie could only be kept by adding a
+*third*, because its value was the token and `?t=` mints credentials — so
+stealing the cookie would have re-bootstrapped a fresh key. Three secrets to
+protect an information-free shell is not a trade worth making.
+
+**Rationale.** The credential no longer travels anywhere the attacker can stand.
+It also retires CSRF as a class here: forgery rides credentials the browser
+attaches by itself, and there no longer is one. The `Origin` and fetch-metadata
+guards stay as defence in depth — a WebSocket upgrade is exempt from CORS — but
+nothing load-bearing rests on them.
+
+**Cost, recorded honestly.** The console now needs JavaScript and
+`localStorage`, and both failure modes say so on the page. Per-launch keys mean
+a relaunched console leaves every open tab holding a dead key; that is answered
+with a 401, which clears the key and prints what to do.
+
+**Revisit.** Unchanged from ADR-0004: if the console is ever exposed beyond
+loopback (N1), this must become real auth, not a longer key.

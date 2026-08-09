@@ -23,3 +23,31 @@ htmx.config.responseHandling = [
   // 5xx is a bug rather than a message; leave the page as it was.
   { code: '5..', swap: false, error: true },
 ];
+
+// Every htmx request presents the console key.
+//
+// Nothing sends it for us — that is the property the console is built on, not
+// an inconvenience. A cookie would ride along automatically and would also ride
+// along to every other service on 127.0.0.1, which is exactly how the token
+// used to leak. `htmx:configRequest` is the documented hook for this, fires
+// before the request is issued, and bubbles to `document`.
+document.addEventListener('htmx:configRequest', function (e) {
+  var key = window.devboxKey.get();
+  if (key) {
+    e.detail.headers['X-Devbox-Key'] = key;
+  }
+});
+
+// `EventSource` accepts no headers, so the stream carries its key in the URL.
+//
+// Installed here rather than left to the SSE extension: that extension claims
+// `htmx.createEventSource` only if it is still undefined, and this file is
+// loaded before it. A stream opened without the key would 401 and leave the
+// heartbeat indicator grey with the rest of the page working.
+htmx.createEventSource = function (url) {
+  var key = window.devboxKey.get();
+  if (key) {
+    url += (url.indexOf('?') === -1 ? '?' : '&') + 'k=' + encodeURIComponent(key);
+  }
+  return new EventSource(url);
+};

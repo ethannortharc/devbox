@@ -35,6 +35,15 @@
 
   var proto = location.protocol === "https:" ? "wss:" : "ws:";
   var url = proto + "//" + location.host + host.dataset.endpoint;
+  // A WebSocket handshake takes no custom headers either, so the key rides the
+  // URL as it does for the event stream. This is a subresource opened by script
+  // that already holds the key — it is never navigated to and never becomes a
+  // `Referer`, so the URL is seen by nothing but the console's own log.
+  var key = window.devboxKey.get();
+  if (key) {
+    url +=
+      (url.indexOf("?") === -1 ? "?" : "&") + "k=" + encodeURIComponent(key);
+  }
   var socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
 

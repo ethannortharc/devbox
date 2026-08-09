@@ -30,6 +30,8 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite;
 
 const TOKEN: &str = "e2e-token";
+/// Distinct from `TOKEN`: the console must not accept one for the other.
+const KEY: &str = "e2e-key";
 const BOX: &str = "e2e-console";
 
 /// Base image the test builds locally.
@@ -119,7 +121,7 @@ fn create_opts(project: &std::path::Path) -> CreateOpts {
 /// Serve the console on an ephemeral loopback port; returns its address.
 async fn serve_console(state_dir: PathBuf) -> SocketAddr {
     let manager = Arc::new(SandboxManager { state_dir });
-    let app = routes::router(AppState::new(manager, TOKEN));
+    let app = routes::router(AppState::new(manager, TOKEN, KEY));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -129,8 +131,8 @@ async fn serve_console(state_dir: PathBuf) -> SocketAddr {
     addr
 }
 
-fn client(port: u16) -> reqwest_lite::Client {
-    reqwest_lite::Client::new(TOKEN, port)
+fn client() -> reqwest_lite::Client {
+    reqwest_lite::Client::new(KEY)
 }
 
 /// A tiny HTTP client over `hyper`'s low-level API would be a lot of code, so
@@ -138,16 +140,15 @@ fn client(port: u16) -> reqwest_lite::Client {
 /// can run on (it needs Docker anyway).
 mod reqwest_lite {
     pub struct Client {
-        /// The `Cookie` header *value*, built once.
+        /// The `X-Devbox-Key` header *value*.
         ///
-        /// The console names its session cookie after the port it is serving
-        /// on, because cookies are not port-scoped and two consoles would
-        /// otherwise evict each other. This client binds an ephemeral port, so
-        /// the name is not a constant — and when round 31 introduced the
-        /// scoping it updated the in-process tests and not this one, which
-        /// skips when Docker is absent. It therefore stayed green locally
-        /// while every request in it would have 401'd on CI.
-        cookie: String,
+        /// This used to be a `Cookie`, and its name had to carry the console's
+        /// port because cookies are not port-scoped. That is precisely what
+        /// made the cookie unusable as a credential — the browser handed it to
+        /// every other service on 127.0.0.1 — and the key that replaced it is
+        /// scoped by the browser's own storage instead, so there is nothing
+        /// port-shaped left to get wrong here.
+        key: String,
     }
 
     pub struct Res {
@@ -156,16 +157,16 @@ mod reqwest_lite {
     }
 
     impl Client {
-        pub fn new(token: &str, port: u16) -> Self {
+        pub fn new(key: &str) -> Self {
             Self {
-                cookie: format!("devbox_console_{port}={token}"),
+                key: key.to_string(),
             }
         }
 
-        /// The header value, for the WebSocket client that builds its own
-        /// request. One definition, so the two cannot drift.
-        pub fn cookie(&self) -> &str {
-            &self.cookie
+        /// The raw key, for the WebSocket client that builds its own request.
+        /// One definition, so the two cannot drift.
+        pub fn key(&self) -> &str {
+            &self.key
         }
 
         pub fn request(&self, method: &str, url: &str) -> Res {
@@ -175,7 +176,7 @@ mod reqwest_lite {
                     "-X",
                     method,
                     "-H",
-                    &format!("Cookie: {}", self.cookie),
+                    &format!("X-Devbox-Key: {}", self.key),
                     "-w",
                     "\n%{http_code}",
                     url,
@@ -205,7 +206,7 @@ mod reqwest_lite {
                     "-X",
                     "POST",
                     "-H",
-                    &format!("Cookie: {}", self.cookie),
+                    &format!("X-Devbox-Key: {}", self.key),
                     "-H",
                     "Content-Type: application/x-www-form-urlencoded",
                     "--data",
@@ -233,7 +234,13 @@ mod reqwest_lite {
             use std::io::Read;
 
             let mut child = std::process::Command::new("curl")
-                .args(["-sS", "-N", "-H", &format!("Cookie: {}", self.cookie), url])
+                .args([
+                    "-sS",
+                    "-N",
+                    "-H",
+                    &format!("X-Devbox-Key: {}", self.key),
+                    url,
+                ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -354,7 +361,7 @@ async fn console_drives_a_real_docker_box_end_to_end() {
 
     let addr = serve_console(state_dir.path().to_path_buf()).await;
     let base = format!("http://127.0.0.1:{}", addr.port());
-    let http = client(addr.port());
+    let http = client();
 
     // ── list shows it running ────────────────────────
     let res = http.get(&format!("{base}/api/boxes"));
@@ -388,11 +395,19 @@ async fn console_drives_a_real_docker_box_end_to_end() {
     assert_eq!(res.status, 200, "files: {}", res.body);
 
     // ── interactive terminal over a real pty ─────────
-    let ws_url = format!("ws://127.0.0.1:{}/api/boxes/{BOX}/term", addr.port());
+    // The key rides the URL here, as it must: a WebSocket handshake started by
+    // a browser carries no custom headers. Authenticating this with the header
+    // form would exercise a path the console accepts and the page can never
+    // take — the terminal could be broken for every real user with this test
+    // still green.
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/api/boxes/{BOX}/term?k={}",
+        addr.port(),
+        http.key()
+    );
     let request = tungstenite::http::Request::builder()
         .uri(&ws_url)
         .header("Host", format!("127.0.0.1:{}", addr.port()))
-        .header("Cookie", http.cookie())
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")

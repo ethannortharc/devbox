@@ -233,8 +233,20 @@
 {% block head %}
 {% if tab == "terminal" %}
 <link rel="stylesheet" href="/assets/css/xterm.css" />
+{% endif %}
+{% endblock %}
+
+{# The terminal's scripts run at the end of the body, where `#terminal` already
+   exists. `term.js` used to sit in the head and wait with `defer` — which this
+   document cannot rely on, because the shell hands it to the parser rather than
+   the browser navigating to it. It gives up silently when `Terminal` is
+   undefined or its host element is missing, so getting either wrong produces a
+   terminal tab that never connects and never says why. Blocking and in place,
+   both are guaranteed. #}
+{% block scripts %}
+{% if tab == "terminal" %}
 <script src="/assets/js/xterm.js"></script>
 <script src="/assets/js/xterm-addon-fit.js"></script>
-<script src="/assets/js/term.js" defer></script>
+<script src="/assets/js/term.js"></script>
 {% endif %}
 {% endblock %}

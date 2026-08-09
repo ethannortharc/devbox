@@ -7,12 +7,34 @@
     <title>{% block title %}devbox{% endblock %}</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/assets/css/app.css" />
+    {# None of these are deferred, and that is load-bearing rather than
+       careless.
+
+       This document is usually not parsed from a navigation. A navigation has
+       no way to present the console key, so it is answered with the shell,
+       which fetches this page and hands it to the parser itself. In that
+       re-parse `defer` does not mean what it means during a normal load: the
+       three scripts below ran in an unspecified order relative to each other
+       and to `DOMContentLoaded`, and htmx won that race. It initialised
+       `<body>` before `sse.js` had registered the extension, so `hx-ext="sse"`
+       matched nothing — and htmx marks a node initialised, so the connection
+       could never be made afterwards either.
+
+       Nothing said so. The page rendered, every button worked, the console
+       logged no error, and the heartbeat simply never arrived.
+
+       Blocking scripts are ordered by the parser in both cases, so htmx sees a
+       document still loading, waits for `DOMContentLoaded`, and by then the
+       extension is registered. `defer` was buying nothing here anyway — these
+       are embedded in the binary and served over loopback. #}
+    <script src="/assets/js/key.js"></script>
     {% block head %}{% endblock %}
-    <script src="/assets/js/htmx.min.js" defer></script>
+    <script src="/assets/js/htmx.min.js"></script>
     <!-- Must load after htmx and before any request: 4xx bodies carry the
-         actionable error text, and htmx 2 does not swap them by default. -->
-    <script src="/assets/js/htmx-config.js" defer></script>
-    <script src="/assets/js/sse.js" defer></script>
+         actionable error text, and htmx 2 does not swap them by default. It
+         also attaches the console key to every request. -->
+    <script src="/assets/js/htmx-config.js"></script>
+    <script src="/assets/js/sse.js"></script>
   </head>
   <body hx-ext="sse" sse-connect="/api/stream">
     <header class="topbar">
@@ -51,5 +73,9 @@
         });
       })();
     </script>
+    {# Page scripts that need the DOM go here, not in `{% block head %}`.
+       `defer` was what used to let a head script wait for the element it
+       operates on, and `defer` is exactly what this document cannot rely on. #}
+    {% block scripts %}{% endblock %}
   </body>
 </html>

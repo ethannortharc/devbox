@@ -36,8 +36,20 @@ impl ConsoleEvent {
 #[derive(Clone)]
 pub struct AppState {
     pub manager: Arc<SandboxManager>,
-    /// Per-launch console token (see [`super::auth`]).
+    /// Per-launch bootstrap token, handed out once in the printed URL.
+    ///
+    /// Buys exactly one thing: the page that installs [`AppState::key`]. It is
+    /// never accepted as authority for anything else (see [`super::auth`]).
     pub token: Arc<str>,
+    /// Per-launch console key — the credential everything else is judged by.
+    ///
+    /// Distinct from `token` on purpose. The two secrets travel differently:
+    /// the token rides a URL the user was shown, the key lives in the
+    /// browser's origin-scoped storage and is presented explicitly. Deriving
+    /// one from the other, or reusing a single value, would mean recovering
+    /// either one recovers both — which is the whole failure this separation
+    /// exists to prevent.
+    pub key: Arc<str>,
     /// Fan-out hub for live console events.
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
@@ -90,11 +102,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(manager: Arc<SandboxManager>, token: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        manager: Arc<SandboxManager>,
+        token: impl Into<Arc<str>>,
+        key: impl Into<Arc<str>>,
+    ) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
             manager,
             token: token.into(),
+            key: key.into(),
             events,
             version: env!("CARGO_PKG_VERSION"),
             rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -230,7 +247,7 @@ mod tests {
         let manager = Arc::new(SandboxManager {
             state_dir: std::path::PathBuf::from("/tmp/devbox-test-state"),
         });
-        AppState::new(manager, "token")
+        AppState::new(manager, "token", "key")
     }
 
     #[test]

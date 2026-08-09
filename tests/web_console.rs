@@ -20,6 +20,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token-0123456789";
+/// Distinct from `TOKEN` on purpose: the console must not accept one for the
+/// other, and a shared constant here would let it and never say so.
+const KEY: &str = "test-key-9876543210";
 
 /// A state dir seeded with two boxes, plus a router wired to it.
 fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
@@ -49,7 +52,7 @@ fn console_with_boxes(names: &[&str]) -> (tempfile::TempDir, Router) {
     let manager = Arc::new(SandboxManager {
         state_dir: dir.path().to_path_buf(),
     });
-    let router = routes::router(AppState::new(manager, TOKEN));
+    let router = routes::router(AppState::new(manager, TOKEN, KEY));
     (dir, router)
 }
 
@@ -67,7 +70,7 @@ fn get_authed(uri: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .body(Body::empty())
         .unwrap()
 }
@@ -77,7 +80,7 @@ fn post_authed(uri: &str) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .body(Body::empty())
         .unwrap()
 }
@@ -87,7 +90,7 @@ fn post_form(uri: &str, form: &str) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(form.to_string()))
         .unwrap()
@@ -101,39 +104,178 @@ async fn body_string(res: axum::response::Response) -> String {
 // ── auth ─────────────────────────────────────────────────
 
 #[tokio::test]
-async fn dashboard_without_a_token_is_rejected() {
-    let (_dir, app) = console_with_boxes(&[]);
-    let res = app.oneshot(get("/")).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+async fn the_dashboard_itself_is_never_served_without_the_key() {
+    // This used to assert a 401 on `GET /`, and a navigation now gets the
+    // shell instead — so the assertion has to move to the thing that actually
+    // mattered, which is that no box reaches an unkeyed caller. A status code
+    // was only ever standing in for that.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    let unkeyed = body_string(app.clone().oneshot(get("/")).await.unwrap()).await;
+    assert!(!unkeyed.contains("alpha"), "shell leaked a box: {unkeyed}");
+
+    let keyed = body_string(app.oneshot(get_authed("/")).await.unwrap()).await;
+    assert!(keyed.contains("alpha"), "the real dashboard renders it");
 }
 
 #[tokio::test]
-async fn wrong_token_is_rejected() {
+async fn a_token_that_is_not_the_token_buys_nothing() {
     let (_dir, app) = console_with_boxes(&[]);
     let res = app.oneshot(get("/?t=not-the-token")).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // A shell, not a bootstrap: the request is shaped like a navigation, so it
+    // is answered like one. What it must not contain is the key.
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(!body.contains(KEY), "a wrong token minted a key: {body}");
+    assert!(body.contains("/assets/js/shell.js"));
 }
 
 #[tokio::test]
-async fn launch_token_is_exchanged_for_a_session_cookie() {
+async fn launch_token_is_exchanged_for_the_console_key() {
     let (_dir, app) = console_with_boxes(&[]);
     let res = app.oneshot(get(&format!("/?t={TOKEN}"))).await.unwrap();
 
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert_eq!(res.status(), StatusCode::OK);
+    // No `Set-Cookie`, ever again. A cookie is scoped by host and not by port,
+    // so the browser handed the console's to every other service on
+    // 127.0.0.1 — a project's own dev server could read the credential out of
+    // its inbound headers and drive the console with it.
+    assert!(
+        res.headers().get(header::SET_COOKIE).is_none(),
+        "the console must not mint a cookie"
+    );
 
-    // Redirect target must be the clean path — the token never reappears.
-    let location = res.headers().get(header::LOCATION).unwrap();
-    assert_eq!(location, "/");
+    let body = body_string(res).await;
+    assert!(
+        body.contains(&format!(r#"content="{KEY}""#)),
+        "the bootstrap page must carry the key: {body}"
+    );
+    assert!(body.contains(r#"content="/""#), "and the clean target");
+    // The token buys this page and nothing else, so it must not be left in the
+    // page for anything later to reuse.
+    assert!(
+        !body.contains(TOKEN),
+        "the bootstrap page must not echo the token: {body}"
+    );
+}
 
-    let cookie = res
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
+#[tokio::test]
+async fn a_bare_navigation_gets_a_shell_that_holds_nothing() {
+    // A top-level navigation sets no headers, so it cannot present the key.
+    // It is answered rather than refused — and what it is answered with is the
+    // reason that is safe.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app.oneshot(get("/")).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("/assets/js/shell.js"));
+    assert!(
+        !body.contains("alpha"),
+        "the shell must not name a box: {body}"
+    );
+    assert!(!body.contains(KEY), "nor carry the key: {body}");
+}
+
+#[tokio::test]
+async fn the_shell_is_all_a_stolen_credential_could_ever_reach() {
+    // The finding this replaced the cookie for. Whatever a hostile loopback
+    // service manages to scrape, it must not be able to read a box or touch
+    // one — so the data routes answer to the key and nothing else.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for uri in ["/api/boxes", "/api/boxes/alpha", "/api/boxes/alpha/files"] {
+        let res = app.clone().oneshot(get(uri)).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must demand the key"
+        );
+    }
+
+    // Including the lifecycle verbs, which is what made this a P1 rather than
+    // an information leak.
+    let stop = Request::builder()
+        .method("POST")
+        .uri("/api/boxes/alpha/stop")
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::empty())
         .unwrap();
-    assert!(cookie.contains(&format!("devbox_console_7878={TOKEN}")));
-    assert!(cookie.contains("HttpOnly"), "cookie must be HttpOnly");
-    assert!(cookie.contains("SameSite=Strict"), "cookie must be strict");
+    let res = app.clone().oneshot(stop).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // And a page POST is not a navigation, so it gets no shell either.
+    let post_page = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(header::HOST, "127.0.0.1:7878")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(post_page).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_stale_key_is_refused_rather_than_handed_another_shell() {
+    // Found in a browser, not here. A key from a previous launch fell into the
+    // same branch as no key at all, so the shell's own fetch was answered with
+    // a second shell, wrote it over itself, and left a blank page: no notice,
+    // no console error, and the dead key still stored, so every reload
+    // repeated it. The console looked broken in a way nothing could explain.
+    //
+    // Offering nothing is a navigation, which cannot present a header and gets
+    // the shell. Offering the wrong thing is the shell reporting back, and has
+    // to be told so.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    let stale = Request::builder()
+        .uri("/boxes/alpha")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header("x-devbox-key", "a-key-from-a-console-that-has-restarted")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(stale).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "a presented-but-wrong key must be refused, not shelled"
+    );
+
+    // The navigation it must not be confused with still works.
+    let res = app.oneshot(get("/boxes/alpha")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(body_string(res).await.contains("/assets/js/shell.js"));
+}
+
+#[tokio::test]
+async fn the_token_is_not_the_key_and_neither_stands_in_for_the_other() {
+    // If either recovered the other, the separation would be decoration — and
+    // that is exactly how the cookie failed, its value having been the token.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    let as_key = Request::builder()
+        .uri("/api/boxes")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header("x-devbox-key", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(as_key).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "the launch token must not work as the key"
+    );
+
+    let as_token = app.oneshot(get(&format!("/?t={KEY}"))).await.unwrap();
+    assert_eq!(
+        as_token.status(),
+        StatusCode::OK,
+        "an unusable token still yields a shell, not a bootstrap"
+    );
+    let body = body_string(as_token).await;
+    assert!(
+        !body.contains(KEY),
+        "the key must not bootstrap itself: {body}"
+    );
 }
 
 #[tokio::test]
@@ -143,10 +285,11 @@ async fn launch_token_preserves_other_query_parameters() {
         .oneshot(get(&format!("/?t={TOKEN}&tab=activity")))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        res.headers().get(header::LOCATION).unwrap(),
-        "/?tab=activity"
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(
+        body.contains(r#"content="/?tab=activity""#),
+        "the bootstrap page must land where the user was sent: {body}"
     );
 }
 
@@ -159,7 +302,7 @@ async fn a_rebound_host_name_is_refused() {
     let req = Request::builder()
         .uri("/")
         .header(header::HOST, "evil.example:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .body(Body::empty())
         .unwrap();
 
@@ -431,7 +574,7 @@ fn put_form(uri: &str, form: &str) -> Request<Body> {
         .method("PUT")
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(form.to_string()))
         .unwrap()
@@ -800,7 +943,7 @@ fn get_initiated(uri: &str, site: &str, dest: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_7878={TOKEN}"))
+        .header("x-devbox-key", KEY)
         .header("sec-fetch-site", site)
         .header("sec-fetch-dest", dest)
         .body(Body::empty())
@@ -872,74 +1015,55 @@ async fn every_served_response_forbids_framing() {
 }
 
 #[tokio::test]
-async fn two_consoles_on_different_ports_do_not_evict_each_other() {
-    // Cookies are not scoped by port, so both consoles shared one name: the
-    // second to open overwrote the first's token, and every request from the
-    // first page came back 401 — a console that had been working and simply
-    // stopped, with nothing on the page able to say why.
+async fn another_consoles_key_does_not_open_this_one() {
+    // Two consoles side by side used to be a problem worth a test of its own:
+    // cookies are not scoped by port, so both shared one name and the second
+    // to open evicted the first, which then 401'd with nothing on the page
+    // able to explain it. Port-suffixing the name fixed the eviction and left
+    // the leak — the browser still *sent* the cookie to every other loopback
+    // service, which is the finding that removed cookies altogether.
+    //
+    // `localStorage` is scoped to an origin, port included, so neither console
+    // can see the other's key and there is nothing left to evict. What remains
+    // worth asserting is the server half: this console answers to its own key
+    // and to no other.
     let (_dir, app) = console_with_boxes(&["alpha"]);
 
-    // A cookie minted by a console on another port is not this one's.
-    let other_port = Request::builder()
-        .uri("/")
+    let foreign = Request::builder()
+        .uri("/api/boxes")
         .header(header::HOST, "127.0.0.1:7878")
-        .header(header::COOKIE, format!("devbox_console_9999={TOKEN}"))
+        .header("x-devbox-key", "a-key-from-the-console-on-9999")
         .body(Body::empty())
         .unwrap();
-    let res = app.clone().oneshot(other_port).await.unwrap();
     assert_eq!(
-        res.status(),
+        app.clone().oneshot(foreign).await.unwrap().status(),
         StatusCode::UNAUTHORIZED,
-        "a cookie for another console must not authenticate this one"
+        "another console's key must not authenticate this one"
     );
 
-    // And both can be held at once, because the names differ.
-    let both = Request::builder()
-        .uri("/")
-        .header(header::HOST, "127.0.0.1:7878")
-        .header(
-            header::COOKIE,
-            format!("devbox_console_9999=other; devbox_console_7878={TOKEN}"),
-        )
-        .body(Body::empty())
-        .unwrap();
-    let res = app.oneshot(both).await.unwrap();
     assert_eq!(
-        res.status(),
+        app.oneshot(get_authed("/api/boxes"))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK,
-        "two consoles must be usable in one browser at the same time"
-    );
-}
-
-#[tokio::test]
-async fn the_launch_exchange_names_the_cookie_for_this_console() {
-    // The write side has to agree with the read side, or the exchange hands
-    // back a cookie the next request will not recognise.
-    let (_dir, app) = console_with_boxes(&[]);
-    let res = app.oneshot(get(&format!("/?t={TOKEN}"))).await.unwrap();
-
-    let cookie = res
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(
-        cookie.starts_with(&format!("devbox_console_7878={TOKEN}")),
-        "got: {cookie}"
+        "and this console's own key must still work"
     );
 }
 
 #[test]
-fn no_test_sends_the_unscoped_console_cookie() {
-    // The console names its cookie after the port it serves on, so
-    // `devbox_console=` is a name nothing accepts any more.
+fn no_test_authenticates_with_a_cookie() {
+    // The console accepts no cookie at all any more, so a test that sends one
+    // is testing a door that is not there — and would pass by taking the
+    // unauthenticated path while appearing to exercise the authenticated one.
     //
-    // This exists because the round that introduced the scoping updated the
-    // tests it could see run — these — and missed `e2e_docker.rs`, which skips
-    // when Docker is absent. The suite stayed green locally while every
-    // request in that test would have returned 401 on CI. A guard that runs
-    // unconditionally is the only kind that covers a test that does not.
+    // This runs unconditionally because the test it is really watching does
+    // not. Round 31 scoped the cookie name to the port, updated the tests it
+    // could see run — these — and missed `e2e_docker.rs`, which skips when
+    // Docker is absent. The suite stayed green locally while every request in
+    // that file would have 401'd on CI. The same trap is open now, one
+    // credential later: a guard that runs whatever is installed is the only
+    // kind that covers a test that does not.
     let mut offenders = Vec::new();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
 
@@ -951,14 +1075,15 @@ fn no_test_sends_the_unscoped_console_cookie() {
         let text = std::fs::read_to_string(&path).expect("readable test");
         for (n, line) in text.lines().enumerate() {
             // Prose may name it; only code may not send it.
-            if line.trim_start().starts_with("//") {
+            if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
                 continue;
             }
             // Assembled, so this line is not itself an instance of what it
-            // is looking for. The scoped form carries `_<port>` before the
-            // `=`; the bare form is what no console issues.
-            let bare = concat!("devbox_console", "=");
-            if line.contains(bare) {
+            // looks for.
+            let sends_cookie = line.contains(concat!("header::", "COOKIE"))
+                || line.contains(concat!("\"Cookie", ":"))
+                || line.contains(concat!("devbox_console", "="));
+            if sends_cookie {
                 offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
             }
         }
@@ -966,8 +1091,8 @@ fn no_test_sends_the_unscoped_console_cookie() {
 
     assert!(
         offenders.is_empty(),
-        "these send a cookie name the console no longer issues; it is \
-         `devbox_console_<port>`:\n{}",
+        "these authenticate with a cookie, which the console no longer reads; \
+         send `X-Devbox-Key`, or `?k=` where a header is impossible:\n{}",
         offenders.join("\n")
     );
 }
