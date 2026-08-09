@@ -1192,3 +1192,59 @@ async fn no_console_script_is_deferred_or_async() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_foreign_navigation_is_refused_before_it_can_be_shelled() {
+    // Round 40, and a CSRF this codebase had already fixed once. The terminal
+    // tab starts its box with a POST *because* a side-effecting GET could be
+    // provoked by a hostile page; putting the shell branch ahead of the
+    // origin checks handed that attack straight back.
+    //
+    // Another site navigates the browser to the terminal tab. The navigation
+    // carries no key, so it reached the shell — and `shell.js` then fetched
+    // the page itself, same-origin and keyed, which is indistinguishable from
+    // a real request. The shell laundered the foreign navigation, the rendered
+    // page auto-posted `/start`, and the box came up unasked.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for site in ["cross-site", "same-site"] {
+        let hostile = Request::builder()
+            .uri("/boxes/alpha?tab=terminal")
+            .header(header::HOST, "127.0.0.1:7878")
+            .header("sec-fetch-site", site)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(hostile).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "a {site} navigation must not even get the shell"
+        );
+    }
+
+    // Framing is refused for the same reason and by the same check.
+    let framed = Request::builder()
+        .uri("/boxes/alpha")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header("sec-fetch-site", "none")
+        .header("sec-fetch-dest", "iframe")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(framed).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // What a real user does still works: typed or bookmarked is `none`, a link
+    // inside the console is `same-origin`.
+    for site in ["none", "same-origin"] {
+        let genuine = Request::builder()
+            .uri("/boxes/alpha?tab=terminal")
+            .header(header::HOST, "127.0.0.1:7878")
+            .header("sec-fetch-site", site)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(genuine).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{site} is the user");
+        assert!(body_string(res).await.contains("/assets/js/shell.js"));
+    }
+}

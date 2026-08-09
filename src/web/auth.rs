@@ -305,6 +305,25 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         return bootstrap(&state.key, safe_target(&strip_token(req.uri())));
     }
 
+    // Who *caused* this request — asked before anything is served, the shell
+    // included.
+    //
+    // Ordering this after the shell branch reintroduced the CSRF the POST on
+    // the terminal tab was moved to a POST to avoid. A hostile page navigates
+    // the browser to `/boxes/<name>?tab=terminal`; the navigation carries no
+    // key, so it took the shell branch before ever reaching these checks — and
+    // the shell then fetched the page itself, same-origin and keyed. That fetch
+    // is indistinguishable from a real one. The shell laundered the foreign
+    // navigation into a local request, the terminal page auto-posted `/start`,
+    // and the box came up for a page the user never chose to visit.
+    //
+    // A genuine navigation is `none` (typed, bookmarked, opened by `devbox
+    // web`) or `same-origin` (a link inside the console); both still pass. The
+    // shell is only reachable by someone who could have reached the page.
+    if !origin_is_self(&req) || foreign_initiated(&req) || embedded(&req) {
+        return unauthorized();
+    }
+
     let offered = presented_key(&req);
     if !offered.is_some_and(|k| tokens_match(k, &state.key)) {
         // Offering *nothing* is a navigation. It cannot do otherwise, so it is
@@ -321,19 +340,6 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         if offered.is_none() && req.method() == Method::GET && is_page_path(&path) {
             return shell();
         }
-        return unauthorized();
-    }
-
-    // Belt and braces. These were load-bearing when a cookie was the
-    // credential, because the browser attached it to requests the user never
-    // made; a key that only page script can send is not forgeable that way, so
-    // CSRF is no longer the class of problem they defend against.
-    //
-    // They stay because one channel still needs them. A WebSocket upgrade is
-    // exempt from CORS, so `origin_is_self` is the standard guard there, and
-    // `embedded` refuses the framed read of any page a hostile site managed to
-    // provoke. Neither costs anything on a request that is already keyed.
-    if !origin_is_self(&req) || foreign_initiated(&req) || embedded(&req) {
         return unauthorized();
     }
 

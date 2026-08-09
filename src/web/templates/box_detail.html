@@ -163,11 +163,18 @@
       <details class="behavior">
         <summary>Behavior summary — what this box has done</summary>
         <pre>{{ behavior }}</pre>
+        {#- `data-download` makes these keyed fetches rather than navigations.
+            A navigation cannot present the console key and `/api/` is not
+            shell-eligible, so as plain links all three returned 401. See
+            `download.js` for why the key does not simply go in the href. -#}
         <p class="muted">
           Export:
-          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=markdown">Markdown</a> ·
-          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=jsonl">JSONL</a> ·
-          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior">JSON</a>
+          <a data-download="{{ boxinfo.name }}-behavior.md"
+             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=markdown">Markdown</a> ·
+          <a data-download="{{ boxinfo.name }}-behavior.jsonl"
+             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=jsonl">JSONL</a> ·
+          <a data-download="{{ boxinfo.name }}-behavior.json"
+             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior">JSON</a>
         </p>
       </details>
       {% endif %}

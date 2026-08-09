@@ -1000,6 +1000,38 @@ mod tests {
     }
 
     #[test]
+    fn behavior_exports_are_keyed_fetches_and_not_navigations() {
+        // These were plain anchors to `/api/`. A navigation cannot present the
+        // console key and `/api/` is not eligible for the shell, so from the
+        // moment the credential stopped being a cookie every export returned
+        // 401 instead of a file.
+        //
+        // The repair must not be to put the key in the href. `?k=` is accepted
+        // under `/api/` for the channels that cannot set a header, and a
+        // clicked link is not one of them — that URL would reach history, the
+        // downloads list, and "Copy link address".
+        let html = detail_with_activity().render().unwrap();
+
+        let exports: Vec<&str> = html
+            .split("<a ")
+            .filter(|fragment| fragment.contains("/behavior"))
+            .map(|fragment| fragment.split('>').next().unwrap_or_default())
+            .collect();
+        assert_eq!(exports.len(), 3, "expected three export links: {html}");
+
+        for tag in exports {
+            assert!(
+                tag.contains("data-download="),
+                "must be fetched with the key, not navigated to: {tag}"
+            );
+            assert!(
+                !tag.contains("k="),
+                "the key must never sit in a link the user can copy: {tag}"
+            );
+        }
+    }
+
+    #[test]
     fn detail_template_renders_each_tab() {
         for (tab, needle) in [
             ("overview", "mount mode"),
