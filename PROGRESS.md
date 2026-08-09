@@ -1434,3 +1434,69 @@ so two overlapping policy saves could wedge a single-worker runtime permanently:
 the holder can only finish on a worker that is now blocked waiting for it.
 
 **Gate** — 524 Rust, 10 Go packages, 71 Python; six linters clean.
+
+## 2026-08-09T21:40Z — Codex review round 42: 6 findings, every one of them mine
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+round 41  1   3      2              2
+round 42  3   3      6              0
+```
+
+The first round in the series to return **nothing but defects introduced by the
+previous two**. The loop has stopped measuring the codebase and is now measuring
+the edits, exactly as rounds 22–23 predicted, at the same rate — roughly one new
+P1 per two fixes, holding for nineteen rounds.
+
+**The guard excused the file it lived in.** Round 41 ended with two audits that
+cover a class rather than an instance, and the P1 here is a blocking
+`lock_project_config` inside `apply_selection` — in `build.rs`, which the lock
+audit skipped wholesale because it "defines the locks and the escape hatch". It
+defines them and also calls one.
+
+The mistake is worth stating exactly, because it will recur in some other form:
+**the exemption was scoped to a file when what needed excusing was a few lines.**
+A file-shaped hole does not stay the size of the thing it was cut for — the file
+goes on accumulating code, and all of it inherits the excuse. In this case none
+was needed at all: the definition is not `async`, and `lock_blocking` takes a
+closure rather than naming the lock, so neither trips the check. Removing the
+exemption entirely was the fix, and it was verified by reverting the very site
+it had been hiding.
+
+**The same collapse, twice in two rounds.** Round 41's fixes were widened to
+`stop_box` and `destroy_sandbox` on the reasoning that a lock is a lock — but
+`lock_rebuild` is a `try_lock`, which refuses instantly, and only
+`lock_project_config` waits. Those two changes were made for a defect they never
+had, and had to be undone. Round 42 then found the identical error one layer
+down: a handshake was made fatal because a refusal is fatal, and a collector
+that restarts *after accepting the connection* also fails the handshake — with
+an EOF, which is an outage, arriving one step later than the dial. Treating it
+as a refusal ended the agent, and the restart cleared every allow set.
+
+Both times the reasoning was **"these arrive through the same function, so they
+are the same event"**. Both times the fix was to make the difference a type
+rather than an inference: `try_lock` versus `lock` in the one case, exported
+`ErrRejected`/`ErrProtocol` sentinels in the other. That is the generalisable
+part — when two outcomes need different handling, the distinction belongs in the
+signature, not in the caller's memory.
+
+**Three findings of one shape: a guard that protects a caller instead of an
+operation.** `devbox stop` bypassed the console's claim entirely, because the
+claim was in the console's wrapper rather than in `stop_sandbox`. `devbox use`
+took its claim *after* `update_mounts` had already stopped and restarted Lima,
+and never took it at all in `--writable`. And the node reported the hash of
+`frr.conf` when the marker is what the daemon actually loaded. In each case the
+protection was attached to one path through the thing rather than to the thing.
+
+**On the audits, honestly.** They did find two real instances that the review
+had not named, which is why they were written. They also produced this round's
+P1 through a bad exemption, and one of them was briefly vacuous — defeated by a
+comment that mentioned the helper by name, because the lookback window included
+prose. Verifying a guard by reverting the fix is now the habit; twice that
+verification itself lied, once because `cargo fmt` had reflowed the code so the
+revert patch matched nothing, and once because the revert left the crate
+uncompilable and the test never ran. **Both look identical to a pass when you
+are reading for a failure that does not appear.**
+
+**Gate** — 528 Rust, 10 Go packages, 71 Python; six linters clean.
