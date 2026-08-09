@@ -1106,10 +1106,11 @@ with a browser in it.
 
 - `token` rides the printed URL (`?t=…`) and buys exactly one thing: a bootstrap
   page that installs the key. It is never authority for anything else.
-- `key` lives in `localStorage`, which is scoped to a full origin — *port
-  included* — so another loopback service cannot read it. It is presented as
-  `X-Devbox-Key`, or as `?k=` on the two channels that cannot set a header
-  (`EventSource`, `WebSocket`), and never on a navigable page.
+- `key` lives in `sessionStorage`, which is scoped to an origin — *port
+  included* — so another loopback service cannot read it, and to a single tab.
+  It is presented as `X-Devbox-Key`, or as `?k=` on the two channels that
+  cannot set a header (`EventSource`, `WebSocket`), and never on a navigable
+  page.
 - A navigation cannot present anything, so it is answered with a fixed,
   data-free shell that fetches the real page itself. The shell is served to
   anyone and discloses less than `/metrics` already does.
@@ -1125,10 +1126,30 @@ attaches by itself, and there no longer is one. The `Origin` and fetch-metadata
 guards stay as defence in depth — a WebSocket upgrade is exempt from CORS — but
 nothing load-bearing rests on them.
 
-**Cost, recorded honestly.** The console now needs JavaScript and
-`localStorage`, and both failure modes say so on the page. Per-launch keys mean
-a relaunched console leaves every open tab holding a dead key; that is answered
-with a 401, which clears the key and prints what to do.
+**Why per tab, added in round 40.** Same origin is not the same program. The
+console binds a predictable port, so a page served earlier from that port by
+something since stopped shares this origin exactly. `localStorage` is shared by
+every tab on an origin and announces writes through the `storage` event, so such
+a page — still open — was handed the key the instant the console installed it,
+and could replay it same-origin against the terminal and lifecycle routes. That
+is the cookie's failure again in miniature: a credential readable by something
+that is not the console.
+
+`sessionStorage` is per tab, so no other tab can read it and no cross-tab event
+fires. **The residual, recorded rather than hidden:** within one tab, history or
+bfcache could restore that earlier page into a tab whose storage now holds the
+key. Nothing available to a page on a fixed loopback origin closes that. An
+ephemeral port would remove the predictable precondition instead, and was
+weighed and declined here — it costs the stable URL §6.1 specifies, and narrows
+rather than eliminates.
+
+**Cost, recorded honestly.** The console needs JavaScript and `sessionStorage`,
+and both failure modes say so on the page. Per-launch keys mean a relaunched
+console leaves every open tab holding a dead key; that is answered with a 401,
+which clears the key and prints what to do. A freshly typed URL or bookmark
+during a live launch has no key and gets the same notice — tabs opened *from*
+the console inherit it, and session restore keeps it, so this is narrower than
+it sounds, and a bookmark never outlived a relaunch in any case.
 
 **Revisit.** Unchanged from ADR-0004: if the console is ever exposed beyond
 loopback (N1), this must become real auth, not a longer key.

@@ -18,7 +18,7 @@
   if (!key || !window.devboxKey.set(key)) {
     document.body.textContent =
       "devbox: this browser will not let the console store its key. " +
-      "The console needs localStorage on this origin.";
+      "The console needs sessionStorage on this origin.";
     return;
   }
 

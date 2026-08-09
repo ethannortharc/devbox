@@ -1024,8 +1024,8 @@ async fn another_consoles_key_does_not_open_this_one() {
     // the leak — the browser still *sent* the cookie to every other loopback
     // service, which is the finding that removed cookies altogether.
     //
-    // `localStorage` is scoped to an origin, port included, so neither console
-    // can see the other's key and there is nothing left to evict. What remains
+    // `sessionStorage` is scoped to an origin, port included, so neither
+    // console can see the other's key and there is nothing left to evict. What remains
     // worth asserting is the server half: this console answers to its own key
     // and to no other.
     let (_dir, app) = console_with_boxes(&["alpha"]);

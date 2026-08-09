@@ -58,7 +58,7 @@
 
   var key = window.devboxKey.get();
   if (!key) {
-    relaunch("This browser holds no key for the console on this port.");
+    relaunch("This tab holds no key for the console on this port.");
     return;
   }
 

@@ -21,11 +21,19 @@
 //! Headers are not secrets. The only repair is a credential that never reaches
 //! the other port at all.
 //!
-//! `localStorage` is that credential. It is scoped to a full origin, *port
+//! `sessionStorage` is that credential. It is scoped to an origin, *port
 //! included*, so `127.0.0.1:3000` cannot read what `127.0.0.1:7878` stored, and
 //! nothing attaches it automatically — page script must choose to send it. That
 //! second property is what retires CSRF here as a class: an ambient credential
 //! is the thing forgery rides, and there no longer is one.
+//!
+//! Per *tab*, not per browser, and that is the second half of the scoping. The
+//! console binds a predictable port, so a page served earlier from that same
+//! port by something since stopped shares this origin exactly. `localStorage`
+//! would have handed such a page the key — every tab on an origin shares it,
+//! and the `storage` event announces each write — leaving it free to replay
+//! same-origin against the terminal and lifecycle routes. See ADR-0048 for the
+//! one residual this leaves.
 //!
 //! ## The two secrets, and why they are two
 //!
