@@ -220,6 +220,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // selection, which the user can see and re-apply. The other order leaves
     // devbox reporting the new selection while the project file describes the
     // old one, and a later recreate silently reverts the box.
+    let _edit = crate::web::build::lock_project_config(&state.project_dir)?;
     config
         .save(&state.project_dir.join("devbox.toml"))
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;

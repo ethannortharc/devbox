@@ -415,6 +415,8 @@ async fn stop_box(State(state): State<AppState>, Path(name): Path<String>) -> Re
 }
 
 async fn destroy_box(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    // The claim is taken inside `destroy_sandbox`, so the CLI path is covered
+    // by the same rule rather than by a second copy of it here.
     if let Err(e) = service::destroy_box(&state.manager, &name, false).await {
         return action_error("destroy", &name, &e);
     }

@@ -206,7 +206,6 @@ func connKey(conn Conn) string {
 		conn.LocalAddr, conn.LocalPort, conn.RemoteAddr, conn.RemotePort, conn.Inode)
 }
 
-// TCPListen is the state value for a listening socket.
 // UnattributedPID marks a flow whose owning process is not knowable.
 //
 // `/proc/net/tcp` lists sockets by inode, not by pid, so the poller sees the
@@ -220,6 +219,7 @@ func connKey(conn Conn) string {
 // init.
 const UnattributedPID uint32 = 0xFFFF_FFFF
 
+// TCPListen is the state value for a listening socket.
 const TCPListen uint8 = 10
 
 // flowEvent builds a `connect` or `accept` event from a /proc/net/tcp row.
@@ -407,7 +407,11 @@ func ParseNetTCP(text string, v6 bool) ([]Conn, error) {
 			continue
 		}
 		fields := strings.Fields(scanner.Text())
-		if len(fields) < 8 {
+		// Ten, because `fields[9]` is read below. Eight let a truncated row
+		// through and then panicked on the index — killing the whole degraded
+		// capture path over one malformed line, on the source that exists
+		// precisely for hosts where the good one cannot run.
+		if len(fields) < 10 {
 			continue
 		}
 

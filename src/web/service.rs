@@ -455,6 +455,10 @@ pub fn save_policy(
     policy: crate::policy::Policy,
 ) -> Result<()> {
     let state = manager.get_sandbox(name)?;
+    // The same claim the rebuild's final write takes: both rewrite the whole
+    // file from a copy they read, so interleaving means one of them silently
+    // reverts the other's section.
+    let _edit = crate::web::build::lock_project_config(&state.project_dir)?;
     // See `DevboxConfig::load_for_edit`: this path writes the file back.
     let mut config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
     config.policy = policy;

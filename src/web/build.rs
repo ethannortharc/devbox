@@ -574,9 +574,19 @@ pub async fn apply_selection(
         .filter(|(_, source)| source.as_str() != "nixpkgs")
         .map(|(name, source)| (name.clone(), source.clone()))
         .collect();
-    config
-        .save(&sandbox.project_dir.join("devbox.toml"))
-        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+    {
+        // Read-modify-write under one claim, so a policy saved between the
+        // read above and this write is not reverted by it.
+        let _edit = lock_project_config(&sandbox.project_dir)?;
+        let latest = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
+            "rebuilt the box, but its devbox.toml can no longer be read, so the new \
+             selection could not be recorded",
+        )?;
+        selection
+            .to_config(&latest)
+            .save(&sandbox.project_dir.join("devbox.toml"))
+            .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+    }
     sandbox.save(&manager.state_dir)?;
 
     state.publish(ConsoleEvent::new(
@@ -754,6 +764,33 @@ pub fn rebuild_lock_path(state_dir: &std::path::Path, box_name: &str) -> std::pa
         "rebuild-{}.lock",
         crate::web::encode_segment(box_name)
     ))
+}
+
+/// Claim a project's `devbox.toml` for one read-modify-write.
+///
+/// Every writer of that file re-reads it, changes one section, and writes the
+/// whole thing back — so two writers interleaving means one section is
+/// silently reverted. The Sets rebuild records a selection while the Policy
+/// tab records a posture, and each was overwriting whichever the other had
+/// just saved, leaving the file, the saved state, and the live firewall
+/// describing three different boxes.
+///
+/// Distinct from the rebuild lock, and deliberately short-lived. Holding the
+/// rebuild lock for a policy edit would block it for the minutes a
+/// `nixos-rebuild` takes — and a policy edit *during* a rebuild is exactly the
+/// case that has to keep working.
+pub fn lock_project_config(project_dir: &std::path::Path) -> Result<RebuildLock> {
+    let path = project_dir.join(".devbox.toml.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    // Blocking, unlike the rebuild claim: this is held for one file rewrite,
+    // so waiting is right where refusing would be a spurious failure.
+    file.lock()
+        .with_context(|| format!("could not lock {}", path.display()))?;
+    Ok(RebuildLock { _file: file })
 }
 
 pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<RebuildLock> {

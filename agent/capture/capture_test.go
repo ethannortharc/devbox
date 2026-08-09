@@ -443,3 +443,26 @@ func TestUnattributedFlowsAreNotBlamedOnInit(t *testing.T) {
 		t.Errorf("both pid and tid must carry the sentinel, got %d/%d", ev.PID, ev.TID)
 	}
 }
+
+func TestATruncatedProcRowIsSkippedNotFatal(t *testing.T) {
+	t.Parallel()
+
+	// The parser indexes `fields[9]`, and the guard allowed eight — so a
+	// truncated `/proc/net/tcp` row panicked and took the whole degraded
+	// capture path with it. That path exists for hosts where the good one
+	// cannot run, which makes it the worst place to be brittle about input.
+	rows := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n" +
+		"   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000\n" +
+		"   1: 0100007F:1F90 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 12345\n"
+
+	conns, err := ParseNetTCP(rows, false)
+	if err != nil {
+		t.Fatalf("a short row must be skipped, not fail the parse: %v", err)
+	}
+	if len(conns) != 1 {
+		t.Fatalf("want the one complete row, got %d", len(conns))
+	}
+	if conns[0].Inode == 0 {
+		t.Error("the complete row should still be parsed in full")
+	}
+}

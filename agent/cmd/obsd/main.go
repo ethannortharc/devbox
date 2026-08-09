@@ -211,6 +211,23 @@ func readUptime(path string) (time.Duration, error) {
 
 // stream connects, handshakes, and pumps events until the context ends.
 func stream(ctx context.Context, cfg config, source capture.Source, out io.Writer) error {
+	// The firewall first, before anything that can fail for unrelated reasons.
+	//
+	// This used to happen after the collector connection, so a collector that
+	// was not listening — a host-side restart, a socket not yet bind-mounted —
+	// returned here and systemd restarted the agent into the same failure. The
+	// box stayed unrestricted for the whole outage, after a reboot that had
+	// already taken its nftables table with it, even though the policy on disk
+	// says exactly what to restore and needs nobody's cooperation to do it.
+	//
+	// Observability depends on the collector. Enforcement does not, and tying
+	// them together made the weaker dependency govern the stronger guarantee.
+	enforcer, err := loadEnforcer(cfg, true)
+	if err != nil {
+		return err
+	}
+	policyStamp := policyFingerprint(cfg.policy)
+
 	conn, err := net.Dial("unix", cfg.socket)
 	if err != nil {
 		return fmt.Errorf("connect to the collector at %s: %w", cfg.socket, err)
@@ -251,11 +268,6 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	// Without this the generated ruleset is not merely incomplete — it is
 	// default-deny with an empty allow set, so `allowlist` and `mirror-only`
 	// block everything they promise to permit.
-	enforcer, err := loadEnforcer(cfg, true)
-	if err != nil {
-		return err
-	}
-	policyStamp := policyFingerprint(cfg.policy)
 	if enforcer != nil {
 		fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
 	}

@@ -86,7 +86,12 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
     let mut events = store.query(&Query {
         since: args.since.clone(),
         until: None,
-        pid: args.pid,
+        // `--pid` defers too, for the same reason as the rest: the lookup is
+        // often attributed to another process — `systemd-resolved` resolves,
+        // the application connects — so filtering by pid in SQL removed the
+        // DNS row that would have named the address, and
+        // `watch --pid <app> --peer <name>` matched nothing.
+        pid: if filtering_late { None } else { args.pid },
         kinds: if filtering_late {
             Vec::new()
         } else {
@@ -118,6 +123,7 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         let path = args.path.as_deref().map(str::to_lowercase);
         events.retain(|event| {
             matches_peer(event, &needle)
+                && args.pid.is_none_or(|want| event.pid == want)
                 && (kinds.is_empty() || kinds.contains(&event.kind))
                 && path.as_deref().is_none_or(|want| {
                     event

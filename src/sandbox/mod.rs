@@ -425,6 +425,20 @@ impl SandboxManager {
     /// Destroy a sandbox permanently.
     /// Warns if there are uncommitted overlay changes.
     pub async fn destroy_sandbox(&self, name: &str, force: bool) -> Result<()> {
+        // The same per-box claim a rebuild takes, held for the whole teardown.
+        //
+        // Destroying during a Sets rebuild removed the runtime and the state
+        // while the detached rebuild task was still running — and that task
+        // finishes by writing `state.json`, so it recreated state for a box
+        // that no longer existed, and the next `create` under that name
+        // collided with a record of something already destroyed.
+        //
+        // Here rather than in the console route, so `devbox destroy` is
+        // covered by the same rule. The lock helper lives in `web::build`
+        // alongside the rest of the rebuild mechanics, which the CLI paths
+        // already reach into for the same reason.
+        let _lock = crate::web::build::lock_rebuild(&self.state_dir, name)?;
+
         let state = self.get_sandbox(name);
         if let Ok(state) = &state {
             let runtime = self.runtime_for_sandbox(state)?;
