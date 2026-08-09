@@ -109,7 +109,7 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
     let app = routes::router(state.clone());
 
     // Keeps open dashboards current; idles while no console is connected.
-    tokio::spawn(super::watch::run(state));
+    tokio::spawn(super::watch::run(state.clone()));
 
     let (listener, addr) = bind_loopback(opts.port, PORT_SCAN).await?;
     let url = console_url(&addr, &token, &opts.landing);
@@ -124,7 +124,7 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
     }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_then_drain(state.clone()))
         .await
         .context("console server failed")?;
 
@@ -136,6 +136,39 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
 async fn shutdown_signal() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::error!(error = %e, "failed to install Ctrl-C handler");
+    }
+}
+
+/// How long Ctrl-C waits for a rebuild to finish before giving up on it.
+///
+/// A `nixos-rebuild` on a cold store can genuinely take this long. The bound
+/// exists so a wedged one cannot make Ctrl-C appear to do nothing, not because
+/// a rebuild that is still running is a problem.
+const REBUILD_DRAIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Stop accepting, then let any rebuild finish what it started.
+///
+/// A rebuild runs detached, so the runtime used to drop it the instant `serve`
+/// returned — and it can be dropped between replacing a box's generated files
+/// and putting them back. What is lost is not the build but the cleanup:
+/// the rollback, the posture restore, and the state write all live after the
+/// point where cancellation lands, so the box is left on a selection nobody
+/// chose, with its firewall down, and nothing on the host recording either.
+/// `kill_on_drop` ends the child process and runs none of it.
+async fn shutdown_then_drain(state: AppState) {
+    shutdown_signal().await;
+
+    if state.wait_for_rebuilds(std::time::Duration::ZERO).await {
+        return;
+    }
+    println!("\ndevbox: a rebuild is in flight — waiting for it to finish or roll back.");
+    println!("  Press Ctrl-C again to abandon it (the box may be left mid-selection).");
+
+    if !state.wait_for_rebuilds(REBUILD_DRAIN).await {
+        eprintln!(
+            "devbox: WARNING — a rebuild did not finish within {}s. The box may be \n               left on a partial selection with its egress posture not restored; \n               `devbox sets apply` or `devbox policy set` will put it right.",
+            REBUILD_DRAIN.as_secs()
+        );
     }
 }
 

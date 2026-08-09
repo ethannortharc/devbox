@@ -388,6 +388,10 @@ pub async fn apply_selection(
     // `pkgs.my-tf`, the module filtered it out, and the rebuild reported
     // success while Terraform vanished from a box whose UI still showed it
     // selected. Round 30 fixed this on the CLI path and left this one.
+    // Across processes, not just across handlers. The `AppState` guard the
+    // route took only knows about this console.
+    let _lock = lock_rebuild(&manager.state_dir, box_name)?;
+
     let project = DevboxConfig::load_or_default(&sandbox.project_dir);
     let recovered = Selection::from_state_and_project(&sandbox, &project);
     let selection = &selection.clone().with_sources(recovered.sources);
@@ -584,6 +588,42 @@ pub async fn apply_selection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lock_path_is_one_flat_file_per_box() {
+        // Box names are directory names: they admit `/` and `.`, so a path
+        // built from one raw would escape the lock directory or collide with
+        // another box's.
+        let dir = std::path::Path::new("/tmp/devbox-state");
+
+        let a = super::rebuild_lock_path(dir, "a/b");
+        assert_eq!(a.parent().unwrap(), dir.join("locks"), "no escaping: {a:?}");
+        assert!(!a.file_name().unwrap().to_str().unwrap().contains('/'));
+
+        // Same box, same lock; different boxes, different locks — including
+        // names that differ only in a character the encoding has to preserve.
+        assert_eq!(a, super::rebuild_lock_path(dir, "a/b"));
+        assert_ne!(a, super::rebuild_lock_path(dir, "a.b"));
+        assert_ne!(
+            super::rebuild_lock_path(dir, "alpha"),
+            super::rebuild_lock_path(dir, "beta")
+        );
+    }
+
+    #[test]
+    fn claiming_a_rebuild_creates_the_lock_where_it_says() {
+        // The claim itself: whether two *processes* exclude each other is the
+        // platform's advisory locking, which this cannot exercise — std
+        // documents intra-process re-locking as platform-dependent, so a test
+        // asserting it would pin an accident. What is checked is that the
+        // claim succeeds and lands on the path the other half computes.
+        let dir = tempfile::tempdir().unwrap();
+        let _held = super::lock_rebuild(dir.path(), "alpha").expect("first claim");
+        assert!(super::rebuild_lock_path(dir.path(), "alpha").exists());
+
+        // And a second box is never blocked by the first.
+        let _other = super::lock_rebuild(dir.path(), "beta").expect("a different box");
+    }
+
     use super::*;
 
     #[test]
@@ -670,5 +710,70 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+/// Exclusive claim on rebuilding one box, held across processes.
+///
+/// The lock is the open file: closing it releases the advisory lock, so
+/// dropping this releases the claim however the caller left — including on a
+/// panic, and including when the process dies without unwinding, which is the
+/// case a lock file containing a pid gets wrong.
+#[derive(Debug)]
+pub struct RebuildLock {
+    _file: std::fs::File,
+}
+
+/// Claim the right to rebuild `box_name`, or say who has it.
+///
+/// The console's in-memory guard only ever protected one `AppState`. A
+/// `devbox sets apply` running beside an open console — or a second `devbox
+/// web` — had its own rebuild slot or none at all, so both could snapshot the
+/// same generated files, overwrite them, rebuild, and then persist different
+/// selections. What is left is a `state.json` and a `devbox.toml` describing a
+/// generation that was never activated, and the box running one neither of
+/// them names.
+///
+/// The lock lives beside the state rather than in the box, because the
+/// contention is between *host* processes and the box may not even be running
+/// when one of them starts.
+/// Where one box's rebuild lock lives.
+///
+/// A box name is a directory name and admits `/` and `.`; built raw, the path
+/// would escape the lock directory or collide with another box's. The
+/// console's URL-segment encoding gives a flat unambiguous filename, and it is
+/// already the agreed way to make this name safe somewhere else.
+///
+/// Separated from the locking because this half is decidable on any host and
+/// the other half is not: whether two *processes* exclude each other is a
+/// property of the platform's advisory locks, and std documents intra-process
+/// re-locking as platform-dependent — so a unit test that asserted it would be
+/// pinning an accident rather than the contract.
+pub fn rebuild_lock_path(state_dir: &std::path::Path, box_name: &str) -> std::path::PathBuf {
+    state_dir.join("locks").join(format!(
+        "rebuild-{}.lock",
+        crate::web::encode_segment(box_name)
+    ))
+}
+
+pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<RebuildLock> {
+    let dir = state_dir.join("locks");
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+
+    let path = rebuild_lock_path(state_dir, box_name);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(RebuildLock { _file: file }),
+        Err(_) => bail!(
+            "another devbox process is already rebuilding box '{box_name}'.\n  \
+             Two rebuilds of one box overwrite each other's generated files and \
+             then record different selections, so this one is refused rather \
+             than run. Wait for the other to finish."
+        ),
     }
 }

@@ -62,6 +62,17 @@ pub struct AppState {
     /// persist *its own* selection — leaving the recorded state describing a
     /// generation that was never built.
     pub rebuilding: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// Notified when the last in-flight rebuild finishes.
+    ///
+    /// A rebuild runs in a detached task, because a `nixos-rebuild` takes
+    /// minutes and the request that starts it has to return the log panel
+    /// immediately. Detached meant the runtime dropped it the moment `serve`
+    /// returned: Ctrl-C partway through left the generated files already
+    /// replaced and `apply_selection` never reaching its rollback, its posture
+    /// restore, or its state write. `kill_on_drop` ends the child process and
+    /// runs none of that cleanup — the box is left mid-selection with its
+    /// firewall down and nothing recording it.
+    rebuilds_idle: Arc<tokio::sync::Notify>,
     /// Collector counters, surfaced by `/metrics` (§7.7).
     ///
     /// Shared with the collector task when one is running; a console started
@@ -79,6 +90,7 @@ impl AppState {
             events,
             version: env!("CARGO_PKG_VERSION"),
             rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
+            rebuilds_idle: Arc::new(tokio::sync::Notify::new()),
             build_status: Arc::new(std::sync::Mutex::new(Default::default())),
             collector_stats: Arc::new(crate::obs::collector::Stats::default()),
         }
@@ -96,7 +108,31 @@ impl AppState {
         Some(RebuildGuard {
             slots: self.rebuilding.clone(),
             box_name: box_name.to_string(),
+            idle: self.rebuilds_idle.clone(),
         })
+    }
+
+    /// Wait until no rebuild is in flight, or until `limit` elapses.
+    ///
+    /// Called from the shutdown path. Waiting is the right default even though
+    /// it delays exit: the alternative is dropping a rebuild between replacing
+    /// a box's generated files and putting them back, which leaves the box on
+    /// a selection nobody chose with its posture not restored. The bound is
+    /// there so a wedged rebuild cannot make Ctrl-C do nothing at all.
+    ///
+    /// Returns whether it drained.
+    pub async fn wait_for_rebuilds(&self, limit: std::time::Duration) -> bool {
+        // Subscribe before checking, or a rebuild that finishes in between is
+        // a notification nobody is waiting for and this blocks until the
+        // timeout on an idle console.
+        let idle = self.rebuilds_idle.clone();
+        let notified = idle.notified();
+        tokio::pin!(notified);
+
+        if self.rebuilding.lock().is_ok_and(|s| s.is_empty()) {
+            return true;
+        }
+        tokio::time::timeout(limit, notified).await.is_ok()
     }
 
     /// Publish an event to every connected console.
@@ -131,12 +167,17 @@ impl AppState {
 pub struct RebuildGuard {
     slots: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     box_name: String,
+    /// Woken when the last rebuild finishes, so shutdown can wait for it.
+    idle: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for RebuildGuard {
     fn drop(&mut self) {
         if let Ok(mut slots) = self.slots.lock() {
             slots.remove(&self.box_name);
+            if slots.is_empty() {
+                self.idle.notify_waiters();
+            }
         }
     }
 }

@@ -156,6 +156,11 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // it back over anything the console had saved in between.
     crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
 
+    // Claimed before anything is read, because two rebuilds that both snapshot
+    // and then both write leave the box on a generation neither recorded. The
+    // console takes the same lock.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+
     // Snapshot for the same reason the console path does: a failed rebuild
     // leaves the active generation alone but the generated *sources* already
     // replaced, so a later manual rebuild would apply a selection this command

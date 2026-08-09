@@ -8,7 +8,7 @@ By contributing to this project, you agree that your contributions will be licen
 
 ## Prerequisites
 
-- Rust toolchain 1.88+ (edition 2024, and let-chains need 1.88)
+- Rust toolchain 1.89+ (edition 2024; let-chains need 1.88, std file locks 1.89)
 - Cargo
 - A VM runtime for end-to-end testing (Lima on macOS, Incus on Linux)
 
