@@ -129,8 +129,8 @@ async fn serve_console(state_dir: PathBuf) -> SocketAddr {
     addr
 }
 
-fn client() -> reqwest_lite::Client {
-    reqwest_lite::Client::new(TOKEN)
+fn client(port: u16) -> reqwest_lite::Client {
+    reqwest_lite::Client::new(TOKEN, port)
 }
 
 /// A tiny HTTP client over `hyper`'s low-level API would be a lot of code, so
@@ -138,7 +138,16 @@ fn client() -> reqwest_lite::Client {
 /// can run on (it needs Docker anyway).
 mod reqwest_lite {
     pub struct Client {
-        token: String,
+        /// The `Cookie` header *value*, built once.
+        ///
+        /// The console names its session cookie after the port it is serving
+        /// on, because cookies are not port-scoped and two consoles would
+        /// otherwise evict each other. This client binds an ephemeral port, so
+        /// the name is not a constant — and when round 31 introduced the
+        /// scoping it updated the in-process tests and not this one, which
+        /// skips when Docker is absent. It therefore stayed green locally
+        /// while every request in it would have 401'd on CI.
+        cookie: String,
     }
 
     pub struct Res {
@@ -147,10 +156,16 @@ mod reqwest_lite {
     }
 
     impl Client {
-        pub fn new(token: &str) -> Self {
+        pub fn new(token: &str, port: u16) -> Self {
             Self {
-                token: token.to_string(),
+                cookie: format!("devbox_console_{port}={token}"),
             }
+        }
+
+        /// The header value, for the WebSocket client that builds its own
+        /// request. One definition, so the two cannot drift.
+        pub fn cookie(&self) -> &str {
+            &self.cookie
         }
 
         pub fn request(&self, method: &str, url: &str) -> Res {
@@ -160,7 +175,7 @@ mod reqwest_lite {
                     "-X",
                     method,
                     "-H",
-                    &format!("Cookie: devbox_console={}", self.token),
+                    &format!("Cookie: {}", self.cookie),
                     "-w",
                     "\n%{http_code}",
                     url,
@@ -190,7 +205,7 @@ mod reqwest_lite {
                     "-X",
                     "POST",
                     "-H",
-                    &format!("Cookie: devbox_console={}", self.token),
+                    &format!("Cookie: {}", self.cookie),
                     "-H",
                     "Content-Type: application/x-www-form-urlencoded",
                     "--data",
@@ -218,13 +233,7 @@ mod reqwest_lite {
             use std::io::Read;
 
             let mut child = std::process::Command::new("curl")
-                .args([
-                    "-sS",
-                    "-N",
-                    "-H",
-                    &format!("Cookie: devbox_console={}", self.token),
-                    url,
-                ])
+                .args(["-sS", "-N", "-H", &format!("Cookie: {}", self.cookie), url])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -345,7 +354,7 @@ async fn console_drives_a_real_docker_box_end_to_end() {
 
     let addr = serve_console(state_dir.path().to_path_buf()).await;
     let base = format!("http://127.0.0.1:{}", addr.port());
-    let http = client();
+    let http = client(addr.port());
 
     // ── list shows it running ────────────────────────
     let res = http.get(&format!("{base}/api/boxes"));
@@ -383,7 +392,7 @@ async fn console_drives_a_real_docker_box_end_to_end() {
     let request = tungstenite::http::Request::builder()
         .uri(&ws_url)
         .header("Host", format!("127.0.0.1:{}", addr.port()))
-        .header("Cookie", format!("devbox_console={TOKEN}"))
+        .header("Cookie", http.cookie())
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")

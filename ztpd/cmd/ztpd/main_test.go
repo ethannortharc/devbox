@@ -135,3 +135,36 @@ func TestUnknownFlagIsAnError(t *testing.T) {
 		t.Error("parseFlags accepted an unknown flag")
 	}
 }
+
+// TestEveryListenerBoundsAWholeRequest guards the class, not the instance.
+//
+// `ReadHeaderTimeout` stops applying the moment the headers are in, so a
+// client can complete them and dribble the body forever. The provisioning
+// listener sits on an unauthenticated network by design — a blank device has
+// no credential to present — and enough half-open requests exhaust descriptors
+// and goroutines until real devices cannot provision.
+//
+// Checked against the source because neither listener can be constructed
+// without binding a socket, and the mistake is an omitted field rather than a
+// wrong value: there is nothing to observe at runtime that says "this one has
+// no ReadTimeout".
+func TestEveryListenerBoundsAWholeRequest(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("cannot read own source: %v", err)
+	}
+	text := string(source)
+
+	servers := strings.Count(text, "&http.Server{")
+	if servers == 0 {
+		t.Fatal("no listeners found; this guard needs updating")
+	}
+	for _, field := range []string{"ReadHeaderTimeout:", "ReadTimeout:", "WriteTimeout:"} {
+		if got := strings.Count(text, field); got != servers {
+			t.Errorf("%d listeners but %d %s — one of them can be held open",
+				servers, got, field)
+		}
+	}
+}

@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ethannortharc/devbox/ztpd/statemachine"
 )
@@ -67,11 +69,78 @@ type Server struct {
 	catalog  Catalog
 	// bootURL is what the bootstrap script points back at.
 	bootURL string
+	// unknown remembers serials the source of truth does not know, bounded.
+	unknown *unknownSerials
 }
 
 // New builds a server.
 func New(registry *statemachine.Registry, catalog Catalog, bootURL string) *Server {
-	return &Server{registry: registry, catalog: catalog, bootURL: bootURL}
+	return &Server{
+		registry: registry,
+		catalog:  catalog,
+		bootURL:  bootURL,
+		unknown:  newUnknownSerials(maxUnknownSerials),
+	}
+}
+
+// maxUnknownSerials bounds what one unauthenticated network can make us hold.
+//
+// Large enough that a genuinely misconfigured fabric — a whole rack cabled
+// before its serials were added to the catalog — is still visible in full;
+// small enough that it is a rounding error against the process.
+const maxUnknownSerials = 256
+
+// unknownSerials records serials that are not in the source of truth.
+//
+// Not the registry. An unknown serial used to be recorded there as a failed
+// node, which meant anything on the provisioning network — which is
+// unauthenticated by design, since a blank device has no credential to offer —
+// could post an endless stream of distinct serials and have every one of them
+// inserted, persisted synchronously, and never evicted. Memory and the state
+// file grew without bound, and because each save writes a full snapshot, every
+// subsequent save cost more: the failure mode is that real nodes stop being
+// able to provision.
+//
+// The operator still needs the signal — a device on the network the catalog
+// has never heard of is worth seeing — so it is kept here instead: bounded, in
+// memory only, and never written to disk.
+type unknownSerials struct {
+	mu    sync.Mutex
+	limit int
+	seen  map[string]time.Time
+	// order is insertion order, for evicting the oldest once full.
+	order []string
+}
+
+func newUnknownSerials(limit int) *unknownSerials {
+	return &unknownSerials{limit: limit, seen: make(map[string]time.Time)}
+}
+
+// Record notes one serial, evicting the oldest if the bound is reached.
+func (u *unknownSerials) Record(serial string, at time.Time) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if _, ok := u.seen[serial]; ok {
+		// Refresh the time, keep its place: a device retrying every thirty
+		// seconds must not evict the rest of the rack.
+		u.seen[serial] = at
+		return
+	}
+	if len(u.order) >= u.limit {
+		oldest := u.order[0]
+		u.order = u.order[1:]
+		delete(u.seen, oldest)
+	}
+	u.order = append(u.order, serial)
+	u.seen[serial] = at
+}
+
+// Len is how many distinct unknown serials are being held.
+func (u *unknownSerials) Len() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.seen)
 }
 
 // Handler returns every route. Tests use it; neither listener does.
@@ -305,27 +374,35 @@ func (s *Server) identify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The catalog first, and nothing is written until it answers.
+	//
+	// This used to `Discover` — insert into the registry, and persist — before
+	// asking who the serial belonged to, so an unknown serial became a stored,
+	// permanent, failed node. On a provisioning network, which is
+	// unauthenticated by design because a blank device has no credential to
+	// present, that made the state file a thing any client could grow without
+	// limit, one distinct serial at a time.
+	name, role, ok := s.catalog.Lookup(req.Serial)
+	if !ok {
+		// Still a real condition and still worth seeing — a device is on the
+		// network that the source of truth has never heard of — but held in a
+		// bounded structure that never reaches disk.
+		if req.Serial == "" {
+			httpError(w, http.StatusBadRequest, "a node must present a serial")
+			return
+		}
+		s.unknown.Record(req.Serial, time.Now())
+		httpError(w, http.StatusNotFound,
+			"serial %q is not in the source of truth", req.Serial)
+		return
+	}
+
 	node, restarted, err := s.registry.Discover(req.Serial)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 	_ = restarted
-
-	name, role, ok := s.catalog.Lookup(req.Serial)
-	if !ok {
-		// An unknown serial is a real condition, not an error to hide: it
-		// means a device is on the network that the source of truth does not
-		// know about, which an operator wants to see.
-		if _, err := s.registry.Advance(req.Serial, statemachine.Failed,
-			"serial is not in the source of truth"); err != nil {
-			httpError(w, http.StatusInternalServerError, "%v", err)
-			return
-		}
-		httpError(w, http.StatusNotFound,
-			"serial %q is not in the source of truth", req.Serial)
-		return
-	}
 
 	if _, err := s.registry.Identify(node.Serial, name, role); err != nil {
 		httpError(w, http.StatusConflict, "%v", err)
@@ -490,6 +567,14 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		converged = 1
 	}
 	fmt.Fprintf(&b, "ztp_fabric_converged %d\n", converged)
+
+	// Held here rather than in the registry, so it cannot distort the SLO
+	// below or grow the state file — but the operator still needs to see that
+	// something on the provisioning network is not in the catalog, which is
+	// the whole reason the signal exists.
+	b.WriteString("# HELP ztp_unknown_serials Distinct serials seen that the catalog does not know.\n")
+	b.WriteString("# TYPE ztp_unknown_serials gauge\n")
+	fmt.Fprintf(&b, "ztp_unknown_serials %d\n", s.unknown.Len())
 
 	b.WriteString("# HELP node_provision_seconds Provisioning time, 95th percentile.\n")
 	b.WriteString("# TYPE node_provision_seconds gauge\n")

@@ -112,9 +112,18 @@ func run(args []string, out io.Writer) error {
 	// anything could spoof a node's identity. Each listener has its own
 	// handler now, and tests assert what is absent from both.
 	metricsSrv := &http.Server{
-		Addr:              cfg.metrics,
-		Handler:           server.OperatorHandler(),
+		Addr:    cfg.metrics,
+		Handler: server.OperatorHandler(),
+		// The same bounds as the provisioning listener. This one is on the
+		// management network rather than the open one, which lowers the odds
+		// and does not change the shape: a listener with no read or write
+		// timeout can be held open by anything that reaches it, and "anything
+		// that reaches it" is a weaker guarantee than it sounds on a network
+		// that also carries a fabric.
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	// Bound synchronously, before startup is declared a success. A detached
 	// ListenAndServe that fails to bind leaves the process running and the
@@ -136,9 +145,25 @@ func run(args []string, out io.Writer) error {
 	// provisioning state on the network blank devices boot from — defeating
 	// the port separation the -metrics flag exists to provide.
 	srv := &http.Server{
-		Addr:              cfg.listen,
-		Handler:           server.ProvisioningHandler(),
+		Addr:    cfg.listen,
+		Handler: server.ProvisioningHandler(),
+		// Headers *and* body, and the write side too.
+		//
+		// `ReadHeaderTimeout` stops applying the moment the headers are in, so
+		// a client could complete them and then dribble the body of
+		// `POST /identify` forever. This listener is on the provisioning
+		// network, which is unauthenticated by design — a blank device has no
+		// credential to present — so enough half-open requests exhaust
+		// descriptors and goroutines and real devices stop being able to
+		// provision. Bounding only the headers bounded the cheap half.
+		//
+		// Generous against what these requests actually are: a few hundred
+		// bytes of JSON from a device on the same segment. A node that cannot
+		// finish that in thirty seconds has a problem no timeout will fix.
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	return srv.ListenAndServe()
 }

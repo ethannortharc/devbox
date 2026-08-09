@@ -2,12 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethannortharc/devbox/ztpd/statemachine"
 )
@@ -116,26 +118,71 @@ func TestIdentifyResolvesASerialAndAdvancesTheNode(t *testing.T) {
 	}
 }
 
-func TestAnUnknownSerialIsRecordedAsFailedNotSilentlyIgnored(t *testing.T) {
+func TestAnUnknownSerialIsRecordedButNotPersisted(t *testing.T) {
 	t.Parallel()
 
 	// A device on the network that the source of truth does not know about is
-	// exactly what an operator wants to see.
+	// exactly what an operator wants to see — so it is still recorded.
+	//
+	// Just not in the registry. It used to be stored there as a failed node,
+	// written to disk on the spot and never evicted, which made the state file
+	// something any client on the provisioning network could grow without
+	// limit. That network is unauthenticated by design: a blank device has no
+	// credential to present.
 	s, h := server(t)
 	rec := do(t, h, "POST", "/identify", `{"serial":"SN-STRANGER"}`)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("code = %d, want 404", rec.Code)
 	}
-	node, ok := s.registry.Get("SN-STRANGER")
-	if !ok {
-		t.Fatal("the stranger should still be recorded")
+	if _, ok := s.registry.Get("SN-STRANGER"); ok {
+		t.Error("an unknown serial must not reach the persisted registry")
 	}
-	if node.State != statemachine.Failed {
-		t.Errorf("state = %s, want failed", node.State)
+	if s.unknown.Len() != 1 {
+		t.Errorf("the operator still needs to see it: held %d", s.unknown.Len())
 	}
-	if !strings.Contains(node.Reason, "source of truth") {
-		t.Errorf("reason = %q", node.Reason)
+}
+
+func TestUnknownSerialsCannotGrowWithoutBound(t *testing.T) {
+	t.Parallel()
+
+	// The whole point. One client posting distinct serials must not be able to
+	// make this process hold more than a fixed amount — and because each
+	// registry save writes a full snapshot, the old behaviour got slower with
+	// every request until real nodes could no longer provision.
+	s, h := server(t)
+	for i := range maxUnknownSerials * 4 {
+		do(t, h, "POST", "/identify", fmt.Sprintf(`{"serial":"SN-BOGUS-%d"}`, i))
+	}
+
+	if got := s.unknown.Len(); got > maxUnknownSerials {
+		t.Errorf("held %d unknown serials, bound is %d", got, maxUnknownSerials)
+	}
+	if len(s.registry.List()) != 0 {
+		t.Error("none of them may reach the registry, or the SLO is theirs to distort")
+	}
+}
+
+func TestARepeatingUnknownSerialDoesNotEvictTheOthers(t *testing.T) {
+	t.Parallel()
+
+	// A misconfigured device retries every thirty seconds. If each retry
+	// counted as a new arrival it would push the rest of the rack out of the
+	// window, and the operator would see the noisiest device instead of all of
+	// the ones that need adding to the catalog.
+	u := newUnknownSerials(3)
+	base := time.Unix(1_700_000_000, 0)
+	for _, serial := range []string{"A", "B", "C"} {
+		u.Record(serial, base)
+	}
+	for i := range 10 {
+		u.Record("A", base.Add(time.Duration(i)*time.Second))
+	}
+	if u.Len() != 3 {
+		t.Fatalf("held %d, want the three distinct serials", u.Len())
+	}
+	if _, ok := u.seen["B"]; !ok {
+		t.Error("a retrying device evicted a quiet one")
 	}
 }
 

@@ -929,3 +929,45 @@ async fn the_launch_exchange_names_the_cookie_for_this_console() {
         "got: {cookie}"
     );
 }
+
+#[test]
+fn no_test_sends_the_unscoped_console_cookie() {
+    // The console names its cookie after the port it serves on, so
+    // `devbox_console=` is a name nothing accepts any more.
+    //
+    // This exists because the round that introduced the scoping updated the
+    // tests it could see run — these — and missed `e2e_docker.rs`, which skips
+    // when Docker is absent. The suite stayed green locally while every
+    // request in that test would have returned 401 on CI. A guard that runs
+    // unconditionally is the only kind that covers a test that does not.
+    let mut offenders = Vec::new();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+
+    for entry in std::fs::read_dir(&dir).expect("tests directory") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable test");
+        for (n, line) in text.lines().enumerate() {
+            // Prose may name it; only code may not send it.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            // Assembled, so this line is not itself an instance of what it
+            // is looking for. The scoped form carries `_<port>` before the
+            // `=`; the bare form is what no console issues.
+            let bare = concat!("devbox_console", "=");
+            if line.contains(bare) {
+                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these send a cookie name the console no longer issues; it is \
+         `devbox_console_<port>`:\n{}",
+        offenders.join("\n")
+    );
+}

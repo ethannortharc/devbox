@@ -265,6 +265,16 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     .await?;
     println!("Substrate: '{substrate}' ({})\n", runtime.name());
 
+    // The retry commands this function may have to print, built while the
+    // outer `args` is still in scope — the per-command loop below shadows it
+    // with the argv it is running.
+    let target = args.target.clone();
+    let substrate_flag = args
+        .substrate
+        .as_deref()
+        .map(|s| format!(" --substrate {s}"))
+        .unwrap_or_default();
+
     // Preflight, before a single namespace exists. Discovering that FRR is
     // missing *after* wiring left the user with a half-built lab and a
     // suggested re-run that then failed at `ip netns add`, because the
@@ -377,6 +387,15 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
                 // teardown has to come first, and saying so is the difference
                 // between a recoverable failure and a lab that has to be
                 // unpicked by hand.
+                // The commands have to be runnable as printed.
+                //
+                // `lab down` and `lab up` both take the topology as a
+                // positional argument, so the version without it failed Clap
+                // parsing before doing anything — advice that cannot be
+                // followed is worse than none, because it costs the reader the
+                // time to find out. An explicitly chosen `--substrate` is
+                // carried through for the same reason: dropping it sends the
+                // retry at whichever box resolution picks by default.
                 bail!(
                     "could not start the routing daemons in namespace '{node}': {}\n\n  \
                      A routed lab needs FRR on the substrate box:\n    \
@@ -384,7 +403,8 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
                      Then tear this partial lab down before retrying — its \
                      namespaces already exist, and `lab up` will not recreate \
                      them:\n    \
-                     devbox lab down\n    devbox lab up",
+                     devbox lab down {target}{substrate_flag}\n    \
+                     devbox lab up {target}{substrate_flag}",
                     result.stderr.trim()
                 );
             }

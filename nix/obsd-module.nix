@@ -123,6 +123,21 @@ in
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
           "CAP_NET_ADMIN"
+          "CAP_SYSLOG"
+        ];
+        # The bounding set is *unconditional*; only the eBPF entries are not.
+        #
+        # `lib.mkIf cfg.enableEbpf` removed the whole option when eBPF was
+        # off — which is the default — and a unit with no `User` and no
+        # bounding set runs as root with the full capability set. So the
+        # configuration that looks like the restricted one was the least
+        # restricted of the two, and `NoNewPrivileges` does not help: it stops
+        # a process *gaining* capabilities, not holding the ones it started
+        # with.
+        #
+        # CAP_SYSLOG is needed either way, because reading /dev/kmsg for the
+        # firewall's record of refused connections has nothing to do with eBPF.
+        CapabilityBoundingSet = [
           # Reading /dev/kmsg, which is where the firewall's record of a
           # refused connection lives. Under `kernel.dmesg_restrict=1` — the
           # default on most distributions — that read needs CAP_SYSLOG, and
@@ -131,20 +146,11 @@ in
           # and policy events simply never appear, which looks exactly like a
           # box that never violated its policy.
           "CAP_SYSLOG"
-        ];
-        CapabilityBoundingSet = lib.mkIf cfg.enableEbpf [
+        ] ++ lib.optionals cfg.enableEbpf [
           "CAP_BPF"
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
           "CAP_NET_ADMIN"
-          # Reading /dev/kmsg, which is where the firewall's record of a
-          # refused connection lives. Under `kernel.dmesg_restrict=1` — the
-          # default on most distributions — that read needs CAP_SYSLOG, and
-          # without it the netfilter source reports itself unsupported and is
-          # skipped. Silently: the agent keeps running, capture keeps working,
-          # and policy events simply never appear, which looks exactly like a
-          # box that never violated its policy.
-          "CAP_SYSLOG"
         ];
 
         # The agent observes; it has no business writing anywhere except its
