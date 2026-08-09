@@ -62,6 +62,14 @@ pub struct AppState {
     /// persist *its own* selection — leaving the recorded state describing a
     /// generation that was never built.
     pub rebuilding: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// Flipped once, when the console is asked to stop.
+    ///
+    /// Live streams watch it. `/api/stream` emits a heartbeat forever, so its
+    /// response never completes — and axum's graceful shutdown waits for every
+    /// accepted connection after its signal resolves. With the dashboard open,
+    /// which `devbox web` opens by default, Ctrl-C therefore waited on a
+    /// stream that had no reason to end. The signal is what gives it one.
+    shutdown: Arc<tokio::sync::watch::Sender<bool>>,
     /// Notified when the last in-flight rebuild finishes.
     ///
     /// A rebuild runs in a detached task, because a `nixos-rebuild` takes
@@ -90,6 +98,7 @@ impl AppState {
             events,
             version: env!("CARGO_PKG_VERSION"),
             rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
+            shutdown: Arc::new(tokio::sync::watch::channel(false).0),
             rebuilds_idle: Arc::new(tokio::sync::Notify::new()),
             build_status: Arc::new(std::sync::Mutex::new(Default::default())),
             collector_stats: Arc::new(crate::obs::collector::Stats::default()),
@@ -110,6 +119,32 @@ impl AppState {
             box_name: box_name.to_string(),
             idle: self.rebuilds_idle.clone(),
         })
+    }
+
+    /// Tell every live stream to finish.
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Resolves once [`AppState::begin_shutdown`] has been called.
+    ///
+    /// A `watch` rather than a `Notify`: a stream that subscribes *after* the
+    /// signal must still see it, and a notification nobody was waiting for is
+    /// simply lost.
+    // `use<>`: the future owns its receiver and must not borrow `self`, or a
+    // handler cannot hand it to a stream it returns.
+    pub fn shutting_down(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let mut rx = self.shutdown.subscribe();
+        async move {
+            if rx.wait_for(|stopping| *stopping).await.is_err() {
+                // The sender is gone, which is not the same as being asked to
+                // stop. Resolving here would end every live stream whenever
+                // the last `AppState` clone dropped — a different event, with
+                // the same visible effect, which is how a test that should
+                // have caught nothing catches everything.
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     /// Wait until no rebuild is in flight, or until `limit` elapses.

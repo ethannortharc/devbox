@@ -78,6 +78,12 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         // rebuilds with an empty list, so switching a project silently removed
         // every package added through the Sets tab while `state.packages` went
         // on reporting them as selected.
+        // The same claim the Sets paths take: this rewrites the box's generated
+        // configuration too, so a console rebuild running beside it would
+        // interleave writes and leave the active generation and the recorded
+        // selection describing different things.
+        let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)?;
+
         if let Err(e) = provision::provision_vm_full(
             runtime.as_ref(),
             name,

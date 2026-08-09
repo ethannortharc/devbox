@@ -72,6 +72,12 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Re-run full provisioning with the (migrated) sets/languages
     // Pass mount_mode so NixOS module sets up overlay declaratively
     let image = state.image.as_str();
+    // The same claim the Sets paths take: this rewrites the box's generated
+    // configuration too, so a console rebuild running beside it would
+    // interleave writes and leave the active generation and the recorded
+    // selection describing different things.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+
     provision::provision_vm_full(
         runtime.as_ref(),
         &name,

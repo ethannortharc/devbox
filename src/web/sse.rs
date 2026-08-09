@@ -48,7 +48,14 @@ pub async fn stream(
         }
     });
 
-    Sse::new(futures::stream::select(ticks, events)).keep_alive(KeepAlive::default())
+    // Ends when the console is asked to stop.
+    //
+    // Without this the stream had no reason to complete — a heartbeat forever
+    // — and axum's graceful shutdown waits for every accepted connection once
+    // its signal resolves. With a dashboard open, which `devbox web` opens by
+    // default, Ctrl-C waited on a stream that was never going to end.
+    let live = futures::stream::select(ticks, events).take_until(state.shutting_down());
+    Sse::new(live).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]

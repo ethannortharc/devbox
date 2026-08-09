@@ -62,6 +62,13 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
 
     // Apply new tools
     println!("Adding tools: {}", args.tools.join(", "));
+    // Every path that rewrites a box's generated configuration takes the same
+    // claim. The Sets paths took it first and these did not, so a rebuild
+    // started here could still interleave with one from the console and leave
+    // the active generation and the recorded selection describing different
+    // things.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+
     nix::upgrade_sets(runtime.as_ref(), &name, &mut config, &args.tools).await?;
 
     // A rebuild restarts the network stack and removes devbox's nftables

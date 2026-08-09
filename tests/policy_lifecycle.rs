@@ -162,3 +162,48 @@ fn only_apply_decides_what_an_open_posture_installs() {
         offenders.join("\n")
     );
 }
+
+/// Every path that rewrites a box's generated configuration claims it first.
+///
+/// The same shape as the guards above, for the same reason. The lock landed on
+/// the two Sets paths — the ones the finding named — while `upgrade`,
+/// `reprovision`, and overlay `use` went on writing the same files unclaimed.
+/// A guard scoped to the instances already found is the mistake this file
+/// exists to stop repeating.
+#[test]
+fn every_rebuild_entry_point_claims_the_box() {
+    /// Calls that rewrite a box's generated Nix configuration.
+    const REBUILDS: &[&str] = &["upgrade_sets(", "provision_vm_full(", "write_set_modules("];
+
+    let mut offenders = Vec::new();
+
+    for entry in walk("src") {
+        let rel = entry.strip_prefix("./").unwrap_or(&entry).to_string();
+        // The definitions themselves, and the module that owns the lock.
+        if rel == "src/nix/mod.rs" || rel == "src/sandbox/provision.rs" || rel == "src/web/build.rs"
+        {
+            continue;
+        }
+        // Creating a box is not rebuilding one: nothing else can be touching a
+        // box that does not exist yet, and the name is not resolvable until it
+        // does.
+        if rel == "src/sandbox/mod.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&entry).expect("readable source");
+        if !REBUILDS.iter().any(|call| source.contains(call)) {
+            continue;
+        }
+        if !source.contains("lock_rebuild(") {
+            offenders.push(rel);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these rewrite a box's generated configuration without claiming it, so \
+         a console rebuild running beside one leaves the active generation and \
+         the recorded selection describing different things:\n{}",
+        offenders.join("\n")
+    );
+}

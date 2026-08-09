@@ -123,10 +123,27 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
         eprintln!("  (could not open a browser automatically: {e})");
     }
 
+    // Stop accepting *first*, then drain.
+    //
+    // `with_graceful_shutdown` keeps accepting until its future resolves, so
+    // draining inside it left the door open: a Sets request arriving during
+    // the wait spawned another detached rebuild, and one already inside a
+    // handler could spawn after the idle check had passed. Axum then drains
+    // the request and not the task it started. The signal resolves at once
+    // now, and the waiting happens below, where nothing can create more.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_then_drain(state.clone()))
+        .with_graceful_shutdown({
+            let state = state.clone();
+            async move {
+                shutdown_signal().await;
+                // Live streams have no natural end; this is theirs.
+                state.begin_shutdown();
+            }
+        })
         .await
         .context("console server failed")?;
+
+    drain_rebuilds(&state).await;
 
     println!("devbox console stopped.");
     Ok(())
@@ -146,27 +163,47 @@ async fn shutdown_signal() {
 /// a rebuild that is still running is a problem.
 const REBUILD_DRAIN: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Stop accepting, then let any rebuild finish what it started.
+/// Let any rebuild finish what it started, after the door is shut.
 ///
 /// A rebuild runs detached, so the runtime used to drop it the instant `serve`
 /// returned — and it can be dropped between replacing a box's generated files
-/// and putting them back. What is lost is not the build but the cleanup:
-/// the rollback, the posture restore, and the state write all live after the
-/// point where cancellation lands, so the box is left on a selection nobody
-/// chose, with its firewall down, and nothing on the host recording either.
+/// and putting them back. What is lost is not the build but the cleanup: the
+/// rollback, the posture restore, and the state write all live after the point
+/// where cancellation lands, so the box is left on a selection nobody chose,
+/// with its firewall down, and nothing on the host recording either.
 /// `kill_on_drop` ends the child process and runs none of it.
-async fn shutdown_then_drain(state: AppState) {
-    shutdown_signal().await;
-
+async fn drain_rebuilds(state: &AppState) {
     if state.wait_for_rebuilds(std::time::Duration::ZERO).await {
         return;
     }
     println!("\ndevbox: a rebuild is in flight — waiting for it to finish or roll back.");
     println!("  Press Ctrl-C again to abandon it (the box may be left mid-selection).");
 
-    if !state.wait_for_rebuilds(REBUILD_DRAIN).await {
+    // The second Ctrl-C has to be *waited on*, or that line is a lie: tokio's
+    // handler stays installed for the life of the process, so the signal was
+    // being consumed and discarded while the user sat out the whole timeout
+    // believing they had cancelled.
+    let abandoned = tokio::select! {
+        drained = state.wait_for_rebuilds(REBUILD_DRAIN) => {
+            if drained {
+                return;
+            }
+            false
+        }
+        _ = shutdown_signal() => true,
+    };
+
+    if abandoned {
         eprintln!(
-            "devbox: WARNING — a rebuild did not finish within {}s. The box may be \n               left on a partial selection with its egress posture not restored; \n               `devbox sets apply` or `devbox policy set` will put it right.",
+            "\ndevbox: abandoning the rebuild. The box may be left on a partial \
+             selection with its egress posture not restored; `devbox sets apply` \
+             or `devbox policy set` will put it right."
+        );
+    } else {
+        eprintln!(
+            "devbox: WARNING — a rebuild did not finish within {}s. The box may be \
+             left on a partial selection with its egress posture not restored; \
+             `devbox sets apply` or `devbox policy set` will put it right.",
             REBUILD_DRAIN.as_secs()
         );
     }
