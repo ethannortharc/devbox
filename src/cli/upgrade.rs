@@ -45,8 +45,15 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     config.sets = crate::sandbox::config::SetsSection::none();
     config.languages = Default::default();
     for set_name in &state.sets {
-        let tool_name = set_name.strip_prefix("lang-").unwrap_or(set_name);
-        config.apply_tools(&[tool_name.to_string()]);
+        // By canonical name first. `apply_tools` is an *alias* table — it knows
+        // `claude` and `mosh` and has no case for `shell`, `tools`, `editor`,
+        // `git` or `container`, so feeding recorded set names through it
+        // cleared those five and restored nothing. A routine upgrade rebuilt
+        // the box without them.
+        if !config.enable_set(set_name) {
+            let tool_name = set_name.strip_prefix("lang-").unwrap_or(set_name);
+            config.apply_tools(&[tool_name.to_string()]);
+        }
     }
 
     // The box's ad-hoc packages, and *only* the box's.

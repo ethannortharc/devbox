@@ -85,6 +85,34 @@ impl SetsSection {
     /// `Default::default()` to mean "clear" therefore turns them all back on —
     /// which is how a fix for `devbox upgrade` re-enabling a disabled set came
     /// to re-enable every disabled set. The two meanings need two names.
+    /// Turn on the set named as [`DevboxConfig::active_sets`] names it.
+    ///
+    /// Returns whether the name was one. The exact inverse of that function,
+    /// and the two have to stay in step: `upgrade` reconstructs a box's
+    /// selection by feeding recorded set names back in, so a name this cannot
+    /// read is a set the box silently loses on the next rebuild.
+    ///
+    /// That is not hypothetical. This did not exist, and `upgrade` used
+    /// `apply_tools` — which understands aliases like `claude` and `mosh` but
+    /// has no case for `shell`, `tools`, `editor`, `git` or `container`. Those
+    /// five were cleared and never restored, so a routine `devbox upgrade`
+    /// rebuilt the box without them.
+    pub fn enable(&mut self, name: &str) -> bool {
+        match name {
+            "system" => self.system = true,
+            "shell" => self.shell = true,
+            "tools" => self.tools = true,
+            "editor" => self.editor = true,
+            "git" => self.git = true,
+            "container" => self.container = true,
+            "network" => self.network = true,
+            "ai-code" => self.ai_code = true,
+            "ai-infra" => self.ai_infra = true,
+            _ => return false,
+        }
+        true
+    }
+
     pub fn none() -> Self {
         Self {
             system: false,
@@ -130,6 +158,23 @@ pub struct LanguagesSection {
     pub java: bool,
     #[serde(default)]
     pub ruby: bool,
+}
+
+impl LanguagesSection {
+    /// Turn on the language named as `active_languages` names it — that is,
+    /// without the `lang-` prefix `active_sets` adds.
+    pub fn enable(&mut self, name: &str) -> bool {
+        match name {
+            "go" => self.go = true,
+            "rust" => self.rust = true,
+            "python" => self.python = true,
+            "node" => self.node = true,
+            "java" => self.java = true,
+            "ruby" => self.ruby = true,
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,8 +294,25 @@ impl DevboxConfig {
                 "ai-infra" | "ollama" | "mcp-hub" | "litellm" | "open-webui" => {
                     self.sets.ai_infra = true;
                 }
-                _ => {}
+                // Not an alias — try it as a canonical set or language name.
+                // Without this `devbox upgrade --tools git` was accepted and
+                // did nothing, because the alias table has no case for the
+                // names `active_sets` actually emits.
+                other => {
+                    self.enable_set(other);
+                }
             }
+        }
+    }
+
+    /// Turn on the set or language named as [`Self::active_sets`] names it.
+    ///
+    /// Returns whether the name was one, so a caller can fall back to the
+    /// alias table in [`Self::apply_tools`] for things a *user* might type.
+    pub fn enable_set(&mut self, name: &str) -> bool {
+        match name.strip_prefix("lang-") {
+            Some(language) => self.languages.enable(language),
+            None => self.sets.enable(name),
         }
     }
 
@@ -417,5 +479,83 @@ mod tests {
         assert!(loaded.languages.go);
         assert!(loaded.sets.ai_code);
         assert_eq!(loaded.sandbox.runtime, "auto");
+    }
+}
+
+#[cfg(test)]
+mod set_roundtrip {
+    use super::*;
+
+    /// Everything `active_sets` can emit must be readable by `enable_set`.
+    ///
+    /// These two are a pair, and `upgrade` closes the loop between them: it
+    /// reads a box's recorded set names and feeds them back in to rebuild the
+    /// selection. A name one side emits and the other cannot read is a set the
+    /// box loses on the next rebuild, silently.
+    ///
+    /// It happened. `upgrade` went through `apply_tools`, an alias table with
+    /// no case for `shell`, `tools`, `editor`, `git` or `container`, so those
+    /// five were cleared and never restored. Asserting the round trip covers
+    /// every set at once, including ones added later.
+    #[test]
+    fn every_name_active_sets_emits_can_be_read_back() {
+        // Everything on, so `active_sets` emits the full vocabulary.
+        let all = DevboxConfig {
+            sets: SetsSection {
+                system: true,
+                shell: true,
+                tools: true,
+                editor: true,
+                git: true,
+                container: true,
+                network: true,
+                ai_code: true,
+                ai_infra: true,
+            },
+            languages: LanguagesSection {
+                go: true,
+                rust: true,
+                python: true,
+                node: true,
+                java: true,
+                ruby: true,
+            },
+            ..Default::default()
+        };
+        let names = all.active_sets();
+        assert!(names.len() >= 15, "expected the full vocabulary: {names:?}");
+
+        let mut rebuilt = DevboxConfig {
+            sets: SetsSection::none(),
+            languages: LanguagesSection::default(),
+            ..Default::default()
+        };
+        for name in &names {
+            assert!(
+                rebuilt.enable_set(name),
+                "`active_sets` emits {name:?} and `enable_set` cannot read it — \
+                 a box carrying that set loses it on the next upgrade"
+            );
+        }
+
+        // And the round trip is lossless, not merely accepting.
+        let mut back = rebuilt.active_sets();
+        let mut expected = names.clone();
+        back.sort();
+        expected.sort();
+        assert_eq!(back, expected, "the selection changed on the way round");
+    }
+
+    #[test]
+    fn a_set_name_typed_as_a_tool_still_works() {
+        // `devbox upgrade --tools git` was accepted and did nothing.
+        let mut config = DevboxConfig {
+            sets: SetsSection::none(),
+            ..Default::default()
+        };
+        config.apply_tools(&["git".into(), "editor".into(), "rust".into()]);
+        assert!(config.sets.git, "--tools git must enable the git set");
+        assert!(config.sets.editor);
+        assert!(config.languages.rust);
     }
 }

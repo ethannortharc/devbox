@@ -328,7 +328,20 @@ ACTIVATED=/etc/frr/.devbox-activated
 frr_answers() {
   [ -n "$(vtysh -c 'show bgp summary' 2>/dev/null || true)" ]
 }
-if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED" && frr_answers; then
+#
+# The marker also has to still describe what is *installed*. It records what a
+# restart once loaded; the frr.conf file is what the daemon reads. Edit that
+# file and restart FRR, or reboot the node, and the two diverge -- the daemon
+# is running the edit while the marker names the old config. Skipping on the
+# marker alone then left the edit in place and reported the marker hash as
+# active, so the server believed the fabric had converged on a configuration no
+# node was running, and skipped the push that would have corrected it.
+#
+# Comparing the installed file too costs nothing and makes the skip mean "this
+# node is running exactly what was activated", which is what the caller reads
+# it as.
+if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED" \
+  && cmp -s /etc/frr/frr.conf "$ACTIVATED" && frr_answers; then
   rm -f /tmp/frr.conf.new
   report verifying
 else

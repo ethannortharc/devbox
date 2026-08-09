@@ -298,6 +298,14 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 					linked <- link{} // shutting down
 					return
 				}
+				// Bounded, or a collector that accepts and never replies
+				// parks this goroutine for good — and with it every hope of
+				// reconnecting, because `dialing` stays set.
+				if err := c.SetDeadline(time.Now().Add(collectorTimeout)); err != nil {
+					c.Close()
+					linked <- link{fatal: fmt.Errorf("set a handshake deadline: %w", err)}
+					return
+				}
 				if err := transport.Handshake(c, hello); err != nil {
 					c.Close()
 					// Only a *refusal* is fatal: the collector saying this
@@ -318,6 +326,21 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 						return
 					}
 					fmt.Fprintf(out, "devbox-obsd: handshake did not complete (%v); retrying\n", err)
+					select {
+					case <-ctx.Done():
+						linked <- link{}
+						return
+					case <-time.After(firstWait):
+					}
+					continue
+				}
+				// Cleared before handing the connection over. A live stream is
+				// idle most of the time by design, and a read deadline left on
+				// it would end a perfectly healthy session; writes take their
+				// own deadline per frame instead.
+				if err := c.SetDeadline(time.Time{}); err != nil {
+					c.Close()
+					fmt.Fprintf(out, "devbox-obsd: could not clear the handshake deadline (%v); retrying\n", err)
 					select {
 					case <-ctx.Done():
 						linked <- link{}
@@ -386,7 +409,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				}
 				continue
 			}
-			if err := transport.WriteFrame(conn, pending[0]); err != nil {
+			if err := writeFrame(conn, pending[0]); err != nil {
 				conn.Close()
 				conn = nil
 				connect()
@@ -462,7 +485,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				hold(payload)
 				continue
 			}
-			if err := transport.WriteFrame(conn, payload); err != nil {
+			if err := writeFrame(conn, payload); err != nil {
 				// Not fatal any more. Returning here ended the process, and
 				// systemd restarting it re-ran the ruleset load — which wipes
 				// the allow sets this agent had spent the session filling.
@@ -485,7 +508,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 			// Deliver what was captured while it was away, oldest first, before
 			// anything newer.
 			for len(pending) > 0 && conn != nil {
-				if err := transport.WriteFrame(conn, pending[0]); err != nil {
+				if err := writeFrame(conn, pending[0]); err != nil {
 					fmt.Fprintf(out, "devbox-obsd: lost the collector again (%v)\n", err)
 					conn.Close()
 					conn = nil
@@ -607,7 +630,34 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 const (
 	firstWait   = 250 * time.Millisecond
 	longestWait = 5 * time.Second
+	// How long the collector gets to answer before it counts as gone.
+	//
+	// Both the handshake and every frame need one. A unix socket read blocks
+	// until the peer replies and a write blocks once its buffer fills, and
+	// neither notices a context being cancelled — so a collector that accepts
+	// the connection and then stops responding wedged the agent silently. The
+	// handshake case left `dialing` set forever, so no reconnection could ever
+	// be attempted; the write case blocked the event loop, which is also where
+	// `enforcer.OnDNS` runs, so DNS-driven policy updates stopped with it.
+	//
+	// Generous, because the collector is on the other side of a unix socket on
+	// the same machine: anything approaching this is a fault, not load.
+	collectorTimeout = 10 * time.Second
 )
+
+// writeFrame sends one frame, bounded.
+//
+// A synchronous write to a collector that has stopped reading blocks once the
+// socket buffer fills — and this is called from the loop that also drains
+// capture and runs `enforcer.OnDNS`, so blocking here stops DNS-driven policy
+// updates and eventually backs capture up behind them. A timeout is treated as
+// a disconnect, because from here it is one.
+func writeFrame(conn net.Conn, payload []byte) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(collectorTimeout)); err != nil {
+		return err
+	}
+	return transport.WriteFrame(conn, payload)
+}
 
 // link is the result of one attempt to reach the collector.
 //

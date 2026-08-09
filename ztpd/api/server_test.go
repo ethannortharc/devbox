@@ -664,8 +664,12 @@ func TestActivationChecksTheDaemonIsActuallyRunning(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("the activation comparison is gone")
 	}
+	// To the end of the *condition*, not the end of the line: the condition is
+	// continued across two lines, and slicing at the first newline read only
+	// half of it — reporting the live-daemon check as missing when it was on
+	// the line below.
 	branch := script[idx:]
-	if end := strings.Index(branch, "\n"); end > 0 {
+	if end := strings.Index(branch, "; then"); end > 0 {
 		branch = branch[:end]
 	}
 	if !strings.Contains(branch, "frr_answers") {
@@ -837,5 +841,43 @@ func TestTheReportedHashComesFromTheMarkerNotTheFile(t *testing.T) {
 	}
 	if strings.Contains(line, "/etc/frr/frr.conf") {
 		t.Errorf("hashing the on-disk file reports configs that never loaded: %q", line)
+	}
+}
+
+// TestTheSkipBranchRequiresTheInstalledConfigToMatchTheMarker closes the gap
+// between "was activated once" and "is what is installed now".
+//
+// The marker records a configuration a restart loaded. `frr.conf` is the file
+// the daemon reads. Editing that file and restarting — or rebooting the node —
+// makes them disagree, and skipping on the marker alone left the edit running
+// while reporting the marker's hash as active. The server then believed the
+// fabric had converged on a configuration no node was running.
+func TestTheSkipBranchRequiresTheInstalledConfigToMatchTheMarker(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	script := rec.Body.String()
+
+	idx := strings.Index(script, "cmp -s /tmp/frr.conf.new")
+	if idx < 0 {
+		t.Fatal("the activation comparison is gone")
+	}
+	// The whole condition, which the fix continues onto a second line.
+	end := strings.Index(script[idx:], "; then")
+	if end < 0 {
+		t.Fatal("the condition is never closed")
+	}
+	cond := script[idx : idx+end]
+
+	for _, required := range []string{
+		`cmp -s /etc/frr/frr.conf "$ACTIVATED"`, // installed matches activated
+		"frr_answers",                           // and the daemon is up
+	} {
+		if !strings.Contains(cond, required) {
+			t.Errorf("the skip branch must also require %s:\n%s", required, cond)
+		}
 	}
 }
