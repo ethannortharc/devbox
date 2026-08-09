@@ -165,19 +165,8 @@ pub async fn stop_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
     // chose, with its firewall down, and nothing recording either. `destroy`
     // takes this claim already; stopping is the same disruption with a
     // gentler name.
-    // Off the worker, for the same reason the policy save is: a Sets rebuild
-    // holds this claim for the length of a `nixos-rebuild`, which is minutes.
-    // Taking it here blocked a Tokio worker for that whole time, so a user who
-    // clicked Stop during a rebuild did not merely wait — they took a worker
-    // out of the pool, and enough of them starve the console that would have
-    // shown the rebuild finishing.
-    let lock_dir = manager.state_dir.clone();
-    let lock_name = name.to_string();
-    let _lock = crate::web::build::lock_blocking(move || {
-        crate::web::build::lock_rebuild(&lock_dir, &lock_name)
-    })
-    .await
-    .context("cannot stop this box while a rebuild is in progress")?;
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+        .context("cannot stop this box while a rebuild is in progress")?;
 
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;

@@ -869,19 +869,20 @@ pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<Rebui
 
 #[cfg(test)]
 mod lock_audit {
-    /// No `async fn` may take a devbox lock on the thread it is running on.
+    /// No `async fn` may take the *waiting* devbox lock on its own thread.
     ///
-    /// These are OS file locks: acquiring a held one blocks the calling thread
-    /// until it is released. In the console that thread is a Tokio worker, and
+    /// `lock_project_config` calls `File::lock`, which blocks the calling
+    /// thread until the holder releases. In the console that thread is a Tokio worker, and
     /// the holder is either another request that is itself `await`ing or a
     /// rebuild that runs for minutes. A single-worker runtime deadlocks on the
     /// first overlap; a larger one starves once enough overlap, and neither
     /// recovers, because the holder can only finish on a worker that is now
     /// blocked waiting for it.
     ///
-    /// Round 41 reported one instance. There were three. This is the check that
-    /// covers the class, and it runs over the tree rather than over a list
-    /// somebody has to remember to extend.
+    /// Round 41 reported the one instance there was. An attempt to widen that
+    /// to "every lock" was wrong: `lock_rebuild` is a `try_lock` and refuses
+    /// rather than waits, so two paths were changed for a defect they never
+    /// had. The check is narrow on purpose, and says why.
     ///
     /// Synchronous callers are fine and are the point of the exemption: in the
     /// CLI, blocking the one command until the lock frees is the intended
@@ -930,13 +931,32 @@ mod lock_audit {
                 if trimmed.starts_with("//") || !in_async {
                     continue;
                 }
-                let takes_lock =
-                    trimmed.contains("lock_rebuild(") || trimmed.contains("lock_project_config(");
+                // `lock_project_config` only. It calls `File::lock`, which
+                // waits for the holder; `lock_rebuild` calls `try_lock` and
+                // refuses at once with a conflict, so it cannot park anything.
+                //
+                // That distinction is the whole content of this check, and
+                // getting it wrong is how two paths were "fixed" for a defect
+                // they never had. If `lock_rebuild` ever starts waiting, add
+                // it here — and not before.
+                let takes_lock = trimmed.contains("lock_project_config(");
                 // Inside the `lock_blocking` closure is exactly where these
                 // belong, so a line that mentions both is correct.
                 if takes_lock && !line.contains("lock_blocking") {
-                    let window = lines[n.saturating_sub(4)..=n].join("\n");
-                    if !window.contains("lock_blocking") {
+                    // Code only. The first version of this looked at the raw
+                    // preceding lines, and the comment above the call site
+                    // explains the fix by *naming* `lock_blocking` — so the
+                    // prose satisfied the check and the guard passed on code
+                    // that had been reverted. A guard defeated by its own
+                    // explanation is worse than no guard: it reports the thing
+                    // it was written to catch as absent.
+                    let code_above: String = lines[n.saturating_sub(4)..n]
+                        .iter()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !code_above.contains("lock_blocking") {
                         offenders.push(format!("{}:{}: {}", path.display(), n + 1, trimmed));
                     }
                 }

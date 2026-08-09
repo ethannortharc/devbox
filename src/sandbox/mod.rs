@@ -461,16 +461,7 @@ impl SandboxManager {
         // covered by the same rule. The lock helper lives in `web::build`
         // alongside the rest of the rebuild mechanics, which the CLI paths
         // already reach into for the same reason.
-        // Off the worker: this is `await`ed from the console, where blocking
-        // on a claim a rebuild holds for minutes parks a thread the console
-        // needs. The CLI reaches the same code and is unaffected — there the
-        // work simply happens on a pool thread instead of the main one.
-        let lock_dir = self.state_dir.clone();
-        let lock_name = name.to_string();
-        let _lock = crate::web::build::lock_blocking(move || {
-            crate::web::build::lock_rebuild(&lock_dir, &lock_name)
-        })
-        .await?;
+        let _lock = crate::web::build::lock_rebuild(&self.state_dir, name)?;
 
         let state = self.get_sandbox(name);
         if let Ok(state) = &state {
