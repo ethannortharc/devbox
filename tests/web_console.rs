@@ -1096,3 +1096,99 @@ fn no_test_authenticates_with_a_cookie() {
         offenders.join("\n")
     );
 }
+
+/// Scripts that read the console key, discovered from the files themselves so
+/// a new one is covered without anyone remembering to list it here.
+fn key_consuming_scripts() -> Vec<String> {
+    let js = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/assets/js");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&js).expect("js assets") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name == "key.js" {
+            continue;
+        }
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("devboxKey")
+        {
+            found.push(name);
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "no script reads the key — check the scan"
+    );
+    found
+}
+
+/// Every document the console serves, by the route that produces it.
+async fn every_served_document(app: &Router) -> Vec<(String, String)> {
+    let mut docs = Vec::new();
+    for (label, req) in [
+        ("shell".to_string(), get("/")),
+        ("bootstrap".to_string(), get(&format!("/?t={TOKEN}"))),
+    ] {
+        docs.push((
+            label,
+            body_string(app.clone().oneshot(req).await.unwrap()).await,
+        ));
+    }
+    for uri in ["/", "/help", "/boxes/alpha", "/boxes/alpha?tab=terminal"] {
+        let res = app.clone().oneshot(get_authed(uri)).await.unwrap();
+        docs.push((uri.to_string(), body_string(res).await));
+    }
+    docs
+}
+
+#[tokio::test]
+async fn every_document_parses_key_js_before_anything_that_reads_it() {
+    // Asserted on what is served, not on the templates: `box_detail.html` loads
+    // `term.js` and never mentions `key.js`, which arrives from the base it
+    // extends. Checking the templates separately would call that a violation,
+    // and checking only the base would miss the page that actually broke.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let consumers = key_consuming_scripts();
+
+    for (name, doc) in every_served_document(&app).await {
+        for c in &consumers {
+            let Some(uses_at) = doc.find(&format!("/assets/js/{c}")) else {
+                continue;
+            };
+            let key_at = doc.find("/assets/js/key.js").unwrap_or_else(|| {
+                panic!("{name} loads {c}, which reads the key, but never loads key.js")
+            });
+            assert!(
+                key_at < uses_at,
+                "{name}: key.js must be parsed before {c}, which reads the key"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_console_script_is_deferred_or_async() {
+    // `defer` is what broke the event stream, and it broke it silently: htmx
+    // initialised `<body>` before `sse.js` registered the extension, htmx marks
+    // a node initialised, and so the stream could never be connected at all.
+    // The page rendered, every button worked, nothing was logged, and the
+    // heartbeat simply never arrived.
+    //
+    // These documents are usually handed to the parser by the shell rather than
+    // fetched by a navigation, and in that re-parse `defer` orders nothing.
+    // Re-adding it would read as ordinary in a diff and fail no other test
+    // here, which is exactly why this one scans for the attribute itself.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for (name, doc) in every_served_document(&app).await {
+        for tag in doc.split("<script").skip(1) {
+            let open = tag.split('>').next().unwrap_or_default();
+            for attr in ["defer", "async"] {
+                assert!(
+                    !open.contains(attr),
+                    "{name}: <script{open}> uses `{attr}`; the parser must do the ordering"
+                );
+            }
+        }
+    }
+}
