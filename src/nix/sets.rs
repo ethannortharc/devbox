@@ -380,6 +380,66 @@ mod tests {
         }
     }
 
+    /// A checked-in module must list exactly what the catalog says.
+    ///
+    /// Provisioning pushes `nix/sets/<name>.nix` when a box is created; every
+    /// later Sets apply regenerates the same path from `NIX_SETS`. So a
+    /// package in one and not the other is installed at creation and removed
+    /// by the first rebuild, for a selection the user never changed — which is
+    /// how `zellij` outlived the v4 removal of the layout subsystem in the
+    /// module while the catalog had already dropped it.
+    ///
+    /// The AI sets are exempt and say why: they wrap each optional tool in
+    /// `tryEval`, so their module is deliberately not a flat list.
+    #[test]
+    fn every_checked_in_module_matches_the_catalog() {
+        const HAND_WRITTEN: &[&str] = &["ai-code", "ai-infra"];
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nix/sets");
+        let mut drift = Vec::new();
+
+        for set in super::NIX_SETS {
+            if HAND_WRITTEN.contains(&set.name) {
+                continue;
+            }
+            let path = dir.join(format!("{}.nix", set.name));
+            let Ok(module) = std::fs::read_to_string(&path) else {
+                continue; // not every set ships a checked-in module
+            };
+            // The bracketed list, with comments stripped.
+            let Some(body) = module
+                .split_once('[')
+                .and_then(|(_, rest)| rest.rsplit_once(']').map(|(list, _)| list.to_string()))
+            else {
+                continue;
+            };
+            let listed: std::collections::BTreeSet<&str> = body
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .flat_map(str::split_whitespace)
+                .collect();
+            let catalogued: std::collections::BTreeSet<&str> =
+                set.packages.iter().copied().collect();
+
+            for extra in listed.difference(&catalogued) {
+                drift.push(format!(
+                    "{}.nix lists '{extra}', which the catalog does not: it is \
+                     installed at creation and removed by the first Sets rebuild",
+                    set.name
+                ));
+            }
+            for missing in catalogued.difference(&listed) {
+                drift.push(format!(
+                    "{}.nix omits '{missing}', which the catalog has: it appears \
+                     only after the first Sets rebuild",
+                    set.name
+                ));
+            }
+        }
+
+        assert!(drift.is_empty(), "{}", drift.join("\n"));
+    }
+
     /// The Ubuntu package mapping must carry everything the catalog does.
     ///
     /// Ubuntu provisioning does not read `NIX_SETS`; it uses a separate

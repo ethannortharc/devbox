@@ -65,51 +65,15 @@ Four tabs, ready to go: **Workspace** (AI coding + brainstorm + file browser), *
 
 ---
 
-## Customizable Layouts
+## Workspace Layouts (removed in v4)
 
-Devbox uses [Zellij](https://zellij.dev/) for workspace layouts. Pick a built-in layout or create your own in minutes.
+v3 shipped a Zellij layout subsystem — `devbox layout list`, `--layout`, custom
+KDL files. v4 replaces the terminal UI with the web console, and the layout
+commands and the `--layout` flag are gone with it. `devbox create --layout tdd`
+is now an error rather than a silent no-op, which is the honest answer for a
+flag nothing reads.
 
-| Layout | Description |
-|--------|-------------|
-| `default` | AI assistant + brainstorm + file browser + monitor + git |
-| `ai-pair` | AI coding + editor + terminal (pair programming) |
-| `fullstack` | Frontend, backend, and database panes |
-| `tdd` | Editor + test runner side-by-side |
-| `debug` | Editor + debugger + logs |
-| `monitor` | System metrics dashboard |
-| `git-review` | Diff viewer + lazygit + editor |
-| `presentation` | Wide editor, minimal chrome |
-
-```bash
-devbox layout list                    # See all layouts
-devbox layout preview ai-pair         # ASCII preview
-devbox create --layout tdd            # Use a layout on create
-devbox layout set-default tdd         # Set your global default
-```
-
-**Create your own layout:**
-
-```bash
-devbox layout create my-workflow      # Generates ~/.devbox/layouts/my-workflow.kdl
-devbox layout edit my-workflow        # Opens in your $EDITOR
-```
-
-Layouts are simple KDL files — define panes, commands, and splits. Your custom layouts override built-ins and are automatically available across all sandboxes.
-
-```kdl
-// Example: custom two-pane layout
-layout {
-    tab name="Dev" {
-        pane split_direction="vertical" {
-            pane name="editor" size="60%" {
-                command "nvim"
-                args "."
-            }
-            pane name="terminal" size="40%"
-        }
-    }
-}
-```
+The box still has a shell; `devbox shell` attaches to it.
 
 ---
 
@@ -190,7 +154,7 @@ cd my-project
 devbox
 
 # Or be explicit
-devbox create --name myapp --tools go,docker --layout ai-pair
+devbox create --name myapp --tools go,docker
 
 # Ubuntu base image instead of NixOS
 devbox create --image ubuntu --tools python
@@ -330,12 +294,6 @@ All layer operations are also available in the **DevBox Management Panel** insid
 | `devbox layer conflicts` | Show files modified on both sides |
 | `devbox layer stash` | Stash current overlay changes |
 | `devbox layer stash-pop` | Restore stashed changes |
-| `devbox layout list` | List available layouts |
-| `devbox layout preview <name>` | ASCII preview of a layout |
-| `devbox layout create <name>` | Create a custom layout |
-| `devbox layout edit <name>` | Edit a layout in $EDITOR |
-| `devbox layout save` | Save layout preference |
-| `devbox layout set-default <n>` | Set global default layout |
 | `devbox snapshot save` | Create a snapshot |
 | `devbox snapshot restore` | Restore a snapshot |
 | `devbox guide [tool]` | Built-in cheat sheets |
@@ -368,7 +326,6 @@ coreutils, gnugrep, gnused, gawk, findutils, diffutils, gzip, gnutar, xz, bzip2,
 
 | Package | Description |
 |---------|-------------|
-| zellij | Terminal multiplexer (workspace layouts) |
 | zsh | Z shell with advanced scripting |
 | zsh-autosuggestions | Fish-like autosuggestions for zsh |
 | zsh-syntax-highlighting | Syntax highlighting for zsh |
@@ -481,7 +438,6 @@ Generated with `devbox init`, auto-detects your project settings.
 [sandbox]
 runtime = "auto"            # auto | lima | incus | multipass | docker
 image = "nixos"             # nixos | ubuntu
-layout = "default"          # zellij layout name
 mount_mode = "overlay"      # overlay (safe) | writable (direct)
 
 [sets]
@@ -507,7 +463,6 @@ memory = "8GiB"
 
 ```bash
 devbox config set runtime lima
-devbox config set layout ai-pair
 devbox config show
 ```
 
@@ -561,7 +516,6 @@ devbox (single binary)
   |     Declarative package management via nixos-rebuild
   |
   |-- Built-in Resources (compiled into binary)
-        8 Zellij layouts (KDL)
         14 tool cheat sheets (Markdown)
         16 NixOS package set definitions
 ```

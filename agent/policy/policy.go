@@ -132,9 +132,36 @@ type Enforcer struct {
 	mirrorOnly bool
 	// added counts successful set insertions, for the metrics surface.
 	added int
+	// setV4/setV6 are the allow sets this enforcer's generation owns.
+	setV4, setV6 string
+}
+
+// WithGeneration binds this enforcer to one policy generation's allow sets.
+func (e *Enforcer) WithGeneration(generation string) *Enforcer {
+	e.setV4, e.setV6 = SetsFor(generation)
+	return e
 }
 
 // New builds an enforcer for a set of allowlisted domains.
+// SetsFor names the allow sets a policy generation owns.
+//
+// The generation is in the name so that an enforcer which has been superseded
+// cannot write into the table that replaced it. The control plane removes
+// `policy.json` before loading a new ruleset, but a DNS answer already in
+// flight can pass the reload check against the *old* policy and run its insert
+// afterwards — putting an address only the old allowlist permitted into the
+// new allow set, where it lives out the full hour of the TTL. Named this way,
+// that insert addresses a set that no longer exists and fails.
+//
+// An empty generation gives the bare names, for a policy written by a control
+// plane that predates this.
+func SetsFor(generation string) (v4, v6 string) {
+	if generation == "" {
+		return SetV4, SetV6
+	}
+	return SetV4 + "_" + generation, SetV6 + "_" + generation
+}
+
 func New(applier Applier, domains []string, mirrorOnly bool) *Enforcer {
 	// `*.example.com` means subdomains, which is what the console says it
 	// means. Stripping the prefix and forgetting it had been there made the
@@ -155,6 +182,10 @@ func New(applier Applier, domains []string, mirrorOnly bool) *Enforcer {
 		allow:      allow,
 		seen:       map[string]time.Time{},
 		mirrorOnly: mirrorOnly,
+		// Bare names until a generation is bound; `WithGeneration` is what the
+		// agent calls once it has read one out of the policy file.
+		setV4: SetV4,
+		setV6: SetV6,
 	}
 }
 
@@ -238,9 +269,9 @@ func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error)
 			continue
 		}
 
-		set := SetV4
+		set := e.setV4
 		if addr.Is6() && !addr.Is4In6() {
-			set = SetV6
+			set = e.setV6
 		}
 		// Marked seen only *after* nft accepts it. Recording it first would
 		// mean a transient failure permanently skipped the address, leaving an

@@ -27,10 +27,18 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     let runtime = manager.runtime_for_sandbox(&state)?;
 
     // Build config from current state
-    let cwd = std::env::current_dir()?;
-    let mut config = DevboxConfig::load_or_default(&cwd);
-
-    // Re-apply existing sets from state
+    // The target box's config, not the caller's current directory.
+    //
+    // `load_or_default` on the CWD gave whatever project the operator happened
+    // to be standing in — and, failing that, the *defaults*, which enable
+    // `shell`, `tools` and `editor`. `apply_tools` only ever turns sets on, so
+    // a box that had deliberately disabled one had it silently rebuilt and
+    // persisted as enabled: the upgrade undid a choice it was never asked
+    // about. ADR-0012 made those sets optional precisely so unchecking them
+    // means something.
+    let mut config = DevboxConfig::load_or_default(&state.project_dir);
+    config.sets = Default::default();
+    config.languages = Default::default();
     for set_name in &state.sets {
         let tool_name = set_name.strip_prefix("lang-").unwrap_or(set_name);
         config.apply_tools(&[tool_name.to_string()]);

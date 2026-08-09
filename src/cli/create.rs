@@ -54,9 +54,6 @@ pub struct CreateArgs {
     #[arg(long)]
     pub bare: bool,
 
-    #[arg(long)]
-    pub layout: Option<String>,
-
     /// Base image: nixos (default, declarative) or ubuntu (familiar + Nix packages)
     #[arg(long, value_enum, default_value = "nixos")]
     pub image: ImageChoice,

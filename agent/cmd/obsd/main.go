@@ -380,6 +380,10 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 		Egress  string   `json:"egress"`
 		Allow   []string `json:"allow"`
 		Ruleset string   `json:"ruleset"`
+		// Generation names the allow sets this policy owns, so an enforcer
+		// that has been superseded cannot insert into the table that replaced
+		// it. Absent for a policy written before this existed.
+		Generation string `json:"generation"`
 	}
 	if err := json.Unmarshal(raw, &spec); err != nil {
 		return nil, fmt.Errorf("parse the policy at %s: %w", cfg.policy, err)
@@ -399,7 +403,8 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 		return nil, nil
 	}
 
-	enforcer := policy.New(policy.NFT{}, spec.Allow, spec.Egress == "mirror-only")
+	enforcer := policy.New(policy.NFT{}, spec.Allow, spec.Egress == "mirror-only").
+		WithGeneration(spec.Generation)
 	if loadRuleset && spec.Ruleset != "" {
 		// Only at startup. `Load` destroys and rebuilds the table, so doing it
 		// on every reload would discard every address the previous enforcer had

@@ -517,10 +517,17 @@ fn agent_policy_json(policy: &Policy, ruleset: &str) -> String {
         .map(|entry| format!("\"{}\"", json_escape(entry)))
         .collect();
 
+    // The generation the agent must insert under.
+    //
+    // Its allow sets carry it in their names, so an enforcer superseded while a
+    // DNS answer was in flight names a set that no longer exists and its insert
+    // fails — rather than landing an address only the *old* allowlist permitted
+    // into the new table for the full hour of the TTL.
     format!(
-        "{{\"egress\":\"{}\",\"allow\":[{}],\"ruleset\":\"{}\"}}",
+        "{{\"egress\":\"{}\",\"allow\":[{}],\"generation\":\"{}\",\"ruleset\":\"{}\"}}",
         policy.egress,
         domains.join(","),
+        super::nftables::generation(policy),
         json_escape(ruleset)
     )
 }

@@ -201,8 +201,8 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
             // blocks nothing; that is what makes auditing in it useful.
             let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
             let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
-            let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
-            let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
+            let _ = writeln!(nft, "    ip daddr @{} accept", set_v4(policy));
+            let _ = writeln!(nft, "    ip6 daddr @{} accept", set_v6(policy));
             emit_flag_log(nft);
         }
         Posture::Open => {
@@ -225,8 +225,8 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
         Posture::Allowlist | Posture::MirrorOnly => {
             let _ = writeln!(nft, "    ip daddr @{SET_STATIC_V4} accept");
             let _ = writeln!(nft, "    ip6 daddr @{SET_STATIC_V6} accept");
-            let _ = writeln!(nft, "    ip daddr @{SET_V4} accept");
-            let _ = writeln!(nft, "    ip6 daddr @{SET_V6} accept");
+            let _ = writeln!(nft, "    ip daddr @{} accept", set_v4(policy));
+            let _ = writeln!(nft, "    ip6 daddr @{} accept", set_v6(policy));
             // Logging is what turns a dropped packet into a `policy` event:
             // the agent tails these and emits one per blocked connection.
             emit_block_log(nft);
@@ -237,6 +237,44 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
 /// Named sets the agent populates from resolved DNS answers.
 pub const SET_V4: &str = "allow_v4";
 pub const SET_V6: &str = "allow_v6";
+
+/// A tag for the policy a ruleset was generated from.
+///
+/// The agent-managed sets carry it in their names, which is what retires an
+/// enforcer that has been superseded. Removing `policy.json` before loading
+/// the new table does not: a DNS event already in flight can pass the agent's
+/// fingerprint check against the *old* policy and then run its insert after
+/// the new table is live, putting an address only the old allowlist permitted
+/// into the new allow set — where it survives for the full hour of the TTL.
+/// With the generation in the name, that insert names a set that no longer
+/// exists and fails, which is the outcome the unlink was reaching for.
+///
+/// Derived from the policy rather than from the ruleset text, so reapplying
+/// the same policy keeps the same sets and does not flush what the agent has
+/// already resolved. Not a checksum in the security sense — a collision here
+/// means two policies share a set name, which is exactly what identical
+/// policies should do.
+pub fn generation(policy: &Policy) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    policy.egress.as_str().hash(&mut hasher);
+    policy.alert_on_violation.hash(&mut hasher);
+    // Sorted, because the same allowlist written in a different order is the
+    // same allowlist and must not churn the sets.
+    let mut allow: Vec<&str> = policy.allow.iter().map(String::as_str).collect();
+    allow.sort_unstable();
+    allow.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The agent-managed set names for a policy.
+pub fn set_v4(policy: &Policy) -> String {
+    format!("{SET_V4}_{}", generation(policy))
+}
+
+pub fn set_v6(policy: &Policy) -> String {
+    format!("{SET_V6}_{}", generation(policy))
+}
 
 /// Sets holding the CIDRs the user stated, which never expire.
 pub const SET_STATIC_V4: &str = "static_v4";
@@ -338,13 +376,13 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
 
     // The agent's sets: every element ages out unless a fresh DNS answer
     // refreshes it. No `interval`, because these hold single addresses.
-    let _ = writeln!(nft, "  set {SET_V4} {{");
+    let _ = writeln!(nft, "  set {} {{", set_v4(policy));
     let _ = writeln!(nft, "    type ipv4_addr");
     let _ = writeln!(nft, "    flags timeout");
     let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
     let _ = writeln!(nft, "  }}");
 
-    let _ = writeln!(nft, "  set {SET_V6} {{");
+    let _ = writeln!(nft, "  set {} {{", set_v6(policy));
     let _ = writeln!(nft, "    type ipv6_addr");
     let _ = writeln!(nft, "    flags timeout");
     let _ = writeln!(nft, "    timeout {ALLOW_TTL_SECS}s");
@@ -442,16 +480,18 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
 ///
 /// This is the DNS-driven half: the agent calls this for each answer it sees
 /// for an allowlisted name, so a CDN rotation needs no ruleset regeneration.
-pub fn add_elements(addrs: &[String]) -> Vec<String> {
+pub fn add_elements(policy: &Policy, addrs: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for addr in addrs {
         match addr.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(a)) => {
-                out.push(format!("add element inet {TABLE} {SET_V4} {{ {a} }}"))
-            }
-            Ok(std::net::IpAddr::V6(a)) => {
-                out.push(format!("add element inet {TABLE} {SET_V6} {{ {a} }}"))
-            }
+            Ok(std::net::IpAddr::V4(a)) => out.push(format!(
+                "add element inet {TABLE} {} {{ {a} }}",
+                set_v4(policy)
+            )),
+            Ok(std::net::IpAddr::V6(a)) => out.push(format!(
+                "add element inet {TABLE} {} {{ {a} }}",
+                set_v6(policy)
+            )),
             // Anything unparseable is skipped rather than interpolated: this
             // string is handed to a command that runs as root.
             Err(_) => continue,
@@ -645,7 +685,7 @@ mod tests {
             "an audited posture must log what the allowlist does not cover:\n{output}"
         );
         assert!(
-            output.contains(&format!("@{SET_V4} accept")),
+            output.contains(&format!("@{} accept", set_v4(&p))),
             "an allowlisted destination must not be flagged:\n{output}"
         );
         // And nothing is blocked — that is what `open` means, and what makes
@@ -929,7 +969,8 @@ mod tests {
         // A set-level timeout is the default for its initializer elements, so
         // one shared set made stated CIDRs expire after an hour with nothing
         // to repopulate them: a CIDR-only allowlist that stopped working.
-        let nft = ruleset(&policy(Posture::Allowlist, &["10.0.0.0/8", "github.com"]));
+        let p = policy(Posture::Allowlist, &["10.0.0.0/8", "github.com"]);
+        let nft = ruleset(&p);
 
         let statics = nft.split("set static_v4 {").nth(1).unwrap();
         let statics = statics.split('}').next().unwrap();
@@ -939,7 +980,7 @@ mod tests {
             "a stated CIDR is a decision, not an observation: {statics}"
         );
 
-        let resolved = nft.split("set allow_v4 {").nth(1).unwrap();
+        let resolved = nft.split(&format!("set {} {{", set_v4(&p))).nth(1).unwrap();
         let resolved = resolved.split('}').next().unwrap();
         assert!(resolved.contains("timeout"));
         assert!(
@@ -950,7 +991,7 @@ mod tests {
         // Both are consulted, or half the allowlist silently does nothing.
         let chain = nft.split("chain output {").nth(1).unwrap();
         assert!(chain.contains("@static_v4 accept"));
-        assert!(chain.contains("@allow_v4 accept"));
+        assert!(chain.contains(&format!("@{} accept", set_v4(&p))));
     }
 
     #[test]
@@ -978,9 +1019,10 @@ mod tests {
     #[test]
     fn sets_exist_even_when_empty() {
         // The agent populates them without caring which posture is in force.
-        let nft = ruleset(&policy(Posture::Open, &[]));
-        assert!(nft.contains("set allow_v4 {"));
-        assert!(nft.contains("set allow_v6 {"));
+        let p = policy(Posture::Open, &[]);
+        let nft = ruleset(&p);
+        assert!(nft.contains(&format!("set {} {{", set_v4(&p))));
+        assert!(nft.contains(&format!("set {} {{", set_v6(&p))));
         assert!(nft.contains("flags interval"), "CIDRs need interval sets");
     }
 
@@ -998,11 +1040,14 @@ mod tests {
 
     #[test]
     fn resolved_answers_become_set_elements_by_family() {
-        let cmds = add_elements(&[
-            "151.101.0.223".into(),
-            "2606:4700::1".into(),
-            "not-an-address".into(),
-        ]);
+        let cmds = add_elements(
+            &policy(Posture::Allowlist, &["example.com"]),
+            &[
+                "151.101.0.223".into(),
+                "2606:4700::1".into(),
+                "not-an-address".into(),
+            ],
+        );
 
         assert_eq!(cmds.len(), 2, "garbage is skipped, not interpolated");
         assert!(cmds[0].contains("allow_v4"));
@@ -1014,11 +1059,14 @@ mod tests {
     #[test]
     fn a_malicious_dns_answer_cannot_inject_a_command() {
         // These strings would be handed to a command running as root.
-        let cmds = add_elements(&[
-            "1.2.3.4; nft flush ruleset".into(),
-            "$(reboot)".into(),
-            "}; add rule inet devbox output accept; #".into(),
-        ]);
+        let cmds = add_elements(
+            &policy(Posture::Allowlist, &["example.com"]),
+            &[
+                "1.2.3.4; nft flush ruleset".into(),
+                "$(reboot)".into(),
+                "}; add rule inet devbox output accept; #".into(),
+            ],
+        );
         assert!(cmds.is_empty(), "nothing unparseable may reach nft");
     }
 
