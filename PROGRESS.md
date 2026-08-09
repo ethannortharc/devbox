@@ -1223,7 +1223,7 @@ this whole exercise and they are the one artefact not being kept.
 fmt/clippy/vet/gofmt/ruff/mypy all clean. Verified by running each, not by
 reading the previous commit message.
 
-## 2026-08-09T08:40Z — Round 40: the finding that took two rounds to fix
+## 2026-08-09T08:40Z — Round 39's last finding, and two the browser found
 
 Rounds 24–39 are not written up here, and that gap is itself the first thing to
 record. The commit messages carry the detail; this file stopped keeping pace at
