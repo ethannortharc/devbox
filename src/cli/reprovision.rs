@@ -78,6 +78,12 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // selection describing different things.
     let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
 
+    // Resolved once, and used for both the rebuild and the state written after
+    // it. A v3 box has no `packages`, so these come out of its project file —
+    // and the save below stamps the schema, which is what makes recording them
+    // the difference between a recoverable gap and a permanent one.
+    let packages = provision::resolved_packages(&state);
+
     provision::provision_vm_full(
         runtime.as_ref(),
         &name,
@@ -85,13 +91,15 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         &state.languages,
         image,
         &state.mount_mode,
-        &provision::package_pairs(&state),
+        &packages.0,
     )
     .await?;
 
     // Update saved state with migrated sets
     let mut updated_state = state.clone();
     updated_state.sets = sets;
+    updated_state.packages = packages.1.packages.iter().cloned().collect();
+    updated_state.package_sources = packages.1.sources.clone();
     // Unconditionally: `apply` clears or installs as the posture requires, and
     // an `open` posture that audits requires a table. Testing the posture here
     // meant a reprovision silently dropped observe-and-warn.

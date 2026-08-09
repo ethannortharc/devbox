@@ -246,23 +246,52 @@ pub(crate) fn is_safe_installable(reference: &str) -> bool {
 /// replaced it with a same-named nixpkgs attribute, or dropped it, while the
 /// UI went on reporting it selected.
 pub fn package_pairs(state: &crate::sandbox::state::SandboxState) -> Vec<(String, String)> {
+    resolved_packages(state)
+        .0
+        .into_iter()
+        .map(|(name, source)| (name, source))
+        .collect()
+}
+
+/// A box's packages, recovered for a box that predates `state.packages`.
+///
+/// The list itself has to come through the selection, not off `state.packages`.
+/// This function used to iterate that field directly and fall back to the
+/// project config only for a package's *source* — which reads as a legacy
+/// fallback and is not one: a v3 box has no entries at all, so there was
+/// nothing to find sources for and the whole list came back empty.
+///
+/// `reprovision` and `devbox use` both rebuild from this, so both silently
+/// dropped every custom package such a box had. That was survivable while the
+/// absence stayed legible; once `save` began stamping `schema`, each of them
+/// wrote "this file is current and has no packages" over a box whose packages
+/// they had just discarded, and nothing could recover them afterwards.
+///
+/// Returned as a pair so the callers that *persist* get the same answer as the
+/// callers that build. The upgrade path needed both and only did one, which is
+/// the whole shape of this defect.
+pub fn resolved_packages(
+    state: &crate::sandbox::state::SandboxState,
+) -> (Vec<(String, String)>, crate::nix::compose::Selection) {
     let config = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
-    state
+    let selection = crate::nix::compose::Selection::from_state_and_project(state, &config);
+    let pairs = selection
         .packages
         .iter()
         .map(|name| {
             // What the box recorded wins over what the current directory
             // declares: after `devbox use` the two are different projects, and
-            // the box's own record is the one that describes the box.
-            let source = state
-                .package_sources
+            // the box's own record is the one that describes the box. The
+            // selection has already applied that precedence.
+            let source = selection
+                .sources
                 .get(name)
-                .or_else(|| config.custom_packages.get(name))
                 .cloned()
                 .unwrap_or_else(|| "nixpkgs".to_string());
             (name.clone(), source)
         })
-        .collect()
+        .collect();
+    (pairs, selection)
 }
 
 pub(crate) fn installable(name: &str, source: &str) -> String {
@@ -1853,5 +1882,82 @@ mod tests {
             let pkgs = nix_packages_for_set(set);
             assert!(!pkgs.is_empty(), "set '{set}' should have packages");
         }
+    }
+}
+
+#[cfg(test)]
+mod resolved_packages_tests {
+    use super::resolved_packages;
+    use crate::sandbox::state::SandboxState;
+
+    fn box_in(project: &std::path::Path, schema: u32, packages: Vec<String>) -> SandboxState {
+        SandboxState {
+            schema,
+            packages,
+            package_sources: Default::default(),
+            name: "b".into(),
+            runtime: "docker".into(),
+            project_dir: project.to_path_buf(),
+            created_at: String::new(),
+            mount_mode: "overlay".into(),
+            sets: vec!["system".into()],
+            languages: vec![],
+            image: "nixos".into(),
+        }
+    }
+
+    fn project_with_packages(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("devbox.toml"),
+            "[custom_packages]\nripgrep = \"nixpkgs\"\nmy-tf = \"nixpkgs#terraform\"\n",
+        )
+        .expect("write devbox.toml");
+    }
+
+    #[test]
+    fn a_v3_box_gets_its_packages_from_the_project_file() {
+        // The list, not merely each package's source. This read `state.packages`
+        // directly and fell back only for a source — which looks like a legacy
+        // fallback and is not one: a v3 box has no entries, so there was
+        // nothing to find sources for and the whole list came back empty.
+        //
+        // `reprovision` and `devbox use` both rebuild from this, so both
+        // dropped every custom package such a box had.
+        let dir = tempfile::tempdir().unwrap();
+        project_with_packages(dir.path());
+
+        let (pairs, selection) = resolved_packages(&box_in(dir.path(), 0, vec![]));
+
+        assert!(
+            pairs.iter().any(|(n, _)| n == "ripgrep"),
+            "the package list was lost: {pairs:?}"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(n, _)| n == "my-tf")
+                .map(|(_, s)| s.as_str()),
+            Some("nixpkgs#terraform"),
+            "and an alias must keep its source"
+        );
+        // The same answer the caller persists, so the rebuild and the record
+        // cannot disagree.
+        assert!(selection.packages.contains("ripgrep"));
+    }
+
+    #[test]
+    fn a_current_box_with_no_packages_stays_empty() {
+        // The other direction, which the schema marker exists to protect: a box
+        // written by current code that genuinely has none must not inherit
+        // whatever the project file happens to declare.
+        let dir = tempfile::tempdir().unwrap();
+        project_with_packages(dir.path());
+
+        let (pairs, _) =
+            resolved_packages(&box_in(dir.path(), crate::sandbox::state::SCHEMA, vec![]));
+        assert!(
+            pairs.is_empty(),
+            "inherited the project's packages: {pairs:?}"
+        );
     }
 }

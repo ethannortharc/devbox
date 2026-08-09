@@ -88,6 +88,17 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     );
     runtime.update_mounts(name, &mounts).await?;
 
+    // Resolved while `state.project_dir` still names the project these came
+    // from, and used for both the rebuild and the state saved after it.
+    //
+    // A v3 box has no `packages`, so they were only ever recoverable from that
+    // project file — and this is the command that changes which file that is.
+    // Reading them after the move would ask a project that has never heard of
+    // them; not recording them at all stamped the schema over an empty list.
+    // Either way the packages become unrecoverable, which is why this happens
+    // here and is written back below.
+    let packages = provision::resolved_packages(&state);
+
     // If overlay mode, reprovision so NixOS module sets up the overlay mount
     if is_overlay {
         println!("Setting up OverlayFS mount via NixOS...");
@@ -108,7 +119,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
             &state.languages,
             &state.image,
             "overlay",
-            &provision::package_pairs(&state),
+            &packages.0,
         )
         .await
         {
@@ -127,6 +138,9 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     //
     // The posture belongs to the project the box is now serving, so the state
     // update has to come first.
+    state.packages = packages.1.packages.iter().cloned().collect();
+    state.package_sources = packages.1.sources.clone();
+
     state.project_dir = cwd;
     state.mount_mode = mount_mode.to_string();
     state.save(&manager.state_dir)?;

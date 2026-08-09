@@ -33,7 +33,10 @@ pub struct SandboxState {
     /// different package under the same name.
     ///
     /// Absent for boxes created before this field existed, which is why
-    /// `package_pairs` still falls back to the project config.
+    /// `resolved_packages` reads the list through the selection rather than off
+    /// `packages` — this map only ever answered "where does *this* package come
+    /// from", so on a box with no packages recorded there was nothing for it to
+    /// answer about and the fallback it looked like never existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub package_sources: std::collections::BTreeMap<String, String>,
     /// Which version of this file's schema wrote it. Zero means "before this
@@ -266,5 +269,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let all = SandboxState::list_all(dir.path()).unwrap();
         assert!(all.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod writer_audit {
+    /// Every path that saves state must record packages before it does.
+    ///
+    /// `save` stamps `schema`, and that stamp means "every field was written by
+    /// code that writes them all". A writer that leaves `packages` untouched
+    /// makes the stamp a lie — and because the stamp is exactly what the
+    /// migration fallback keys on, the lie is permanent: a v3 box's packages
+    /// become unrecoverable the first time any such path runs.
+    ///
+    /// Round 41 found one writer in that state. There were three. This is the
+    /// check that would have found all of them, and it runs over whatever is in
+    /// the tree rather than over the list someone remembered to update.
+    #[test]
+    fn every_state_writer_records_packages_before_stamping_the_schema() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+
+        let mut files = Vec::new();
+        collect_rs(&src, &mut files);
+        for path in files {
+            // `state.rs` defines `save`; it is not a caller of it.
+            if path.ends_with("sandbox/state.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable source");
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // A save of sandbox state, as distinct from a config save.
+                //
+                // Both take the state directory, and a text scan cannot see
+                // types — so the global-config writer is excluded by receiver
+                // name. That is a real limitation: a `SandboxState` binding
+                // literally named `config` would slip past. It is spelled out
+                // rather than hidden because the failure mode of this guard is
+                // silence, and silence here reads as "every writer is fine".
+                if !(line.contains(".save(&manager.state_dir")
+                    || line.contains(".save(&self.state_dir"))
+                {
+                    continue;
+                }
+                if line.trim_start().starts_with("config.save(") {
+                    continue;
+                }
+                // Look back over the enclosing work for a write to `packages`.
+                let from = n.saturating_sub(60);
+                let window = lines[from..=n].join("\n");
+                if !window.contains(".packages = ") && !window.contains("packages:") {
+                    offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these save sandbox state — which stamps `schema`, claiming every \
+             field was written — without recording `packages`. A box created \
+             before that field existed loses them permanently here:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
     }
 }
