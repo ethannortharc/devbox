@@ -565,6 +565,22 @@ async fn put_policy(
     let posture = updated.egress;
     let entries = updated.allow.len();
     let policy = updated.clone();
+
+    // One claim over the write *and* the apply.
+    //
+    // Releasing it after the save let two overlapping edits reach the firewall
+    // in the opposite order from the file: `devbox.toml` could end at
+    // `isolated` while a delayed earlier `open` cleared the live table, so the
+    // box was running the posture nobody had asked for last.
+    let project_dir = match state.manager.get_sandbox(&name) {
+        Ok(s) => s.project_dir,
+        Err(e) => return not_found(&name, &e),
+    };
+    let _edit = match build::lock_project_config(&state.manager.state_dir, &project_dir) {
+        Ok(lock) => lock,
+        Err(e) => return server_error("failed to claim devbox.toml", &e),
+    };
+
     if let Err(e) = service::save_policy(&state.manager, &name, updated) {
         return server_error("failed to save the policy", &e);
     }

@@ -157,6 +157,17 @@ pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
 
 /// Stop a box, or do nothing if it is not running.
 pub async fn stop_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
+    // Refused while a rebuild owns the box.
+    //
+    // Stopping the guest mid-rebuild fails the rebuild — and its rollback of
+    // the generated files and its posture restore both run *inside* the guest,
+    // so neither can happen. What is left is a box carrying a selection nobody
+    // chose, with its firewall down, and nothing recording either. `destroy`
+    // takes this claim already; stopping is the same disruption with a
+    // gentler name.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+        .context("cannot stop this box while a rebuild is in progress")?;
+
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
@@ -455,10 +466,10 @@ pub fn save_policy(
     policy: crate::policy::Policy,
 ) -> Result<()> {
     let state = manager.get_sandbox(name)?;
-    // The same claim the rebuild's final write takes: both rewrite the whole
-    // file from a copy they read, so interleaving means one of them silently
-    // reverts the other's section.
-    let _edit = crate::web::build::lock_project_config(&state.project_dir)?;
+    // The claim is the caller's: it has to cover the *apply* as well as this
+    // write, or two overlapping edits can finish their applies in the opposite
+    // order from their file writes — devbox.toml ending at `isolated` while a
+    // delayed earlier `open` clears the live table.
     // See `DevboxConfig::load_for_edit`: this path writes the file back.
     let mut config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
     config.policy = policy;

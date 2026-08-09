@@ -577,7 +577,7 @@ pub async fn apply_selection(
     {
         // Read-modify-write under one claim, so a policy saved between the
         // read above and this write is not reverted by it.
-        let _edit = lock_project_config(&sandbox.project_dir)?;
+        let _edit = lock_project_config(&manager.state_dir, &sandbox.project_dir)?;
         let latest = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
             "rebuilt the box, but its devbox.toml can no longer be read, so the new \
              selection could not be recorded",
@@ -775,12 +775,35 @@ pub fn rebuild_lock_path(state_dir: &std::path::Path, box_name: &str) -> std::pa
 /// just saved, leaving the file, the saved state, and the live firewall
 /// describing three different boxes.
 ///
+/// **The lock must be taken before the load, not before the save.** Loading
+/// first and locking second changes nothing: the copy in hand is already
+/// stale, and writing it under a lock overwrites the newer file just as
+/// surely. The whole read-modify-write belongs inside.
+///
 /// Distinct from the rebuild lock, and deliberately short-lived. Holding the
 /// rebuild lock for a policy edit would block it for the minutes a
 /// `nixos-rebuild` takes — and a policy edit *during* a rebuild is exactly the
 /// case that has to keep working.
-pub fn lock_project_config(project_dir: &std::path::Path) -> Result<RebuildLock> {
-    let path = project_dir.join(".devbox.toml.lock");
+///
+/// Kept in the state directory, not the project. The first version put a
+/// zero-byte `.devbox.toml.lock` in the user's repository and never removed
+/// it, so ordinary use left an untracked file in `git status` — and a
+/// read-only or unusual checkout could not be edited at all. devbox's own
+/// directory is where devbox's own bookkeeping goes.
+pub fn lock_project_config(
+    state_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+) -> Result<RebuildLock> {
+    let dir = state_dir.join("locks");
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+
+    // Keyed by the canonical path, so two boxes sharing a project share the
+    // claim and a relative path does not become a second lock for one file.
+    let canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let path = dir.join(format!("project-{}.lock", project_key(&canonical)));
+
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -791,6 +814,14 @@ pub fn lock_project_config(project_dir: &std::path::Path) -> Result<RebuildLock>
     file.lock()
         .with_context(|| format!("could not lock {}", path.display()))?;
     Ok(RebuildLock { _file: file })
+}
+
+/// A filename-safe key for a project directory.
+fn project_key(path: &std::path::Path) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<RebuildLock> {

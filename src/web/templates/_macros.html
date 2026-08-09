@@ -131,13 +131,23 @@
 {% macro policy_editor(name, view) %}
 {%- if let Some(error) = view.error %}
 {#- Unknown, which is not the same as open: the box may still be firewalled.
-    No posture is preselected, because any choice here would be a guess. -#}
+
+    And no form. It used to offer one, saying a posture chosen here would
+    overwrite the unreadable file — but `put_policy` reads that same file
+    before parsing the replacement, so every submission failed on the way in.
+    Implementing the overwrite is not the fix either: the rest of devbox.toml
+    is the user's mounts, resources and environment, and rewriting the file
+    from a posture alone would erase them. That is exactly what
+    `load_for_edit` exists to refuse. -#}
 <div class="notice error">
   <strong>This box's posture could not be read.</strong>
   {{ error }}
-  <br />Fix <code>devbox.toml</code>, or set a posture below to overwrite it.
+  <br />Repair <code>devbox.toml</code> and reload this page. The posture
+  cannot be set from here until the file parses, because saving it would
+  rewrite the rest of the file — the mounts, resources, and environment —
+  from defaults.
 </div>
-{%- endif %}
+{%- else %}
 <form hx-put="/api/boxes/{{ name|urlencode_strict }}/policy"
       hx-target="#policy-result"
       hx-swap="innerHTML">
@@ -183,6 +193,8 @@
     <button class="btn btn-primary" type="submit">Save policy</button>
   </div>
 </form>
+
+{%- endif %}
 
 <div id="policy-result"></div>
 {% endmacro %}

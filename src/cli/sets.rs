@@ -200,6 +200,14 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // what it is running.
     crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await?;
 
+    // The claim covers the read *and* the write.
+    //
+    // Taking it just before the save changed nothing: the copy in hand was
+    // already stale, and writing it under a lock overwrote a newer policy just
+    // as surely — leaving the firewall enforcing one posture while devbox.toml
+    // named another, and the next start applying the one on disk.
+    let _edit = crate::web::build::lock_project_config(&manager.state_dir, &state.project_dir)?;
+
     let base = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
         .context("rebuilt the box, but its devbox.toml can no longer be read")?;
     let config = after.to_config(&base);
@@ -220,7 +228,6 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // selection, which the user can see and re-apply. The other order leaves
     // devbox reporting the new selection while the project file describes the
     // old one, and a later recreate silently reverts the box.
-    let _edit = crate::web::build::lock_project_config(&state.project_dir)?;
     config
         .save(&state.project_dir.join("devbox.toml"))
         .context("rebuilt the box, but could not record the selection in devbox.toml")?;
