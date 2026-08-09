@@ -866,3 +866,104 @@ pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<Rebui
         ),
     }
 }
+
+#[cfg(test)]
+mod lock_audit {
+    /// No `async fn` may take a devbox lock on the thread it is running on.
+    ///
+    /// These are OS file locks: acquiring a held one blocks the calling thread
+    /// until it is released. In the console that thread is a Tokio worker, and
+    /// the holder is either another request that is itself `await`ing or a
+    /// rebuild that runs for minutes. A single-worker runtime deadlocks on the
+    /// first overlap; a larger one starves once enough overlap, and neither
+    /// recovers, because the holder can only finish on a worker that is now
+    /// blocked waiting for it.
+    ///
+    /// Round 41 reported one instance. There were three. This is the check that
+    /// covers the class, and it runs over the tree rather than over a list
+    /// somebody has to remember to extend.
+    ///
+    /// Synchronous callers are fine and are the point of the exemption: in the
+    /// CLI, blocking the one command until the lock frees is the intended
+    /// behaviour.
+    #[test]
+    fn no_async_path_blocks_a_worker_on_a_lock() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&src, &mut files);
+
+        let mut offenders = Vec::new();
+        for path in files {
+            // This file defines the locks and the escape hatch.
+            if path.ends_with("web/build.rs") {
+                continue;
+            }
+            // The CLI is exempt, and the exemption is the whole distinction.
+            //
+            // Its commands are `async` because the runtime APIs are, not
+            // because anything else is being served: one process, one job, and
+            // blocking it until the lock frees is precisely what the user
+            // asked for when they ran a command against a box that is mid
+            // rebuild. The console is the opposite — the thread it would block
+            // is one it needs to answer every other request, including the
+            // stream that would show the rebuild finishing.
+            if path.components().any(|c| c.as_os_str() == "cli") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable source");
+            let lines: Vec<&str> = text.lines().collect();
+            let mut in_async = false;
+
+            for (n, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                // Track the enclosing function. Indentation is the signal that
+                // a new item started, which is enough for this codebase's
+                // layout and is why the check is a lint and not a proof.
+                if trimmed.starts_with("pub async fn ") || trimmed.starts_with("async fn ") {
+                    in_async = true;
+                } else if trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("fn ")
+                    || trimmed.starts_with("impl ")
+                {
+                    in_async = false;
+                }
+                if trimmed.starts_with("//") || !in_async {
+                    continue;
+                }
+                let takes_lock =
+                    trimmed.contains("lock_rebuild(") || trimmed.contains("lock_project_config(");
+                // Inside the `lock_blocking` closure is exactly where these
+                // belong, so a line that mentions both is correct.
+                if takes_lock && !line.contains("lock_blocking") {
+                    let window = lines[n.saturating_sub(4)..=n].join("\n");
+                    if !window.contains("lock_blocking") {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, trimmed));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these take an OS file lock directly inside an `async fn`, which \
+             blocks a Tokio worker until the holder releases — and the holder \
+             may be a rebuild that runs for minutes. Wrap them in \
+             `build::lock_blocking`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+}
