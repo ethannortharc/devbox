@@ -157,6 +157,30 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
         ..Default::default()
     })?;
 
+    // A capped window is not a window.
+    //
+    // `MAX_LIMIT` rows back means the query stopped, not that the box stopped:
+    // `diff` compares two summaries and reports what is in one and not the
+    // other, so a domain, process, or violation past the cap is reported as
+    // *absent*. That is the one answer this command must never give wrongly —
+    // "this run did nothing new" is what someone acts on.
+    //
+    // Refused rather than warned. A diff nobody can trust is worth less than
+    // no diff, and the fix is a narrower window, which the message names.
+    for (label, window) in [("--from", &earlier), ("the later window", &later)] {
+        if window.len() >= Query::MAX_LIMIT {
+            bail!(
+                "{label} holds at least {} events, which is where the query stops \
+                 — so anything after that point would be reported as absent, and \
+                 a diff that says 'nothing new' when there is would be worse than \
+                 none.\n\n  \
+                 Narrow it with `--from` and `--at`, or summarize the halves \
+                 separately with `devbox behavior summary --since`.",
+                Query::MAX_LIMIT
+            );
+        }
+    }
+
     let before = behavior::summarize(&name, &earlier);
     let after = behavior::summarize(&name, &later);
     let d = behavior::diff(&before, &after);

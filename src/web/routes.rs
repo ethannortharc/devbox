@@ -279,17 +279,43 @@ async fn box_behavior(
         Err(e) => return server_error("failed to query events", &e),
     };
 
+    // Say so when the window was cut off.
+    //
+    // `MAX_LIMIT` rows means the query stopped, not that the box did, and this
+    // endpoint serves both a rendered summary and a JSONL export. Returning
+    // either as though it covered the whole window lets a consumer mistake a
+    // partial audit for a complete one — the same failure the CLI refuses
+    // outright, except an export has no reader to warn.
+    let truncated = events.len() >= crate::obs::store::Query::MAX_LIMIT;
+
     let summary = crate::obs::behavior::summarize(&name, &events);
 
-    match q.format.as_deref() {
-        Some("markdown") => (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/markdown; charset=utf-8",
-            )],
-            crate::obs::behavior::render_markdown(&summary),
-        )
-            .into_response(),
+    // On every representation, because each of the three is something a
+    // consumer might archive as "what this box did".
+    let mut response = match q.format.as_deref() {
+        Some("markdown") => {
+            let mut body = crate::obs::behavior::render_markdown(&summary);
+            if truncated {
+                body.insert_str(
+                    0,
+                    &format!(
+                        "> **Incomplete.** This window holds at least {} events, which \
+                         is where the query stops. What follows covers the oldest {} \
+                         only — narrow the window with `since`.\n\n",
+                        crate::obs::store::Query::MAX_LIMIT,
+                        crate::obs::store::Query::MAX_LIMIT
+                    ),
+                );
+            }
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/markdown; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response()
+        }
         Some("jsonl") => match crate::obs::behavior::render_jsonl(&events) {
             Ok(body) => (
                 [(
@@ -302,7 +328,17 @@ async fn box_behavior(
             Err(e) => server_error("failed to export events", &anyhow::Error::from(e)),
         },
         _ => Json(summary).into_response(),
+    };
+
+    // A header as well as the prose: the export has no reader to warn, and a
+    // script archiving it as a complete audit is the case that matters.
+    if truncated {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-devbox-truncated"),
+            HeaderValue::from_static("true"),
+        );
     }
+    response
 }
 
 // ── metrics ──────────────────────────────────────────────

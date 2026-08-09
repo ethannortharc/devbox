@@ -146,11 +146,21 @@ in
           # and policy events simply never appear, which looks exactly like a
           # box that never violated its policy.
           "CAP_SYSLOG"
+          # Loading the egress ruleset, which has nothing to do with eBPF: the
+          # agent runs `nft -f -` at startup whenever `policy.json` carries
+          # one, so an agent without this fails with EPERM, restarts, and fails
+          # again — a restart loop on the *default* configuration, with the
+          # box's firewall never coming back after a reboot.
+          #
+          # Round 32 made this set unconditional to stop the default running as
+          # root with every capability, and left this entry on the eBPF side of
+          # the split. Trading "too many capabilities" for "not enough to do
+          # the job" is not a fix.
+          "CAP_NET_ADMIN"
         ] ++ lib.optionals cfg.enableEbpf [
           "CAP_BPF"
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
-          "CAP_NET_ADMIN"
         ];
 
         # The agent observes; it has no business writing anywhere except its

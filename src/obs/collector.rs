@@ -403,14 +403,29 @@ impl Collector {
     /// Drain the queue into the store in batches.
     async fn write_loop(self: Arc<Self>, mut rx: mpsc::Receiver<Event>) {
         let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
+        // When the *oldest* queued event must be on disk by.
+        //
+        // The timeout used to be recreated on every receive, so it measured
+        // the gap between arrivals rather than the age of the batch: a steady
+        // stream every 100ms never let it expire, and nothing was written
+        // until all 256 slots filled. Queries ran about twenty-five seconds
+        // behind the box, and a crash took the whole pending batch with it —
+        // on a busy box, which is when the timeline matters most.
+        let mut deadline: Option<tokio::time::Instant> = None;
 
         loop {
-            let got = tokio::time::timeout(BATCH_LINGER, rx.recv()).await;
+            let wait = deadline
+                .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+                .unwrap_or(BATCH_LINGER);
+            let got = tokio::time::timeout(wait, rx.recv()).await;
             match got {
                 Ok(Some(event)) => {
                     // Publish live before storing: the console should not wait
                     // on a disk write to show what just happened.
                     let _ = self.live.send(event.clone());
+                    if batch.is_empty() {
+                        deadline = Some(tokio::time::Instant::now() + BATCH_LINGER);
+                    }
                     batch.push(event);
                     if batch.len() < BATCH_SIZE {
                         continue;
@@ -429,6 +444,8 @@ impl Collector {
                 }
             }
             self.flush(&mut batch).await;
+            // The next batch starts its own clock when its first event lands.
+            deadline = None;
         }
     }
 

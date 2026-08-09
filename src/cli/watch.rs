@@ -68,28 +68,37 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
 
     let store = Store::open(&path)?;
 
-    // `--peer` is applied after correlation, not in SQL.
+    // With `--peer`, *every* filter waits until after correlation.
     //
-    // A connect event records the address it dialled; the *name* is in a
-    // separate DNS event, and only correlation brings the two together. So
-    // pushing `--peer pypi.org` into the query dropped precisely the connect
-    // rows the flag exists to find — the DNS row matched, the connections it
-    // explained did not — and the enrichment then ran on what was left. The
-    // filter has to see the rows the way the user does: after the addresses
-    // have names.
+    // Not just the peer one. A connect event records the address it dialled
+    // and the name lives in a separate DNS event, so `--type connect` or
+    // `--path` in SQL discarded the very rows the enrichment needed —
+    // `watch --type connect --peer pypi.org` matched nothing at all, because
+    // the DNS answers that would have named those addresses were filtered out
+    // before the map was built. Round 27 moved the peer filter out and left
+    // its neighbours behind.
     //
     // The scan widens when the flag is used, so `--limit` still counts matches
     // shown rather than rows examined. That costs a bigger read on a filtered
     // query and nothing at all on an unfiltered one.
     let peer = args.peer.clone();
+    let filtering_late = peer.is_some();
     let mut events = store.query(&Query {
         since: args.since.clone(),
         until: None,
         pid: args.pid,
-        kinds,
+        kinds: if filtering_late {
+            Vec::new()
+        } else {
+            kinds.clone()
+        },
         peer: None,
-        path: args.path.clone(),
-        limit: Some(if peer.is_some() {
+        path: if filtering_late {
+            None
+        } else {
+            args.path.clone()
+        },
+        limit: Some(if filtering_late {
             Query::MAX_LIMIT
         } else {
             args.limit
@@ -106,7 +115,16 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
 
     if let Some(peer) = &peer {
         let needle = peer.to_lowercase();
-        events.retain(|event| matches_peer(event, &needle));
+        let path = args.path.as_deref().map(str::to_lowercase);
+        events.retain(|event| {
+            matches_peer(event, &needle)
+                && (kinds.is_empty() || kinds.contains(&event.kind))
+                && path.as_deref().is_none_or(|want| {
+                    event
+                        .path()
+                        .is_some_and(|p| p.to_lowercase().contains(want))
+                })
+        });
         // Still newest-first here, so this keeps the most recent matches.
         events.truncate(args.limit);
     }
