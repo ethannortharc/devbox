@@ -246,11 +246,7 @@ pub(crate) fn is_safe_installable(reference: &str) -> bool {
 /// replaced it with a same-named nixpkgs attribute, or dropped it, while the
 /// UI went on reporting it selected.
 pub fn package_pairs(state: &crate::sandbox::state::SandboxState) -> Vec<(String, String)> {
-    resolved_packages(state)
-        .0
-        .into_iter()
-        .map(|(name, source)| (name, source))
-        .collect()
+    resolved_packages(state).0
 }
 
 /// A box's packages, recovered for a box that predates `state.packages`.
