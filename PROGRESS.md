@@ -1377,3 +1377,60 @@ fixes — where it has stayed for eighteen rounds.
 **Gate** — 521 Rust, 10 Go packages, 71 Python; fmt/clippy/vet/gofmt/ruff/mypy
 clean. Driven in a real browser twice, once per credential change, which is the
 only reason two of round 39's silent defects were found at all.
+
+## 2026-08-09T19:30Z — Codex review round 41: 4 findings, all addressed
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+round 41  1   3      2              2
+```
+
+Half the findings of the round before, and the same story underneath: **the P1
+was caused by round 40's fix, and one P2 was round 40's fix being only half of
+one.** Eighteen rounds on, the loop is still measuring the quality of the edits
+rather than the quality of the original code.
+
+**A marker that made a survivable bug permanent.** Round 40 added `schema` to
+`state.json` so an *absent* field could be told from an empty one. `devbox
+upgrade` reads packages off `state.packages`, which a v3 box does not have, so
+the rebuild had always dropped them — survivable, because the absence stayed
+legible and the next render read them back out of `devbox.toml`. The marker
+closed that door: upgrade would have recorded "this file is current and has no
+packages" about a box whose packages it had just discarded.
+
+The rule the marker actually asserts is *every field was written by code that
+writes them all*. Adding it obliged every writer to be checked against that
+claim, and only the writer that motivated it was. **A field whose meaning is
+"trust this file" converts every incomplete path into a permanent one.**
+
+**And a fix that solved the half it could see.** Round 40 moved the ruleset load
+ahead of the collector dial, which stopped the restart loop destroying the
+nftables table every two seconds. But those sets are created *empty* and only
+captured DNS fills them, and DNS arrives through a loop that did not start until
+the collector answered — so an allowlist posture still blocked every allowlisted
+domain for the whole outage. The finding and the fix had the same words in them
+and different scopes: *the table survives* is not *the allowlist works*.
+
+Restructuring it broke the cross-language pipeline test twice, and both were
+real. Events captured before the first connection were counted and discarded —
+trading the ordinary case, where the collector is listening at startup, for the
+rare one. And a refused handshake stopped being fatal, because it had been moved
+into the same goroutine as the retrying dial: **an outage and a rejection are
+different events, and putting them on one path turned a loud misconfiguration
+into an infinite retry.** That is the same shape as round 40's shell branch
+laundering a foreign navigation — a path added for one case quietly swallowing
+another.
+
+Worth noting what caught them: the only test in the suite that runs the Go agent
+against the Rust collector. Neither defect is visible from either side alone.
+
+**The two older findings were both a value standing in for a different value.**
+ztpd recorded the hash of whatever its catalog held when a node reported
+healthy — "what would I serve now" in place of "what did that node install",
+which come apart precisely when a node retries its report across a restart. And
+the console took an OS file lock on a Tokio worker and held it across an await,
+so two overlapping policy saves could wedge a single-worker runtime permanently:
+the holder can only finish on a worker that is now blocked waiting for it.
+
+**Gate** — 524 Rust, 10 Go packages, 71 Python; six linters clean.
