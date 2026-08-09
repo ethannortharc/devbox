@@ -1265,7 +1265,7 @@ async fn the_printed_url_still_works_when_clicked_from_another_site() {
 
     for site in ["cross-site", "same-site", "none"] {
         let clicked = Request::builder()
-            .uri(&format!("/?t={TOKEN}"))
+            .uri(format!("/?t={TOKEN}"))
             .header(header::HOST, "127.0.0.1:7878")
             .header("sec-fetch-site", site)
             .body(Body::empty())
