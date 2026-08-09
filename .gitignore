@@ -31,3 +31,7 @@ __pycache__/
 .mypy_cache/
 /labkit/dist/
 /labkit/*.egg-info/
+
+# Browser-automation scratch output. Written into the repo root by the
+# Playwright MCP server during manual verification; never part of a build.
+.playwright-mcp/
