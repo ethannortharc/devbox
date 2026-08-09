@@ -86,7 +86,10 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Update saved state with migrated sets
     let mut updated_state = state.clone();
     updated_state.sets = sets;
-    if saved_policy.egress != crate::policy::Posture::Open {
+    // Unconditionally: `apply` clears or installs as the posture requires, and
+    // an `open` posture that audits requires a table. Testing the posture here
+    // meant a reprovision silently dropped observe-and-warn.
+    {
         let runtime = manager.runtime_for_sandbox(&updated_state)?;
         crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await?;
         println!("Egress posture '{}' re-applied.", saved_policy.egress);

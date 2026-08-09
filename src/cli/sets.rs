@@ -63,7 +63,8 @@ pub async fn run(args: SetsArgs, manager: &SandboxManager) -> Result<()> {
 fn list(args: ListArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.name.as_deref())?;
     let state = manager.get_sandbox(&name)?;
-    let current = Selection::from_state(&state);
+    let project = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    let current = Selection::from_state_and_project(&state, &project);
 
     println!("Sets for '{name}':\n");
     for set in NIX_SETS {
@@ -99,13 +100,20 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.name.as_deref())?;
     let state = manager.get_sandbox(&name)?;
 
-    let before = Selection::from_state(&state);
+    // Falls back to the project file for a box predating the state fields;
+    // without it `before` shows no packages and the apply removes them all.
+    let project = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
+    let before = Selection::from_state_and_project(&state, &project);
     // Sources come off the box, not off the command line: `--packages` names
     // what to have, and where an aliased package comes from is already
     // recorded. Without this the alias resolves to itself and the rebuild
     // fails on an undefined variable.
+    //
+    // From `before` rather than from state directly, because on a box that
+    // predates the state fields those are empty — taking them raw would drop
+    // the source one line after recovering it.
     let after = Selection::new(args.sets.clone(), args.packages.clone())
-        .with_sources(state.package_sources.clone());
+        .with_sources(before.sources.clone());
     after.validate()?;
 
     println!("Selection change: {}", describe_change(&before, &after));

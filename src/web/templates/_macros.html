@@ -20,23 +20,23 @@
 {% macro box_actions(b) %}
 <div class="actions">
   <button class="btn btn-primary"
-          hx-post="/api/boxes/{{ b.name }}/start"
+          hx-post="/api/boxes/{{ b.name|urlencode_strict }}/start"
           hx-target="closest .card"
           hx-swap="outerHTML"
           hx-indicator="closest .card"
           {% if b.status == "running" %}disabled{% endif %}>Start</button>
 
   <button class="btn"
-          hx-post="/api/boxes/{{ b.name }}/stop"
+          hx-post="/api/boxes/{{ b.name|urlencode_strict }}/stop"
           hx-target="closest .card"
           hx-swap="outerHTML"
           hx-indicator="closest .card"
           {% if b.status != "running" %}disabled{% endif %}>Stop</button>
 
-  <a class="btn" href="/boxes/{{ b.name }}?tab=terminal">Terminal</a>
+  <a class="btn" href="/boxes/{{ b.name|urlencode_strict }}?tab=terminal">Terminal</a>
 
   <button class="btn btn-danger"
-          hx-post="/api/boxes/{{ b.name }}/destroy"
+          hx-post="/api/boxes/{{ b.name|urlencode_strict }}/destroy"
           hx-confirm="Destroy box &quot;{{ b.name }}&quot;? The box and its overlay are removed. Your project directory on the host is untouched."
           hx-target="closest .card"
           hx-swap="outerHTML">Destroy</button>
@@ -46,7 +46,7 @@
 {% macro box_card(b) %}
 <article class="card" id="box-{{ b.name }}">
   <div class="card-head">
-    <h2><a href="/boxes/{{ b.name }}">{{ b.name }}</a></h2>
+    <h2><a href="/boxes/{{ b.name|urlencode_strict }}">{{ b.name }}</a></h2>
     <span class="spacer"></span>
     {% call status_badge(b.status) %}{% endcall %}
   </div>
@@ -86,7 +86,7 @@
     configuration.nix, so an unchecked set is never evaluated or built. -#}
 {% macro set_checklist(name, groups, packages) %}
 <form id="set-form"
-      hx-post="/api/boxes/{{ name }}/sets"
+      hx-post="/api/boxes/{{ name|urlencode_strict }}/sets"
       hx-target="#build-panel"
       hx-swap="innerHTML">
   {% for g in groups %}
@@ -138,7 +138,7 @@
   <br />Fix <code>devbox.toml</code>, or set a posture below to overwrite it.
 </div>
 {%- endif %}
-<form hx-put="/api/boxes/{{ name }}/policy"
+<form hx-put="/api/boxes/{{ name|urlencode_strict }}/policy"
       hx-target="#policy-result"
       hx-swap="innerHTML">
   <fieldset class="setgroup">

@@ -44,7 +44,7 @@ async fn open_console_for_cwd(manager: &SandboxManager, tools: Option<&[String]>
     serve(
         manager,
         WebOptions {
-            landing: format!("/boxes/{name}"),
+            landing: format!("/boxes/{}", devbox::web::encode_segment(&name)),
             ..WebOptions::default()
         },
     )

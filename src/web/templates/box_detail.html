@@ -16,17 +16,17 @@
 
   <section class="panel">
     <nav class="tabs">
-      <a href="/boxes/{{ boxinfo.name }}?tab=overview"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=overview"
          {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
-      <a href="/boxes/{{ boxinfo.name }}?tab=activity"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=activity"
          {% if tab == "activity" %}aria-current="page"{% endif %}>Activity</a>
-      <a href="/boxes/{{ boxinfo.name }}?tab=sets"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=sets"
          {% if tab == "sets" %}aria-current="page"{% endif %}>Sets</a>
-      <a href="/boxes/{{ boxinfo.name }}?tab=policy"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=policy"
          {% if tab == "policy" %}aria-current="page"{% endif %}>Policy</a>
-      <a href="/boxes/{{ boxinfo.name }}?tab=files"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=files"
          {% if tab == "files" %}aria-current="page"{% endif %}>Files</a>
-      <a href="/boxes/{{ boxinfo.name }}?tab=terminal"
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=terminal"
          {% if tab == "terminal" %}aria-current="page"{% endif %}>Terminal</a>
     </nav>
 
@@ -58,7 +58,7 @@
         <p>
           Nothing has been captured for this box. The agent
           (<code>devbox-obsd</code>) streams into
-          <code>~/.devbox/boxes/{{ boxinfo.name }}/events.db</code> once the box
+          <code>~/.devbox/boxes/{{ boxinfo.name|urlencode_strict }}/events.db</code> once the box
           is provisioned with observability enabled.
         </p>
       </div>
@@ -73,7 +73,7 @@
               The SSE channel carries the heartbeat; this carries events. -#}
           <div class="stream"
                id="activity-stream"
-               hx-get="/api/boxes/{{ boxinfo.name }}/activity"
+               hx-get="/api/boxes/{{ boxinfo.name|urlencode_strict }}/activity"
                hx-trigger="every 2s"
                hx-swap="innerHTML">
             {% for r in stream %}
@@ -165,9 +165,9 @@
         <pre>{{ behavior }}</pre>
         <p class="muted">
           Export:
-          <a href="/api/boxes/{{ boxinfo.name }}/behavior?format=markdown">Markdown</a> ·
-          <a href="/api/boxes/{{ boxinfo.name }}/behavior?format=jsonl">JSONL</a> ·
-          <a href="/api/boxes/{{ boxinfo.name }}/behavior">JSON</a>
+          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=markdown">Markdown</a> ·
+          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=jsonl">JSONL</a> ·
+          <a href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior">JSON</a>
         </p>
       </details>
       {% endif %}
@@ -202,7 +202,7 @@
         Nothing here has touched your project directory yet.
       </p>
       <div id="files"
-           hx-get="/api/boxes/{{ boxinfo.name }}/files"
+           hx-get="/api/boxes/{{ boxinfo.name|urlencode_strict }}/files"
            hx-trigger="load, every 5s">
         <p class="muted">Loading…</p>
       </div>
@@ -216,13 +216,13 @@
           another loopback port: it is same-site enough for the browser to
           send the session cookie, and a subresource request carries no
           `Origin` for the middleware to reject. POST is origin-checked. -#}
-      <div hx-post="/api/boxes/{{ boxinfo.name }}/start"
+      <div hx-post="/api/boxes/{{ boxinfo.name|urlencode_strict }}/start"
            hx-trigger="load"
            hx-swap="none"></div>
       <div id="terminal"
            class="terminal"
            data-box="{{ boxinfo.name }}"
-           data-endpoint="/api/boxes/{{ boxinfo.name }}/term"></div>
+           data-endpoint="/api/boxes/{{ boxinfo.name|urlencode_strict }}/term"></div>
       <p class="muted" id="term-status">connecting…</p>
       {% endif %}
     </div>

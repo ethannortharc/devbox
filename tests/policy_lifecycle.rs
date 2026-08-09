@@ -112,19 +112,46 @@ fn walk(dir: &str) -> Vec<String> {
 /// there is one statement of it.
 #[test]
 fn only_apply_decides_what_an_open_posture_installs() {
-    let source = std::fs::read_to_string("src/policy/enforce.rs").expect("enforce.rs");
-
+    // Across the whole tree, not one file.
+    //
+    // The first version of this guard read `enforce.rs` alone, because that is
+    // where the two stale copies were. The very next round found two more in
+    // `cli/policy.rs` and `cli/reprovision.rs` — a guard scoped more narrowly
+    // than the class it guards catches the instances you already know about,
+    // which is the same as catching nothing.
     let mut offenders = Vec::new();
-    for (n, line) in source.lines().enumerate() {
-        if !line.contains("Posture::Open") {
+
+    for entry in walk("src") {
+        let rel = entry.strip_prefix("./").unwrap_or(&entry).to_string();
+        if !rel.ends_with(".rs") {
             continue;
         }
-        // The one place allowed to test it is the decision itself, which is
-        // recognisable by consulting `audits`.
-        if line.contains("audits(") {
+        // `policy/mod.rs` defines the enum and its own behaviour, and
+        // `nftables.rs` is where the ruleset for each posture is written —
+        // both must name it. Everything else should be asking `apply`.
+        if rel == "src/policy/mod.rs" || rel == "src/policy/nftables.rs" {
             continue;
         }
-        offenders.push(format!("src/policy/enforce.rs:{}: {}", n + 1, line.trim()));
+        let source = std::fs::read_to_string(&entry).expect("readable source");
+
+        let mut in_tests = false;
+        for (n, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with("mod tests") {
+                in_tests = true;
+            }
+            if in_tests {
+                continue;
+            }
+            if !line.contains("Posture::Open") {
+                continue;
+            }
+            // Testing it to *build* a policy is fine; testing it to decide
+            // whether to install one is what goes stale.
+            if line.contains("audits(") || line.contains("egress: Posture::Open") {
+                continue;
+            }
+            offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+        }
     }
 
     assert!(

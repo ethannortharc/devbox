@@ -84,12 +84,45 @@ impl Selection {
     /// State stores sets and languages separately; languages are just sets
     /// with a `lang-` prefix, so they are folded together here.
     pub fn from_state(state: &SandboxState) -> Self {
+        Self::from_state_and_project(state, &DevboxConfig::default())
+    }
+
+    /// The same, with the project config as the fallback for a box predating
+    /// the state fields.
+    ///
+    /// `packages` and `package_sources` were added to `state.json` after boxes
+    /// existed, and serde fills a missing field with an empty collection — so
+    /// a box created before them reports *no* custom packages, however many
+    /// `devbox.toml` declares. The Sets form is rebuilt from this selection
+    /// and posts the whole thing back, so opening that page and changing one
+    /// checkbox uninstalled every custom package the box had, silently and
+    /// permanently.
+    ///
+    /// Empty state with a non-empty project file is the migration case and the
+    /// only case this covers. A box that genuinely has no packages and a
+    /// project that declares none look identical here and behave identically
+    /// either way; a box whose packages were deliberately removed has them
+    /// removed from `devbox.toml` too, because that is the file `apply` writes
+    /// back.
+    pub fn from_state_and_project(state: &SandboxState, project: &DevboxConfig) -> Self {
         let langs = state.languages.iter().map(|l| format!("lang-{l}"));
-        Self::new(
-            state.sets.iter().cloned().chain(langs),
-            state.packages.iter().cloned(),
-        )
-        .with_sources(state.package_sources.clone())
+
+        let migrating = state.packages.is_empty() && !project.custom_packages.is_empty();
+        let (packages, sources): (Vec<String>, BTreeMap<String, String>) = if migrating {
+            (
+                project.custom_packages.keys().cloned().collect(),
+                project
+                    .custom_packages
+                    .iter()
+                    .filter(|(_, source)| source.as_str() != "nixpkgs")
+                    .map(|(name, source)| (name.clone(), source.clone()))
+                    .collect(),
+            )
+        } else {
+            (state.packages.to_vec(), state.package_sources.clone())
+        };
+
+        Self::new(state.sets.iter().cloned().chain(langs), packages).with_sources(sources)
     }
 
     /// Attach the sources for packages this selection names.
@@ -584,6 +617,59 @@ mod tests {
         assert!(
             !toml.contains("my-tf"),
             "the alias resolves to null and is filtered out in silence:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn a_box_predating_the_state_fields_keeps_its_packages() {
+        // `packages` and `package_sources` were added to `state.json` after
+        // boxes existed, and serde fills a missing field with an empty
+        // collection — so a box created before them reported *no* custom
+        // packages however many `devbox.toml` declared. The Sets form is
+        // rebuilt from this selection and posts the whole thing back, so
+        // opening that page and toggling one checkbox uninstalled every custom
+        // package the box had, silently and for good.
+        let mut project = DevboxConfig::default();
+        project
+            .custom_packages
+            .insert("ripgrep".into(), "nixpkgs".into());
+        project
+            .custom_packages
+            .insert("my-tf".into(), "nixpkgs#terraform".into());
+
+        let legacy = SandboxState {
+            name: "old".into(),
+            runtime: "docker".into(),
+            project_dir: "/tmp/p".into(),
+            created_at: String::new(),
+            mount_mode: "overlay".into(),
+            sets: vec!["system".into()],
+            languages: vec![],
+            image: "nixos".into(),
+            packages: vec![],
+            package_sources: Default::default(),
+        };
+
+        let sel = Selection::from_state_and_project(&legacy, &project);
+        assert!(sel.packages.contains("ripgrep"), "{:?}", sel.packages);
+        assert_eq!(
+            sel.attr_path("my-tf"),
+            "terraform",
+            "the alias's source has to come back with it, or the rebuild fails"
+        );
+
+        // A box that really has no packages, with a project that declares
+        // none, is unaffected — and so is one whose state is authoritative.
+        let current = SandboxState {
+            packages: vec!["fd".into()],
+            ..legacy.clone()
+        };
+        let sel = Selection::from_state_and_project(&current, &project);
+        assert!(sel.packages.contains("fd"));
+        assert!(
+            !sel.packages.contains("ripgrep"),
+            "state wins once it has an answer: {:?}",
+            sel.packages
         );
     }
 

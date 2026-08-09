@@ -219,3 +219,22 @@ def test_an_interface_name_is_measured_in_bytes_not_code_points() -> None:
     assert Interface(name="e" * 15, peer="b:eth1").name == "e" * 15
     with pytest.raises(ValidationError, match="bytes"):
         Interface(name="e" * 16, peer="b:eth1")
+
+
+def test_a_device_name_cannot_exceed_the_hostname_limit() -> None:
+    """A name the kernel refuses stops the node before it can say so.
+
+    `/identify` hands this name back and the bootstrap script runs
+    `hostname "$NAME"` under ``set -e``. Past ``HOST_NAME_MAX`` that command
+    fails, and it fails *before* the script reaches its own ``report failed`` —
+    so the node goes quiet instead of reporting an error, and provisioning
+    waits for a state that never arrives. The cost of refusing here is a
+    message; the cost of allowing it is a stuck fabric with no explanation.
+    """
+    from labkit.sot.models import HOST_NAME_MAX
+
+    ok = "a" * HOST_NAME_MAX
+    assert Device(name=ok, role="leaf", serial="S1").name == ok
+
+    with pytest.raises(ValidationError, match="hostname"):
+        Device(name="a" * (HOST_NAME_MAX + 1), role="leaf", serial="S1")

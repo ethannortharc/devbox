@@ -162,8 +162,15 @@ async fn box_detail(
     // Rebuild the selection from persisted state, packages included — the
     // form posts the *whole* selection back, so anything missing here is
     // silently dropped on the next apply.
+    // The project config is the fallback for a box created before `state.json`
+    // carried packages: serde fills those fields with empty collections, so
+    // this page would render an empty extra-packages field and post it back,
+    // uninstalling everything the box had.
     let selection = match state.manager.get_sandbox(&name) {
-        Ok(s) => Selection::from_state(&s),
+        Ok(s) => {
+            let project = crate::sandbox::config::DevboxConfig::load_or_default(&s.project_dir);
+            Selection::from_state_and_project(&s, &project)
+        }
         Err(_) => Selection::default(),
     };
 

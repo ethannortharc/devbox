@@ -194,9 +194,14 @@ async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
     // Reapply. A new entry that only lands in `devbox.toml` stays blocked on
     // the running box until something else happens to rebuild the ruleset —
     // which reads as the allowlist simply not working.
-    if config.policy.egress != Posture::Open {
-        reapply(manager, &name, &config.policy).await?;
-    }
+    //
+    // Unconditionally, and `apply` decides what to do with it. Skipping `open`
+    // was right while `open` always meant "no table"; it stopped being right
+    // when an `open` posture with alerts started installing audit rules — and
+    // this is the command that *creates* that situation, by adding the first
+    // allowlist entry to a policy whose alerts are already on. The audit table
+    // was never installed, so the mode came into being switched off.
+    reapply(manager, &name, &config.policy).await?;
     Ok(())
 }
 

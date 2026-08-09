@@ -23,6 +23,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # narrow.
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
+#: Linux's `HOST_NAME_MAX`. The kernel refuses `sethostname` beyond it, and the
+#: bootstrap script calls `hostname` under `set -e` — so a name past this stops
+#: the node before it can report why it stopped.
+HOST_NAME_MAX = 64
+
 Role = Literal["spine", "leaf", "border", "service", "host"]
 
 
@@ -148,9 +153,29 @@ class Device(Model):
     @field_validator("name", "site")
     @classmethod
     def _valid_name(cls, value: str) -> str:
+        """It becomes a hostname, so the kernel's limit applies here.
+
+        `/identify` returns this name and the bootstrap script runs
+        `hostname "$NAME"` under `set -e`. A name past `HOST_NAME_MAX` makes
+        that command fail, and it fails *before* the script reaches its own
+        `report failed` — so the node goes silent rather than reporting an
+        error, and provisioning waits for a state that will never arrive.
+        Refusing here costs a message; allowing it costs a stuck fabric with
+        no explanation anywhere.
+
+        Bytes, not characters, for the same reason as `Interface.name`: the
+        regex is ASCII-only so the two agree, and saying bytes keeps them
+        agreeing if it ever widens.
+        """
         if not NAME_RE.match(value):
             raise ValueError(
                 f"{value!r} must be lowercase letters, digits, or '-'; it becomes a hostname"
+            )
+        encoded = len(value.encode("utf-8"))
+        if encoded > HOST_NAME_MAX:
+            raise ValueError(
+                f"{value!r} is {encoded} bytes; a hostname may be at most "
+                f"{HOST_NAME_MAX}, and the node cannot report the failure"
             )
         return value
 
