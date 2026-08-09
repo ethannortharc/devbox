@@ -123,6 +123,18 @@ func ReadJSON(r io.Reader, v any) error {
 }
 
 // Handshake performs the agent side: send Hello, read HelloAck.
+// ErrRejected is the collector explicitly refusing this agent — a wrong box id,
+// a name it does not know. Permanent: retrying cannot change the answer.
+var ErrRejected = errors.New("collector rejected the agent")
+
+// ErrProtocol is a version disagreement. Also permanent, and for the same
+// reason: neither side will change version by being asked again.
+var ErrProtocol = errors.New("protocol mismatch")
+
+// Sentinels rather than message text, because the caller has to act on the
+// difference: a refusal must stop the agent, and a connection that died
+// mid-handshake must not. Matching on strings would make that distinction a
+// property of the wording.
 func Handshake(rw io.ReadWriter, hello Hello) error {
 	hello.Protocol = ProtocolVersion
 	if err := WriteJSON(rw, hello); err != nil {
@@ -134,12 +146,12 @@ func Handshake(rw io.ReadWriter, hello Hello) error {
 		return fmt.Errorf("transport: no handshake reply: %w", err)
 	}
 	if !ack.Accepted {
-		return fmt.Errorf("transport: collector rejected the agent: %s", ack.Reason)
+		return fmt.Errorf("transport: %w: %s", ErrRejected, ack.Reason)
 	}
 	if ack.Protocol != ProtocolVersion {
 		return fmt.Errorf(
-			"transport: protocol mismatch — agent speaks %d, collector speaks %d",
-			ProtocolVersion, ack.Protocol)
+			"transport: %w — agent speaks %d, collector speaks %d",
+			ErrProtocol, ProtocolVersion, ack.Protocol)
 	}
 	return nil
 }

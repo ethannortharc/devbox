@@ -192,3 +192,71 @@ func TestHandshakeFailsWhenTheCollectorSaysNothing(t *testing.T) {
 		t.Errorf("expected a handshake-reply error, got %v", err)
 	}
 }
+
+// TestHandshakeErrorsAreDistinguishable is what lets the agent tell an outage
+// from a refusal.
+//
+// The agent must exit on a refusal and must *not* exit on a connection that
+// died mid-exchange: exiting there hands the supervisor a restart, and the
+// restart reloads the ruleset, clearing every allow set DNS had filled. Matching
+// on message text would make that distinction a property of the wording.
+func TestHandshakeErrorsAreDistinguishable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a refusal is permanent", func(t *testing.T) {
+		rw := &fakeConn{reply: HelloAck{Accepted: false, Reason: "unknown box"}}
+		err := Handshake(rw, Hello{BoxID: "nope"})
+		if !errors.Is(err, ErrRejected) {
+			t.Errorf("err = %v, want ErrRejected", err)
+		}
+		if errors.Is(err, ErrProtocol) {
+			t.Error("a refusal must not also read as a protocol mismatch")
+		}
+	})
+
+	t.Run("a version disagreement is permanent", func(t *testing.T) {
+		rw := &fakeConn{reply: HelloAck{Accepted: true, Protocol: ProtocolVersion + 1}}
+		err := Handshake(rw, Hello{BoxID: "b"})
+		if !errors.Is(err, ErrProtocol) {
+			t.Errorf("err = %v, want ErrProtocol", err)
+		}
+	})
+
+	t.Run("a dropped connection is neither", func(t *testing.T) {
+		// The collector accepted and then went away before replying, which is
+		// what a restart looks like from here.
+		rw := &fakeConn{truncate: true}
+		err := Handshake(rw, Hello{BoxID: "b"})
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, ErrRejected) || errors.Is(err, ErrProtocol) {
+			t.Errorf("a dropped handshake must be retryable, got %v", err)
+		}
+	})
+}
+
+// fakeConn answers one handshake, or hangs up part-way through.
+type fakeConn struct {
+	reply    HelloAck
+	truncate bool
+	out      bytes.Buffer
+	in       *bytes.Reader
+}
+
+func (f *fakeConn) Write(p []byte) (int, error) { return f.out.Write(p) }
+
+func (f *fakeConn) Read(p []byte) (int, error) {
+	if f.in == nil {
+		if f.truncate {
+			f.in = bytes.NewReader(nil) // EOF: accepted, then gone
+		} else {
+			var buf bytes.Buffer
+			if err := WriteJSON(&buf, f.reply); err != nil {
+				return 0, err
+			}
+			f.in = bytes.NewReader(buf.Bytes())
+		}
+	}
+	return f.in.Read(p)
+}

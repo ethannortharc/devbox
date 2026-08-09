@@ -577,7 +577,15 @@ pub async fn apply_selection(
     {
         // Read-modify-write under one claim, so a policy saved between the
         // read above and this write is not reverted by it.
-        let _edit = lock_project_config(&manager.state_dir, &sandbox.project_dir)?;
+        //
+        // Off the worker: this waits for the holder, and the holder here is
+        // another request that is itself `await`ing. A rebuild reaching
+        // persistence while a policy save holds the project lock parked a
+        // Tokio worker, which a single-worker runtime never recovers from —
+        // the holder can only finish on a worker that is now blocked on it.
+        let lock_dir = manager.state_dir.clone();
+        let lock_project = sandbox.project_dir.clone();
+        let _edit = lock_blocking(move || lock_project_config(&lock_dir, &lock_project)).await?;
         let latest = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
             "rebuilt the box, but its devbox.toml can no longer be read, so the new \
              selection could not be recorded",
@@ -895,10 +903,19 @@ mod lock_audit {
 
         let mut offenders = Vec::new();
         for path in files {
-            // This file defines the locks and the escape hatch.
-            if path.ends_with("web/build.rs") {
-                continue;
-            }
+            // No exemption for this file, deliberately.
+            //
+            // It had one — "this file defines the locks and the escape hatch" —
+            // and that is how round 42 found a real instance here: `build.rs`
+            // both defines the locks *and* calls one inside an `async fn`, so
+            // the guard written to catch exactly that had excused the file it
+            // lived in. None is needed. The definition of
+            // `lock_project_config` is not `async`, and `lock_blocking` takes a
+            // closure rather than naming the lock, so neither trips the check
+            // on its own.
+            //
+            // An exemption scoped to a file rather than to the lines that need
+            // it hides whatever else that file comes to contain.
             // The CLI is exempt, and the exemption is the whole distinction.
             //
             // Its commands are `async` because the runtime APIs are, not

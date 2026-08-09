@@ -439,6 +439,18 @@ impl SandboxManager {
 
     /// Stop a sandbox.
     pub async fn stop_sandbox(&self, name: &str) -> Result<()> {
+        // The same claim the console's stop takes, here because the CLI does
+        // not go through it.
+        //
+        // `devbox stop` calls this directly, so the guard added for the console
+        // protected one of the two ways to stop a box. Stopping the guest
+        // mid-rebuild fails that rebuild, and its rollback of the generated
+        // files and its posture restore both run *inside* the guest — so
+        // neither happens. What is left is a box on a selection nobody chose
+        // with its firewall down, and nothing recording either.
+        let _lock = crate::web::build::lock_rebuild(&self.state_dir, name)
+            .context("cannot stop this box while a rebuild is in progress")?;
+
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
         runtime.stop(name).await?;

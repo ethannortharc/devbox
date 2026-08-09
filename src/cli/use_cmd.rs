@@ -86,6 +86,21 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         cwd.display(),
         mount_mode,
     );
+    // Claimed before the runtime is touched, and for every mode.
+    //
+    // It used to be taken inside the overlay branch, *after* `update_mounts`
+    // had already stopped Lima, rewritten its configuration and started it
+    // again. A claim that fails at that point fails having already done the
+    // disruptive half: mounts moved, state still naming the old project. And
+    // `--writable` never took it at all, so that path could restart the guest
+    // underneath a running rebuild with nothing refusing it.
+    //
+    // Held for the whole command, because every part of it — the mounts, the
+    // reprovision, the state write — is a change a concurrent rebuild must not
+    // interleave with.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+        .context("cannot switch this box to another project while a rebuild is in progress")?;
+
     runtime.update_mounts(name, &mounts).await?;
 
     // Resolved while `state.project_dir` still names the project these came
@@ -106,12 +121,6 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         // rebuilds with an empty list, so switching a project silently removed
         // every package added through the Sets tab while `state.packages` went
         // on reporting them as selected.
-        // The same claim the Sets paths take: this rewrites the box's generated
-        // configuration too, so a console rebuild running beside it would
-        // interleave writes and leave the active generation and the recorded
-        // selection describing different things.
-        let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)?;
-
         if let Err(e) = provision::provision_vm_full(
             runtime.as_ref(),
             name,

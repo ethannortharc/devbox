@@ -289,24 +289,48 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		}
 		dialing = true
 		go func() {
-			c, err := dialCollector(ctx, cfg.socket, out)
-			if err != nil {
-				// Only returns an error once we are shutting down.
-				linked <- link{}
+			// Retried in here rather than by the caller, so the loop outside
+			// never has to know the difference between "not listening yet" and
+			// "listened, then went away mid-handshake".
+			for {
+				c, err := dialCollector(ctx, cfg.socket, out)
+				if err != nil {
+					linked <- link{} // shutting down
+					return
+				}
+				if err := transport.Handshake(c, hello); err != nil {
+					c.Close()
+					// Only a *refusal* is fatal: the collector saying this
+					// agent is not who it claims to be, or speaks a version it
+					// will not accept. Retrying either forever would turn a
+					// loud misconfiguration into a silent one.
+					//
+					// A handshake that dies mid-exchange is not a refusal. A
+					// collector that restarts after accepting the connection
+					// and before replying produces an EOF, and treating that as
+					// fatal ended the agent — after which the supervisor
+					// restarts it and the ruleset reload clears every allow set
+					// DNS had filled. That is the outage this path exists to
+					// survive, arriving one step later than the dial.
+					if errors.Is(err, transport.ErrRejected) ||
+						errors.Is(err, transport.ErrProtocol) {
+						linked <- link{fatal: fmt.Errorf("handshake with the collector: %w", err)}
+						return
+					}
+					fmt.Fprintf(out, "devbox-obsd: handshake did not complete (%v); retrying\n", err)
+					select {
+					case <-ctx.Done():
+						linked <- link{}
+						return
+					case <-time.After(firstWait):
+					}
+					continue
+				}
+				fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
+					cfg.socket, cfg.boxID, source.Name())
+				linked <- link{conn: c}
 				return
 			}
-			if err := transport.Handshake(c, hello); err != nil {
-				// Not an outage, and not retryable. A refused handshake is the
-				// collector saying this agent is not who it claims to be —
-				// wrong box id, wrong protocol version — and retrying that
-				// forever would turn a loud misconfiguration into a silent one.
-				c.Close()
-				linked <- link{fatal: fmt.Errorf("handshake with the collector: %w", err)}
-				return
-			}
-			fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
-				cfg.socket, cfg.boxID, source.Name())
-			linked <- link{conn: c}
 		}()
 	}
 	connect()
@@ -378,15 +402,23 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		select {
 		case e, ok := <-events:
 			if !ok {
-				// Source finished and the channel drained.
+				// The source's own outcome first.
+				//
+				// Draining can wait for a collector that is not there, and a
+				// source that *failed* must not be hidden behind that wait:
+				// capture has stopped, so policy updates have stopped too, and
+				// the operator would see an agent apparently still working.
+				srcErr := <-srcDone
+				if srcErr != nil {
+					return srcErr
+				}
 				if err := drain(); err != nil {
 					cancelSrc()
 					return err
 				}
 				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
-				err := <-srcDone
-				if err != nil || cfg.once {
-					return err
+				if cfg.once {
+					return nil
 				}
 				// `-once` is what makes a finished source end the process; its
 				// own help text says so, and without this the flag had no
@@ -569,6 +601,14 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 	return enforcer, nil
 }
 
+// Pacing shared by the dial and the handshake retry: both are waiting for the
+// same collector to come back, and two different rhythms would only make the
+// log harder to read.
+const (
+	firstWait   = 250 * time.Millisecond
+	longestWait = 5 * time.Second
+)
+
 // link is the result of one attempt to reach the collector.
 //
 // `fatal` separates "not listening yet" from "refused us". The first is an
@@ -597,8 +637,6 @@ type link struct {
 // while this waits.
 func dialCollector(ctx context.Context, socket string, out io.Writer) (net.Conn, error) {
 	const (
-		firstWait   = 250 * time.Millisecond
-		longestWait = 5 * time.Second
 		// Long outages must not be silent, and must not be a log flood either.
 		reportEvery = time.Minute
 	)

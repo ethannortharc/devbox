@@ -354,9 +354,16 @@ fi
 # The two differ across a source-of-truth change, and a node retrying its report
 # across a ztpd restart is exactly when they do.
 #
+# Hashed from the marker, not from frr.conf. The marker is written only after a
+# restart returns success, so it names the configuration the daemon actually
+# loaded; frr.conf is merely what is on disk. A manual edit between runs makes
+# them differ, and the skip branch above trusts the marker — so hashing the file
+# would report a configuration that was never activated, and the server would
+# then skip the push that would have corrected it.
+#
 # The server truncates sha256 to eight bytes, which is the first sixteen hex
 # characters of what sha256sum prints.
-CFG_HASH="$(sha256sum /etc/frr/frr.conf 2>/dev/null | cut -c1-16)"
+CFG_HASH="$(sha256sum "$ACTIVATED" 2>/dev/null | cut -c1-16)"
 
 # Self-check, then phone home.
 #

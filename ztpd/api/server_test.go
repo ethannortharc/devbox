@@ -804,3 +804,38 @@ func TestAnOlderNodeStillRecordsSomething(t *testing.T) {
 		t.Error("a node that reports no hash must still get the catalog's")
 	}
 }
+
+// TestTheReportedHashComesFromTheMarkerNotTheFile keeps "what the daemon
+// loaded" apart from "what is on disk".
+//
+// The marker is written only after a restart returns success, so it names the
+// configuration FRR actually took. `frr.conf` is merely the file — a manual
+// edit between runs makes them differ, and the skip branch trusts the marker.
+// Hashing the file would report a configuration that was never activated, and
+// the server would then skip the push that would have corrected it.
+func TestTheReportedHashComesFromTheMarkerNotTheFile(t *testing.T) {
+	t.Parallel()
+
+	s := New(statemachine.NewRegistry(), &MapCatalog{}, "http://ztp.example")
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap.sh", nil)
+	rec := httptest.NewRecorder()
+	s.ProvisioningHandler().ServeHTTP(rec, req)
+	script := rec.Body.String()
+
+	line := ""
+	for _, l := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "CFG_HASH=") {
+			line = strings.TrimSpace(l)
+			break
+		}
+	}
+	if line == "" {
+		t.Fatal("the script no longer computes a config hash")
+	}
+	if !strings.Contains(line, "$ACTIVATED") {
+		t.Errorf("the hash must come from the activation marker: %q", line)
+	}
+	if strings.Contains(line, "/etc/frr/frr.conf") {
+		t.Errorf("hashing the on-disk file reports configs that never loaded: %q", line)
+	}
+}
