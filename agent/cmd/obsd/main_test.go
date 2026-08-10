@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ethannortharc/devbox/agent/transport"
 )
 
 func TestVersionFlagPrintsIdentity(t *testing.T) {
@@ -315,5 +317,99 @@ func TestCaptureAndEnforcementRunWithoutACollector(t *testing.T) {
 	// fixture smaller than the queue drops none of them.
 	if !strings.Contains(log, "event(s) sent") {
 		t.Errorf("capture never ran without a collector: %q", log)
+	}
+}
+
+// TestFramesReachAListeningCollector runs the agent against a real socket.
+//
+// Nothing in this package did, and that gap has a cost. The write deadline was
+// added by rewriting every `transport.WriteFrame(conn, …)` call — including the
+// one inside the wrapper being introduced, so `writeFrame` called itself. It
+// compiled, `go vet` was clean, and every test here passed, because not one of
+// them ever reached a collector that would accept a frame. The only thing that
+// caught it was a Rust test in another language's suite.
+//
+// A fake collector is a listener, a handshake and a frame count. That is cheap
+// enough that its absence was an oversight rather than a decision.
+func TestFramesReachAListeningCollector(t *testing.T) {
+	t.Parallel()
+
+	// Short path: a unix socket is capped near 104 bytes and `t.TempDir()`
+	// spends most of that on the test's name.
+	dir, err := os.MkdirTemp("", "obsd")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "c.sock")
+
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	frames := make(chan int, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			frames <- -1
+			return
+		}
+		defer conn.Close()
+
+		var hello transport.Hello
+		if err := transport.ReadJSON(conn, &hello); err != nil {
+			frames <- -1
+			return
+		}
+		if err := transport.WriteJSON(conn, transport.HelloAck{
+			Accepted: true,
+			Protocol: transport.ProtocolVersion,
+		}); err != nil {
+			frames <- -1
+			return
+		}
+		n := 0
+		for {
+			if _, err := transport.ReadFrame(conn); err != nil {
+				frames <- n
+				return
+			}
+			n++
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cfg := config{
+		socket:  sock,
+		boxID:   "box-under-test",
+		fixture: "../../event/testdata/events.jsonl",
+		queue:   64,
+		once:    true,
+	}
+	source, err := chooseSource(cfg)
+	if err != nil {
+		t.Fatalf("chooseSource: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := stream(ctx, cfg, source, &out); err != nil {
+		t.Fatalf("stream: %v\n%s", err, out.String())
+	}
+
+	// The agent has exited, so the collector's read side is done too.
+	select {
+	case n := <-frames:
+		if n <= 0 {
+			t.Fatalf("the collector received %d frames\n%s", n, out.String())
+		}
+		if !strings.Contains(out.String(), "event(s) sent") {
+			t.Errorf("the agent did not report sending: %q", out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the collector never finished reading\n%s", out.String())
 	}
 }
