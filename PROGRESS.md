@@ -1614,3 +1614,78 @@ name, and the single caller that already holds the claim now asks for
 having to know the hazard exists.
 
 **Gate** — 532 Rust, 10 Go packages, 71 Python; six linters clean.
+
+## 2026-08-10T00:40Z — Round 45: 7 findings, and the point where point-fixing stopped
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+round 41  1   3      2              2
+round 42  3   3      6              0
+round 43  2   2      3              1
+round 44  1   2      1              2
+round 45  6   1      4              3
+```
+
+The count went back up, and where it went up matters more than that it did: six
+of the seven are in the locking and policy-restore paths, which have now
+produced a finding in five consecutive rounds. That is not a run of bad luck. It
+is what a subsystem does when its invariants live in prose.
+
+**The finding that settled it.** Round 44 reported that `None` in the
+generated-file snapshot meant both "absent" and "unreadable", with rollback
+deleting on the former. I fixed the per-file half and left the set-module
+directory ten lines below doing the same thing — having quoted that type's own
+comment, *"No archive has two meanings and they need opposite handling"*, as
+evidence the type already separated them. **Reading the comment that describes
+the class is not the same as checking the class.**
+
+Three paths could also leave a box unfirewalled: `nixos-rebuild switch` removes
+the nftables table, a *failed* switch rolls back and switches again, and both
+`upgrade` and `reprovision` returned on `?` before their restore. And
+`reprovision` replayed a posture captured before a rebuild that takes minutes,
+overwriting anything edited in the gap.
+
+## The design pass
+
+Rather than a sixth round of point fixes, the subsystem was counted.
+**Eighteen policy applications; nine ran with no claim on the box they were
+changing.** Nothing in the code said which of them meant to, which is why five
+rounds of fixing one call site each had not converged and would not have.
+
+Three things were wrong underneath, and all three were expressible:
+
+**The two locks were one type.** `lock_rebuild` refuses immediately and
+`lock_project_config` waits, and both returned `RebuildLock`. Nothing in a
+signature distinguished them, so nothing could — which is how two paths came to
+be "fixed" for a deadlock only the waiting one could have had, and how a
+function that returned "the lock" looked complete while dropping the other. They
+are `BoxClaim` and `ProjectClaim` now.
+
+**The claim was a habit.** `restore_after_rebuild` and `apply_saved` take
+`&BoxClaim`; a caller without one does not compile. `start_box_holding_claim`
+stated that requirement in its *name*, which is a comment with a colon in it.
+
+**Contention had no policy.** Paths that merely *use* a box — `exec`, `attach`,
+`code`, the lab — now step aside when a rebuild owns it, because the holder is
+already obliged to restore the posture before returning. Nothing that worked
+starts failing.
+
+**The pass found a bug in its first ten minutes, and it was the previous
+round's.** Round 45 added the box claim to the CLI policy editor as a local
+inside `load()` — dropped the instant that function returned, so the editor held
+nothing while it saved and applied. Written, committed, and inert. The type
+split is what surfaced it: the signature now has to say which claim survives.
+
+**What to take from this.** The loop had been asking "is this call site
+correct?" for five rounds and getting a true answer each time. The question that
+mattered was "what does this subsystem guarantee, and what enforces it?" — and
+nothing in a per-diff review asks that. A reviewer sees the change; the missing
+invariant is in the code it did not touch. **Counting the population rather than
+inspecting the instance is what turned five rounds of symptoms into one cause.**
+
+Verified adversarially, as everything here now is: applying policy without a
+claim does not compile, a `ProjectClaim` cannot be passed where a `BoxClaim` is
+wanted, and the re-run census reads thirteen applications, zero unaccounted for.
+
+**Gate** — 533 Rust, 10 Go packages, 71 Python; six linters clean.
