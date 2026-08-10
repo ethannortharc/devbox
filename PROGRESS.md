@@ -1500,3 +1500,60 @@ uncompilable and the test never ran. **Both look identical to a pass when you
 are reading for a failure that does not appear.**
 
 **Gate** — 528 Rust, 10 Go packages, 71 Python; six linters clean.
+
+## 2026-08-09T22:35Z — Codex review round 43: 4 findings, and three self-inflicted wounds while fixing them
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+round 41  1   3      2              2
+round 42  3   3      6              0
+round 43  2   2      3              1
+```
+
+**The pre-existing P1 is the most ordinary bug in the whole series, and it
+survived forty-two rounds.** `devbox upgrade` clears the selection and rebuilds
+it by feeding each recorded set name through `apply_tools` — which is an *alias*
+table. It knows `claude`, `mosh`, `aider`; it has no case for `shell`, `tools`,
+`editor`, `git` or `container`. Those five were cleared and never restored, so a
+routine upgrade rebuilt the box without them. `--tools git` was accepted and did
+nothing for the same reason.
+
+Nothing exotic, nothing concurrent, no kernel involved. It lasted because
+`active_sets` and the code that reads its output back are a *pair* with nothing
+holding them together, and a pair with no test between them fails silently in
+one direction only — the direction nobody looks. The repair is the round trip:
+turn everything on, emit, read back, compare. A set added later is covered
+without anyone remembering it exists.
+
+**Three things went wrong while making these fixes, and all three read as
+success.**
+
+The write deadline was added by rewriting every `transport.WriteFrame(conn, …)`
+call — including the one inside the wrapper being introduced, so `writeFrame`
+called itself. It compiled. `go vet` was clean. The agent's own tests passed,
+because none of them reach a live collector; only the cross-language pipeline
+test writes a frame, and it had not been re-run.
+
+A comment naming a file in backticks terminated the Go raw string the ZTP script
+lives in. `server.go` says in its own doc comment that the script must contain
+no backticks *including in comments*, and the test that parses it says it has
+been broken that way three times. This is the fourth, written while adding a
+comment about being careful. The `sh -n` guard cannot catch it: the crate no
+longer compiles, so the test never runs.
+
+And the round-40 test asserting the FRR skip branch checks liveness sliced the
+condition at the first newline. Splitting that condition over two lines made it
+read half and report the check as missing.
+
+**The common shape is worth naming, because it is now the dominant failure mode
+of this loop:** a broken build, an unreachable test, and a test reading the
+wrong half of a line all produce *the absence of a failure*, which is exactly
+what success looks like from the outside. Round 21 said a test asserting on the
+wrong object is worse than no test. These are the same claim generalised — **any
+verification that cannot run is indistinguishable from one that passed**, and
+the only defence found so far is to make the thing fail on purpose and watch it.
+That habit — revert the fix, confirm the guard screams — has now caught a
+vacuous guard, a no-op patch, and an uncompilable revert, in one session.
+
+**Gate** — 530 Rust, 10 Go packages, 71 Python; six linters clean.
