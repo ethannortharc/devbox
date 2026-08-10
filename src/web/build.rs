@@ -465,7 +465,7 @@ pub async fn apply_selection(
     // selected. Round 30 fixed this on the CLI path and left this one.
     // Across processes, not just across handlers. The `AppState` guard the
     // route took only knows about this console.
-    let _lock = lock_rebuild(&manager.state_dir, box_name)?;
+    let claim = claim_box(&manager.state_dir, box_name)?;
 
     let project = DevboxConfig::load_or_default(&sandbox.project_dir);
     let recovered = Selection::from_state_and_project(&sandbox, &project);
@@ -490,7 +490,7 @@ pub async fn apply_selection(
     // did this; the background path did not, and simply never rebuilt.
     // Already holding the claim for this box, so the claiming form would
     // refuse itself.
-    crate::web::service::ensure_running_holding_claim(manager, box_name).await?;
+    crate::web::service::ensure_running_holding_claim(manager, box_name, &claim).await?;
 
     let publish = |line: &str| {
         state.publish(ConsoleEvent::new(
@@ -549,7 +549,7 @@ pub async fn apply_selection(
         // key, last value retained — so the browser showed the *less* severe
         // message. The route only publishes if nothing here did.
         if let Err(policy_err) =
-            crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name).await
+            crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name, &claim).await
         {
             // Reported as its own terminal status, not folded into the rebuild
             // error: "the rebuild failed" and "and now the firewall is gone
@@ -595,7 +595,8 @@ pub async fn apply_selection(
     // out. A rebuild is not that — nobody is waiting at a prompt, and the
     // console is about to print a verdict — so this path wants the strict
     // form, which propagates.
-    if let Err(e) = crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name).await
+    if let Err(e) =
+        crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name, &claim).await
     {
         // Terminal status, not a log line among the build output. "rebuild
         // complete" printed underneath a warning nobody scrolled back to read
@@ -665,7 +666,8 @@ pub async fn apply_selection(
         // the holder can only finish on a worker that is now blocked on it.
         let lock_dir = manager.state_dir.clone();
         let lock_project = sandbox.project_dir.clone();
-        let _edit = lock_blocking(move || lock_project_config(&lock_dir, &lock_project)).await?;
+        let _edit =
+            claim_project_off_worker(move || claim_project(&lock_dir, &lock_project)).await?;
         let latest = DevboxConfig::load_for_edit(&sandbox.project_dir).context(
             "rebuilt the box, but its devbox.toml can no longer be read, so the new \
              selection could not be recorded",
@@ -840,11 +842,11 @@ mod tests {
         // asserting it would pin an accident. What is checked is that the
         // claim succeeds and lands on the path the other half computes.
         let dir = tempfile::tempdir().unwrap();
-        let _held = super::lock_rebuild(dir.path(), "alpha").expect("first claim");
+        let _held = super::claim_box(dir.path(), "alpha").expect("first claim");
         assert!(super::rebuild_lock_path(dir.path(), "alpha").exists());
 
         // And a second box is never blocked by the first.
-        let _other = super::lock_rebuild(dir.path(), "beta").expect("a different box");
+        let _other = super::claim_box(dir.path(), "beta").expect("a different box");
     }
 
     use super::*;
@@ -936,14 +938,50 @@ mod tests {
     }
 }
 
-/// Exclusive claim on rebuilding one box, held across processes.
+/// Exclusive claim on one box's lifecycle, held across processes.
+///
+/// Refuses immediately when another holder has it: a second rebuild of the same
+/// box is a mistake to report, not a queue to join.
+///
+/// Also a *capability*. Functions that change what a box enforces take one by
+/// reference, so a call site that does not hold the claim cannot be written —
+/// which is the difference between an invariant and a habit. Nine of eighteen
+/// policy applications had no claim when this was documentation.
 ///
 /// The lock is the open file: closing it releases the advisory lock, so
 /// dropping this releases the claim however the caller left — including on a
 /// panic, and including when the process dies without unwinding, which is the
 /// case a lock file containing a pid gets wrong.
 #[derive(Debug)]
-pub struct RebuildLock {
+pub struct BoxClaim {
+    /// Which box this is a claim on.
+    ///
+    /// Carried so a function handed a claim can check it is the right one. A
+    /// claim on box A proves nothing about box B, and without this the type
+    /// would accept either.
+    box_name: String,
+    _file: std::fs::File,
+}
+
+impl BoxClaim {
+    /// The box this claim covers.
+    pub fn box_name(&self) -> &str {
+        &self.box_name
+    }
+}
+
+/// Exclusive claim on one project's `devbox.toml`, held across processes.
+///
+/// *Waits* for the holder, unlike [`BoxClaim`] — a read-modify-write of one
+/// file is short and refusing it would be a spurious failure.
+///
+/// A separate type on purpose. Both were `RebuildLock`, so nothing in the
+/// signature distinguished a claim that refuses from one that blocks, and the
+/// two were repeatedly reasoned about as if they were one thing: two paths were
+/// once "fixed" for a deadlock that only the waiting one could have. Types that
+/// behave differently under contention should not be interchangeable.
+#[derive(Debug)]
+pub struct ProjectClaim {
     _file: std::fs::File,
 }
 
@@ -1003,10 +1041,10 @@ pub fn rebuild_lock_path(state_dir: &std::path::Path, box_name: &str) -> std::pa
 /// it, so ordinary use left an untracked file in `git status` — and a
 /// read-only or unusual checkout could not be edited at all. devbox's own
 /// directory is where devbox's own bookkeeping goes.
-pub fn lock_project_config(
+pub fn claim_project(
     state_dir: &std::path::Path,
     project_dir: &std::path::Path,
-) -> Result<RebuildLock> {
+) -> Result<ProjectClaim> {
     let dir = state_dir.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
 
@@ -1026,7 +1064,7 @@ pub fn lock_project_config(
     // so waiting is right where refusing would be a spurious failure.
     file.lock()
         .with_context(|| format!("could not lock {}", path.display()))?;
-    Ok(RebuildLock { _file: file })
+    Ok(ProjectClaim { _file: file })
 }
 
 /// A filename-safe key for a project directory.
@@ -1049,16 +1087,16 @@ fn project_key(path: &std::path::Path) -> String {
 ///
 /// The CLI does not need this and does not use it: there, blocking the one
 /// command until the lock is free is exactly the intended behaviour.
-pub async fn lock_blocking<F>(acquire: F) -> Result<RebuildLock>
+pub async fn claim_project_off_worker<F>(acquire: F) -> Result<ProjectClaim>
 where
-    F: FnOnce() -> Result<RebuildLock> + Send + 'static,
+    F: FnOnce() -> Result<ProjectClaim> + Send + 'static,
 {
     tokio::task::spawn_blocking(acquire)
         .await
         .context("the task waiting for a devbox lock was cancelled")?
 }
 
-pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<RebuildLock> {
+pub fn claim_box(state_dir: &std::path::Path, box_name: &str) -> Result<BoxClaim> {
     let dir = state_dir.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
 
@@ -1070,7 +1108,10 @@ pub fn lock_rebuild(state_dir: &std::path::Path, box_name: &str) -> Result<Rebui
         .with_context(|| format!("could not open {}", path.display()))?;
 
     match file.try_lock() {
-        Ok(()) => Ok(RebuildLock { _file: file }),
+        Ok(()) => Ok(BoxClaim {
+            box_name: box_name.to_string(),
+            _file: file,
+        }),
         Err(_) => bail!(
             "another devbox process is already rebuilding box '{box_name}'.\n  \
              Two rebuilds of one box overwrite each other's generated files and \
@@ -1161,10 +1202,10 @@ mod lock_audit {
                 // getting it wrong is how two paths were "fixed" for a defect
                 // they never had. If `lock_rebuild` ever starts waiting, add
                 // it here — and not before.
-                let takes_lock = trimmed.contains("lock_project_config(");
+                let takes_lock = trimmed.contains("claim_project(");
                 // Inside the `lock_blocking` closure is exactly where these
                 // belong, so a line that mentions both is correct.
-                if takes_lock && !line.contains("lock_blocking") {
+                if takes_lock && !line.contains("claim_project_off_worker") {
                     // Code only. The first version of this looked at the raw
                     // preceding lines, and the comment above the call site
                     // explains the fix by *naming* `lock_blocking` — so the
@@ -1178,7 +1219,7 @@ mod lock_audit {
                         .cloned()
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if !code_above.contains("lock_blocking") {
+                    if !code_above.contains("claim_project_off_worker") {
                         offenders.push(format!("{}:{}: {}", path.display(), n + 1, trimmed));
                     }
                 }
@@ -1190,7 +1231,7 @@ mod lock_audit {
             "these take an OS file lock directly inside an `async fn`, which \
              blocks a Tokio worker until the holder releases — and the holder \
              may be a rebuild that runs for minutes. Wrap them in \
-             `build::lock_blocking`:\n{}",
+             `build::claim_project_off_worker`:\n{}",
             offenders.join("\n")
         );
     }

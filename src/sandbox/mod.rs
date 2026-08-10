@@ -269,12 +269,12 @@ impl SandboxManager {
             // it — so doing it on every attach costs one exec and closes the
             // window for good.
             SandboxStatus::Running => {
-                crate::policy::enforce::apply_saved(self, &state, name).await?;
+                crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
             }
             SandboxStatus::Stopped => {
                 println!("Starting sandbox '{name}'...");
                 runtime.start(name).await?;
-                crate::policy::enforce::apply_saved(self, &state, name).await?;
+                crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
             }
             SandboxStatus::NotFound => {
                 bail!(
@@ -448,7 +448,7 @@ impl SandboxManager {
         // files and its posture restore both run *inside* the guest — so
         // neither happens. What is left is a box on a selection nobody chose
         // with its firewall down, and nothing recording either.
-        let _lock = crate::web::build::lock_rebuild(&self.state_dir, name)
+        let _lock = crate::web::build::claim_box(&self.state_dir, name)
             .context("cannot stop this box while a rebuild is in progress")?;
 
         let state = self.get_sandbox(name)?;
@@ -473,7 +473,7 @@ impl SandboxManager {
         // covered by the same rule. The lock helper lives in `web::build`
         // alongside the rest of the rebuild mechanics, which the CLI paths
         // already reach into for the same reason.
-        let _lock = crate::web::build::lock_rebuild(&self.state_dir, name)?;
+        let _lock = crate::web::build::claim_box(&self.state_dir, name)?;
 
         let state = self.get_sandbox(name);
         if let Ok(state) = &state {
@@ -540,7 +540,7 @@ impl SandboxManager {
         // Whether or not this call started it. A box already running may have
         // been started outside devbox, and running a command in it is exactly
         // the moment its posture has to be true.
-        crate::policy::enforce::apply_saved(self, &state, name).await?;
+        crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let result = runtime.exec_cmd(name, &cmd_refs, interactive).await?;

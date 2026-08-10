@@ -592,7 +592,13 @@ pub async fn restore_after_rebuild(
     manager: &crate::sandbox::SandboxManager,
     state: &crate::sandbox::state::SandboxState,
     name: &str,
+    claim: &crate::web::build::BoxClaim,
 ) -> Result<()> {
+    debug_assert_eq!(
+        claim.box_name(),
+        name,
+        "a claim on one box proves nothing about another"
+    );
     // Read and apply under the same claim the editors take.
     //
     // Without it, this reads posture A, a Policy-tab save or `devbox policy
@@ -604,8 +610,8 @@ pub async fn restore_after_rebuild(
     // serialised: a lock that one participant ignores orders nothing.
     let lock_dir = manager.state_dir.clone();
     let lock_project = state.project_dir.clone();
-    let _edit = crate::web::build::lock_blocking(move || {
-        crate::web::build::lock_project_config(&lock_dir, &lock_project)
+    let _edit = crate::web::build::claim_project_off_worker(move || {
+        crate::web::build::claim_project(&lock_dir, &lock_project)
     })
     .await?;
 
@@ -632,11 +638,73 @@ pub async fn restore_after_rebuild(
         })
 }
 
-pub async fn apply_saved(
+/// Apply the saved posture if this box is not already owned by someone.
+///
+/// For the paths that merely *use* a box — `exec`, `attach`, `code`, the lab —
+/// rather than changing it. They want the posture to be true, and they have no
+/// business queueing behind a rebuild to say so.
+///
+/// A refused claim is not a failure here. The holder is a rebuild, and a
+/// rebuild is already obliged to restore the posture before it returns; a
+/// second application on top of that would be redundant at best and a stale
+/// overwrite at worst. Stepping aside is the whole answer.
+///
+/// This existed as a naming convention before — nine of eighteen policy
+/// applications ran with no claim at all, and nothing said which of them meant
+/// to.
+/// Restore the saved posture after a rebuild this process does not own.
+///
+/// Only for callers that rebuild *through another process* — the lab substrate
+/// path drives `nixos-rebuild` inside a box it does not hold a claim on. A
+/// caller that does its own rebuilding holds the claim and must use
+/// [`restore_after_rebuild`], which requires it.
+pub async fn restore_after_rebuild_or_step_aside(
     manager: &crate::sandbox::SandboxManager,
     state: &crate::sandbox::state::SandboxState,
     name: &str,
 ) -> Result<()> {
+    let claim = match crate::web::build::claim_box(&manager.state_dir, name) {
+        Ok(claim) => claim,
+        Err(_) => {
+            tracing::debug!(
+                box_id = %name,
+                "a rebuild owns this box; leaving the egress posture to it"
+            );
+            return Ok(());
+        }
+    };
+    restore_after_rebuild(manager, state, name, &claim).await
+}
+
+pub async fn apply_saved_or_step_aside(
+    manager: &crate::sandbox::SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+) -> Result<()> {
+    let claim = match crate::web::build::claim_box(&manager.state_dir, name) {
+        Ok(claim) => claim,
+        Err(_) => {
+            tracing::debug!(
+                box_id = %name,
+                "a rebuild owns this box; leaving the egress posture to it"
+            );
+            return Ok(());
+        }
+    };
+    apply_saved(manager, state, name, &claim).await
+}
+
+pub async fn apply_saved(
+    manager: &crate::sandbox::SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+    claim: &crate::web::build::BoxClaim,
+) -> Result<()> {
+    debug_assert_eq!(
+        claim.box_name(),
+        name,
+        "a claim on one box proves nothing about another"
+    );
     // Loaded fallibly. `load_or_default` turns a malformed `devbox.toml` into
     // the *default* config, whose posture is `open` — so a corrupted file would
     // silently unfirewall a box that had been isolated, and report nothing.
@@ -652,8 +720,8 @@ pub async fn apply_saved(
     // serialised: a lock that one participant ignores orders nothing.
     let lock_dir = manager.state_dir.clone();
     let lock_project = state.project_dir.clone();
-    let _edit = crate::web::build::lock_blocking(move || {
-        crate::web::build::lock_project_config(&lock_dir, &lock_project)
+    let _edit = crate::web::build::claim_project_off_worker(move || {
+        crate::web::build::claim_project(&lock_dir, &lock_project)
     })
     .await?;
 

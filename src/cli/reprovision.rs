@@ -29,7 +29,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         SandboxStatus::Stopped => {
             println!("Starting sandbox '{name}'...");
             runtime.start(&name).await?;
-            crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+            crate::policy::enforce::apply_saved_or_step_aside(manager, &state, &name).await?;
         }
         SandboxStatus::NotFound => {
             anyhow::bail!(
@@ -80,7 +80,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // configuration too, so a console rebuild running beside it would
     // interleave writes and leave the active generation and the recorded
     // selection describing different things.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+    let claim = crate::web::build::claim_box(&manager.state_dir, &name)?;
 
     // Resolved once, and used for both the rebuild and the state written after
     // it. A v3 box has no `packages`, so these come out of its project file —
@@ -104,7 +104,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     .await;
     if let Err(e) = provisioned {
         if let Err(restore) =
-            crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await
+            crate::policy::enforce::restore_after_rebuild(manager, &state, &name, &claim).await
         {
             eprintln!(
                 "devbox: WARNING — reprovisioning failed *and* the egress posture could \
@@ -129,7 +129,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // enforced A. `restore_after_rebuild` loads and applies under the same
     // claim the editors take, which is the only way the two can be ordered.
     let restored =
-        crate::policy::enforce::restore_after_rebuild(manager, &updated_state, &name).await;
+        crate::policy::enforce::restore_after_rebuild(manager, &updated_state, &name, &claim).await;
 
     // The bookkeeping happens whether or not the firewall came back.
     //

@@ -94,7 +94,15 @@ fn load(
     String,
     DevboxConfig,
     std::path::PathBuf,
-    crate::web::build::RebuildLock,
+    // *Both* claims, returned so both outlive this function.
+    //
+    // The box claim used to be a local here, so it was dropped the moment this
+    // returned and the editor held nothing while it saved and applied — the
+    // guard was written, committed, and did nothing. It was invisible because
+    // both claims were the same type and returning one of them looked like
+    // returning the lock.
+    crate::web::build::BoxClaim,
+    crate::web::build::ProjectClaim,
 )> {
     let name = manager.resolve_name(name)?;
     let state = manager.get_sandbox(&name)?;
@@ -122,15 +130,15 @@ fn load(
     // reinstall the old posture — switching from an open project to an isolated
     // one and ending up open. The box is the thing both operations are about,
     // so the box is what they have to agree on.
-    let _box_claim = crate::web::build::lock_rebuild(&manager.state_dir, &state.name).context(
+    let box_claim = crate::web::build::claim_box(&manager.state_dir, &state.name).context(
         "cannot change this box's policy while a rebuild or project switch is in progress",
     )?;
 
-    let edit = crate::web::build::lock_project_config(&manager.state_dir, &state.project_dir)?;
+    let edit = crate::web::build::claim_project(&manager.state_dir, &state.project_dir)?;
     // `load_for_edit`, not `load_or_default`: every caller here may go on to
     // write the file, and falling back to defaults would erase the rest of it.
     let config = DevboxConfig::load_for_edit(&state.project_dir)?;
-    Ok((name, config, path, edit))
+    Ok((name, config, path, box_claim, edit))
 }
 
 fn save(config: &DevboxConfig, path: &std::path::Path) -> Result<()> {
@@ -140,7 +148,7 @@ fn save(config: &DevboxConfig, path: &std::path::Path) -> Result<()> {
 }
 
 fn show(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
-    let (name, config, _, _edit) = load(manager, args.name.as_deref())?;
+    let (name, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
     let policy = &config.policy;
 
     println!("Egress policy for '{name}':\n");
@@ -182,7 +190,7 @@ async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
     // overlapping edits finish their *applies* in the opposite order from
     // their file writes — devbox.toml ending at `isolated` while a delayed
     // earlier `open` cleared the live table.
-    let (name, mut config, path, _edit) = load(manager, args.name.as_deref())?;
+    let (name, mut config, path, _box_claim, _edit) = load(manager, args.name.as_deref())?;
 
     let previous = config.policy.egress;
     config.policy.egress = posture;
@@ -207,7 +215,7 @@ async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
 
 async fn allow(args: AllowArgs, manager: &SandboxManager) -> Result<()> {
     // Held to the end, so the reapply below runs under the same claim.
-    let (name, mut config, path, _edit) = load(manager, args.name.as_deref())?;
+    let (name, mut config, path, _box_claim, _edit) = load(manager, args.name.as_deref())?;
 
     let mut added = Vec::new();
     for entry in &args.entries {
@@ -295,7 +303,7 @@ async fn reapply(
 }
 
 fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
-    let (name, config, _, _edit) = load(manager, args.name.as_deref())?;
+    let (name, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
 
     let target = Target {
         domain: args.domain.clone(),
@@ -323,7 +331,7 @@ fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 fn rules(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
-    let (_, config, _, _edit) = load(manager, args.name.as_deref())?;
+    let (_, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
     print!("{}", crate::policy::nftables::ruleset(&config.policy));
     Ok(())
 }

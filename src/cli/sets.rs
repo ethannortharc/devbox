@@ -152,7 +152,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // and this carried on with the *old* project directory, wrote the selection
     // into the old project's devbox.toml, and overwrote box state to name a
     // project the runtime was no longer mounting.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+    let claim = crate::web::build::claim_box(&manager.state_dir, &name)?;
 
     // Re-read under it. Taking the claim does not make a stale copy fresh.
     let state = manager.get_sandbox(&name)?;
@@ -163,7 +163,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     //
     // The claim is already held, so the starting form that takes one would
     // refuse this command its own lock.
-    crate::web::service::ensure_running_holding_claim(manager, &name).await?;
+    crate::web::service::ensure_running_holding_claim(manager, &name, &claim).await?;
 
     // Validate the project config *before* touching the box: discovering it is
     // malformed after the rebuild has switched the generation would leave the
@@ -202,7 +202,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         // rebuild worked or not. Returning the rebuild error first left the
         // box unrestricted on exactly the path where something already went
         // wrong.
-        crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+        crate::policy::enforce::apply_saved(manager, &state, &name, &claim).await?;
         return Err(e);
     }
 
@@ -213,7 +213,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // while reporting only a write error. The box is already running the new
     // configuration; getting its firewall back matters more than recording
     // what it is running.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await?;
+    crate::policy::enforce::restore_after_rebuild(manager, &state, &name, &claim).await?;
 
     // The claim covers the read *and* the write.
     //
@@ -221,7 +221,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // already stale, and writing it under a lock overwrote a newer policy just
     // as surely — leaving the firewall enforcing one posture while devbox.toml
     // named another, and the next start applying the one on disk.
-    let _edit = crate::web::build::lock_project_config(&manager.state_dir, &state.project_dir)?;
+    let _edit = crate::web::build::claim_project(&manager.state_dir, &state.project_dir)?;
 
     let base = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
         .context("rebuilt the box, but its devbox.toml can no longer be read")?;

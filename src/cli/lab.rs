@@ -794,7 +794,7 @@ async fn resolve_substrate(
     // `Runtime`, bypassing attach and exec — so a substrate started outside
     // devbox ran `lab up`, faults, and teardown with no posture at all. This
     // is the chokepoint, so the enforcement belongs here.
-    crate::policy::enforce::apply_saved(manager, &state, &name).await?;
+    crate::policy::enforce::apply_saved_or_step_aside(manager, &state, &name).await?;
 
     Ok((runtime, name))
 }
@@ -809,7 +809,7 @@ async fn reapply_policy(manager: &SandboxManager, substrate: &str) -> Result<()>
     // Strict: the lab's prefixes just changed, so a posture that fails to
     // reload is either exempting a subnet that no longer exists or blocking
     // one that does. Neither is something to print a success message over.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, substrate).await
+    crate::policy::enforce::restore_after_rebuild_or_step_aside(manager, &state, substrate).await
 }
 
 /// Write a file inside the substrate.

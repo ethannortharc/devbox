@@ -98,7 +98,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     // Held for the whole command, because every part of it — the mounts, the
     // reprovision, the state write — is a change a concurrent rebuild must not
     // interleave with.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+    let claim = crate::web::build::claim_box(&manager.state_dir, name)
         .context("cannot switch this box to another project while a rebuild is in progress")?;
 
     runtime.update_mounts(name, &mounts).await?;
@@ -156,7 +156,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
 
     // Unconditional: both branches disturb the box — one reprovisions, the
     // other restarts the VM — and both take devbox's nftables table with them.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, name).await?;
+    crate::policy::enforce::restore_after_rebuild(manager, &state, name, &claim).await?;
 
     println!("Sandbox '{}' updated. Attaching...", name);
     manager.attach(name).await

@@ -130,18 +130,21 @@ pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
     // *old* YAML: the pending `limactl start` then either failed after the YAML
     // had already changed, or left a running VM on the old mounts while state
     // recorded the new project.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+    let claim = crate::web::build::claim_box(&manager.state_dir, name)
         .context("cannot start this box while a rebuild or project switch is in progress")?;
-    start_box_holding_claim(manager, name).await
+    start_box_holding_claim(manager, name, &claim).await
 }
 
-/// The same, for the one caller that already holds the claim.
+/// The same, for a caller that already holds the claim.
 ///
-/// Named awkwardly on purpose. The claiming form above is what a new call site
-/// should reach for, and this one has to be chosen deliberately — the rebuild
-/// starts the guest partway through its own work, and taking a claim it already
-/// holds would refuse itself.
-pub async fn start_box_holding_claim(manager: &SandboxManager, name: &str) -> Result<()> {
+/// It takes the claim rather than naming it in the function. The awkward name
+/// was the whole contract before, which is a comment with a colon in it — this
+/// version cannot be called without the thing it requires.
+pub async fn start_box_holding_claim(
+    manager: &SandboxManager,
+    name: &str,
+    claim: &crate::web::build::BoxClaim,
+) -> Result<()> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
@@ -149,7 +152,9 @@ pub async fn start_box_holding_claim(manager: &SandboxManager, name: &str) -> Re
         // Running too, for the same reason as `attach`: a box that is already
         // up may have been started outside this path, or created moments ago,
         // and never had its posture installed. Applying is idempotent.
-        SandboxStatus::Running => crate::policy::enforce::apply_saved(manager, &state, name).await,
+        SandboxStatus::Running => {
+            crate::policy::enforce::apply_saved(manager, &state, name, claim).await
+        }
         SandboxStatus::Stopped => {
             // Two requests can see `Stopped` at once — clicking Start while the
             // Terminal tab opens is enough. Incus rejects the second start as
@@ -164,7 +169,7 @@ pub async fn start_box_holding_claim(manager: &SandboxManager, name: &str) -> Re
             {
                 return Err(e).with_context(|| format!("failed to start box '{name}'"));
             }
-            crate::policy::enforce::apply_saved(manager, &state, name).await
+            crate::policy::enforce::apply_saved(manager, &state, name, claim).await
         }
         SandboxStatus::NotFound => bail!(
             "box '{name}' is registered but runtime '{}' does not have it; \
@@ -185,7 +190,7 @@ pub async fn stop_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
     // chose, with its firewall down, and nothing recording either. `destroy`
     // takes this claim already; stopping is the same disruption with a
     // gentler name.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+    let _lock = crate::web::build::claim_box(&manager.state_dir, name)
         .context("cannot stop this box while a rebuild is in progress")?;
 
     let state = manager.get_sandbox(name)?;
@@ -217,8 +222,12 @@ pub async fn ensure_running(manager: &SandboxManager, name: &str) -> Result<()> 
 }
 
 /// The same, for a caller that already holds the per-box claim.
-pub async fn ensure_running_holding_claim(manager: &SandboxManager, name: &str) -> Result<()> {
-    start_box_holding_claim(manager, name).await
+pub async fn ensure_running_holding_claim(
+    manager: &SandboxManager,
+    name: &str,
+    claim: &crate::web::build::BoxClaim,
+) -> Result<()> {
+    start_box_holding_claim(manager, name, claim).await
 }
 
 /// Shells the terminal will try, best first.

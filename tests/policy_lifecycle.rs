@@ -194,7 +194,11 @@ fn every_rebuild_entry_point_claims_the_box() {
         if !REBUILDS.iter().any(|call| source.contains(call)) {
             continue;
         }
-        if !source.contains("lock_rebuild(") {
+        // `claim_box`, renamed from `lock_rebuild` when the two locks were split
+        // into distinct types — the box claim refuses, the project claim waits,
+        // and sharing one guard type was how they came to be reasoned about as
+        // one thing.
+        if !source.contains("claim_box(") {
             offenders.push(rel);
         }
     }

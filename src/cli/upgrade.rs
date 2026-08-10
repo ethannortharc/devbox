@@ -104,7 +104,7 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // started here could still interleave with one from the console and leave
     // the active generation and the recorded selection describing different
     // things.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+    let claim = crate::web::build::claim_box(&manager.state_dir, &name)?;
 
     // Not `?`. A failure here can happen *after* `nixos-rebuild switch`, and a
     // failed switch attempts a rollback — which is another network-generation
@@ -116,7 +116,7 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
         // Best effort, and reported: the box may be unreachable, in which case
         // saying so is more use than a second error about the firewall.
         if let Err(restore) =
-            crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await
+            crate::policy::enforce::restore_after_rebuild(manager, &state, &name, &claim).await
         {
             eprintln!(
                 "devbox: WARNING — the upgrade failed *and* the egress posture could \
@@ -133,7 +133,8 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // whether or not the firewall came back. Returning here first left
     // state.json describing the *old* selection for a box that already has the
     // new one — a second, quieter inconsistency layered on the first.
-    let restored = crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await;
+    let restored =
+        crate::policy::enforce::restore_after_rebuild(manager, &state, &name, &claim).await;
 
     // Update saved state with new sets/languages
     let mut updated_state = state;
