@@ -4,7 +4,7 @@ pub mod sets;
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use self::rebuild::{nixos_rebuild, write_devbox_nix, write_nix_file, write_state_toml};
 use self::sets::{NIX_SETS, generate_set_nix, generate_sets_default_nix, generate_state_toml};
@@ -89,7 +89,7 @@ pub async fn write_set_modules(
     // Read back what the box already declares, so regenerating the state file
     // does not reset the guest username or the mount mode (both of which the
     // NixOS module reads from it).
-    let existing = read_state_toml(runtime, sandbox_name).await;
+    let existing = read_state_toml(runtime, sandbox_name).await?;
     let username = existing
         .as_ref()
         .and_then(|t| toml_string(t, "user", "name"));
@@ -161,7 +161,19 @@ pub async fn write_set_modules(
 }
 
 /// Read the box's current `devbox-state.toml`, if it has one.
-async fn read_state_toml(runtime: &dyn Runtime, sandbox_name: &str) -> Option<toml::Value> {
+/// Read the box's own declared state, distinguishing "not there" from "could
+/// not be read".
+///
+/// `Ok(None)` means the file is genuinely absent, which is the first-provision
+/// case and the only one where omitting these keys is correct.
+///
+/// Everything else is an error, because the caller's *purpose* is to preserve
+/// the guest username and mount mode across a regeneration — and a value it
+/// cannot read is written out as absent, which makes the NixOS module fall back
+/// to its defaults. A transport hiccup or a corrupt file would therefore reset
+/// precisely what this read exists to protect, silently, during an unrelated
+/// Sets change.
+async fn read_state_toml(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Option<toml::Value>> {
     let result = runtime
         .exec_cmd(
             sandbox_name,
@@ -169,11 +181,36 @@ async fn read_state_toml(runtime: &dyn Runtime, sandbox_name: &str) -> Option<to
             false,
         )
         .await
-        .ok()?;
+        .with_context(|| format!("could not read the declared state of box '{sandbox_name}'"))?;
     if result.exit_code != 0 {
-        return None;
+        // Absent on a first provision, and non-zero for unreadable too — so
+        // ask which it was rather than guessing the harmless answer.
+        let probe = runtime
+            .exec_cmd(
+                sandbox_name,
+                &["test", "-e", "/etc/devbox/devbox-state.toml"],
+                false,
+            )
+            .await
+            .with_context(|| {
+                format!("could not check for the declared state of box '{sandbox_name}'")
+            })?;
+        if probe.exit_code != 0 {
+            return Ok(None); // genuinely not there yet
+        }
+        bail!(
+            "box '{sandbox_name}' has a devbox-state.toml that cannot be read, so \
+             regenerating it would drop the guest username and mount mode it \
+             records. Refusing rather than resetting them."
+        );
     }
-    toml::from_str(&result.stdout).ok()
+    let parsed = toml::from_str(&result.stdout).with_context(|| {
+        format!(
+            "box '{sandbox_name}' has a devbox-state.toml that cannot be parsed, so \
+             regenerating it would drop the guest username and mount mode it records"
+        )
+    })?;
+    Ok(Some(parsed))
 }
 
 /// Pull `table.key` out of a parsed TOML document.
