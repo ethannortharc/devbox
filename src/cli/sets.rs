@@ -165,7 +165,9 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // leaves the active generation alone but the generated *sources* already
     // replaced, so a later manual rebuild would apply a selection this command
     // reported as failed.
-    let backup = crate::web::build::snapshot_generated(runtime.as_ref(), &name).await;
+    // Before anything is mutated: a snapshot that could not be taken means the
+    // rollback would be working from a guess, and the guess it makes is `rm`.
+    let backup = crate::web::build::snapshot_generated(runtime.as_ref(), &name).await?;
 
     // Every step past the snapshot rolls back, not only the rebuild. A write
     // that fails partway leaves some modules replaced and some not, and a

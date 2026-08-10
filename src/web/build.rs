@@ -139,19 +139,51 @@ const GENERATED_SETS_DIR: &str = "/etc/devbox/sets";
 const SETS_BACKUP: &str = "/etc/devbox/.sets-backup.tar";
 
 /// Read the generated files so a failed rebuild can put them back.
+///
+/// Fallible, and that is the point. A `cat` that fails records *nothing* about
+/// why, and "nothing" used to be stored as `None` — the same value that means
+/// "this file did not exist". Rollback reads `None` as absent and runs `rm -f`,
+/// so a guest transport hiccup or a permissions error during the snapshot
+/// turned a rollback into a deletion of the last good generated sources.
+///
+/// Existence is probed separately from reading, so the two answers cannot be
+/// confused: an absent file is a fact worth recording, and an unreadable one is
+/// a reason to stop before anything is mutated.
 pub async fn snapshot_generated(
     runtime: &dyn crate::runtime::Runtime,
     box_name: &str,
-) -> Generated {
+) -> Result<Generated> {
     let mut out = Vec::new();
     for path in GENERATED_FILES {
-        let content = runtime
+        // Does it exist? A transport failure here is not an answer.
+        let probe = runtime
+            .exec_cmd(box_name, &["test", "-e", path], false)
+            .await
+            .with_context(|| {
+                format!(
+                    "could not check whether {path} exists in box '{box_name}', so a \
+                     rollback could not tell an absent file from an unread one — \
+                     refusing to rebuild rather than risk deleting it"
+                )
+            })?;
+        if probe.exit_code != 0 {
+            out.push((*path, None)); // genuinely absent
+            continue;
+        }
+
+        let read = runtime
             .exec_cmd(box_name, &["cat", path], false)
             .await
-            .ok()
-            .filter(|r| r.exit_code == 0)
-            .map(|r| r.stdout);
-        out.push((*path, content));
+            .with_context(|| format!("could not read {path} in box '{box_name}'"))?;
+        if read.exit_code != 0 {
+            bail!(
+                "{path} exists in box '{box_name}' but could not be read (exit \
+                 {}), so a failed rebuild could not put it back. Refusing to \
+                 rebuild rather than risk deleting it.",
+                read.exit_code
+            );
+        }
+        out.push((*path, Some(read.stdout)));
     }
 
     // The per-set modules too, as a tarball. Their names are not a fixed list
@@ -188,11 +220,11 @@ pub async fn snapshot_generated(
         .await
         .is_ok_and(|r| r.exit_code == 0);
 
-    Generated {
+    Ok(Generated {
         files: out,
         sets_archived: archived,
         sets_existed: existed,
-    }
+    })
 }
 
 /// Put the generated files back. Best effort: a box that is now unreachable
@@ -413,7 +445,9 @@ pub async fn apply_selection(
     // Everything below runs *inside* the guest — the snapshot, the writes, the
     // rebuild — so a stopped box fails on the first exec. The CLI path already
     // did this; the background path did not, and simply never rebuilt.
-    crate::web::service::ensure_running(manager, box_name).await?;
+    // Already holding the claim for this box, so the claiming form would
+    // refuse itself.
+    crate::web::service::ensure_running_holding_claim(manager, box_name).await?;
 
     let publish = |line: &str| {
         state.publish(ConsoleEvent::new(
@@ -436,7 +470,10 @@ pub async fn apply_selection(
     // would then quietly apply the selection the console reported as rolled
     // back. Worse, a source that failed to build keeps failing until someone
     // notices why.
-    let backup = snapshot_generated(runtime.as_ref(), box_name).await;
+    // Before anything is mutated. A snapshot that could not be taken is not a
+    // reason to proceed carefully — it is a reason not to proceed, because the
+    // rollback this rebuild depends on would be working from a guess.
+    let backup = snapshot_generated(runtime.as_ref(), box_name).await?;
     // Fallibly, and *before* the box is touched. `load_or_default` turns a
     // malformed devbox.toml into defaults, and step 3 writes the derived
     // config back over the original — so a syntax error anywhere in the file
@@ -606,6 +643,131 @@ pub async fn apply_selection(
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::{ExecResult, Runtime, SandboxStatus};
+
+    /// A guest whose `cat` fails for a reason that is not "the file is absent".
+    struct FlakyGuest {
+        /// `test -e` says the file is there; reading it does not work.
+        read_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for FlakyGuest {
+        async fn exec_cmd(&self, _: &str, argv: &[&str], _: bool) -> anyhow::Result<ExecResult> {
+            match argv.first().copied() {
+                // Present.
+                Some("test") => Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                Some("cat") if self.read_fails => Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "permission denied".into(),
+                }),
+                Some("cat") => Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: "contents".into(),
+                    stderr: String::new(),
+                }),
+                // The sets tarball and anything else.
+                _ => Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            }
+        }
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        async fn create(
+            &self,
+            _: &crate::runtime::CreateOpts,
+        ) -> anyhow::Result<crate::runtime::SandboxInfo> {
+            unimplemented!()
+        }
+        async fn start(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn stop(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn status(&self, _: &str) -> anyhow::Result<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn priority(&self) -> u32 {
+            0
+        }
+        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
+            unimplemented!()
+        }
+        async fn list(&self) -> anyhow::Result<Vec<crate::runtime::SandboxInfo>> {
+            unimplemented!()
+        }
+        async fn snapshot_create(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_restore(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_list(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Vec<crate::runtime::SnapshotInfo>> {
+            unimplemented!()
+        }
+        async fn upgrade(&self, _: &str, _: &[String]) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn update_mounts(&self, _: &str, _: &[crate::runtime::Mount]) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_that_exists_but_cannot_be_read_stops_the_rebuild() {
+        // `None` in the snapshot means "this file was absent", and rollback
+        // acts on that with `rm -f`. A failed read recorded the same value, so
+        // a permissions error or a guest transport hiccup during the snapshot
+        // turned the rollback into a deletion of the last good generated
+        // sources — the exact thing the snapshot exists to protect.
+        //
+        // Refusing before anything is mutated is the only safe answer: there is
+        // no rollback to fall back on if the rollback is the thing that is
+        // broken.
+        let guest = FlakyGuest { read_fails: true };
+        let err = match snapshot_generated(&guest, "b").await {
+            Ok(_) => panic!("an unreadable file must stop the rebuild"),
+            Err(e) => e,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("could not be read") && text.contains("Refusing"),
+            "the refusal should say what and why: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_readable_guest_still_snapshots() {
+        let guest = FlakyGuest { read_fails: false };
+        let snap = match snapshot_generated(&guest, "b").await {
+            Ok(snap) => snap,
+            Err(e) => panic!("a healthy guest must snapshot: {e}"),
+        };
+        assert!(
+            snap.files.iter().any(|(_, c)| c.is_some()),
+            "expected contents to be captured"
+        );
+    }
+
     #[test]
     fn a_lock_path_is_one_flat_file_per_box() {
         // Box names are directory names: they admit `/` and `.`, so a path

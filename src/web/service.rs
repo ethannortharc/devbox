@@ -122,6 +122,26 @@ pub async fn get_box(manager: &Arc<SandboxManager>, name: &str) -> Result<BoxSum
 /// button and from lazy-start when a Terminal tab is opened (§6.3), and those
 /// can race.
 pub async fn start_box(manager: &SandboxManager, name: &str) -> Result<()> {
+    // The per-box lifecycle claim, because starting is a lifecycle change.
+    //
+    // `devbox use` holds this claim across `update_mounts`, which on Lima stops
+    // the VM, rewrites its YAML and starts it again. A Start button or a
+    // Terminal lazy-start landing in that window relaunched the guest from the
+    // *old* YAML: the pending `limactl start` then either failed after the YAML
+    // had already changed, or left a running VM on the old mounts while state
+    // recorded the new project.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, name)
+        .context("cannot start this box while a rebuild or project switch is in progress")?;
+    start_box_holding_claim(manager, name).await
+}
+
+/// The same, for the one caller that already holds the claim.
+///
+/// Named awkwardly on purpose. The claiming form above is what a new call site
+/// should reach for, and this one has to be chosen deliberately — the rebuild
+/// starts the guest partway through its own work, and taking a claim it already
+/// holds would refuse itself.
+pub async fn start_box_holding_claim(manager: &SandboxManager, name: &str) -> Result<()> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
@@ -194,6 +214,11 @@ pub async fn destroy_box(manager: &Arc<SandboxManager>, name: &str, force: bool)
 /// Start the box if needed, so a view that requires a live box can open it.
 pub async fn ensure_running(manager: &SandboxManager, name: &str) -> Result<()> {
     start_box(manager, name).await
+}
+
+/// The same, for a caller that already holds the per-box claim.
+pub async fn ensure_running_holding_claim(manager: &SandboxManager, name: &str) -> Result<()> {
+    start_box_holding_claim(manager, name).await
 }
 
 /// Shells the terminal will try, best first.

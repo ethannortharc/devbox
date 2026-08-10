@@ -593,6 +593,22 @@ pub async fn restore_after_rebuild(
     state: &crate::sandbox::state::SandboxState,
     name: &str,
 ) -> Result<()> {
+    // Read and apply under the same claim the editors take.
+    //
+    // Without it, this reads posture A, a Policy-tab save or `devbox policy
+    // set` writes and applies B under the lock, and then this applies stale A
+    // on top. The file says B and nftables enforces A — and when A is the more
+    // open of the two, that silently reopens egress on a box whose recorded
+    // posture says it is closed. Round 39 put the write side under this lock
+    // and left the read side outside it, which makes the pair only half
+    // serialised: a lock that one participant ignores orders nothing.
+    let lock_dir = manager.state_dir.clone();
+    let lock_project = state.project_dir.clone();
+    let _edit = crate::web::build::lock_blocking(move || {
+        crate::web::build::lock_project_config(&lock_dir, &lock_project)
+    })
+    .await?;
+
     let config = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
         .with_context(|| {
             format!(
@@ -625,6 +641,22 @@ pub async fn apply_saved(
     // the *default* config, whose posture is `open` — so a corrupted file would
     // silently unfirewall a box that had been isolated, and report nothing.
     // Corruption is not consent.
+    // Read and apply under the same claim the editors take.
+    //
+    // Without it, this reads posture A, a Policy-tab save or `devbox policy
+    // set` writes and applies B under the lock, and then this applies stale A
+    // on top. The file says B and nftables enforces A — and when A is the more
+    // open of the two, that silently reopens egress on a box whose recorded
+    // posture says it is closed. Round 39 put the write side under this lock
+    // and left the read side outside it, which makes the pair only half
+    // serialised: a lock that one participant ignores orders nothing.
+    let lock_dir = manager.state_dir.clone();
+    let lock_project = state.project_dir.clone();
+    let _edit = crate::web::build::lock_blocking(move || {
+        crate::web::build::lock_project_config(&lock_dir, &lock_project)
+    })
+    .await?;
+
     let config = match crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir) {
         Ok(config) => config,
         Err(e) => {
