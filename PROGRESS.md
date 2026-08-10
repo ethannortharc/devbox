@@ -1557,3 +1557,60 @@ That habit — revert the fix, confirm the guard screams — has now caught a
 vacuous guard, a no-op patch, and an uncompilable revert, in one session.
 
 **Gate** — 530 Rust, 10 Go packages, 71 Python; six linters clean.
+
+## 2026-08-09T23:30Z — Codex review round 44: 3 findings, and the shape of a half-finished lock
+
+```
+        P1  P2   mine   pre-existing
+round 40  3   4      3              4
+round 41  1   3      2              2
+round 42  3   3      6              0
+round 43  2   2      3              1
+round 44  1   2      1              2
+```
+
+Five rounds, twenty-four findings, and the count is finally falling while the
+mix moves back toward the codebase. Round 42 was all mine; this one is mostly
+not.
+
+**Round 39's fix, seen from the other side.** That round put policy *writes*
+under the project claim. The readers were left outside it, so a rebuild or a
+start loads posture A, an editor saves and applies B under the lock, and stale A
+lands on top afterwards. The file says B and nftables enforces A — and when A is
+the more open of the two, a box whose recorded posture reads `isolated` is
+serving traffic.
+
+The generalisable form: **a lock that one participant ignores orders nothing.**
+Half-serialising a pair looks exactly like serialisation from inside the half
+that is covered, and the review that added the write-side lock had no reason to
+look at the read side. Locks are a property of a *set* of accesses; nothing in
+the code says what that set is, which is why the omission is invisible.
+
+Worth recording that adding the claim needed a call-graph check first, because
+`lock_project_config` waits rather than refusing. A self-nested take would hang
+forever, and a permanent hang is a worse outcome than the race it would have
+prevented. That asymmetry — refusing locks fail loudly, waiting locks fail
+silently and terminally — is why the two are now separated in the audit.
+
+**The most destructive finding is a value with two meanings.** `None` in the
+generated-file snapshot means "this file was absent", and rollback acts on that
+with `rm -f`. A `cat` that failed for any *other* reason recorded the same
+value. So a guest transport hiccup during the snapshot turned the rollback that
+exists to restore those files into the thing that deleted them.
+
+This is the third time in five rounds that a single value stood for two facts:
+empty-versus-absent in `state.packages`, refusal-versus-outage in the handshake,
+and now absent-versus-unreadable here. Each time the fix was the same — make the
+distinction representable — and each time the bug had survived because *the
+common case makes them agree*. A file that is absent and a file that cannot be
+read look identical until the day the difference is destructive.
+
+**One finding was caused by round 42's fix**, which is the expected rate. Making
+`devbox use` hold its claim across `update_mounts` opened a window where the
+Start button could relaunch the guest from the pre-switch YAML. The repair worth
+copying is not the lock, it is the naming: the *claiming* form took the plain
+name, and the single caller that already holds the claim now asks for
+`start_box_holding_claim` explicitly. A new call site gets the safe one without
+having to know the hazard exists.
+
+**Gate** — 532 Rust, 10 Go packages, 71 Python; six linters clean.
