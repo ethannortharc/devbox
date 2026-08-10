@@ -590,7 +590,6 @@ fn json_escape(s: &str) -> String {
 /// unrestricted box.
 pub async fn restore_after_rebuild(
     manager: &crate::sandbox::SandboxManager,
-    state: &crate::sandbox::state::SandboxState,
     name: &str,
     claim: &crate::web::build::BoxClaim,
 ) -> Result<()> {
@@ -599,6 +598,19 @@ pub async fn restore_after_rebuild(
         name,
         "a claim on one box proves nothing about another"
     );
+    // Read here, under the claim, rather than taken from the caller.
+    //
+    // Callers read a box's state long before they claim it — for validation,
+    // for a preview, for the name. A `devbox use` completing in that gap
+    // releases its own claim, so the caller's claim then succeeds over a
+    // snapshot naming the project the box has just stopped belonging to, and
+    // this would install that project's posture on the box now serving another.
+    // With `open` on one side and `isolated` on the other, that clears a
+    // firewall that the file still says is up.
+    //
+    // Not a parameter any more, because a parameter is a place for a stale
+    // value to arrive from.
+    let state = &manager.get_sandbox(name)?;
     // Read and apply under the same claim the editors take.
     //
     // Without it, this reads posture A, a Policy-tab save or `devbox policy
@@ -660,43 +672,38 @@ pub async fn restore_after_rebuild(
 /// [`restore_after_rebuild`], which requires it.
 pub async fn restore_after_rebuild_or_step_aside(
     manager: &crate::sandbox::SandboxManager,
-    state: &crate::sandbox::state::SandboxState,
     name: &str,
 ) -> Result<()> {
-    let claim = match crate::web::build::claim_box(&manager.state_dir, name) {
-        Ok(claim) => claim,
-        Err(_) => {
-            tracing::debug!(
-                box_id = %name,
-                "a rebuild owns this box; leaving the egress posture to it"
-            );
-            return Ok(());
-        }
+    let Some(claim) = crate::web::build::try_claim_box(&manager.state_dir, name)? else {
+        tracing::debug!(
+            box_id = %name,
+            "a rebuild owns this box; leaving the egress posture to it"
+        );
+        return Ok(());
     };
-    restore_after_rebuild(manager, state, name, &claim).await
+    restore_after_rebuild(manager, name, &claim).await
 }
 
 pub async fn apply_saved_or_step_aside(
     manager: &crate::sandbox::SandboxManager,
-    state: &crate::sandbox::state::SandboxState,
     name: &str,
 ) -> Result<()> {
-    let claim = match crate::web::build::claim_box(&manager.state_dir, name) {
-        Ok(claim) => claim,
-        Err(_) => {
-            tracing::debug!(
-                box_id = %name,
-                "a rebuild owns this box; leaving the egress posture to it"
-            );
-            return Ok(());
-        }
+    // `?`, not a shrug. Contention is `Ok(None)`; anything else means the claim
+    // could not be evaluated — an unwritable state directory, a filesystem that
+    // will not lock — and treating that as "a rebuild is running" let `attach`,
+    // `exec` and `code` carry on having applied no egress policy at all.
+    let Some(claim) = crate::web::build::try_claim_box(&manager.state_dir, name)? else {
+        tracing::debug!(
+            box_id = %name,
+            "a rebuild owns this box; leaving the egress posture to it"
+        );
+        return Ok(());
     };
-    apply_saved(manager, state, name, &claim).await
+    apply_saved(manager, name, &claim).await
 }
 
 pub async fn apply_saved(
     manager: &crate::sandbox::SandboxManager,
-    state: &crate::sandbox::state::SandboxState,
     name: &str,
     claim: &crate::web::build::BoxClaim,
 ) -> Result<()> {
@@ -705,6 +712,19 @@ pub async fn apply_saved(
         name,
         "a claim on one box proves nothing about another"
     );
+    // Read here, under the claim, rather than taken from the caller.
+    //
+    // Callers read a box's state long before they claim it — for validation,
+    // for a preview, for the name. A `devbox use` completing in that gap
+    // releases its own claim, so the caller's claim then succeeds over a
+    // snapshot naming the project the box has just stopped belonging to, and
+    // this would install that project's posture on the box now serving another.
+    // With `open` on one side and `isolated` on the other, that clears a
+    // firewall that the file still says is up.
+    //
+    // Not a parameter any more, because a parameter is a place for a stale
+    // value to arrive from.
+    let state = &manager.get_sandbox(name)?;
     // Loaded fallibly. `load_or_default` turns a malformed `devbox.toml` into
     // the *default* config, whose posture is `open` — so a corrupted file would
     // silently unfirewall a box that had been isolated, and report nothing.
@@ -786,26 +806,10 @@ mod tests {
         let manager = crate::sandbox::SandboxManager {
             state_dir: dir.path().to_path_buf(),
         };
-        let state = crate::sandbox::state::SandboxState {
-            schema: crate::sandbox::state::SCHEMA,
-            name: "busy".into(),
-            runtime: "test-null".into(),
-            // Deliberately a path with no devbox.toml: reaching the load at all
-            // would be the bug, and it would fail loudly if it did.
-            project_dir: dir.path().join("nowhere"),
-            created_at: String::new(),
-            mount_mode: "overlay".into(),
-            sets: vec![],
-            languages: vec![],
-            image: "nixos".into(),
-            packages: vec![],
-            package_sources: Default::default(),
-        };
-
         // Someone else is mid-rebuild.
         let _held = crate::web::build::claim_box(dir.path(), "busy").expect("first claim");
 
-        let outcome = apply_saved_or_step_aside(&manager, &state, "busy").await;
+        let outcome = apply_saved_or_step_aside(&manager, "busy").await;
         assert!(
             outcome.is_ok(),
             "a used box must not fail because a rebuild owns it: {:?}",
@@ -823,24 +827,10 @@ mod tests {
         let manager = crate::sandbox::SandboxManager {
             state_dir: dir.path().to_path_buf(),
         };
-        let state = crate::sandbox::state::SandboxState {
-            schema: crate::sandbox::state::SCHEMA,
-            name: "free".into(),
-            runtime: "test-null".into(),
-            project_dir: dir.path().join("nowhere"),
-            created_at: String::new(),
-            mount_mode: "overlay".into(),
-            sets: vec![],
-            languages: vec![],
-            image: "nixos".into(),
-            packages: vec![],
-            package_sources: Default::default(),
-        };
-
         // No claim held, so this proceeds — and reaches the runtime lookup for
         // a runtime that does not exist. Any outcome but "stepped quietly
         // aside" proves the claim was taken and the work attempted.
-        let outcome = apply_saved_or_step_aside(&manager, &state, "free").await;
+        let outcome = apply_saved_or_step_aside(&manager, "free").await;
         assert!(
             outcome.is_err(),
             "with the claim free this must do the work, not skip it"

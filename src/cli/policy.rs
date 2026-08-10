@@ -105,7 +105,12 @@ fn load(
     crate::web::build::ProjectClaim,
 )> {
     let name = manager.resolve_name(name)?;
-    let state = manager.get_sandbox(&name)?;
+    // Claim, then read. Reading first left `path` and `project_dir` naming the
+    // project the box belonged to *before* a concurrent `devbox use` — so `set`
+    // and `allow` edited that old file and applied its posture to a box now
+    // serving another project, which is how an `open` policy lands on a box
+    // recorded as `isolated`.
+    let (box_claim, state) = manager.claim_and_read(&name)?;
     let path = state.project_dir.join("devbox.toml");
     // The claim comes first and is returned to the caller, so it is held from
     // this read to the matching write.
@@ -130,10 +135,6 @@ fn load(
     // reinstall the old posture — switching from an open project to an isolated
     // one and ending up open. The box is the thing both operations are about,
     // so the box is what they have to agree on.
-    let box_claim = crate::web::build::claim_box(&manager.state_dir, &state.name).context(
-        "cannot change this box's policy while a rebuild or project switch is in progress",
-    )?;
-
     let edit = crate::web::build::claim_project(&manager.state_dir, &state.project_dir)?;
     // `load_for_edit`, not `load_or_default`: every caller here may go on to
     // write the file, and falling back to defaults would erase the rest of it.

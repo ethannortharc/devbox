@@ -794,7 +794,7 @@ async fn resolve_substrate(
     // `Runtime`, bypassing attach and exec — so a substrate started outside
     // devbox ran `lab up`, faults, and teardown with no posture at all. This
     // is the chokepoint, so the enforcement belongs here.
-    crate::policy::enforce::apply_saved_or_step_aside(manager, &state, &name).await?;
+    crate::policy::enforce::apply_saved_or_step_aside(manager, &name).await?;
 
     Ok((runtime, name))
 }
@@ -805,11 +805,23 @@ async fn resolve_substrate(
 /// prefixes (ADR-0046), so writing the file is only half the job — the table
 /// in the kernel is what decides, and it does not reread anything.
 async fn reapply_policy(manager: &SandboxManager, substrate: &str) -> Result<()> {
-    let state = manager.get_sandbox(substrate)?;
+    // Strict, and that has to include contention.
+    //
+    // The comment below has always said this, and the code stepped aside — the
+    // one place in the codebase where stepping aside is wrong. Everywhere else
+    // the claim holder is obliged to restore the posture before it returns, so
+    // skipping costs nothing. Here the prefixes file has *already* changed, and
+    // the holder's restore reads a posture it captured before that change, or
+    // has already run. The reload is not deferred by skipping it; it is lost.
+    // `lab up` then leaves an isolated lab blocked, and `lab down` leaves a
+    // stale subnet exemption behind.
+    let claim = crate::web::build::claim_box(&manager.state_dir, substrate).context(
+        "the lab's prefixes changed but the substrate is busy, so the firewall          could not be reloaded to match them",
+    )?;
     // Strict: the lab's prefixes just changed, so a posture that fails to
     // reload is either exempting a subnet that no longer exists or blocking
     // one that does. Neither is something to print a success message over.
-    crate::policy::enforce::restore_after_rebuild_or_step_aside(manager, &state, substrate).await
+    crate::policy::enforce::restore_after_rebuild(manager, substrate, &claim).await
 }
 
 /// Write a file inside the substrate.

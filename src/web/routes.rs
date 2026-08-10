@@ -572,17 +572,16 @@ async fn put_policy(
     // in the opposite order from the file: `devbox.toml` could end at
     // `isolated` while a delayed earlier `open` cleared the live table, so the
     // box was running the posture nobody had asked for last.
-    let project_dir = match state.manager.get_sandbox(&name) {
-        Ok(s) => s.project_dir,
-        Err(e) => return not_found(&name, &e),
-    };
-    // Off the worker. Holding this across the apply below is deliberate; taking
-    // it *on a Tokio worker* is what made two overlapping saves able to wedge
-    // the console permanently — see `build::lock_blocking`.
-    let _box_claim = match build::claim_box(&state.manager.state_dir, &name) {
-        Ok(claim) => claim,
+    // Claim, then read. Reading the project first meant a `devbox use`
+    // finishing in the gap left this request locking the *old* project while
+    // `save_policy` re-resolved and wrote the new one — from a form derived
+    // from the old policy, then applied live. An old `open` posture replaced
+    // the newly selected project's restrictive one.
+    let (_box_claim, sandbox) = match state.manager.claim_and_read(&name) {
+        Ok(pair) => pair,
         Err(e) => return action_error("change the policy of", &name, &e),
     };
+    let project_dir = sandbox.project_dir;
 
     let lock_dir = state.manager.state_dir.clone();
     let lock_project = project_dir.clone();

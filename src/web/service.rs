@@ -152,9 +152,7 @@ pub async fn start_box_holding_claim(
         // Running too, for the same reason as `attach`: a box that is already
         // up may have been started outside this path, or created moments ago,
         // and never had its posture installed. Applying is idempotent.
-        SandboxStatus::Running => {
-            crate::policy::enforce::apply_saved(manager, &state, name, claim).await
-        }
+        SandboxStatus::Running => crate::policy::enforce::apply_saved(manager, name, claim).await,
         SandboxStatus::Stopped => {
             // Two requests can see `Stopped` at once — clicking Start while the
             // Terminal tab opens is enough. Incus rejects the second start as
@@ -169,7 +167,7 @@ pub async fn start_box_holding_claim(
             {
                 return Err(e).with_context(|| format!("failed to start box '{name}'"));
             }
-            crate::policy::enforce::apply_saved(manager, &state, name, claim).await
+            crate::policy::enforce::apply_saved(manager, name, claim).await
         }
         SandboxStatus::NotFound => bail!(
             "box '{name}' is registered but runtime '{}' does not have it; \

@@ -60,6 +60,30 @@ impl SandboxManager {
 
     // ── Lifecycle ────────────────────────────────────────
 
+    /// Claim a box and read its state under that claim, in that order.
+    ///
+    /// The order is the whole point. Every caller that took the claim *after*
+    /// reading the state had a correct-looking claim over a stale snapshot: a
+    /// `devbox use` completing in the gap releases its own claim, so this one
+    /// succeeds — and then the command proceeds against the project the box
+    /// used to belong to. It writes the selection into the old project's
+    /// `devbox.toml`, or applies the old project's policy to a box now serving
+    /// the new one, which is how an `open` posture lands on a box recorded as
+    /// `isolated`.
+    ///
+    /// Round 45 fixed that in `sets`. Round 46 found it in the console rebuild,
+    /// both policy editors, and the enforcement helper. Pairing the two here
+    /// means the pairing cannot be got wrong at a call site, because there is
+    /// no call site left to get it wrong at.
+    pub fn claim_and_read(
+        &self,
+        name: &str,
+    ) -> Result<(crate::web::build::BoxClaim, SandboxState)> {
+        let claim = crate::web::build::claim_box(&self.state_dir, name)?;
+        let state = self.get_sandbox(name)?;
+        Ok((claim, state))
+    }
+
     /// Create a new sandbox end-to-end.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_sandbox(
@@ -269,12 +293,12 @@ impl SandboxManager {
             // it — so doing it on every attach costs one exec and closes the
             // window for good.
             SandboxStatus::Running => {
-                crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
+                crate::policy::enforce::apply_saved_or_step_aside(self, name).await?;
             }
             SandboxStatus::Stopped => {
                 println!("Starting sandbox '{name}'...");
                 runtime.start(name).await?;
-                crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
+                crate::policy::enforce::apply_saved_or_step_aside(self, name).await?;
             }
             SandboxStatus::NotFound => {
                 bail!(
@@ -540,7 +564,7 @@ impl SandboxManager {
         // Whether or not this call started it. A box already running may have
         // been started outside devbox, and running a command in it is exactly
         // the moment its posture has to be true.
-        crate::policy::enforce::apply_saved_or_step_aside(self, &state, name).await?;
+        crate::policy::enforce::apply_saved_or_step_aside(self, name).await?;
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let result = runtime.exec_cmd(name, &cmd_refs, interactive).await?;

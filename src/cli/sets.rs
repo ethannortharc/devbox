@@ -202,7 +202,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         // rebuild worked or not. Returning the rebuild error first left the
         // box unrestricted on exactly the path where something already went
         // wrong.
-        crate::policy::enforce::apply_saved(manager, &state, &name, &claim).await?;
+        crate::policy::enforce::apply_saved(manager, &name, &claim).await?;
         return Err(e);
     }
 
@@ -213,7 +213,7 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // while reporting only a write error. The box is already running the new
     // configuration; getting its firewall back matters more than recording
     // what it is running.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, &name, &claim).await?;
+    crate::policy::enforce::restore_after_rebuild(manager, &name, &claim).await?;
 
     // The claim covers the read *and* the write.
     //

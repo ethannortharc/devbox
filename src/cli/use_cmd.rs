@@ -23,7 +23,7 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
         bail!("Sandbox '{}' not found.", name);
     }
 
-    let mut state = manager.get_sandbox(name)?;
+    let state = manager.get_sandbox(name)?;
     let mount_mode = if args.writable { "writable" } else { "overlay" };
 
     // If already pointing at same dir with same mode and running, just attach
@@ -100,6 +100,11 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
     // interleave with.
     let claim = crate::web::build::claim_box(&manager.state_dir, name)
         .context("cannot switch this box to another project while a rebuild is in progress")?;
+    // Re-read under the claim. The copy above was taken for validation, long
+    // before this claim existed, and a `devbox use` completing in the gap
+    // releases its own claim — so this one succeeds over a snapshot naming the
+    // project the box has just stopped belonging to.
+    let mut state = manager.get_sandbox(name)?;
 
     runtime.update_mounts(name, &mounts).await?;
 
@@ -156,7 +161,17 @@ pub async fn run(args: UseArgs, manager: &SandboxManager) -> Result<()> {
 
     // Unconditional: both branches disturb the box — one reprovisions, the
     // other restarts the VM — and both take devbox's nftables table with them.
-    crate::policy::enforce::restore_after_rebuild(manager, &state, name, &claim).await?;
+    crate::policy::enforce::restore_after_rebuild(manager, name, &claim).await?;
+
+    // Released before the shell, not after it.
+    //
+    // The claim covers the switch — the mounts, the reprovision, the state
+    // write, the posture restore — and every one of those is finished here.
+    // Holding it through `attach` meant holding it for as long as the user kept
+    // the shell open, during which every rebuild, policy edit, project switch,
+    // stop and destroy of this box failed with "already rebuilding". An
+    // interactive session is not a critical section.
+    drop(claim);
 
     println!("Sandbox '{}' updated. Attaching...", name);
     manager.attach(name).await

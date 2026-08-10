@@ -449,8 +449,6 @@ pub async fn apply_selection(
     box_name: &str,
     selection: &Selection,
 ) -> Result<()> {
-    let sandbox = manager.get_sandbox(box_name)?;
-
     // The form posts names, because names are what the field shows. Where an
     // aliased package comes from lives on the box, so it is reattached before
     // anything is validated or written — validating the selection first would
@@ -466,6 +464,12 @@ pub async fn apply_selection(
     // Across processes, not just across handlers. The `AppState` guard the
     // route took only knows about this console.
     let claim = claim_box(&manager.state_dir, box_name)?;
+    // Re-read under it. `sandbox` was fetched before the claim, and a
+    // `devbox use` finishing in that gap releases its own claim — so this one
+    // succeeds over a snapshot naming the project the box has just left, and
+    // the rebuild would use the old project's selection and save its
+    // `project_dir` back over the new one.
+    let sandbox = manager.get_sandbox(box_name)?;
 
     let project = DevboxConfig::load_or_default(&sandbox.project_dir);
     let recovered = Selection::from_state_and_project(&sandbox, &project);
@@ -549,7 +553,7 @@ pub async fn apply_selection(
         // key, last value retained — so the browser showed the *less* severe
         // message. The route only publishes if nothing here did.
         if let Err(policy_err) =
-            crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name, &claim).await
+            crate::policy::enforce::restore_after_rebuild(manager, box_name, &claim).await
         {
             // Reported as its own terminal status, not folded into the rebuild
             // error: "the rebuild failed" and "and now the firewall is gone
@@ -595,9 +599,7 @@ pub async fn apply_selection(
     // out. A rebuild is not that — nobody is waiting at a prompt, and the
     // console is about to print a verdict — so this path wants the strict
     // form, which propagates.
-    if let Err(e) =
-        crate::policy::enforce::restore_after_rebuild(manager, &sandbox, box_name, &claim).await
-    {
+    if let Err(e) = crate::policy::enforce::restore_after_rebuild(manager, box_name, &claim).await {
         // Terminal status, not a log line among the build output. "rebuild
         // complete" printed underneath a warning nobody scrolled back to read
         // is the console saying the box is fine while its firewall is gone.
@@ -1097,6 +1099,32 @@ where
 }
 
 pub fn claim_box(state_dir: &std::path::Path, box_name: &str) -> Result<BoxClaim> {
+    match try_claim_box(state_dir, box_name)? {
+        Some(claim) => Ok(claim),
+        None => bail!(
+            "another devbox process is already rebuilding box '{box_name}'.\n  \
+             Two rebuilds of one box overwrite each other's generated files and \
+             then record different selections, so this one is refused rather \
+             than run. Wait for the other to finish."
+        ),
+    }
+}
+
+/// The same, telling contention apart from a broken lock directory.
+///
+/// `Ok(None)` means someone else holds it — expected, and the only outcome a
+/// caller is entitled to shrug at. `Err` means the claim could not be evaluated
+/// at all: an unwritable state directory, a filesystem that will not lock.
+///
+/// The distinction exists because a caller that stepped aside on contention was
+/// also stepping aside on those. An unwritable lock directory silently became
+/// "a rebuild is running", so `attach`, `exec` and `code` carried on and applied
+/// no egress policy at all — the failure that most needs saying out loud,
+/// reported as the one that needs nothing.
+///
+/// `TryLockError` draws the line for us: `WouldBlock` is contention, and
+/// anything else is the lock system itself failing.
+pub fn try_claim_box(state_dir: &std::path::Path, box_name: &str) -> Result<Option<BoxClaim>> {
     let dir = state_dir.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
 
@@ -1108,16 +1136,13 @@ pub fn claim_box(state_dir: &std::path::Path, box_name: &str) -> Result<BoxClaim
         .with_context(|| format!("could not open {}", path.display()))?;
 
     match file.try_lock() {
-        Ok(()) => Ok(BoxClaim {
+        Ok(()) => Ok(Some(BoxClaim {
             box_name: box_name.to_string(),
             _file: file,
-        }),
-        Err(_) => bail!(
-            "another devbox process is already rebuilding box '{box_name}'.\n  \
-             Two rebuilds of one box overwrite each other's generated files and \
-             then record different selections, so this one is refused rather \
-             than run. Wait for the other to finish."
-        ),
+        })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("could not evaluate the claim on box '{box_name}'")),
     }
 }
 

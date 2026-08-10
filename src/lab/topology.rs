@@ -229,7 +229,13 @@ fn default_asn_base() -> u32 {
 }
 
 /// A complete lab topology.
+///
+/// Strict here as well as on the nested tables. Round 45 annotated the children
+/// and left the root, so `[servces]` was still ignored, `Services` still took
+/// its defaults, and the lab still validated and built a network the file did
+/// not describe — the same defect the round before, one level up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Topology {
     pub lab: LabSection,
     #[serde(default)]

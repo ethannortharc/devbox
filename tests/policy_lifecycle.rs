@@ -211,3 +211,82 @@ fn every_rebuild_entry_point_claims_the_box() {
         offenders.join("\n")
     );
 }
+
+/// No function may claim a box *after* reading the state that claim protects.
+///
+/// The claim is what makes a snapshot still true. Taken afterwards it is a
+/// correct-looking claim over a stale read: a `devbox use` completing in the gap
+/// releases its own claim, so this one succeeds — and the command then proceeds
+/// against the project the box used to belong to. It writes the selection into
+/// the old project's `devbox.toml`, or applies the old project's policy to a box
+/// now serving the new one, which is how an `open` posture lands on a box
+/// recorded as `isolated`.
+///
+/// Round 45 found this in one path and it was fixed there. Round 46 found it in
+/// four more, because the fix was applied to the instance and the invariant was
+/// only ever written down in a commit message. `SandboxManager::claim_and_read`
+/// pairs the two; this makes the pairing the only shape that passes.
+#[test]
+fn no_path_claims_a_box_after_reading_its_state() {
+    let mut offenders = Vec::new();
+
+    for entry in walk("src") {
+        let rel = entry.strip_prefix("./").unwrap_or(&entry).to_string();
+        // The pairing helper is where the two legitimately appear in order.
+        if rel == "src/sandbox/mod.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&entry).expect("readable source");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut fn_start = 0usize;
+        let mut read_at: Option<usize> = None;
+        for (n, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("fn ")
+                || t.starts_with("pub fn ")
+                || t.starts_with("async fn ")
+                || t.starts_with("pub async fn ")
+            {
+                fn_start = n;
+                read_at = None;
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            // `claim_and_read` is the fix, not an instance of the problem.
+            if t.contains("claim_and_read(") {
+                read_at = None;
+                continue;
+            }
+            if t.contains("get_sandbox(") && read_at.is_none() {
+                read_at = Some(n);
+            }
+            if t.contains("claim_box(")
+                && let Some(r) = read_at
+            {
+                // A re-read under the claim is the other legitimate shape, so
+                // only complain when nothing is read again afterwards.
+                let after = lines[n..(n + 12).min(lines.len())].join("\n");
+                if !after.contains("get_sandbox(") {
+                    offenders.push(format!(
+                        "{rel}: reads box state at line {}, claims it at line {} \
+                         (fn starting line {})",
+                        r + 1,
+                        n + 1,
+                        fn_start + 1
+                    ));
+                }
+                read_at = None;
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these take the box claim after reading the state it protects, so the \
+         claim covers a snapshot that may already name the wrong project. Use \
+         `SandboxManager::claim_and_read`, or re-read under the claim:\n{}",
+        offenders.join("\n")
+    );
+}
