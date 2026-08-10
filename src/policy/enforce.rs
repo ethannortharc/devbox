@@ -769,6 +769,84 @@ pub async fn apply_saved(
 
 #[cfg(test)]
 mod tests {
+    /// A path that only *uses* a box must not fight a rebuild for it.
+    ///
+    /// This is the contention rule, and it is a behaviour rather than a
+    /// convention now: `exec`, `attach`, `code` and the lab want the posture to
+    /// be true, and when a rebuild owns the box the rebuild is already obliged
+    /// to make it true before it returns. Applying on top would be redundant at
+    /// best and a stale overwrite at worst.
+    ///
+    /// The failure this pins is not an error — it is the opposite. If this ever
+    /// starts returning `Err`, every one of those commands begins failing for
+    /// the minutes a `nixos-rebuild` takes.
+    #[tokio::test]
+    async fn using_a_box_someone_else_is_rebuilding_steps_aside() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manager = crate::sandbox::SandboxManager {
+            state_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::sandbox::state::SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
+            name: "busy".into(),
+            runtime: "test-null".into(),
+            // Deliberately a path with no devbox.toml: reaching the load at all
+            // would be the bug, and it would fail loudly if it did.
+            project_dir: dir.path().join("nowhere"),
+            created_at: String::new(),
+            mount_mode: "overlay".into(),
+            sets: vec![],
+            languages: vec![],
+            image: "nixos".into(),
+            packages: vec![],
+            package_sources: Default::default(),
+        };
+
+        // Someone else is mid-rebuild.
+        let _held = crate::web::build::claim_box(dir.path(), "busy").expect("first claim");
+
+        let outcome = apply_saved_or_step_aside(&manager, &state, "busy").await;
+        assert!(
+            outcome.is_ok(),
+            "a used box must not fail because a rebuild owns it: {:?}",
+            outcome.err()
+        );
+    }
+
+    /// And with nobody holding it, the same call really does try.
+    ///
+    /// Without this the test above passes just as well on a function that
+    /// always returns `Ok`, which is the shape of a guard that proves nothing.
+    #[tokio::test]
+    async fn with_no_rebuild_in_flight_it_actually_applies() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manager = crate::sandbox::SandboxManager {
+            state_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::sandbox::state::SandboxState {
+            schema: crate::sandbox::state::SCHEMA,
+            name: "free".into(),
+            runtime: "test-null".into(),
+            project_dir: dir.path().join("nowhere"),
+            created_at: String::new(),
+            mount_mode: "overlay".into(),
+            sets: vec![],
+            languages: vec![],
+            image: "nixos".into(),
+            packages: vec![],
+            package_sources: Default::default(),
+        };
+
+        // No claim held, so this proceeds — and reaches the runtime lookup for
+        // a runtime that does not exist. Any outcome but "stepped quietly
+        // aside" proves the claim was taken and the work attempted.
+        let outcome = apply_saved_or_step_aside(&manager, &state, "free").await;
+        assert!(
+            outcome.is_err(),
+            "with the claim free this must do the work, not skip it"
+        );
+    }
+
     use super::*;
 
     #[test]
