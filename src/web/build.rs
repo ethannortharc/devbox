@@ -193,32 +193,75 @@ pub async fn snapshot_generated(
     // and on a VM runtime these commands run as the ordinary guest user — so
     // an unprivileged `tar` silently produced no backup, and the restore then
     // reported success without restoring anything.
-    let archived = runtime
-        .exec_cmd(
-            box_name,
-            &[
-                "sh",
-                "-c",
-                &crate::policy::enforce::elevated(&format!(
-                    "if [ -d {GENERATED_SETS_DIR} ]; then \
-                       rm -f {SETS_BACKUP} && \
-                       tar cf {SETS_BACKUP} -C {GENERATED_SETS_DIR} .; \
-                     fi"
-                )),
-            ],
-            false,
-        )
-        .await
-        .is_ok_and(|r| r.exit_code == 0);
-
-    let existed = runtime
+    // Existence first, and fallibly.
+    //
+    // `is_ok_and(exit_code == 0)` turned every transport failure into `false`,
+    // and `false` here means "the directory was not there" — which `restore`
+    // acts on by removing it and its backup. So a probe that merely failed to
+    // run made the rollback delete a set-module directory that existed.
+    //
+    // The same defect as the per-file snapshot above, in the same function, and
+    // it survived that fix because the fix was applied to the instance that was
+    // reported rather than to the pair the function actually returns.
+    let probe = runtime
         .exec_cmd(
             box_name,
             &["sh", "-c", &format!("[ -d {GENERATED_SETS_DIR} ]")],
             false,
         )
         .await
-        .is_ok_and(|r| r.exit_code == 0);
+        .with_context(|| {
+            format!(
+                "could not check for {GENERATED_SETS_DIR} in box '{box_name}', so a \
+                 rollback could not tell an absent directory from an unchecked one — \
+                 refusing to rebuild rather than risk deleting it"
+            )
+        })?;
+    let existed = probe.exit_code == 0;
+
+    // Elevated, and its failure fatal. `/etc/devbox/sets` is root-owned, and on
+    // a VM runtime these commands run as the ordinary guest user — so an
+    // unprivileged `tar` silently produced no backup, and the restore then
+    // reported success without restoring anything.
+    //
+    // Recording that and carrying on was the earlier repair. It is not enough:
+    // a rebuild whose rollback cannot put the modules back is a rebuild with no
+    // way home, and starting it anyway only moves the failure somewhere less
+    // recoverable.
+    let archived = if existed {
+        let result = runtime
+            .exec_cmd(
+                box_name,
+                &[
+                    "sh",
+                    "-c",
+                    &crate::policy::enforce::elevated(&format!(
+                        "rm -f {SETS_BACKUP} && \
+                         tar cf {SETS_BACKUP} -C {GENERATED_SETS_DIR} ."
+                    )),
+                ],
+                false,
+            )
+            .await
+            .with_context(|| {
+                format!("could not archive {GENERATED_SETS_DIR} in box '{box_name}'")
+            })?;
+        if result.exit_code != 0 {
+            bail!(
+                "{GENERATED_SETS_DIR} exists in box '{box_name}' but could not be \
+                 archived (exit {}: {}), so a failed rebuild could not put the set \
+                 modules back. Refusing to rebuild rather than proceed without a \
+                 rollback.",
+                result.exit_code,
+                result.stderr.trim()
+            );
+        }
+        true
+    } else {
+        // Nothing to archive, which is a first or legacy box rather than a
+        // failure.
+        false
+    };
 
     Ok(Generated {
         files: out,

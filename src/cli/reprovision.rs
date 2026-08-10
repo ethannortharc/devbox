@@ -45,15 +45,19 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         }
     }
 
-    // Read the posture *before* provisioning, not after. The rebuild removes
-    // the box's firewall, so discovering an unreadable devbox.toml afterwards
-    // leaves a live box unrestricted with no saved posture to restore.
-    let saved_policy = crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)
-        .context(
-            "refusing to reprovision: this box's devbox.toml cannot be read, and \
-             rebuilding would remove its firewall with no posture to restore",
-        )?
-        .policy;
+    // Read the posture *before* provisioning — as a precondition, not as the
+    // value to reinstate.
+    //
+    // The rebuild removes the box's firewall, so discovering an unreadable
+    // devbox.toml afterwards leaves a live box unrestricted with no posture to
+    // restore. That check is worth keeping. What is *not* safe is carrying this
+    // copy forward: provisioning takes minutes, and applying a posture captured
+    // before it lets an edit in that window be silently overwritten. The
+    // restore below re-reads under the editors' claim instead.
+    crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir).context(
+        "refusing to reprovision: this box's devbox.toml cannot be read, and \
+         rebuilding would remove its firewall with no posture to restore",
+    )?;
 
     println!("Re-provisioning sandbox '{name}'...");
     println!("This will push all config files and rebuild the system.");
@@ -84,7 +88,11 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // the difference between a recoverable gap and a permanent one.
     let packages = provision::resolved_packages(&state);
 
-    provision::provision_vm_full(
+    // Not `?`. On NixOS `provision_vm_full` runs `nixos-rebuild switch` before
+    // its later shell and helper-file steps, so a failure in one of those
+    // returns with the network generation already switched and devbox's
+    // nftables table already gone. A restrictive box would be left open.
+    let provisioned = provision::provision_vm_full(
         runtime.as_ref(),
         &name,
         &sets,
@@ -93,7 +101,18 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         &state.mount_mode,
         &packages.0,
     )
-    .await?;
+    .await;
+    if let Err(e) = provisioned {
+        if let Err(restore) =
+            crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await
+        {
+            eprintln!(
+                "devbox: WARNING — reprovisioning failed *and* the egress posture could \
+                 not be restored, so box '{name}' may be running unrestricted: {restore}"
+            );
+        }
+        return Err(e);
+    }
 
     // Update saved state with migrated sets
     let mut updated_state = state.clone();
@@ -103,14 +122,14 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Unconditionally: `apply` clears or installs as the posture requires, and
     // an `open` posture that audits requires a table. Testing the posture here
     // meant a reprovision silently dropped observe-and-warn.
-    let restored = {
-        let runtime = manager.runtime_for_sandbox(&updated_state)?;
-        let outcome = crate::policy::enforce::apply(runtime.as_ref(), &name, &saved_policy).await;
-        if outcome.is_ok() {
-            println!("Egress posture '{}' re-applied.", saved_policy.egress);
-        }
-        outcome
-    };
+    // Re-read rather than replay. `saved_policy` was captured before a
+    // provisioning run that takes minutes, and applying it here without the
+    // editor's lock let a policy edit save and apply posture B in the gap and
+    // then be overwritten by stale A — leaving the file saying B while nftables
+    // enforced A. `restore_after_rebuild` loads and applies under the same
+    // claim the editors take, which is the only way the two can be ordered.
+    let restored =
+        crate::policy::enforce::restore_after_rebuild(manager, &updated_state, &name).await;
 
     // The bookkeeping happens whether or not the firewall came back.
     //

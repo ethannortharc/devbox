@@ -106,7 +106,25 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // things.
     let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
 
-    nix::upgrade_sets(runtime.as_ref(), &name, &mut config, &args.tools).await?;
+    // Not `?`. A failure here can happen *after* `nixos-rebuild switch`, and a
+    // failed switch attempts a rollback — which is another network-generation
+    // change. Either way devbox's nftables table is already gone, so returning
+    // now leaves an isolated or allowlisted box with no firewall at all, which
+    // is a worse outcome than the upgrade failing.
+    let rebuilt = nix::upgrade_sets(runtime.as_ref(), &name, &mut config, &args.tools).await;
+    if let Err(e) = rebuilt {
+        // Best effort, and reported: the box may be unreachable, in which case
+        // saying so is more use than a second error about the firewall.
+        if let Err(restore) =
+            crate::policy::enforce::restore_after_rebuild(manager, &state, &name).await
+        {
+            eprintln!(
+                "devbox: WARNING — the upgrade failed *and* the egress posture could \
+                 not be restored, so box '{name}' may be running unrestricted: {restore}"
+            );
+        }
+        return Err(e);
+    }
 
     // A rebuild restarts the network stack and removes devbox's nftables
     // table, so the saved posture has to go back on — the same reason

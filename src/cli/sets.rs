@@ -142,10 +142,28 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
         );
     }
 
+    // Claimed before the state this command acts on is read, because the claim
+    // is what makes that state still true.
+    //
+    // It used to sit below, and its comment already said "before anything is
+    // read" — which the code did not do. `state`, its project directory and the
+    // requested selection were all read first, so a `devbox use` completing in
+    // the gap released the claim before this took it: the claim then succeeded
+    // and this carried on with the *old* project directory, wrote the selection
+    // into the old project's devbox.toml, and overwrote box state to name a
+    // project the runtime was no longer mounting.
+    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
+
+    // Re-read under it. Taking the claim does not make a stale copy fresh.
+    let state = manager.get_sandbox(&name)?;
+
     let runtime = manager.runtime_for_sandbox(&state)?;
     // Both the file writes and the rebuild run *inside* the guest, so a stopped
     // box fails on the first exec. Every other live-box action starts it first.
-    crate::web::service::ensure_running(manager, &name).await?;
+    //
+    // The claim is already held, so the starting form that takes one would
+    // refuse this command its own lock.
+    crate::web::service::ensure_running_holding_claim(manager, &name).await?;
 
     // Validate the project config *before* touching the box: discovering it is
     // malformed after the rebuild has switched the generation would leave the
@@ -155,11 +173,6 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // not: `to_config` was projecting onto this minutes-old copy and writing
     // it back over anything the console had saved in between.
     crate::sandbox::config::DevboxConfig::load_for_edit(&state.project_dir)?;
-
-    // Claimed before anything is read, because two rebuilds that both snapshot
-    // and then both write leave the box on a generation neither recorded. The
-    // console takes the same lock.
-    let _lock = crate::web::build::lock_rebuild(&manager.state_dir, &name)?;
 
     // Snapshot for the same reason the console path does: a failed rebuild
     // leaves the active generation alone but the generated *sources* already

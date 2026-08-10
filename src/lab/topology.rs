@@ -75,6 +75,11 @@ impl std::str::FromStr for Role {
 
 /// One node in the topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Unknown keys are refused. A typo like `rol = "frr-router"` is otherwise
+/// accepted in silence, `role` takes its default, and the lab builds a
+/// different network than the file describes — reporting success for a
+/// topology nobody asked for. A misspelled key is a malformed topology.
+#[serde(deny_unknown_fields)]
 pub struct Node {
     pub name: String,
     #[serde(default)]
@@ -89,6 +94,7 @@ pub struct Node {
 
 /// One link between two node interfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Link {
     /// Exactly two endpoints, each `node:iface`.
     pub endpoints: Vec<String>,
@@ -169,6 +175,7 @@ impl Link {
 
 /// Core services the lab runs (§9.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Services {
     #[serde(default = "yes")]
     pub dns: bool,
@@ -194,6 +201,7 @@ impl Default for Services {
 
 /// Lab-level settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LabSection {
     pub name: String,
     /// `auto` | `lima` | `incus` | `host`.
@@ -454,6 +462,42 @@ ntp = true
         assert!(!t.services.dhcp);
         assert_eq!(t.nodes[0].sets, vec!["network"]);
         assert_eq!(t.routers().len(), 3);
+    }
+
+    #[test]
+    fn a_misspelled_key_is_a_malformed_topology_not_a_default() {
+        // Serde ignores unknown fields by default, so `rol` was accepted, `role`
+        // took its default of `host`, and the lab built a network with no FRR
+        // on it — then reported success. A topology that cannot be spelled
+        // wrongly is worth more than one that quietly means something else.
+        let typo = r#"
+[lab]
+name = "typo"
+
+[[nodes]]
+name = "leaf1"
+rol = "frr-router"
+"#;
+        let err = match Topology::from_toml(typo) {
+            Ok(t) => panic!(
+                "a misspelled key parsed, and the node came out as {:?}",
+                t.nodes[0].role
+            ),
+            // The chain, not just the top line: `anyhow` puts the parse detail
+            // in the source, and that is what the binary prints when a command
+            // returns an error. Asserting on `to_string()` would have checked a
+            // summary the user never sees alone.
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(
+            err.contains("rol"),
+            "the error should name the key that was not understood: {err}"
+        );
+
+        // And the correct spelling still parses, so this is a typo check rather
+        // than a stricter schema.
+        let good = typo.replace("rol =", "role =");
+        Topology::from_toml(&good).expect("the corrected topology must parse");
     }
 
     #[test]

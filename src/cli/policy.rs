@@ -106,6 +106,26 @@ fn load(
     // took no claim at all — so `devbox policy set` overlapping a Sets rebuild
     // or a console policy save could overwrite a newly persisted selection, or
     // be overwritten itself and silently lose the posture just requested.
+    // The per-box claim, taken *before* the project claim.
+    //
+    // Two locks exist: this one is per box and refuses immediately, the project
+    // one waits. Every other path takes them in this order — box, then project
+    // — and the order is not a style choice. A path that took the project claim
+    // first and then waited on the box claim could sit forever holding a lock
+    // that only blocks; because the box claim refuses instead of waiting,
+    // nothing ever waits while holding the project lock, and the cycle cannot
+    // close.
+    //
+    // What it fixes: policy editors locked by *project directory*, and
+    // `devbox use` changes which project a box belongs to. An edit still
+    // applying against the old project could land after the switch and
+    // reinstall the old posture — switching from an open project to an isolated
+    // one and ending up open. The box is the thing both operations are about,
+    // so the box is what they have to agree on.
+    let _box_claim = crate::web::build::lock_rebuild(&manager.state_dir, &state.name).context(
+        "cannot change this box's policy while a rebuild or project switch is in progress",
+    )?;
+
     let edit = crate::web::build::lock_project_config(&manager.state_dir, &state.project_dir)?;
     // `load_for_edit`, not `load_or_default`: every caller here may go on to
     // write the file, and falling back to defaults would erase the rest of it.

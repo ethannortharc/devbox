@@ -579,6 +579,11 @@ async fn put_policy(
     // Off the worker. Holding this across the apply below is deliberate; taking
     // it *on a Tokio worker* is what made two overlapping saves able to wedge
     // the console permanently — see `build::lock_blocking`.
+    let _box_claim = match build::lock_rebuild(&state.manager.state_dir, &name) {
+        Ok(claim) => claim,
+        Err(e) => return action_error("change the policy of", &name, &e),
+    };
+
     let lock_dir = state.manager.state_dir.clone();
     let lock_project = project_dir.clone();
     let _edit =
