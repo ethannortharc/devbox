@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 /// The checked-in Nix module for each set, embedded at compile time.
 ///
-/// This — not [`generate_set_nix`] — is what a box actually gets. The two used
-/// to disagree: provisioning pushed these files, and `sets apply` regenerated
+/// This is what a box actually gets. There used to be a generator beside it,
+/// and the two disagreed: provisioning pushed these files, and `sets apply`
+/// regenerated
 /// every non-guarded set from [`NIX_SETS`] as a flat package list, so the first
 /// apply silently replaced the checked-in module with a lossy reconstruction of
 /// it. Anything a set expressed that a bare list of attribute names cannot —
@@ -15,7 +16,8 @@ use std::collections::HashMap;
 ///
 /// [`NIX_SETS`] keeps its job: it is the package *index* — what the console
 /// lists, what `resolved_packages` diffs, and what the non-NixOS `nix profile
-/// install` path consumes. `set_files_match_index` pins the two together.
+/// install` path consumes. `every_checked_in_module_matches_the_catalog`
+/// pins the two together.
 pub static NIX_SET_FILES: &[(&str, &str)] = &[
     ("default.nix", include_str!("../../nix/sets/default.nix")),
     ("system.nix", include_str!("../../nix/sets/system.nix")),
@@ -444,6 +446,18 @@ mod tests {
             .map(str::to_string)
     }
 
+    /// The `${…}` interpolations in a Nix expression, by token.
+    fn interpolations(text: &str) -> impl Iterator<Item = String> + '_ {
+        text.split("${").skip(1).filter_map(|rest| {
+            let token = rest.split('}').next()?.trim();
+            let shaped = !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+            shaped.then(|| token.to_string())
+        })
+    }
+
     /// Explicit `pkgs.<attr.path>` references (dynamic `pkgs.${…}` excluded).
     fn pkgs_attr_paths(text: &str) -> impl Iterator<Item = String> + '_ {
         text.split("pkgs.").skip(1).filter_map(|rest| {
@@ -486,8 +500,12 @@ mod tests {
                 continue;
             }
             if in_string {
+                // Verbatim into the group, blank in the flat view. What a
+                // string interpolates is a closure dependency — `${frr}` in
+                // the network helper is why that helper exists — and blanking
+                // it hid `${pkgs.htop}` from the caller just as thoroughly.
                 if depth > 0 {
-                    group.push(' ');
+                    group.push(c);
                 }
                 out.push(' ');
                 continue;
@@ -558,10 +576,19 @@ mod tests {
             };
 
             if HAND_WRITTEN.contains(&set.name) {
+                // The guarded modules name each package as a quoted string
+                // (`tryAttr "ollama"`) or an explicit `pkgs.<attr>` path, so
+                // those tokens — extracted from the comment-stripped source,
+                // never a raw substring search — are what the module
+                // installs. Substring matching passed on `# codex is gone`,
+                // a comment, while the catalog went on advertising codex.
+                let body = comments_stripped(&module);
+                let named: std::collections::BTreeSet<String> =
+                    quoted_tokens(&body).chain(pkgs_attr_paths(&body)).collect();
                 let catalogued: std::collections::BTreeSet<&str> =
                     set.packages.iter().copied().collect();
                 for package in &catalogued {
-                    if !module.contains(package) {
+                    if !named.contains(*package) {
                         drift.push(format!(
                             "{}.nix never names '{package}', which the catalog has: \
                              the console offers a package the box does not install",
@@ -569,14 +596,7 @@ mod tests {
                         ));
                     }
                 }
-                // And the other way. The guarded modules name each package as
-                // a quoted string (`tryAttr "ollama"`) or an explicit
-                // `pkgs.<attr>` path, so those are the installable tokens: one
-                // the catalog does not list is a package the box installs and
-                // the console cannot show. One-directional checking is exactly
-                // the asymmetry ADR-0052 exists to close.
-                let body = comments_stripped(&module);
-                for token in quoted_tokens(&body).chain(pkgs_attr_paths(&body)) {
+                for token in &named {
                     if !catalogued.contains(token.as_str()) {
                         drift.push(format!(
                             "{}.nix installs '{token}', which the catalog does not \
@@ -598,12 +618,19 @@ mod tests {
             };
             let body = comments_stripped(&body);
             let (body, removed) = bare_list_only(&body);
+            let listed: std::collections::BTreeSet<&str> = body.split_whitespace().collect();
+            let catalogued: std::collections::BTreeSet<&str> =
+                set.packages.iter().copied().collect();
+
             // A parenthesised expression installs whatever it evaluates to,
             // invisibly to the name comparison below — so each one must be a
             // shape this test recognises. Today that is exactly one shape:
             // the `runCommand` helper `network` uses to symlink FRR's daemons
-            // onto PATH. Anything else is a package smuggled past the
-            // catalog.
+            // onto PATH. And recognising the shape is not trusting it: every
+            // `${…}` the helper interpolates is a closure dependency, so each
+            // one has to name a catalogued package — `${frr}` passes because
+            // `network` lists frr, and a `${pkgs.htop}` smuggled into the
+            // script is drift like any other.
             for group in &removed {
                 if !group.starts_with("runCommand ") {
                     drift.push(format!(
@@ -612,11 +639,20 @@ mod tests {
                          helper, teach the test its shape",
                         set.name
                     ));
+                    continue;
+                }
+                for dep in interpolations(group) {
+                    let dep = dep.strip_prefix("pkgs.").unwrap_or(&dep);
+                    if !catalogued.contains(dep) {
+                        drift.push(format!(
+                            "{}.nix's helper interpolates '{dep}', which the \
+                             catalog does not list: a closure dependency the \
+                             console cannot show or remove",
+                            set.name
+                        ));
+                    }
                 }
             }
-            let listed: std::collections::BTreeSet<&str> = body.split_whitespace().collect();
-            let catalogued: std::collections::BTreeSet<&str> =
-                set.packages.iter().copied().collect();
 
             for extra in listed.difference(&catalogued) {
                 drift.push(format!(
@@ -661,69 +697,6 @@ mod tests {
         }
     }
 
-    /// **Every** set's catalog entry and checked-in module must agree.
-    ///
-    /// Provisioning pushes the checked-in modules; `write_set_modules`
-    /// regenerates from this catalog. When the two disagree, a box gets one
-    /// set of packages at create and a different one after any Sets apply.
-    /// That is how `conntrack` came to be present on a fresh box and absent
-    /// once the user touched a checkbox — silently disarming the flush that
-    /// makes a tightened policy take effect.
-    ///
-    /// Written for all sets rather than the one that broke: the same drift can
-    /// happen in any of them, and the two earlier instances of this class were
-    /// each fixed individually before anyone generalized it.
-    #[test]
-    fn every_set_matches_its_checked_in_module() {
-        // (name, module source) — `include_str!` needs a literal path.
-        let modules: &[(&str, &str)] = &[
-            ("system", include_str!("../../nix/sets/system.nix")),
-            ("shell", include_str!("../../nix/sets/shell.nix")),
-            ("tools", include_str!("../../nix/sets/tools.nix")),
-            ("editor", include_str!("../../nix/sets/editor.nix")),
-            ("git", include_str!("../../nix/sets/git.nix")),
-            ("container", include_str!("../../nix/sets/container.nix")),
-            ("network", include_str!("../../nix/sets/network.nix")),
-            ("ai-code", include_str!("../../nix/sets/ai-code.nix")),
-            ("ai-infra", include_str!("../../nix/sets/ai-infra.nix")),
-            ("lang-go", include_str!("../../nix/sets/lang-go.nix")),
-            ("lang-rust", include_str!("../../nix/sets/lang-rust.nix")),
-            (
-                "lang-python",
-                include_str!("../../nix/sets/lang-python.nix"),
-            ),
-            ("lang-node", include_str!("../../nix/sets/lang-node.nix")),
-            ("lang-java", include_str!("../../nix/sets/lang-java.nix")),
-            ("lang-ruby", include_str!("../../nix/sets/lang-ruby.nix")),
-        ];
-
-        // Every catalogued set needs a module here, or the check silently
-        // stops covering it — the failure mode this test exists to prevent.
-        for set in super::NIX_SETS {
-            assert!(
-                modules.iter().any(|(name, _)| *name == set.name),
-                "set `{}` has no checked-in module in this list; add it",
-                set.name
-            );
-        }
-
-        for (name, module) in modules {
-            let set = super::NIX_SETS
-                .iter()
-                .find(|s| s.name == *name)
-                .unwrap_or_else(|| panic!("`{name}` is not in the catalog"));
-
-            for package in set.packages {
-                assert!(
-                    module.contains(package),
-                    "`{package}` is in the `{name}` catalog but not in \
-                     nix/sets/{name}.nix; a Sets apply would change what the \
-                     box has"
-                );
-            }
-        }
-    }
-
     use super::*;
 
     #[test]
@@ -736,73 +709,103 @@ mod tests {
 
     /// The set index and the catalog must map the same sets, exactly.
     ///
-    /// Substring matching on the raw file passed a commented-out import: the
-    /// pathname was still in the text while evaluation would fail. So the
-    /// index is parsed — comments stripped, then one `key = import ./name.nix`
-    /// binding per line — and compared in both directions: a catalogued set
-    /// the index does not import cannot be selected, and an import the
-    /// catalog does not know is a module the console cannot toggle.
+    /// Substring matching on the raw file passed a commented-out import, so
+    /// the index is parsed. And leniently parsed bindings passed three more
+    /// counterfeits: `import ./system.nix.disabled`, an import without
+    /// `{ inherit pkgs; }`, and an alias key beside the real one. So every
+    /// `=` binding must take the one canonical form, duplicates are refused,
+    /// and the resulting map must equal the catalog's — not merely cover it.
     #[test]
     fn set_index_imports_every_set() {
         let default = comments_stripped(set_file("default").expect("default.nix is embedded"));
 
         let mut imported = std::collections::BTreeMap::new();
         for line in default.lines() {
+            let line = line.trim();
             let Some((key, rest)) = line.split_once('=') else {
                 continue;
             };
-            let Some(rest) = rest.trim().strip_prefix("import ./") else {
-                continue;
+            let key = key.trim();
+            let rest = rest.trim();
+            let parsed = rest
+                .strip_prefix("import ./")
+                .and_then(|rest| rest.strip_suffix(".nix { inherit pkgs; };"));
+            let Some(name) = parsed else {
+                panic!(
+                    "nix/sets/default.nix binds `{key} = {rest}`, which is not the \
+                     canonical `import ./<name>.nix {{ inherit pkgs; }};` — a \
+                     malformed binding evaluates to something other than a set \
+                     module, or not at all"
+                );
             };
-            let Some(name) = rest.split(".nix").next() else {
-                continue;
-            };
-            imported.insert(key.trim().to_string(), name.to_string());
+            assert!(
+                imported.insert(key.to_string(), name.to_string()).is_none(),
+                "nix/sets/default.nix binds `{key}` twice"
+            );
         }
 
-        for set in NIX_SETS {
-            let key = set.name.replace('-', "_");
-            assert_eq!(
-                imported.get(&key).map(String::as_str),
-                Some(set.name),
-                "nix/sets/default.nix does not bind `{key} = import ./{}.nix`, so \
-                 selecting the '{}' set would fail to evaluate",
-                set.name,
-                set.name
-            );
-        }
-        for (key, name) in &imported {
-            assert!(
-                NIX_SETS.iter().any(|set| set.name == *name),
-                "nix/sets/default.nix imports './{name}.nix' as `{key}`, which the \
-                 catalog does not know: the console cannot toggle it"
-            );
-        }
+        let expected: std::collections::BTreeMap<String, String> = NIX_SETS
+            .iter()
+            .map(|set| (set.name.replace('-', "_"), set.name.to_string()))
+            .collect();
+        assert_eq!(
+            imported, expected,
+            "nix/sets/default.nix and the catalog must map exactly the same \
+             sets: an extra binding is a module the console cannot toggle, a \
+             missing one is a set that cannot be selected"
+        );
     }
 
-    /// Every catalogued set ships exactly one embedded module, and every
-    /// embedded module is either the index or a catalogued set.
+    /// Every catalogued set ships exactly one embedded module, every module
+    /// is the index or a catalogued set, and each embedded copy is the file
+    /// on disk.
     ///
     /// `write_set_modules` and `apply_config` push `NIX_SET_FILES` verbatim
-    /// with no generated fallback, so an entry missing from the table is a
-    /// module the box silently never receives — the failure mode the removed
-    /// fallback used to paper over with a lossy reconstruction.
+    /// with no generated fallback, so this table is the whole story of what a
+    /// box receives. "At least one entry" was not enough to pin it: duplicate
+    /// filenames passed, and so did two `include_str!` contents swapped while
+    /// keeping their names — boxes would receive the wrong module under each.
     #[test]
     fn every_set_ships_exactly_one_module() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nix/sets");
+        let mut seen = std::collections::BTreeSet::new();
+
+        for (filename, content) in NIX_SET_FILES {
+            assert!(
+                seen.insert(*filename),
+                "NIX_SET_FILES lists '{filename}' twice"
+            );
+            let name = filename.strip_suffix(".nix").unwrap_or(filename);
+            assert!(
+                name == "default" || NIX_SETS.iter().any(|set| set.name == name),
+                "NIX_SET_FILES ships '{filename}', which is neither the index nor \
+                 a catalogued set"
+            );
+            let on_disk = std::fs::read_to_string(dir.join(filename))
+                .unwrap_or_else(|e| panic!("read nix/sets/{filename}: {e}"));
+            assert_eq!(
+                *content, on_disk,
+                "the embedded '{filename}' differs from nix/sets/{filename} — a \
+                 swapped include_str! or a stale build artifact, and either way \
+                 boxes receive something other than the checked-in module"
+            );
+        }
+
+        assert!(
+            seen.contains("default.nix"),
+            "NIX_SET_FILES has no set index"
+        );
+        assert_eq!(
+            seen.len(),
+            NIX_SETS.len() + 1,
+            "NIX_SET_FILES and the catalog disagree on how many modules exist"
+        );
         for set in NIX_SETS {
             assert!(
                 set_file(set.name).is_some(),
                 "the '{}' set has no entry in NIX_SET_FILES: provisioning and \
                  Sets apply would never write its module",
                 set.name
-            );
-        }
-        for (filename, _) in NIX_SET_FILES {
-            let name = filename.strip_suffix(".nix").unwrap_or(filename);
-            assert!(
-                name == "default" || NIX_SETS.iter().any(|set| set.name == name),
-                "NIX_SET_FILES ships '{filename}', which is neither the index nor \
-                 a catalogued set"
             );
         }
     }

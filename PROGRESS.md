@@ -1996,3 +1996,24 @@ inside the guest in production, where no host scan queue exists. The fix
 belongs to the test: `build_agent` now runs the fresh binary once with
 `-version` before anything waits on it, paying the per-file scan where nothing
 is timing.
+
+## Round 48 — reviewing the fixes to the fixes
+
+Eight findings on round 47's own changes, none must-fix, all addressed. The
+theme this round was tests that promised more than they checked: the AI-set
+comparison still passed on a package named only in a comment; the recognised
+`runCommand` shape could smuggle `${pkgs.htop}` inside its script string; the
+index parser accepted `system.nix.disabled`, an import without
+`{ inherit pkgs; }`, and an alias binding; the bijection test proved "at least
+one" where "exactly one, and byte-equal to the file on disk" was the claim;
+and the stdio warm-up turned a broken agent into a green skip. Each now checks
+what its name says. An older, weaker duplicate of the module-drift test was
+deleted outright rather than updated — two tests for one invariant is how the
+weaker one ends up being the one somebody reads.
+
+On the runtime side: lab teardown validates a pidfile's number and the
+process's identity before root sends a signal, and ztpd's `restart_frr`
+snapshots the pids it TERMs, polls those pids rather than re-reading files a
+dying daemon may unlink, escalates to KILL once, and fails the restart if
+anything survives — starting a replacement against a live predecessor's
+sockets is the race the wait exists to close.

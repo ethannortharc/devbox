@@ -348,40 +348,46 @@ restart_frr() {
   _run="${DEVBOX_ZTP_RUN_DIR:-/run/devbox-ztp}"
   mkdir -p "$_run" "/run/frr/$DEVBOX_ZTP_NETNS" "/etc/frr/$DEVBOX_ZTP_NETNS"
   touch "/etc/frr/$DEVBOX_ZTP_NETNS/vtysh.conf"
+  # Snapshot the pids before touching anything. The wait below must poll the
+  # processes that were signalled, not re-read pidfiles a daemon may unlink on
+  # its way out while still holding the zserv socket -- that re-read declared
+  # the old zebra gone and recreated FRR mid-race, which is the exact failure
+  # the wait exists to prevent. Non-numeric pidfile content is skipped rather
+  # than signalled: kill takes the file's word for a process identity, and a
+  # stale file's number may belong to anything by now.
+  _pids=""
   for _daemon in bgpd zebra mgmtd; do
     _pidfile="$_run/$_daemon.pid"
     if [ -s "$_pidfile" ]; then
-      kill "$(cat "$_pidfile")" 2>/dev/null || true
+      _pid=$(cat "$_pidfile" 2>/dev/null)
+      case "$_pid" in
+        ''|*[!0-9]*) ;;
+        *) _pids="$_pids $_pid"; kill "$_pid" 2>/dev/null || true ;;
+      esac
     fi
   done
-  # Wait for the old daemons to actually exit before starting replacements.
-  # SIGTERM returns immediately; a replacement started while its predecessor
-  # still owns the pidfile and zserv socket either fails to bind or races the
-  # old process's cleanup, and either way the node reports a restart it did
-  # not complete. Bounded, then escalated: a daemon that ignores TERM for
-  # five seconds is not shutting down.
-  _tries=25
-  _left=0
-  while [ "$_tries" -gt 0 ]; do
-    _left=0
-    for _daemon in bgpd zebra mgmtd; do
-      _pidfile="$_run/$_daemon.pid"
-      if [ -s "$_pidfile" ] && kill -0 "$(cat "$_pidfile")" 2>/dev/null; then
-        _left=1
-      fi
+  _wait_gone() {
+    _tries=$1
+    while [ "$_tries" -gt 0 ]; do
+      _left=""
+      for _pid in $_pids; do
+        if kill -0 "$_pid" 2>/dev/null; then _left="$_left $_pid"; fi
+      done
+      _pids="$_left"
+      [ -z "$_pids" ] && return 0
+      _tries=$((_tries - 1))
+      sleep 0.2 2>/dev/null || sleep 1
     done
-    [ "$_left" -eq 0 ] && break
-    _tries=$((_tries - 1))
-    sleep 0.2 2>/dev/null || sleep 1
-  done
-  if [ "$_left" -eq 1 ]; then
-    for _daemon in bgpd zebra mgmtd; do
-      _pidfile="$_run/$_daemon.pid"
-      if [ -s "$_pidfile" ]; then
-        kill -9 "$(cat "$_pidfile")" 2>/dev/null || true
-      fi
+    return 1
+  }
+  if ! _wait_gone 25; then
+    for _pid in $_pids; do
+      kill -9 "$_pid" 2>/dev/null || true
     done
-    sleep 0.2 2>/dev/null || sleep 1
+    # A daemon that survives SIGKILL is unkillable kernel state; starting a
+    # replacement against its sockets can only produce the race this whole
+    # block exists to close, so fail the restart instead.
+    _wait_gone 25 || return 1
   fi
   # Stale runtime files, not the directory: the pidfiles now name dead
   # processes and a leftover zserv socket would make the new zebra fail to

@@ -55,7 +55,7 @@ fn go_available() -> bool {
 /// child the kernel had not yet let start. The scan verdict is cached per
 /// file, so paying for it here — on a `-version` call nothing is timing —
 /// makes every later exec immediate.
-fn build_agent(out_dir: &Path) -> Option<PathBuf> {
+fn build_agent(out_dir: &Path) -> PathBuf {
     let binary = out_dir.join("devbox-obsd");
     let status = Command::new("go")
         .args(["build", "-o"])
@@ -63,17 +63,25 @@ fn build_agent(out_dir: &Path) -> Option<PathBuf> {
         .arg("./agent/cmd/obsd")
         .current_dir(repo_root())
         .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
+        .expect("run go build");
+    // Panics, not skips. `go_available` is the one legitimate reason to sit
+    // a test out; once the toolchain exists, an agent that fails to build or
+    // to answer `-version` is a broken agent, and turning that into a skip
+    // made the integration suite green on exactly the regressions it exists
+    // to catch.
+    assert!(status.success(), "go build ./agent/cmd/obsd failed");
     let warmed = Command::new(&binary)
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .ok()?;
-    warmed.success().then_some(binary)
+        .expect("run the freshly built agent");
+    assert!(
+        warmed.success(),
+        "devbox-obsd -version failed on a binary that just built: the agent \
+         cannot start"
+    );
+    binary
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,10 +92,7 @@ async fn go_agent_streams_into_the_rust_collector() {
     }
 
     let work = tempfile::tempdir().expect("temp dir");
-    let Some(agent) = build_agent(work.path()) else {
-        eprintln!("skipping: could not build devbox-obsd");
-        return;
-    };
+    let agent = build_agent(work.path());
 
     // ── collector ────────────────────────────────────────
     let state_dir = work.path().join("state");
@@ -305,10 +310,7 @@ async fn vm_stdio_transport_carries_the_same_protocol() {
     }
 
     let work = tempfile::tempdir().expect("temp dir");
-    let Some(agent) = build_agent(work.path()) else {
-        eprintln!("skipping: could not build devbox-obsd");
-        return;
-    };
+    let agent = build_agent(work.path());
     let fixture = repo_root().join("agent/event/testdata/events.jsonl");
     let expected = std::fs::read_to_string(&fixture)
         .unwrap()
@@ -360,10 +362,7 @@ async fn idle_stdio_agent_exits_when_the_host_session_disappears() {
     }
 
     let work = tempfile::tempdir().expect("temp dir");
-    let Some(agent) = build_agent(work.path()) else {
-        eprintln!("skipping: could not build devbox-obsd");
-        return;
-    };
+    let agent = build_agent(work.path());
     let fixture = repo_root().join("agent/event/testdata/events.jsonl");
     let expected = std::fs::read_to_string(&fixture)
         .unwrap()
@@ -430,10 +429,7 @@ async fn the_collector_rejects_an_agent_claiming_another_box() {
     }
 
     let work = tempfile::tempdir().expect("temp dir");
-    let Some(agent) = build_agent(work.path()) else {
-        eprintln!("skipping: could not build devbox-obsd");
-        return;
-    };
+    let agent = build_agent(work.path());
 
     let state_dir = work.path().join("state");
     let sock = socket_path(&state_dir, "myapp");

@@ -269,13 +269,28 @@ pub fn down_commands(topology: &Topology) -> Vec<Vec<String>> {
             // gone, and then it can enumerate nothing: mgmtd, zebra and bgpd
             // survived while the directory recording their pids was removed
             // out from under them.
+            //
+            // And no pid is signalled on the file's word alone. A daemon that
+            // crashed leaves its pidfile behind, the number gets reused, and a
+            // blind `kill` from root lands on whatever owns it now — so the
+            // content must be numeric and the process must look like one of
+            // ours (`sh` covers the ztpd supervisor loop) before anything is
+            // sent. A reused pid that happens to be another daemon of the
+            // same name is a risk this cannot close from a shell, but the
+            // window shrinks from "any process" to "same-named process".
             vec![
                 privileged(vec![
                     "sh".into(),
                     "-c".into(),
                     format!(
                         "for p in /run/devbox/lab/{}/{}/*.pid; do \
-                           [ -f \"$p\" ] && kill \"$(cat \"$p\")\" 2>/dev/null || true; \
+                           [ -f \"$p\" ] || continue; \
+                           pid=$(cat \"$p\" 2>/dev/null); \
+                           case \"$pid\" in ''|*[!0-9]*) continue;; esac; \
+                           case \"$(ps -o comm= -p \"$pid\" 2>/dev/null)\" in \
+                             zebra|bgpd|mgmtd|dnsmasq|chronyd|devbox-ztpd|sh) \
+                               kill \"$pid\" 2>/dev/null || true;; \
+                           esac; \
                          done; \
                          ip netns pids {ns} 2>/dev/null | xargs -r kill 2>/dev/null; \
                          rm -rf /run/devbox/lab/{}/{}; exit 0",
