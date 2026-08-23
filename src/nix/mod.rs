@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 
 use self::rebuild::{nixos_rebuild, write_devbox_nix, write_nix_file, write_state_toml};
-use self::sets::{NIX_SETS, generate_set_nix, generate_state_toml};
+use self::sets::generate_state_toml;
 use crate::runtime::Runtime;
 use crate::sandbox::config::DevboxConfig;
 
@@ -78,30 +78,19 @@ pub async fn write_set_modules(
     // set on later needs no extra round trip. What the selection controls is
     // `configuration.nix`, which imports only the chosen ones — so only those
     // closures are ever evaluated or built.
-    write_nix_file(
-        runtime,
-        sandbox_name,
-        "default.nix",
-        sets::set_file("default").expect("the set index is embedded"),
-    )
-    .await?;
-
-    for set in NIX_SETS {
-        // The checked-in module, not a list regenerated from `NIX_SETS`. A set
-        // is a Nix expression and only some of them are a flat list of names:
-        // the AI sets wrap each optional tool in `tryEval` so one tool missing
-        // from a channel does not fail the whole rebuild, and `network` builds
-        // a derivation to put FRR's daemons on PATH. Regenerating dropped
-        // whatever did not survive the round trip — and dropped it only on
-        // `sets apply`, so a box was correct when created and quietly lost
-        // those packages the first time its selection was touched.
-        write_nix_file(
-            runtime,
-            sandbox_name,
-            &format!("{}.nix", set.name),
-            sets::set_file(set.name).unwrap_or(&generate_set_nix(set)),
-        )
-        .await?;
+    // The checked-in modules, verbatim, index included — and no generated
+    // fallback. A set is a Nix expression and only some of them are a flat
+    // list of names: the AI sets wrap each optional tool in `tryEval` so one
+    // tool missing from a channel does not fail the whole rebuild, and
+    // `network` builds a derivation to put FRR's daemons on PATH.
+    // Regenerating from the package index dropped whatever did not survive
+    // that round trip — and dropped it only on `sets apply`, so a box was
+    // correct when created and quietly lost those packages the first time its
+    // selection was touched. A fallback would reopen the same hole one
+    // missing table entry at a time; `every_set_ships_exactly_one_module`
+    // pins the table against the catalog instead.
+    for (filename, content) in sets::NIX_SET_FILES {
+        write_nix_file(runtime, sandbox_name, filename, content).await?;
     }
 
     write_devbox_nix(

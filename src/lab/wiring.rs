@@ -262,12 +262,19 @@ pub fn down_commands(topology: &Topology) -> Vec<Vec<String>> {
             // holding their pidfiles and sockets — so the next `lab up`
             // starts a second set that cannot bind, and the lab comes up
             // half-wired with no obvious cause.
+            //
+            // Every `*.pid`, not only the supervisors. `ip netns pids` below
+            // normally sweeps the daemons, but on the partial-teardown rerun —
+            // the case this function exists for — the namespace may already be
+            // gone, and then it can enumerate nothing: mgmtd, zebra and bgpd
+            // survived while the directory recording their pids was removed
+            // out from under them.
             vec![
                 privileged(vec![
                     "sh".into(),
                     "-c".into(),
                     format!(
-                        "for p in /run/devbox/lab/{}/{}/*.supervisor.pid; do \
+                        "for p in /run/devbox/lab/{}/{}/*.pid; do \
                            [ -f \"$p\" ] && kill \"$(cat \"$p\")\" 2>/dev/null || true; \
                          done; \
                          ip netns pids {ns} 2>/dev/null | xargs -r kill 2>/dev/null; \

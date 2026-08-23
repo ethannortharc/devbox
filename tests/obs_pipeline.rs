@@ -45,7 +45,16 @@ fn go_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build `devbox-obsd` for the host, returning its path.
+/// Build `devbox-obsd` for the host and run it once, returning its path.
+///
+/// The warm-up run is not decoration. On macOS the first exec of a freshly
+/// linked binary can stall for tens of seconds in Gatekeeper's malware scan
+/// while the machine is busy producing binaries — longer than the collector's
+/// Hello window. The stdio tests then watched their agent die of EPIPE
+/// against a reader that had rightly given up, or timed out waiting for a
+/// child the kernel had not yet let start. The scan verdict is cached per
+/// file, so paying for it here — on a `-version` call nothing is timing —
+/// makes every later exec immediate.
 fn build_agent(out_dir: &Path) -> Option<PathBuf> {
     let binary = out_dir.join("devbox-obsd");
     let status = Command::new("go")
@@ -55,7 +64,16 @@ fn build_agent(out_dir: &Path) -> Option<PathBuf> {
         .current_dir(repo_root())
         .status()
         .ok()?;
-    status.success().then_some(binary)
+    if !status.success() {
+        return None;
+    }
+    let warmed = Command::new(&binary)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    warmed.success().then_some(binary)
 }
 
 #[tokio::test(flavor = "multi_thread")]

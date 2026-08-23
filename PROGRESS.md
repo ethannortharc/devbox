@@ -1953,3 +1953,46 @@ common shape is a component that treats "I did the part I understood" as done.
 What caught all three was the same thing: running the feature end to end on a
 real box and looking at the state it actually produced, rather than at what
 each step said about itself.
+
+## Round 47 — reviewing the fixes themselves
+
+The six ZTP-run fixes went through the same review loop as everything else
+(gpt-5.6-sol, xhigh). Seven findings, none must-fix, all addressed:
+
+- The lossy module generator survived as a *fallback* in `write_set_modules` —
+  one missing table entry away from reopening ADR-0052's hole. Both writers now
+  iterate `NIX_SET_FILES` with no fallback, the generator is deleted, and a
+  bijection test pins the table against the catalog.
+- The drift test blanked every parenthesised expression, so `(pkgs.htop)`
+  could be installed with the catalog never hearing of it; and the AI sets were
+  checked in one direction only. Removed expressions now come back to the
+  caller and must be the one `runCommand` helper shape; the AI modules'
+  quoted tokens and `pkgs.` paths are compared against the catalog both ways.
+- The index test accepted a commented-out import. It parses bindings now,
+  both directions.
+- Teardown killed only `*.supervisor.pid`; on the partial-teardown rerun the
+  namespace can already be gone, and `ip netns pids` then enumerates nothing —
+  daemons outlived the directory recording their pids. Every `*.pid` dies.
+- `restart_frr` sent SIGTERM and immediately started replacements. Bounded
+  wait, escalate to KILL, remove stale pidfiles and the zserv socket first.
+- `busybox` is a configurable multicall binary; the applet is now confirmed
+  with `--list` before use, `getent` is verified to exist, and a substrate with
+  no resolver tool at all passes the check rather than failing a healthy node
+  over a diagnostic it cannot run.
+
+Also this morning: a wedged macOS XprotectService stalled *every* first-exec of
+a fresh binary at `_dyld_start` — `cargo run`, test binaries, a 33KB
+hello-world, and the build script alike. Diagnosis that it was environmental:
+`codesign --verify` in 0.04s, sample showing pre-main, a control binary
+hanging identically. Worth remembering the shape: a toolchain that suddenly
+"hangs everywhere" may not be the toolchain.
+
+The same queue then failed the stdio obs-pipeline tests three runs straight —
+and the third run finally told the truth: the agent died of `broken pipe`
+against a collector whose ten-second Hello window had expired while the
+agent's exec sat in the scan queue. The collector's behaviour is correct — a
+transport that never says hello should be abandoned — and the agent execs
+inside the guest in production, where no host scan queue exists. The fix
+belongs to the test: `build_agent` now runs the fresh binary once with
+`-version` before anything waits on it, paying the per-file scan where nothing
+is timing.

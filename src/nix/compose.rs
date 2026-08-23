@@ -350,8 +350,8 @@ pub fn is_valid_attr_path(attr: &str) -> bool {
 
 /// A Nix attribute-set key for a set name (`lang-go` → `lang_go`).
 ///
-/// Mirrors [`super::sets::generate_sets_default_nix`], which keys the set
-/// index the same way.
+/// Mirrors the checked-in `nix/sets/default.nix`, which keys the set index
+/// the same way; `set_index_imports_every_set` pins the mapping.
 pub fn nix_key(set_name: &str) -> String {
     set_name.replace('-', "_")
 }

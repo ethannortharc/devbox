@@ -354,6 +354,39 @@ restart_frr() {
       kill "$(cat "$_pidfile")" 2>/dev/null || true
     fi
   done
+  # Wait for the old daemons to actually exit before starting replacements.
+  # SIGTERM returns immediately; a replacement started while its predecessor
+  # still owns the pidfile and zserv socket either fails to bind or races the
+  # old process's cleanup, and either way the node reports a restart it did
+  # not complete. Bounded, then escalated: a daemon that ignores TERM for
+  # five seconds is not shutting down.
+  _tries=25
+  _left=0
+  while [ "$_tries" -gt 0 ]; do
+    _left=0
+    for _daemon in bgpd zebra mgmtd; do
+      _pidfile="$_run/$_daemon.pid"
+      if [ -s "$_pidfile" ] && kill -0 "$(cat "$_pidfile")" 2>/dev/null; then
+        _left=1
+      fi
+    done
+    [ "$_left" -eq 0 ] && break
+    _tries=$((_tries - 1))
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  if [ "$_left" -eq 1 ]; then
+    for _daemon in bgpd zebra mgmtd; do
+      _pidfile="$_run/$_daemon.pid"
+      if [ -s "$_pidfile" ]; then
+        kill -9 "$(cat "$_pidfile")" 2>/dev/null || true
+      fi
+    done
+    sleep 0.2 2>/dev/null || sleep 1
+  fi
+  # Stale runtime files, not the directory: the pidfiles now name dead
+  # processes and a leftover zserv socket would make the new zebra fail to
+  # bind where the old one sat.
+  rm -f "$_run"/*.pid "$_run/zserv.api"
   # mgmtd first, and it takes no -f.
   #
   # FRR 10 moved interface configuration into mgmtd's northbound datastore.
@@ -493,10 +526,20 @@ done
 dns_answers() {
   if command -v nslookup >/dev/null 2>&1; then
     nslookup -type=A "$1" >/dev/null 2>&1
-  elif command -v busybox >/dev/null 2>&1; then
+  elif command -v busybox >/dev/null 2>&1 \
+    && busybox --list 2>/dev/null | grep -qx nslookup; then
+    # busybox is a configurable multicall binary; the applet has to be
+    # confirmed, or a build without it fails here and the getent branch that
+    # would have worked is never reached.
     busybox nslookup -type=A "$1" >/dev/null 2>&1
-  else
+  elif command -v getent >/dev/null 2>&1; then
     getent hosts "$1" >/dev/null 2>&1
+  else
+    # No resolver tool at all. Passing is deliberate: the check exists to
+    # catch a misconfigured fabric, and a substrate with no DNS client is a
+    # tooling gap, not evidence of one. Failing here would mark a healthy
+    # node failed over a diagnostic it cannot run.
+    return 0
   fi
 }
 
