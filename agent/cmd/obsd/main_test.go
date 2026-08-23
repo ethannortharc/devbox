@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -12,8 +13,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethannortharc/devbox/agent/capture"
+	"github.com/ethannortharc/devbox/agent/event"
 	"github.com/ethannortharc/devbox/agent/transport"
 )
+
+type statusPacket struct{}
+
+func (statusPacket) Name() string { return "packet" }
+func (statusPacket) Domains() []event.Type {
+	return []event.Type{event.TypeDNS, event.TypeTLS}
+}
+func (statusPacket) Run(context.Context, chan<- *event.Event) error { return nil }
 
 func TestVersionFlagPrintsIdentity(t *testing.T) {
 	t.Parallel()
@@ -49,8 +60,29 @@ func TestFlagDefaults(t *testing.T) {
 	if cfg.noEBPF {
 		t.Error("eBPF must be enabled by default; -no-ebpf is the degraded path")
 	}
+	if !cfg.packet {
+		t.Error("packet capture must be enabled by default; DNS policy depends on it")
+	}
+	if cfg.stdio {
+		t.Error("stdio is selected only by the host supervisor")
+	}
+	if cfg.noTransport || !cfg.restore {
+		t.Errorf("unexpected lifecycle defaults: %+v", cfg)
+	}
 	if cfg.queue < 1 {
 		t.Errorf("queue depth = %d; the buffer must be bounded but non-empty", cfg.queue)
+	}
+}
+
+func TestRestorePolicyFlagControlsFirewallOwnership(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseFlags([]string{"-restore-policy=false"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags returned %v", err)
+	}
+	if ownsPolicy(cfg) {
+		t.Fatal("an exec observer with restoration disabled still owns DNS allow-set updates")
 	}
 }
 
@@ -98,6 +130,33 @@ func TestZeroQueueIsRejected(t *testing.T) {
 	}
 }
 
+func TestPCAPFlagsAreBoundedAndExclusive(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseFlags([]string{
+		"-pcap", "-pcap-proto", "udp",
+		"-pcap-saddr", "10.0.0.2", "-pcap-sport", "53000",
+		"-pcap-daddr", "1.1.1.1", "-pcap-dport", "53",
+		"-pcap-duration", "3s", "-pcap-packets", "12",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse pcap flags: %v", err)
+	}
+	if !cfg.pcap || cfg.pcapProto != "udp" || cfg.pcapDPort != 53 || cfg.pcapPackets != 12 {
+		t.Fatalf("pcap cfg = %+v", cfg)
+	}
+	for _, args := range [][]string{
+		{"-pcap", "-stdio"},
+		{"-pcap", "-no-transport"},
+		{"-pcap", "-fixture", "events.jsonl"},
+		{"-pcap", "-pcap-dport", "70000"},
+	} {
+		if _, err := parseFlags(args, io.Discard); err == nil {
+			t.Fatalf("accepted incompatible pcap flags %v", args)
+		}
+	}
+}
+
 func TestVsockIsRejectedUntilItExists(t *testing.T) {
 	t.Parallel()
 
@@ -119,7 +178,7 @@ func TestSourceSelection(t *testing.T) {
 		t.Errorf("source = %q, want fixture", fixture.Name())
 	}
 
-	proc, err := chooseSource(config{boxID: "b", noEBPF: true})
+	proc, err := chooseSource(config{boxID: "b", noEBPF: true, packet: false})
 	if err != nil {
 		t.Fatalf("proc source: %v", err)
 	}
@@ -127,11 +186,92 @@ func TestSourceSelection(t *testing.T) {
 		t.Errorf("source = %q, want proc", proc.Name())
 	}
 
-	// Asking for eBPF from a binary built without it must fail loudly rather
-	// than quietly degrade — a quiet timeline reads as "nothing happened".
-	if _, err := chooseSource(config{boxID: "b"}); err == nil {
-		t.Error("eBPF capture should refuse rather than silently fall back")
+	// Capture preflight must always leave a usable source. A portable build
+	// degrades to /proc; an eBPF build may do the same when this test process
+	// lacks the kernel capabilities needed to attach probes.
+	ebpf, err := chooseSource(config{boxID: "b", packet: false})
+	if err != nil {
+		t.Fatalf("automatic source: %v", err)
 	}
+	if ebpf.Name() != "ebpf" && ebpf.Name() != "proc" {
+		t.Fatalf("automatic source = %q, want ebpf or proc fallback", ebpf.Name())
+	}
+	if !capture.EBPFBuilt() && ebpf.Name() != "proc" {
+		t.Fatalf("portable build source = %q, want proc", ebpf.Name())
+	}
+	if sourceIncludes(ebpf, "ebpf") != (ebpf.Name() == "ebpf") {
+		t.Fatalf("sourceIncludes disagrees with selected source %q", ebpf.Name())
+	}
+}
+
+func TestCaptureStatusReportsEffectiveDomainsNotRequestedFlags(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{boxID: "b", packet: true, policy: "/etc/devbox/policy.json"}
+	degraded := currentCaptureStatus(cfg, &capture.Proc{BoxID: "b"})
+	for _, domain := range degraded.Capture {
+		if domain == "dns" {
+			t.Fatalf("proc fallback falsely advertised DNS: %+v", degraded)
+		}
+	}
+
+	recovered := currentCaptureStatus(cfg, capture.NewMulti(
+		&capture.Proc{BoxID: "b"},
+		statusPacket{},
+	))
+	if !contains(recovered.Capture, "dns") || !contains(recovered.Capture, "tls") {
+		t.Fatalf("live packet source was not published: %+v", recovered)
+	}
+	if !recovered.PolicyConfigured {
+		t.Fatal("the status lost that the DNS feed is wired to policy")
+	}
+}
+
+func TestCaptureStatusIsAtomicReadableAndOwnerScoped(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "run", "obsd-status.json")
+	status := captureStatus{PID: os.Getpid(), BoxID: "b", Capture: []string{"dns"}}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCaptureStatus(path, encoded); err != nil {
+		t.Fatalf("writeCaptureStatus: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got captureStatus
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("published partial JSON: %v", err)
+	}
+	if got.PID != os.Getpid() || !contains(got.Capture, "dns") {
+		t.Fatalf("status = %+v", got)
+	}
+	removeCaptureStatus(path, os.Getpid()+1)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("another process removed this status: %v", err)
+	}
+	removeCaptureStatus(path, os.Getpid())
+	if !os.IsNotExist(statError(path)) {
+		t.Fatalf("owner status still exists at %s", path)
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func statError(path string) error {
+	_, err := os.Stat(path)
+	return err
 }
 
 // TestBackoffClimbsToACeiling covers the part of `dialCollector` that can be
@@ -411,5 +551,32 @@ func TestFramesReachAListeningCollector(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the collector never finished reading\n%s", out.String())
+	}
+}
+
+func TestStdioMonitorTreatsHostEOFAsSessionEnd(t *testing.T) {
+	t.Parallel()
+
+	agent, host := net.Pipe()
+	defer agent.Close()
+	done := make(chan error, 1)
+	go func() { done <- monitorStdio(context.Background(), agent) }()
+
+	if err := transport.WriteFrame(host, nil); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("a valid heartbeat ended the session: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	_ = host.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("host EOF looked like a healthy session")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle agent did not notice the host disappeared")
 	}
 }

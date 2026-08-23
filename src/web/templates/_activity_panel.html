@@ -1,0 +1,138 @@
+{#- The Activity tab, in three layers: what capture is doing, what the window
+    looks like, and the events themselves. Every view is rendered from the one
+    load, so switching between them is a CSS state change rather than a round
+    trip — the data is already here. -#}
+
+<div id="capture-bar" sse-swap="{{ capture_event }}" hx-swap="innerHTML">
+  {% include "_capture_bar.html" %}
+</div>
+
+{#- Rendered whether or not a store exists yet. Gating the whole panel on it
+    left a page opened before capture started with no stream element and no
+    trigger: capture would begin, events would be stored, and that page showed
+    nothing at all until someone thought to reload it. -#}
+
+<div class="actviews">
+  {#- Radios rather than links: every view is already rendered, so switching
+      is a CSS state change and costs no request and no re-render. They sit
+      outside the live-swapped stream so a swap cannot reset the choice. -#}
+  <input class="viewpick" type="radio" name="actview" id="v-stream" checked />
+  <input class="viewpick" type="radio" name="actview" id="v-peers" />
+  <input class="viewpick" type="radio" name="actview" id="v-flows" />
+  <input class="viewpick" type="radio" name="actview" id="v-dns" />
+  <input class="viewpick" type="radio" name="actview" id="v-proc" />
+  <input class="viewpick" type="radio" name="actview" id="v-files" />
+  <input class="viewpick" type="radio" name="actview" id="v-policy" />
+
+  {#- One region for everything that describes the loaded window: the density
+      strip, the switcher's counts, and the six analysis tables. They are
+      re-read together or they disagree — a live strip above a table frozen at
+      page load reports two different windows a few centimetres apart.
+
+      The radios stay outside it, so a swap cannot reset which view is open,
+      and the stream stays outside it too, because the stream is appended to
+      and this is replaced. Held still by the same `pause` the stream uses. -#}
+  <div id="activity-live"
+       hx-get="/api/boxes/{{ boxname|urlencode_strict }}/activity/live"
+       {#- The `[...]` filter binds to the *event name*, and htmx parses it
+           immediately after that name and before any modifier. Written after
+           `throttle:` it was never read as a filter at all — the duration
+           parser swallowed `5s[…]`, leaving this refreshing several times a
+           second and ignoring `pause` completely. -#}
+       hx-trigger="sse:{{ activity_event }}[!document.getElementById('act-pause').checked] throttle:5s,
+                   every 30s[!document.getElementById('act-pause').checked]"
+       hx-swap="innerHTML">
+{% include "_activity_live.html" %}
+  </div>
+
+  {# ── stream ─────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-stream">
+    <div class="actfilter">
+      {#- Pause is deliberately outside the filter form. Inside it, ticking the
+          box fired the form's `change` trigger and reloaded the whole stream —
+          the one thing someone who just asked it to hold still does not want. -#}
+      <form id="act-filters"
+            class="filterfields"
+            hx-get="/api/boxes/{{ boxname|urlencode_strict }}/activity"
+            hx-target="#activity-stream"
+            hx-sync="#activity-stream:replace"
+            hx-swap="innerHTML"
+            hx-trigger="change, keyup changed delay:250ms from:find input[name=q], submit"
+            hx-on::submit="event.preventDefault()">
+        <input class="text search" type="search" name="q" value="{{ filter_query }}"
+               placeholder="filter by process, peer, path…" aria-label="Filter the stream" />
+        {#- Outside `#activity-live`, and never replaced: these hold the
+            reader's selection, and the search box beside them holds text
+            nobody wants swapped from under their cursor. The window's re-read
+            updates their counts out-of-band and nothing else. -#}
+        <span class="domain-chips">
+          {% include "_activity_chips.html" %}
+        </span>
+      </form>
+      <span class="spacer"></span>
+      <label class="chip chip-pause">
+        <input type="checkbox" id="act-pause" />
+        <span>pause</span>
+      </label>
+    </div>
+
+    {#- The anchor travels in the request and comes back out-of-band, so each
+        page tails from where *it* is rather than from a shared cursor. That
+        is what makes a tab opened five minutes later show neither duplicates
+        nor a gap. -#}
+    <input type="hidden" id="act-anchor" name="after" value="{{ cursor }}" />
+
+    {#- Driven by the collector's own signal, not a clock: a quiet box
+        generates no requests at all, and a burst is on screen within half a
+        second. The `every 20s` is a reconnect safety net, not the mechanism.
+        Both stop while paused. -#}
+    {#- `hx-sync` is load-bearing, not tidiness. A filter reload and a tail
+        both target this element and both return an out-of-band cursor, so
+        without it a tail that started before a filter change could land after
+        it — inserting unfiltered rows and rewinding the cursor, which then
+        re-delivers everything in between. Queued on the element both name, so
+        a filter change aborts an in-flight tail, while a signal arriving
+        mid-request is queued rather than dropped — dropping it would stall
+        the stream until the next signal or the 20-second net. -#}
+    <div class="stream"
+         id="activity-stream"
+         hx-get="/api/boxes/{{ boxname|urlencode_strict }}/activity/tail"
+         hx-trigger="sse:{{ activity_event }}[!document.getElementById('act-pause').checked],
+                     every 20s[!document.getElementById('act-pause').checked]"
+         hx-include="#act-anchor, #act-filters"
+         hx-sync="this:queue last"
+         hx-swap="afterbegin"
+         hx-disinherit="*"
+         hx-on::after-swap="if (this.querySelector(':scope > .ev')) { this.querySelectorAll(':scope > p.muted').forEach(function (p) { p.remove() }) } while (this.children.length > 2000) this.removeChild(this.lastElementChild)">
+      {% include "_activity_rows.html" %}
+      {% if stream.is_empty() %}
+      <p class="muted">Nothing matches. {% if !filter_query.is_empty() %}Clear the filter to see everything.{% else %}No activity recorded yet.{% endif %}</p>
+      {% endif %}
+    </div>
+  </section>
+
+</div>
+
+{#- Gated on the store, unlike everything above it: these three links are the
+    behaviour export, and `/api/boxes/<name>/behavior` answers 404 until there
+    is something to summarize. Offering a link that cannot work is worse than
+    offering none. -#}
+{% if has_store %}
+<details class="behavior">
+  <summary>Behavior summary — what this box has done</summary>
+  <pre>{{ behavior }}</pre>
+  {#- `data-download` makes these keyed fetches rather than navigations.
+      A navigation cannot present the console key and `/api/` is not
+      shell-eligible, so as plain links all three returned 401. See
+      `download.js` for why the key does not simply go in the href. -#}
+  <p class="muted">
+    Export:
+    <a data-download="{{ boxname }}-behavior.md"
+       href="/api/boxes/{{ boxname|urlencode_strict }}/behavior?format=markdown">Markdown</a> ·
+    <a data-download="{{ boxname }}-behavior.jsonl"
+       href="/api/boxes/{{ boxname|urlencode_strict }}/behavior?format=jsonl">JSONL</a> ·
+    <a data-download="{{ boxname }}-behavior.json"
+       href="/api/boxes/{{ boxname|urlencode_strict }}/behavior">JSON</a>
+  </p>
+</details>
+{% endif %}

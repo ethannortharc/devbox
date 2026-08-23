@@ -240,7 +240,7 @@ fn config(args: ConfigArgs) -> Result<()> {
     Ok(())
 }
 
-async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
+pub(crate) async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     let lab = Lab::resolve(&args.target)?;
     let commands = lab.up_commands()?;
 
@@ -256,6 +256,9 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
         print_configs(&lab);
         return Ok(());
     }
+    let _lab_claim =
+        crate::web::build::claim_box(&manager.state_dir, &format!("lab-operation-{}", lab.name()))
+            .context("another process is already changing this lab")?;
 
     let (runtime, substrate) = resolve_substrate(
         manager,
@@ -294,6 +297,43 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
                  Add it with `devbox upgrade --name {substrate} --tools network`, \
                  then re-run `devbox lab up`.",
                 lab.topology.routers().len()
+            );
+        }
+        for command in crate::lab::frr::identity_commands() {
+            let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+            let result = runtime.exec_cmd(&substrate, &argv, false).await?;
+            if result.exit_code != 0 {
+                bail!(
+                    "FRR is installed, but its runtime identity could not be prepared: {}",
+                    result.stderr.trim()
+                );
+            }
+        }
+    }
+
+    let mut service_commands = Vec::new();
+    if lab.topology.services.dns || lab.topology.services.dhcp {
+        service_commands.push("dnsmasq");
+    }
+    if lab.topology.services.ntp {
+        service_commands.push("chronyd");
+    }
+    if lab.topology.nodes.iter().any(|node| node.role.blank()) {
+        service_commands.push("busybox");
+    }
+    for command in service_commands {
+        let probe = runtime
+            .exec_cmd(
+                &substrate,
+                &["sh", "-c", &format!("command -v {command}")],
+                false,
+            )
+            .await;
+        if !probe.is_ok_and(|result| result.exit_code == 0) {
+            bail!(
+                "this topology needs '{command}', but substrate '{substrate}' does not have it.\n  \
+                 Add the complete lab toolchain with `devbox upgrade --name {substrate} --tools network`, \
+                 then re-run `devbox lab up`."
             );
         }
     }
@@ -361,6 +401,13 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     // the only symptom was a scenario that quietly failed its assertions.
     let mut started = 0usize;
     for (node, conf) in lab.router_configs() {
+        if lab
+            .topology
+            .node(&node)
+            .is_some_and(|node| !node.role.preconfigured())
+        {
+            continue;
+        }
         push_file(
             runtime.as_ref(),
             &substrate,
@@ -413,17 +460,13 @@ async fn up(args: UpArgs, manager: &SandboxManager) -> Result<()> {
     }
     println!("Router configs written and FRR started for {started} node(s).");
 
-    // Service orchestration — dnsmasq, chrony, and `devbox-ztpd` — is not
-    // wired yet. Saying so is the whole point: a topology that asks for those
-    // and gets a silent success is a lab the user will debug for an hour
-    // before discovering nothing was ever started.
-    report_unstarted_services(&lab);
+    orchestrate_services(&lab, runtime.as_ref(), &substrate).await?;
 
     println!("\nCheck it with `devbox lab status {}`.", args.target);
     Ok(())
 }
 
-async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
+pub(crate) async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
     let lab = Lab::resolve(&args.target)?;
     let commands = lab.down_commands();
 
@@ -431,6 +474,9 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
         print_commands(&commands);
         return Ok(());
     }
+    let _lab_claim =
+        crate::web::build::claim_box(&manager.state_dir, &format!("lab-operation-{}", lab.name()))
+            .context("another process is already changing this lab")?;
 
     let (runtime, substrate) = resolve_substrate(
         manager,
@@ -521,60 +567,409 @@ async fn down(args: DownArgs, manager: &SandboxManager) -> Result<()> {
     Ok(())
 }
 
-/// Name the parts of a topology this bring-up did not start.
-///
-/// The wiring, addressing, and routing configs are real. Everything a
-/// `service` or `ztp-blank` node needs — dnsmasq with options 66/67, chrony,
-/// `devbox-ztpd`, and the bootstrap run itself — is not orchestrated yet, and
-/// reporting success without saying so would send someone hunting a fabric
-/// that was never asked to provision.
-fn report_unstarted_services(lab: &Lab) {
-    use crate::lab::topology::Role;
+#[derive(serde::Deserialize)]
+struct ZtpStatus {
+    converged: bool,
+    expected: usize,
+    healthy: usize,
+    failed: usize,
+    #[serde(default)]
+    missing: Vec<String>,
+}
 
-    let mut pending: Vec<String> = Vec::new();
-    if lab.topology.services.dns {
-        pending.push("dnsmasq (DNS)".into());
-    }
-    if lab.topology.services.dhcp {
-        pending.push("dnsmasq DHCP with options 66/67".into());
-    }
-    if lab.topology.services.ntp {
-        pending.push("chrony (NTP)".into());
-    }
+/// Start the role services and, for a ZTP fabric, do the whole zero-touch
+/// sequence.  Returning success means every declared blank node has reported
+/// healthy; it is not merely a statement that background processes were
+/// launched.
+async fn orchestrate_services(lab: &Lab, runtime: &dyn Runtime, substrate: &str) -> Result<()> {
+    use crate::lab::services::{ServicePlan, ZtpPlan, config_dir, namespace, run_dir};
 
-    let blank = lab
-        .topology
-        .nodes
-        .iter()
-        .filter(|n| n.role == Role::ZtpBlank)
-        .count();
-    if blank > 0 {
-        pending.push(format!(
-            "devbox-ztpd, and the bootstrap on {blank} blank node(s)"
-        ));
-    }
-    let services = lab
-        .topology
-        .nodes
-        .iter()
-        .filter(|n| n.role == Role::Service)
-        .count();
-    if services > 0 {
-        pending.push(format!("the workload on {services} service node(s)"));
+    let Some(service) = ServicePlan::from_lab(lab)? else {
+        return Ok(());
+    };
+
+    for node in &lab.topology.nodes {
+        let result = runtime
+            .exec_cmd(
+                substrate,
+                &["sudo", "mkdir", "-p", &run_dir(lab.name(), &node.name)],
+                false,
+            )
+            .await?;
+        if result.exit_code != 0 {
+            bail!(
+                "could not create the runtime directory for '{}': {}",
+                node.name,
+                result.stderr.trim()
+            );
+        }
     }
 
-    if pending.is_empty() {
-        return;
+    if let Some(config) = &service.dnsmasq {
+        let path = format!("{}/dnsmasq.conf", config_dir(lab.name(), &service.node));
+        push_file(runtime, substrate, &path, config).await?;
+        run_checked(
+            runtime,
+            substrate,
+            &[
+                "sudo",
+                "ip",
+                "netns",
+                "exec",
+                &namespace(lab.name(), &service.node),
+                "dnsmasq",
+                &format!("--conf-file={path}"),
+            ],
+            "start the lab DNS service",
+        )
+        .await?;
+        println!("DNS started on {} ({})", service.node, service.address);
     }
 
-    println!("\nNot started by this bring-up (service orchestration is not wired yet):");
-    for item in &pending {
-        println!("  - {item}");
+    if let Some(config) = &service.chrony {
+        let path = format!("{}/chrony.conf", config_dir(lab.name(), &service.node));
+        push_file(runtime, substrate, &path, config).await?;
+        run_checked(
+            runtime,
+            substrate,
+            &[
+                "sudo",
+                "ip",
+                "netns",
+                "exec",
+                &namespace(lab.name(), &service.node),
+                "chronyd",
+                "-f",
+                &path,
+            ],
+            "start the lab NTP service",
+        )
+        .await?;
+        println!("NTP started on {} ({})", service.node, service.address);
+    }
+
+    let Some(ztp) = ZtpPlan::from_lab(lab)? else {
+        return Ok(());
+    };
+
+    crate::sandbox::provision::install_embedded_binary(
+        runtime,
+        substrate,
+        "devbox-ztpd",
+        crate::embedded::ZTPD,
+    )
+    .await
+    .context("install the embedded ZTP server on the substrate")?;
+
+    let sot = format!("/etc/devbox/lab/{}/ztp", lab.name());
+    push_file(
+        runtime,
+        substrate,
+        &format!("{sot}/serials.json"),
+        &ztp.serials_json,
+    )
+    .await?;
+    for blank in &ztp.blanks {
+        push_file(
+            runtime,
+            substrate,
+            &format!("{sot}/{}.conf", blank.node),
+            &blank.frr_config,
+        )
+        .await?;
+    }
+
+    let service_ns = namespace(lab.name(), &ztp.service.node);
+    let service_run = run_dir(lab.name(), &ztp.service.node);
+    let ztp_log = format!("{service_run}/ztpd.log");
+    let ztp_supervisor = format!("{service_run}/ztpd.supervisor.pid");
+    let ztp_script = ztp_supervisor_script(
+        &service_ns,
+        ztp.service.address,
+        &sot,
+        &ztp_log,
+        &ztp_supervisor,
+    );
+    run_checked(
+        runtime,
+        substrate,
+        &["sudo", "sh", "-c", &ztp_script],
+        "start the ZTP server supervisor",
+    )
+    .await?;
+
+    wait_http_health(
+        runtime,
+        substrate,
+        &service_ns,
+        &format!("http://{}:8080/healthz", ztp.service.address),
+    )
+    .await
+    .with_context(|| format!("ZTP server log: {ztp_log}"))?;
+    println!(
+        "ZTP server started on {} ({})",
+        ztp.service.node, ztp.service.address
+    );
+
+    for server in &ztp.dhcp_servers {
+        let path = format!("{}/dnsmasq-dhcp.conf", config_dir(lab.name(), &server.node));
+        push_file(runtime, substrate, &path, &server.config).await?;
+        run_checked(
+            runtime,
+            substrate,
+            &[
+                "sudo",
+                "ip",
+                "netns",
+                "exec",
+                &namespace(lab.name(), &server.node),
+                "dnsmasq",
+                &format!("--conf-file={path}"),
+            ],
+            &format!("start DHCP on '{}'", server.node),
+        )
+        .await?;
     }
     println!(
-        "  The wiring, addressing, and routing configs above are real; \n  \
-         these have to be started inside the substrate by hand for now."
+        "DHCP started with options 66/67 for {} blank node(s).",
+        ztp.blanks.len()
     );
+
+    for blank in &ztp.blanks {
+        let ns = namespace(lab.name(), &blank.node);
+        let dir = config_dir(lab.name(), &blank.node);
+        let hook = format!("{dir}/udhcpc.sh");
+        push_file(runtime, substrate, &hook, &blank.dhcp_hook).await?;
+        run_checked(
+            runtime,
+            substrate,
+            &["sudo", "chmod", "0755", &hook],
+            "make the DHCP hook executable",
+        )
+        .await?;
+
+        // `ip netns exec` bind-mounts this file over /etc/resolv.conf for the
+        // namespace, so the bootstrap DNS self-check asks the service node.
+        push_file(
+            runtime,
+            substrate,
+            &format!("/etc/netns/{ns}/resolv.conf"),
+            &format!("nameserver {}\n", ztp.service.address),
+        )
+        .await?;
+        run_checked(
+            runtime,
+            substrate,
+            &[
+                "sudo",
+                "ip",
+                "netns",
+                "exec",
+                &ns,
+                "busybox",
+                "udhcpc",
+                "-n",
+                "-q",
+                "-t",
+                "5",
+                "-T",
+                "2",
+                "-i",
+                &blank.iface,
+                "-s",
+                &hook,
+            ],
+            &format!("obtain the DHCP lease for '{}':{}", blank.node, blank.iface),
+        )
+        .await?;
+
+        let lease_path = format!("{}/dhcp.env", run_dir(lab.name(), &blank.node));
+        let lease = runtime
+            .exec_cmd(substrate, &["sudo", "cat", &lease_path], false)
+            .await?;
+        if lease.exit_code != 0
+            || !lease
+                .stdout
+                .lines()
+                .any(|line| line == format!("boot_url={}", ztp.boot_url))
+        {
+            bail!(
+                "'{}' received an address but not the expected DHCP option 67 ({})",
+                blank.node,
+                ztp.boot_url
+            );
+        }
+
+        let blank_run = run_dir(lab.name(), &blank.node);
+        let bootstrap_log = format!("{blank_run}/bootstrap.log");
+        let bootstrap_supervisor = format!("{blank_run}/bootstrap.supervisor.pid");
+        let bootstrap = format!(
+            "ip netns exec {ns} env \
+             DEVBOX_ZTP_SERIAL={} DEVBOX_ZTP_FRR_DIR={} DEVBOX_ZTP_RUN_DIR={} \
+             DEVBOX_ZTP_NETNS={ns} DEVBOX_ZTP_SKIP_HOSTNAME=1 \
+             DEVBOX_ZTP_DNS_NAME={} DEVBOX_ZTP_NTP={} \
+             sh -c 'for attempt in 1 2 3; do wget -qO- {} | sh && exit 0; sleep 5; done; exit 1' \
+             > {} 2>&1 & echo $! > {}",
+            blank.serial,
+            dir,
+            blank_run,
+            crate::lab::services::ZTP_DNS_NAME,
+            ztp.service.address,
+            ztp.boot_url,
+            bootstrap_log,
+            bootstrap_supervisor,
+        );
+        run_checked(
+            runtime,
+            substrate,
+            &["sudo", "sh", "-c", &bootstrap],
+            &format!("launch the bootstrap supervisor for '{}'", blank.node),
+        )
+        .await?;
+    }
+
+    let status = wait_ztp_convergence(runtime, substrate, &service_ns).await?;
+    println!(
+        "ZTP converged: {}/{} node(s) healthy (failed: {}, missing: {}).",
+        status.healthy,
+        status.expected,
+        status.failed,
+        status.missing.len()
+    );
+    wait_lab_reachability(lab, runtime, substrate).await?;
+    println!(
+        "Routed reachability converged across {} ordered node pair(s).",
+        lab.reachability_pairs().len()
+    );
+    Ok(())
+}
+
+fn ztp_supervisor_script(
+    service_ns: &str,
+    address: std::net::Ipv4Addr,
+    sot: &str,
+    log: &str,
+    pid_file: &str,
+) -> String {
+    format!(
+        "{{ while [ -e /var/run/netns/{} ]; do \
+         ip netns exec {} /usr/local/bin/devbox-ztpd \
+         -listen {}:8080 -metrics 127.0.0.1:9090 -advertise {} -sot {}; \
+         sleep 2; done; }} >> {} 2>&1 </dev/null & echo $! > {}",
+        service_ns, service_ns, address, address, sot, log, pid_file,
+    )
+}
+
+async fn run_checked(
+    runtime: &dyn Runtime,
+    substrate: &str,
+    command: &[&str],
+    action: &str,
+) -> Result<()> {
+    let result = runtime
+        .exec_cmd(substrate, command, false)
+        .await
+        .with_context(|| format!("could not {action}"))?;
+    if result.exit_code != 0 {
+        bail!("could not {action}: {}", result.stderr.trim());
+    }
+    Ok(())
+}
+
+async fn wait_http_health(
+    runtime: &dyn Runtime,
+    substrate: &str,
+    namespace: &str,
+    url: &str,
+) -> Result<()> {
+    for _ in 0..30 {
+        let result = runtime
+            .exec_cmd(
+                substrate,
+                &[
+                    "sudo", "ip", "netns", "exec", namespace, "wget", "-qO-", url,
+                ],
+                false,
+            )
+            .await;
+        if result.is_ok_and(|result| result.exit_code == 0) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    bail!("the service did not become healthy within 6 seconds")
+}
+
+async fn wait_ztp_convergence(
+    runtime: &dyn Runtime,
+    substrate: &str,
+    service_namespace: &str,
+) -> Result<ZtpStatus> {
+    let mut latest = None;
+    for _ in 0..150 {
+        let result = runtime
+            .exec_cmd(
+                substrate,
+                &[
+                    "sudo",
+                    "ip",
+                    "netns",
+                    "exec",
+                    service_namespace,
+                    "wget",
+                    "-qO-",
+                    "http://127.0.0.1:9090/status",
+                ],
+                false,
+            )
+            .await;
+        if let Ok(result) = result
+            && result.exit_code == 0
+            && let Ok(status) = serde_json::from_str::<ZtpStatus>(&result.stdout)
+        {
+            if status.converged && status.expected > 0 && status.healthy == status.expected {
+                return Ok(status);
+            }
+            latest = Some(status);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    match latest {
+        Some(status) => bail!(
+            "ZTP did not converge within 150 seconds: {}/{} healthy, {} failed, missing [{}]",
+            status.healthy,
+            status.expected,
+            status.failed,
+            status.missing.join(", ")
+        ),
+        None => bail!("the ZTP status API did not answer within 150 seconds"),
+    }
+}
+
+async fn wait_lab_reachability(lab: &Lab, runtime: &dyn Runtime, substrate: &str) -> Result<()> {
+    let commands = lab.reachability_commands();
+    let mut last_failure = String::new();
+    for _ in 0..30 {
+        let mut ready = true;
+        for (from, to, command) in &commands {
+            let argv: Vec<&str> = command.iter().map(String::as_str).collect();
+            let result = runtime.exec_cmd(substrate, &argv, false).await?;
+            if result.exit_code != 0 {
+                last_failure = format!("{from} -> {to}: {}", result.stderr.trim());
+                ready = false;
+                break;
+            }
+        }
+        if ready {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!(
+        "ZTP nodes reported healthy, but the routed reachability matrix did not \
+         converge within 30 seconds; last failure: {last_failure}"
+    )
 }
 
 /// Parse the `--direction` flag.
@@ -587,7 +982,7 @@ fn parse_direction(text: &str) -> Result<Direction> {
     }
 }
 
-async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
+pub(crate) async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
     let lab = Lab::resolve(&args.target)?;
     let link = fault::find_link(&lab.topology, &args.link)?;
     let direction = parse_direction(&args.direction)?;
@@ -619,6 +1014,9 @@ async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
         print_commands(&commands);
         return Ok(());
     }
+    let _lab_claim =
+        crate::web::build::claim_box(&manager.state_dir, &format!("lab-operation-{}", lab.name()))
+            .context("another process is already changing this lab")?;
 
     let (runtime, substrate) = resolve_substrate(
         manager,
@@ -634,7 +1032,7 @@ async fn inject(args: FaultArgs, manager: &SandboxManager) -> Result<()> {
     Ok(())
 }
 
-async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
+pub(crate) async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
     let lab = Lab::resolve(&args.target)?;
     let link = fault::find_link(&lab.topology, &args.link)?;
     let commands = fault::heal(lab.name(), &link, Direction::Both);
@@ -643,6 +1041,9 @@ async fn heal(args: HealArgs, manager: &SandboxManager) -> Result<()> {
         print_commands(&commands);
         return Ok(());
     }
+    let _lab_claim =
+        crate::web::build::claim_box(&manager.state_dir, &format!("lab-operation-{}", lab.name()))
+            .context("another process is already changing this lab")?;
 
     let (runtime, substrate) = resolve_substrate(
         manager,
@@ -773,17 +1174,36 @@ async fn resolve_substrate(
     let state = manager.get_sandbox(&name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
-    // A lab needs network namespaces and veth pairs, which need CAP_NET_ADMIN.
-    // devbox creates Docker boxes without it, so such a substrate is accepted
-    // and then fails on the first `ip netns add` — after the user has waited
-    // for everything before it.
+    // A lab needs to create persistent network namespaces. Normal devbox
+    // Docker boxes deliberately lack CAP_SYS_ADMIN, but an explicitly
+    // privileged container can be a useful CI substrate. Probe the exact
+    // operation instead of rejecting every Docker runtime by label: this both
+    // fails before any real lab namespace exists and lets the production
+    // orchestration run end-to-end in its privileged acceptance test.
     if state.runtime == "docker" {
-        bail!(
-            "box '{name}' runs under Docker without the capabilities a lab needs \
-             (network namespaces and veth pairs require CAP_NET_ADMIN).\n  \
-             Use a VM substrate — `devbox create --runtime lima` — and pass it \
-             with `--substrate <name>`."
-        );
+        let probe = runtime
+            .exec_cmd(
+                &name,
+                &[
+                    "sh",
+                    "-c",
+                    &crate::policy::enforce::elevated(
+                        "ns=devbox-capability-probe-$$; \
+                         ip netns add \"$ns\" >/dev/null 2>&1 || exit 1; \
+                         ip netns del \"$ns\" >/dev/null 2>&1",
+                    ),
+                ],
+                false,
+            )
+            .await;
+        if !probe.is_ok_and(|result| result.exit_code == 0) {
+            bail!(
+                "box '{name}' runs under Docker without the privileges a lab needs \
+                 (persistent network namespaces require CAP_SYS_ADMIN and \
+                 CAP_NET_ADMIN).\n  Use a VM substrate — `devbox create --runtime lima` \
+                 — and pass it with `--substrate <name>`."
+            );
+        }
     }
 
     if runtime.status(&name).await? != SandboxStatus::Running {
@@ -887,5 +1307,19 @@ mod tests {
                 assert!(!text.contains(meta), "{text} contains {meta}");
             }
         }
+    }
+
+    #[test]
+    fn ztp_supervisor_detaches_the_entire_loop_and_uses_the_netns_handle() {
+        let script = ztp_supervisor_script(
+            "devbox-ztp-svc",
+            "10.0.0.2".parse().unwrap(),
+            "/etc/devbox/lab/ztp/ztp",
+            "/run/devbox/lab/ztp/svc/ztpd.log",
+            "/run/devbox/lab/ztp/svc/ztpd.supervisor.pid",
+        );
+        assert!(script.starts_with("{ while [ -e /var/run/netns/devbox-ztp-svc ]"));
+        assert!(script.contains("; done; } >> /run/devbox/lab/ztp/svc/ztpd.log 2>&1 </dev/null &"));
+        assert!(!script.contains("ip netns list"));
     }
 }

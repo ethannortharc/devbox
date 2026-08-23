@@ -12,10 +12,10 @@ devbox
 
 That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and opens a local web console where you can watch and govern everything the box does.
 
-> **v4 is in progress on the `v4` branch.** It keeps the v3 sandbox core and
-> replaces the terminal UI with a local web console, adds eBPF-based
-> observability and egress policy, and adds a multi-node network lab.
-> Start at [docs/quickstart-v4.md](docs/quickstart-v4.md).
+v4 keeps the proven sandbox core and replaces the terminal UI with a local web
+console, continuous eBPF/proc observability, live egress policy, real packet
+capture, multi-node network labs, and zero-touch fabric provisioning. Start at
+[the v4 quickstart](docs/quickstart-v4.md).
 
 ---
 
@@ -57,11 +57,21 @@ did this run do that the last one didn't?" the same way `devbox diff` answers
 
 ---
 
-## Default Workspace
+## Local web console
 
-![Default Workspace](docs/screenshot-workspace.png)
+![devbox v4 console](docs/screenshot-console.png)
 
-Four tabs, ready to go: **Workspace** (AI coding + brainstorm + file browser), **DevBox** (monitor + help + management), **Shell** (plain terminal), and **Git** (lazygit).
+The console manages box creation and lifecycle, streamed Nix rebuilds, Activity
+and flow pcaps, egress policy, overlay files, a browser terminal, and routed Lab
+topologies. It binds loopback only and gives every launch a random
+`devbox-….localhost` browser origin. A one-time URL token installs a key in that
+origin's storage and requests send it explicitly as `x-devbox-key`; it is never
+a cookie or a navigable URL credential. Open as many tabs as you need: typing
+the bound loopback address shown by `devbox web` (`http://127.0.0.1:7878` by
+default) redirects each tab to the current private origin. `Host`, origin, and
+framing guards protect the console. Browser profiles do not share credentials:
+open the launch URL printed by `devbox web` once in each profile (for example,
+once in Chrome and once in an embedded browser) before using its bare address.
 
 ---
 
@@ -111,7 +121,7 @@ ssh -L 3000:localhost:3000 -p $(limactl show-ssh --format=port devbox-myapp) $(w
 devbox create --name shared-api --tools go,docker
 
 # From your laptop: SSH in and attach
-ssh yourserver -t "devbox shell --name shared-api"
+ssh yourserver -t "devbox shell shared-api"
 ```
 
 ---
@@ -120,11 +130,15 @@ ssh yourserver -t "devbox shell --name shared-api"
 
 ### Prerequisites
 
-- A VM runtime:
+- A supported VM runtime for the default protected-overlay workspace:
   - [Lima](https://lima-vm.io/) (macOS, recommended)
   - [Incus](https://linuxcontainers.org/incus/) (Linux, recommended)
-  - [Multipass](https://multipass.run/) (macOS/Linux)
-  - [Docker](https://www.docker.com/) (any platform, fallback)
+
+Docker is available only as an explicit, weaker-isolation base box:
+`devbox create --runtime docker --image ubuntu --writable --bare`. It is not
+an automatic fallback because it cannot provide the protected OverlayFS
+contract. New Multipass boxes are disabled until image and read-only mount
+semantics can be guaranteed; existing registered boxes remain manageable.
 
 ### Install
 
@@ -132,13 +146,18 @@ ssh yourserver -t "devbox shell --name shared-api"
 curl -fsSL https://raw.githubusercontent.com/ethannortharc/devbox/main/install.sh | sh
 ```
 
-Or build from source (requires Rust 1.89+):
+Or build from source (requires Rust 1.89+ and Go 1.26+; Go builds the embedded
+Linux observability agent and ZTP server):
 
 ```bash
 git clone https://github.com/ethannortharc/devbox.git
 cd devbox
 cargo install --path .
 ```
+
+Release/packaging builds may supply matching binaries with
+`DEVBOX_OBSD_BINARY=/path/to/devbox-obsd` and
+`DEVBOX_ZTPD_BINARY=/path/to/devbox-ztpd` instead of invoking Go.
 
 ### Verify your system
 
@@ -164,7 +183,7 @@ devbox create --image ubuntu --tools python
 
 ```bash
 # Attach to an existing sandbox
-devbox shell --name myapp
+devbox shell myapp
 
 # Run a one-off command inside the sandbox
 devbox exec --name myapp -- make test
@@ -179,15 +198,16 @@ devbox commit
 devbox discard
 
 # Stop or destroy
-devbox stop --name myapp
-devbox destroy --name myapp
+devbox stop myapp
+devbox destroy myapp
 ```
 
 ### Managing tools
 
 ```bash
 devbox upgrade --tools rust       # Add Rust toolchain to running sandbox
-devbox packages                   # Open TUI package manager
+devbox sets list                  # Inspect declarative sets
+devbox sets apply --set system --set git --set lang-rust
 devbox nix add <package>          # Add any nixpkgs package
 devbox guide lazygit              # Show cheat sheet for a tool
 ```
@@ -206,6 +226,8 @@ Devbox prioritizes protecting your host filesystem and providing safe, reversibl
 | **VM boundary** | Full VM isolation (not containers). Your host OS is never modified. |
 | **Credential safety** | No credentials are stored in the sandbox state. API keys are passed via environment variables, never written to disk. |
 | **Writable opt-in** | Direct host mount requires explicit `--writable` flag. Default is always safe overlay mode. |
+| **Behaviour audit** | A background collector persists process, network, DNS, TLS and workspace-file events per box. |
+| **Egress policy** | `allowlist`, `mirror-only`, and `isolated` postures compile to live nftables enforcement. |
 
 ```bash
 devbox diff                      # Review overlay changes
@@ -275,8 +297,9 @@ All layer operations are also available in the **DevBox Management Panel** insid
 
 | Command | Description |
 |---------|-------------|
-| `devbox` | Create or attach (smart default) |
+| `devbox` | Ensure a box for this project and open its console page |
 | `devbox create` | Create a new sandbox |
+| `devbox web` | Open the local web console without touching a box |
 | `devbox shell` | Attach to a sandbox |
 | `devbox exec <cmd>` | Run a command inside the sandbox |
 | `devbox stop` | Stop a sandbox |
@@ -285,7 +308,11 @@ All layer operations are also available in the **DevBox Management Panel** insid
 | `devbox status` | Show detailed sandbox status |
 | `devbox use <name>` | Switch sandbox to current directory |
 | `devbox upgrade --tools <set>` | Add tools to a running sandbox |
-| `devbox packages` | Open TUI package manager |
+| `devbox sets list/apply` | Inspect or rebuild the declarative set selection |
+| `devbox watch` | Query or stream captured activity |
+| `devbox behavior summary/diff/pcap` | Compare runs or capture a real flow pcap |
+| `devbox policy show/set/allow/test/rules` | Inspect and enforce egress posture |
+| `devbox lab list/up/down/status/config/fault/heal` | Operate routed network labs |
 | `devbox diff` | Show overlay changes vs host |
 | `devbox commit` | Sync overlay changes to host |
 | `devbox discard` | Throw away overlay changes |
@@ -402,9 +429,10 @@ docker, docker-compose, lazydocker (TUI), dive (image analyzer), buildkit, skope
 </details>
 
 <details>
-<summary><b>network</b> -- 7 packages</summary>
+<summary><b>network</b> -- 13 packages</summary>
 
-tailscale, mosh, nmap, tcpdump, bandwhich, trippy, doggo
+frr, dnsmasq, chrony, busybox, iproute2, conntrack-tools, tailscale, mosh,
+nmap, tcpdump, bandwhich, trippy, doggo
 
 </details>
 
@@ -436,7 +464,7 @@ Generated with `devbox init`, auto-detects your project settings.
 
 ```toml
 [sandbox]
-runtime = "auto"            # auto | lima | incus | multipass | docker
+runtime = "auto"            # auto | lima | incus | docker (explicit limited mode)
 image = "nixos"             # nixos | ubuntu
 mount_mode = "overlay"      # overlay (safe) | writable (direct)
 
@@ -444,7 +472,7 @@ mount_mode = "overlay"      # overlay (safe) | writable (direct)
 editor = true               # neovim, helix, nano
 git = true                  # git, lazygit, gh
 container = false           # docker, compose, lazydocker
-network = false             # tailscale, mosh, nmap
+network = false             # FRR/lab services + network diagnostics
 ai_code = true              # claude-code, codex, aider, aichat, ...
 ai_infra = false            # ollama, open-webui
 
@@ -457,6 +485,11 @@ node = false
 [resources]
 cpu = 4
 memory = "8GiB"
+
+[policy]
+egress = "mirror-only"      # open | allowlist | mirror-only | isolated
+allow = ["github.com"]
+alert_on_violation = true
 ```
 
 ### Global defaults
@@ -481,14 +514,15 @@ Both images install the same [120+ tools](docs/PACKAGES.md) from [nixpkgs](https
 
 ## Runtime Support
 
-Devbox auto-detects the best available VM runtime on your system.
+Devbox auto-detects only runtimes that implement the default NixOS protected
+overlay contract. Restricted runtimes must be selected explicitly.
 
-| Runtime | Platform | Priority |
-|---------|----------|----------|
-| Incus | Linux | Highest |
-| Lima | macOS | High |
-| Multipass | macOS/Linux | Medium |
-| Docker | Any | Fallback |
+| Runtime | Platform | New-box support |
+|---------|----------|-----------------|
+| Incus | Linux | Auto-detected; NixOS overlay or Ubuntu writable |
+| Lima | macOS | Auto-detected; NixOS overlay or Ubuntu writable |
+| Docker | Any | Explicit only: Ubuntu + writable + bare |
+| Multipass | macOS/Linux | Existing boxes only; new creation disabled |
 
 ---
 
@@ -497,8 +531,8 @@ Devbox auto-detects the best available VM runtime on your system.
 ```
 devbox (single binary)
   |
-  |-- CLI Layer (clap)
-  |     21 commands with consistent UX
+  |-- CLI + local web control plane
+  |     one lifecycle, policy, observability, terminal and Lab API
   |
   |-- Sandbox Manager
   |     Lifecycle: create -> start -> attach -> stop -> destroy
@@ -515,9 +549,13 @@ devbox (single binary)
   |     Base64-encoded push via shell commands
   |     Declarative package management via nixos-rebuild
   |
-  |-- Built-in Resources (compiled into binary)
-        14 tool cheat sheets (Markdown)
-        16 NixOS package set definitions
+  |-- Observability + control
+  |     embedded devbox-obsd, background collector, per-box SQLite
+  |     eBPF/proc capture, behavior diff, pcap, nftables policy
+  |
+  |-- Network Lab + ZTP
+        namespaces/veth/FRR/netem, DNS/NTP/DHCP role services
+        embedded devbox-ztpd, source of truth, config generation, SLOs
 ```
 
 ### Provisioning flow
@@ -526,8 +564,9 @@ devbox (single binary)
 2. Devbox pushes `.nix` config files into the VM at `/etc/devbox/`
 3. NixOS module is imported into the VM's system configuration
 4. `nixos-rebuild switch` installs all declared packages from binary cache
-5. Devbox binary and help files are copied into the VM
-6. Sandbox state is saved to `~/.devbox/sandboxes/<name>/`
+5. Matching observability/configuration agents and policy are installed
+6. Sandbox state is saved to `~/.devbox/sandboxes/<name>/` and the background
+   collector begins supervising it
 
 ---
 
@@ -537,8 +576,12 @@ devbox (single binary)
 # Build
 cargo build --release
 
-# Test (52 unit + 15 integration tests)
+# Test all Rust units and integrations
 cargo test
+
+# Go agent/ZTP and Python lab toolkit
+go test ./...
+(cd labkit && uv run pytest)
 
 # Lint
 cargo clippy -- -D warnings

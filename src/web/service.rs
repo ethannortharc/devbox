@@ -5,6 +5,8 @@
 //! status mapping, and the concurrent status fan-out. HTTP handlers stay thin
 //! and this layer stays testable without a server.
 
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +24,11 @@ use crate::sandbox::state::SandboxState;
 /// Runtime CLIs (`limactl`, `incus`, `docker`) occasionally hang on a stale
 /// socket. The dashboard must still render, so a slow probe degrades to
 /// `unknown` rather than blocking the page.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
+// Lima's status implementation has two bounded stages: the runtime list call
+// (4s) and, for a powered-on VM, a real guest-shell probe (3s). Keep the web
+// budget above their combined worst case or a useful `unreachable` diagnosis
+// is truncated into a generic `unknown` just before it arrives.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(9);
 
 /// A box as the console and the JSON API present it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -30,7 +36,7 @@ pub struct BoxSummary {
     pub name: String,
     pub runtime: String,
     pub project_dir: String,
-    /// One of `running`, `stopped`, `missing`, `unknown`.
+    /// One of `running`, `unreachable`, `stopped`, `missing`, `unknown`.
     pub status: String,
     pub mount_mode: String,
     pub sets: Vec<String>,
@@ -49,6 +55,7 @@ pub struct BoxSummary {
 pub fn status_label(status: &SandboxStatus) -> &'static str {
     match status {
         SandboxStatus::Running => "running",
+        SandboxStatus::Unreachable(_) => "unreachable",
         SandboxStatus::Stopped => "stopped",
         SandboxStatus::NotFound => "missing",
         SandboxStatus::Unknown(_) => "unknown",
@@ -69,7 +76,27 @@ pub fn summarize(state: &SandboxState, status: Option<&SandboxStatus>) -> BoxSum
         languages: state.languages.clone(),
         image: state.image.clone(),
         packages: state.packages.clone(),
-        created_at: state.created_at.clone(),
+        created_at: display_created_at(&state.created_at),
+    }
+}
+
+/// Normalize both current RFC 3339 timestamps and the legacy epoch marker
+/// emitted by early v4 runtimes. Unknown values are preserved for diagnosis.
+fn display_created_at(value: &str) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            value
+                .strip_suffix("s-since-epoch")
+                .and_then(|seconds| seconds.parse::<i64>().ok())
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        });
+
+    match parsed {
+        Some(date) => date.format("%Y-%m-%d %H:%M UTC").to_string(),
+        None if value.trim().is_empty() => "—".to_string(),
+        None => value.to_string(),
     }
 }
 
@@ -152,7 +179,7 @@ pub async fn start_box_holding_claim(
         // Running too, for the same reason as `attach`: a box that is already
         // up may have been started outside this path, or created moments ago,
         // and never had its posture installed. Applying is idempotent.
-        SandboxStatus::Running => crate::policy::enforce::apply_saved(manager, name, claim).await,
+        SandboxStatus::Running => {}
         SandboxStatus::Stopped => {
             // Two requests can see `Stopped` at once — clicking Start while the
             // Terminal tab opens is enough. Incus rejects the second start as
@@ -167,14 +194,54 @@ pub async fn start_box_holding_claim(
             {
                 return Err(e).with_context(|| format!("failed to start box '{name}'"));
             }
-            crate::policy::enforce::apply_saved(manager, name, claim).await
         }
         SandboxStatus::NotFound => bail!(
             "box '{name}' is registered but runtime '{}' does not have it; \
              run `devbox destroy {name}` to clean up the stale entry",
             state.runtime
         ),
+        SandboxStatus::Unreachable(reason) => bail!(
+            "box '{name}' is powered on but its guest shell is unreachable: {reason}. Stop the box, then start it again"
+        ),
         SandboxStatus::Unknown(s) => bail!("box '{name}' is in an unknown state: {s}"),
+    }
+
+    if let Err(policy_error) = crate::policy::enforce::apply_saved(manager, name, claim).await {
+        match runtime.stop(name).await {
+            Ok(()) => bail!(
+                "box '{name}' was started, but its saved egress posture could not be applied: {policy_error:#}. The box was stopped for safety"
+            ),
+            Err(stop_error) => bail!(
+                "box '{name}' was started, but its saved egress posture could not be applied: {policy_error:#}. The box could not be stopped and may still be running without that policy: {stop_error:#}. Run `devbox stop {name}` immediately"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Require a live box without changing its lifecycle state.
+///
+/// Terminal startup owns the only Start POST. The WebSocket handshake must be
+/// a pure attach; otherwise an explicit Stop between the POST and handshake is
+/// silently undone by the socket route.
+pub async fn require_running(manager: &SandboxManager, name: &str) -> Result<()> {
+    let state = manager.get_sandbox(name)?;
+    let runtime = manager.runtime_for_sandbox(&state)?;
+    match runtime.status(name).await? {
+        SandboxStatus::Running => Ok(()),
+        SandboxStatus::Stopped => {
+            bail!("box '{name}' is stopped; start it before opening a terminal")
+        }
+        SandboxStatus::NotFound => bail!(
+            "box '{name}' is registered but runtime '{}' does not have it",
+            state.runtime
+        ),
+        SandboxStatus::Unreachable(reason) => {
+            bail!("box '{name}' is powered on but its guest shell is unreachable: {reason}")
+        }
+        SandboxStatus::Unknown(status) => {
+            bail!("box '{name}' is in an unknown state: {status}")
+        }
     }
 }
 
@@ -194,14 +261,26 @@ pub async fn stop_box(manager: &Arc<SandboxManager>, name: &str) -> Result<()> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
-    match runtime.status(name).await? {
-        SandboxStatus::Running => runtime
+    match runtime.status(name).await {
+        Ok(SandboxStatus::Running)
+        | Ok(SandboxStatus::Unreachable(_))
+        | Ok(SandboxStatus::Unknown(_)) => runtime
             .stop(name)
             .await
             .with_context(|| format!("failed to stop box '{name}'")),
         // Already stopped, or gone from the runtime: either way there is
         // nothing to stop, and reporting an error would make the button lie.
-        _ => Ok(()),
+        Ok(SandboxStatus::Stopped | SandboxStatus::NotFound) => Ok(()),
+        // Stop is the recovery action. A failed preflight probe must not keep
+        // us from calling a runtime whose stop implementation has its own
+        // force/recovery path (notably Lima with a wedged SSH endpoint).
+        Err(error) => {
+            tracing::warn!(box_id = %name, error = %error, "status probe failed before stop; attempting recovery stop");
+            runtime
+                .stop(name)
+                .await
+                .with_context(|| format!("failed to recover and stop box '{name}'"))
+        }
     }
 }
 
@@ -362,6 +441,149 @@ pub fn parse_selection_form(body: &str) -> compose::Selection {
     }
 
     compose::Selection::new(sets, packages)
+}
+
+/// Validated input for one web-created box.
+#[derive(Debug, Clone)]
+pub struct CreateSpec {
+    pub name: String,
+    pub project_dir: PathBuf,
+    /// `None` means use the same auto-detection as the CLI.
+    pub runtime: Option<String>,
+    pub config: crate::sandbox::config::DevboxConfig,
+    pub bare: bool,
+}
+
+/// Parse and validate the create form before any runtime side effect.
+///
+/// Kept in the control plane rather than the handler so the HTTP and lifecycle
+/// concerns do not blend together, and so malformed resource values cannot
+/// reach a runtime command or Lima's generated YAML.
+pub fn parse_create_form(manager: &SandboxManager, body: &str) -> Result<CreateSpec> {
+    let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, value) in form_urlencoded::parse(body.as_bytes()) {
+        fields
+            .entry(key.into_owned())
+            .or_default()
+            .push(value.into_owned());
+    }
+    let one = |name: &str| {
+        fields
+            .get(name)
+            .and_then(|values| values.last())
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+    };
+
+    let project = one("project_dir");
+    if project.is_empty() {
+        bail!("project directory is required");
+    }
+    let project_dir = PathBuf::from(project)
+        .canonicalize()
+        .with_context(|| format!("project directory '{project}' does not exist"))?;
+    if !project_dir.is_dir() {
+        bail!(
+            "project path '{}' is not a directory",
+            project_dir.display()
+        );
+    }
+
+    let name = match one("name") {
+        "" => manager.name_from_dir(&project_dir),
+        explicit => explicit.to_string(),
+    };
+    if !crate::sandbox::state::is_safe_name(&name) {
+        bail!(
+            "box name must be 1-64 characters, not a path component, and free of control characters"
+        );
+    }
+
+    let runtime = match one("runtime") {
+        "" | "auto" => None,
+        value @ ("incus" | "lima" | "docker") => Some(value.to_string()),
+        other => bail!("unsupported runtime '{other}'"),
+    };
+    let image = match one("image") {
+        "" | "nixos" => "nixos",
+        "ubuntu" => "ubuntu",
+        other => bail!("unsupported image '{other}'"),
+    };
+    let mount_mode = match one("mount_mode") {
+        "" | "overlay" => "overlay",
+        "writable" => "writable",
+        other => bail!("unsupported mount mode '{other}'"),
+    };
+    let cpu = match one("cpu") {
+        "" | "0" => 0,
+        value => value
+            .parse::<u32>()
+            .with_context(|| format!("CPU count '{value}' is not a positive integer"))?,
+    };
+    if cpu > 256 {
+        bail!("CPU count {cpu} is unreasonable; choose 0-256");
+    }
+    let memory = one("memory");
+    if !valid_memory(memory) {
+        bail!("memory must look like 4096M, 4G, or 4GiB");
+    }
+
+    // The shared checklist parser canonicalizes locked sets and packages.
+    let mut selection = parse_selection_form(body);
+    let existing = crate::sandbox::config::DevboxConfig::load_for_edit(&project_dir)?;
+    let sources: BTreeMap<String, String> = selection
+        .packages
+        .iter()
+        .filter_map(|package| {
+            existing
+                .custom_packages
+                .get(package)
+                .filter(|source| source.as_str() != "nixpkgs")
+                .map(|source| (package.clone(), source.clone()))
+        })
+        .collect();
+    selection = selection.with_sources(sources);
+    selection.validate()?;
+
+    let mut config = existing;
+    config.sets = crate::sandbox::config::SetsSection::none();
+    config.languages = Default::default();
+    for set in &selection.sets {
+        if !config.enable_set(set) {
+            bail!("unknown set '{set}'");
+        }
+    }
+    config.custom_packages = selection.declared_sources().into_iter().collect();
+    config.sandbox.image = image.to_string();
+    config.sandbox.mount_mode = mount_mode.to_string();
+    config.resources.cpu = cpu;
+    config.resources.memory = memory.to_string();
+
+    let bare = fields.contains_key("bare");
+    if let Some(runtime) = runtime.as_deref() {
+        crate::sandbox::validate_create_contract(runtime, &config, bare)?;
+    }
+
+    Ok(CreateSpec {
+        name,
+        project_dir,
+        runtime,
+        config,
+        bare,
+    })
+}
+
+fn valid_memory(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 16 || !value.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
 }
 
 // ── policy (the Policy tab) ──────────────────────────────
@@ -640,6 +862,10 @@ mod tests {
     #[test]
     fn maps_every_runtime_status() {
         assert_eq!(status_label(&SandboxStatus::Running), "running");
+        assert_eq!(
+            status_label(&SandboxStatus::Unreachable("guest probe failed".into())),
+            "unreachable"
+        );
         assert_eq!(status_label(&SandboxStatus::Stopped), "stopped");
         assert_eq!(status_label(&SandboxStatus::NotFound), "missing");
         assert_eq!(
@@ -657,6 +883,17 @@ mod tests {
         assert_eq!(s.project_dir, "/Users/test/code/myapp");
         assert_eq!(s.sets, vec!["system", "git"]);
         assert_eq!(s.languages, vec!["rust"]);
+        assert_eq!(s.created_at, "2026-08-06 00:00 UTC");
+    }
+
+    #[test]
+    fn legacy_epoch_timestamps_are_readable() {
+        assert_eq!(
+            display_created_at("1773238855s-since-epoch"),
+            "2026-03-11 14:20 UTC"
+        );
+        assert_eq!(display_created_at(""), "—");
+        assert_eq!(display_created_at("runtime-specific"), "runtime-specific");
     }
 
     #[test]
@@ -727,6 +964,89 @@ mod tests {
         let sel = parse_selection_form("set=git&csrf=whatever&nonsense=1");
         assert!(sel.sets.contains("git"));
         assert_eq!(sel.sets.len(), 2, "git plus the locked system set");
+    }
+
+    #[test]
+    fn create_form_is_rooted_in_the_submitted_project() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: state.path().to_path_buf(),
+        };
+        let body = format!(
+            "project_dir={}&name=alpha&runtime=docker&image=ubuntu&mount_mode=writable&bare=on&cpu=4&memory=8GiB&set=git&set=lang-rust&packages=hyperfine",
+            form_urlencoded::byte_serialize(project.path().to_string_lossy().as_bytes())
+                .collect::<String>()
+        );
+
+        let spec = parse_create_form(&manager, &body).unwrap();
+        assert_eq!(spec.name, "alpha");
+        assert_eq!(spec.project_dir, project.path().canonicalize().unwrap());
+        assert_eq!(spec.runtime.as_deref(), Some("docker"));
+        assert_eq!(spec.config.sandbox.image, "ubuntu");
+        assert_eq!(spec.config.sandbox.mount_mode, "writable");
+        assert_eq!(spec.config.resources.cpu, 4);
+        assert_eq!(spec.config.resources.memory, "8GiB");
+        assert!(spec.bare);
+        assert!(spec.config.sets.git);
+        assert!(spec.config.languages.rust);
+        assert!(!spec.config.languages.go);
+        assert_eq!(
+            spec.config
+                .custom_packages
+                .get("hyperfine")
+                .map(String::as_str),
+            Some("nixpkgs")
+        );
+    }
+
+    #[test]
+    fn create_form_rejects_values_before_runtime_selection() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: state.path().to_path_buf(),
+        };
+        let encoded = form_urlencoded::byte_serialize(project.path().to_string_lossy().as_bytes())
+            .collect::<String>();
+
+        for tail in [
+            "runtime=made-up",
+            "memory=%22%0Aevil%3A+true",
+            "cpu=9999",
+            "name=..",
+            "set=not-a-set",
+        ] {
+            let body = format!("project_dir={encoded}&{tail}");
+            assert!(
+                parse_create_form(&manager, &body).is_err(),
+                "accepted {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_form_rejects_unimplemented_runtime_contracts() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: state.path().to_path_buf(),
+        };
+        let encoded = form_urlencoded::byte_serialize(project.path().to_string_lossy().as_bytes())
+            .collect::<String>();
+
+        for tail in [
+            "runtime=multipass&image=nixos&mount_mode=overlay",
+            "runtime=lima&image=ubuntu&mount_mode=overlay",
+            "runtime=docker&image=ubuntu&mount_mode=writable",
+            "runtime=docker&image=nixos&mount_mode=writable&bare=on",
+        ] {
+            let body = format!("project_dir={encoded}&{tail}");
+            assert!(
+                parse_create_form(&manager, &body).is_err(),
+                "accepted unsupported contract {tail}"
+            );
+        }
     }
 
     #[test]

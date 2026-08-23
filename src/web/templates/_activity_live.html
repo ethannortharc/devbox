@@ -1,0 +1,193 @@
+<section class="situation">
+  <div class="situation-head">
+    <div>
+      <span class="eyebrow">Window</span>
+      <h3>{% if totals.started.is_empty() %}Nothing captured yet{% else %}{{ totals.started }} → {{ totals.ended }}{% endif %}</h3>
+    </div>
+    <div class="situation-figures">
+      <span><b>{{ totals.events }}</b> events</span>
+      <span><b>{{ totals.processes }}</b> processes</span>
+      <span><b>{{ totals.peers }}</b> peers</span>
+      <span><b>{{ totals.bytes_tx }}</b> out</span>
+      <span><b>{{ totals.bytes_rx }}</b> in</span>
+      {% if totals.blocked > 0 %}
+      <span class="figure-blocked"><b>{{ totals.blocked }}</b> blocked</span>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if timeline.is_empty() %}
+  <p class="muted">No events in this window.</p>
+  {% else %}
+  <div class="sparkstrip" role="img"
+       aria-label="Event density across the window, coloured by the dominant kind of activity.">
+    {% for b in timeline %}
+    <span class="spark spark-{{ b.domain }}"
+          style="height: {{ b.height }}%"
+          title="{{ b.label }} · {{ b.total }} events · mostly {{ b.domain }}"></span>
+    {% endfor %}
+  </div>
+  <div class="sparkaxis">
+    <span>{{ totals.started }}</span>
+    <span class="spacer"></span>
+    <span>{{ totals.ended }}</span>
+  </div>
+  {% endif %}
+</section>
+
+  <nav class="actswitch" aria-label="Activity views">
+    <label for="v-stream">Stream</label>
+    <label for="v-peers">Peers <b>{{ peers.len() }}</b></label>
+    <label for="v-flows">Flows <b>{{ flows.len() }}</b></label>
+    <label for="v-dns">DNS <b>{{ lookups.len() }}</b></label>
+    <label for="v-proc">Processes <b>{{ tree.len() }}</b></label>
+    <label for="v-files">Files <b>{{ files.len() }}</b></label>
+    <label for="v-policy" class="{% if !violations.is_empty() %}label-alert{% endif %}">Policy <b>{{ violations.len() }}</b></label>
+  </nav>
+
+  {# ── peers ──────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-peers">
+    {% if peers.is_empty() %}
+    <p class="muted">This box has not talked to anything.</p>
+    {% else %}
+    <div class="tablewrap">
+      <table class="data">
+        <thead><tr><th>peer</th><th>ports</th><th>conns</th><th>↑ out</th><th>↓ in</th><th>processes</th><th>policy</th></tr></thead>
+        <tbody>
+          {% for p in peers %}
+          <tr class="peer-{{ p.verdict }}">
+            <td class="cell-peer">{{ p.peer }}</td>
+            <td>{{ p.ports }}</td>
+            <td>{{ p.connections }}</td>
+            <td>{{ p.bytes_tx }}</td>
+            <td>{{ p.bytes_rx }}</td>
+            <td>{{ p.processes }}</td>
+            <td><span class="verdict verdict-{{ p.verdict }}">{{ p.verdict }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+
+  {# ── flows ──────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-flows">
+    {% if flows.is_empty() %}
+    <p class="muted">No connections recorded.</p>
+    {% else %}
+    <div class="tablewrap">
+      <table class="data">
+        <thead>
+          <tr><th>peer</th><th>port</th><th>proto</th><th>alpn</th><th>↑</th><th>↓</th><th>process</th><th>capture</th></tr>
+        </thead>
+        <tbody>
+          {% for f in flows %}
+          <tr>
+            <td class="cell-peer" title="{{ f.addr }}">{{ f.peer }}</td>
+            <td>{{ f.port }}</td>
+            <td>{{ f.proto }}</td>
+            <td>{{ f.alpn }}</td>
+            <td>{{ f.tx() }}</td>
+            <td>{{ f.rx() }}</td>
+            <td>{{ f.comm }}·{{ f.pid }}</td>
+            <td>
+              <a data-download="{{ boxname }}-flow-{{ f.pid }}.pcap"
+                 data-method="POST"
+                 href="/api/boxes/{{ boxname|urlencode_strict }}/flows/pcap?proto={{ f.proto|urlencode_strict }}{% if let Some(saddr) = f.capture_saddr %}&amp;saddr={{ saddr|urlencode_strict }}{% endif %}&amp;daddr={{ f.addr|urlencode_strict }}&amp;dport={{ f.port }}">pcap</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+
+  {# ── dns ────────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-dns">
+    {% if lookups.is_empty() %}
+    <p class="muted">No lookups recorded.</p>
+    {% else %}
+    <div class="tablewrap">
+      <table class="data">
+        <thead><tr><th>time</th><th>name</th><th>type</th><th>answers</th><th>process</th></tr></thead>
+        <tbody>
+          {% for l in lookups %}
+          <tr>
+            <td>{{ l.ts }}</td>
+            <td class="cell-peer">{{ l.name }}</td>
+            <td>{{ l.qtype }}</td>
+            <td>{% if l.answers.is_empty() %}<span class="muted">no answer</span>{% else %}{{ l.answers|join(", ") }}{% endif %}</td>
+            <td>{{ l.comm }}·{{ l.pid }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+
+  {# ── processes ──────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-proc">
+    {% if tree.is_empty() %}
+    <p class="muted">No processes recorded.</p>
+    {% else %}
+    <ul class="ptree">
+      {% for row in tree %}
+      <li style="padding-left: {{ row.depth }}rem">
+        <span class="ev-proc">{{ row.chain.comm }}<span class="ev-pid">·{{ row.chain.pid }}</span></span>
+        {% if let Some(cmd) = row.chain.command %}<code>{{ cmd }}</code>{% endif %}
+        {% if !row.chain.peers.is_empty() %}
+        <span class="muted">→ {{ row.chain.peers|join(", ") }}</span>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  {# ── files ──────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-files">
+    {% if files.is_empty() %}
+    <p class="muted">No file activity recorded. File capture needs the eBPF probes.</p>
+    {% else %}
+    <div class="tablewrap">
+      <table class="data">
+        <thead><tr><th>time</th><th>op</th><th>path</th><th>process</th></tr></thead>
+        <tbody>
+          {% for f in files %}
+          <tr><td>{{ f.ts }}</td><td>{{ f.op }}</td><td class="cell-path">{{ f.path }}</td><td>{{ f.comm }}·{{ f.pid }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+
+  {# ── policy ─────────────────────────────────────────────────────── #}
+  <section class="actpanel actpanel-policy">
+    <div class="policy-posture">
+      <span class="eyebrow">Posture seen in this window</span>
+      <strong>{% if let Some(mode) = egress_mode %}{{ mode }}{% else %}not recorded{% endif %}</strong>
+    </div>
+    {% if violations.is_empty() %}
+    <p class="muted">Policy refused nothing in this window.</p>
+    {% else %}
+    <div class="tablewrap">
+      <table class="data data-violations">
+        <thead><tr><th>time</th><th>target</th><th>verdict</th><th>reason</th></tr></thead>
+        <tbody>
+          {% for v in violations %}
+          <tr>
+            <td>{{ v.ts }}</td>
+            <td class="cell-peer">{{ v.target }}</td>
+            <td><span class="verdict verdict-blocked">{{ v.verdict }}</span></td>
+            <td>{{ v.reason }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 
 use self::rebuild::{nixos_rebuild, write_devbox_nix, write_nix_file, write_state_toml};
-use self::sets::{NIX_SETS, generate_set_nix, generate_sets_default_nix, generate_state_toml};
+use self::sets::{NIX_SETS, generate_set_nix, generate_state_toml};
 use crate::runtime::Runtime;
 use crate::sandbox::config::DevboxConfig;
 
@@ -37,43 +37,19 @@ pub async fn apply_config(
     let state_toml = generate_state_toml(&sets, &languages, &config.custom_packages);
     write_state_toml(runtime, sandbox_name, &state_toml).await?;
 
-    // Write all set Nix files
-    write_nix_file(
-        runtime,
-        sandbox_name,
-        "default.nix",
-        &generate_sets_default_nix(),
-    )
-    .await?;
-
-    for set in NIX_SETS {
-        let content = generate_set_nix(set);
-        let filename = format!("{}.nix", set.name);
-        write_nix_file(runtime, sandbox_name, &filename, &content).await?;
+    // Write all set Nix files — the checked-in modules, for the reason
+    // `write_set_modules` gives. This path had the same defect and no
+    // exemption for the AI sets, so `devbox upgrade` replaced their `tryEval`
+    // guards with a flat list: one tool missing from the channel then failed
+    // the rebuild of a box whose selection the user had not touched.
+    for (filename, content) in sets::NIX_SET_FILES {
+        write_nix_file(runtime, sandbox_name, filename, content).await?;
     }
 
     // Rebuild
     nixos_rebuild(runtime, sandbox_name).await?;
 
     Ok(())
-}
-
-/// Sets whose module is checked in rather than generated.
-///
-/// Their packages are optional by nature, so the module guards each one with
-/// `tryEval`. A generated flat list has no such guard.
-const GUARDED_SETS: &[&str] = &["ai-code", "ai-infra"];
-
-/// The checked-in module source for a guarded set.
-///
-/// Embedded at compile time so the binary carries it: these are pushed into a
-/// box that has no copy of the repository.
-fn embedded_set_nix(name: &str) -> Option<&'static str> {
-    match name {
-        "ai-code" => Some(include_str!("../../nix/sets/ai-code.nix")),
-        "ai-infra" => Some(include_str!("../../nix/sets/ai-infra.nix")),
-        _ => None,
-    }
 }
 
 /// Push the Nix set modules and the composed `configuration.nix` for a
@@ -106,31 +82,24 @@ pub async fn write_set_modules(
         runtime,
         sandbox_name,
         "default.nix",
-        &generate_sets_default_nix(),
+        sets::set_file("default").expect("the set index is embedded"),
     )
     .await?;
 
     for set in NIX_SETS {
-        // The AI sets ship as checked-in modules that wrap each optional tool
-        // in `tryEval`, because some of them are absent or broken on a given
-        // nixpkgs channel. Regenerating them as flat package lists throws that
-        // away, so one unavailable optional tool fails the entire rebuild —
-        // for the set that is on by default.
-        if GUARDED_SETS.contains(&set.name) {
-            write_nix_file(
-                runtime,
-                sandbox_name,
-                &format!("{}.nix", set.name),
-                embedded_set_nix(set.name).unwrap_or(&generate_set_nix(set)),
-            )
-            .await?;
-            continue;
-        }
+        // The checked-in module, not a list regenerated from `NIX_SETS`. A set
+        // is a Nix expression and only some of them are a flat list of names:
+        // the AI sets wrap each optional tool in `tryEval` so one tool missing
+        // from a channel does not fail the whole rebuild, and `network` builds
+        // a derivation to put FRR's daemons on PATH. Regenerating dropped
+        // whatever did not survive the round trip — and dropped it only on
+        // `sets apply`, so a box was correct when created and quietly lost
+        // those packages the first time its selection was touched.
         write_nix_file(
             runtime,
             sandbox_name,
             &format!("{}.nix", set.name),
-            &generate_set_nix(set),
+            sets::set_file(set.name).unwrap_or(&generate_set_nix(set)),
         )
         .await?;
     }

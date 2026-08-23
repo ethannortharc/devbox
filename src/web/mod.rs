@@ -11,11 +11,13 @@ pub mod assets;
 pub mod auth;
 pub mod build;
 pub mod help;
+pub mod labs;
 pub mod routes;
 pub mod server;
 pub mod service;
 pub mod sse;
 pub mod state;
+pub mod tail;
 pub mod term;
 pub mod watch;
 

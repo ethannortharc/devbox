@@ -20,8 +20,9 @@ htmx.config.responseHandling = [
   // 4xx carries an explanation the user needs to see. Still marked as an error
   // so htmx fires htmx:responseError for anything listening.
   { code: '4..', swap: true, error: true },
-  // 5xx is a bug rather than a message; leave the page as it was.
-  { code: '5..', swap: false, error: true },
+  // 5xx responses are escaped, designed error fragments. Showing them is
+  // essential: otherwise a server failure looks exactly like a dead button.
+  { code: '5..', swap: true, error: true },
 ];
 
 // Every htmx request presents the console key.
@@ -35,6 +36,161 @@ document.addEventListener('htmx:configRequest', function (e) {
   var key = window.devboxKey.get();
   if (key) {
     e.detail.headers['X-Devbox-Key'] = key;
+  }
+});
+
+// Apply every live grid snapshot card by card. Replacing the whole grid would
+// detach an active request target, while doing so immediately after the request
+// would erase its actionable error response. Per-card merging protects active
+// cards and carries same-state errors while every other box keeps updating.
+function mergeBoxesSnapshot(html) {
+  var grid = document.getElementById('box-grid');
+  if (!grid) return;
+
+  var template = document.createElement('template');
+  template.innerHTML = html;
+  var incoming = new Map();
+  template.content.querySelectorAll('.card[data-box-name]').forEach(function (card) {
+    incoming.set(card.dataset.boxName, card);
+  });
+
+  var installed = [];
+  grid.querySelectorAll('.card[data-box-name]').forEach(function (current) {
+    var name = current.dataset.boxName;
+    // htmx adds the request class to the resolved indicator itself. Lifecycle
+    // buttons use `hx-indicator="closest .card"`, so the class normally lives
+    // on `current`; keep the descendant check for future nested indicators.
+    if (current.matches('.htmx-request') || current.querySelector('.htmx-request')) {
+      incoming.delete(name);
+      return;
+    }
+
+    var replacement = incoming.get(name);
+    if (replacement) {
+      incoming.delete(name);
+      preserveLifecycleErrorForSameStatus(current, replacement);
+      current.replaceWith(replacement);
+      installed.push(replacement);
+    } else {
+      current.remove();
+    }
+  });
+
+  incoming.forEach(function (card) {
+    grid.appendChild(card);
+    installed.push(card);
+  });
+
+  if (!grid.querySelector('.card[data-box-name]')) {
+    grid.innerHTML = html;
+    htmx.process(grid);
+    return;
+  }
+  grid.querySelectorAll('.empty').forEach(function (empty) {
+    empty.remove();
+  });
+  installed.forEach(function (card) {
+    htmx.process(card);
+  });
+}
+
+// Carry a lifecycle error only across a snapshot that confirms the same state.
+// This protects a fail-closed Start response from the next notice-free stopped
+// snapshot, while a real transition from another tab or the CLI clears the now
+// stale error. The server renders this status marker on every card.
+function preserveLifecycleErrorForSameStatus(current, incoming) {
+  var error = current && current.querySelector('.inline-feedback.error');
+  if (
+    !error ||
+    !current.dataset.boxStatus ||
+    current.dataset.boxStatus !== incoming.dataset.boxStatus ||
+    incoming.querySelector('.inline-feedback.error')
+  ) {
+    return false;
+  }
+  incoming.appendChild(error.cloneNode(true));
+  return true;
+}
+
+// Keep an actionable lifecycle error while still accepting newer same-state
+// data for the detail card. A Start that fails closed commonly produces the
+// exact stopped state the watcher publishes next; replacing the response with
+// that notice-free snapshot made the reason disappear a few seconds later.
+function mergeDetailSnapshotPreservingError(html) {
+  var slot = document.getElementById('detail-card-slot');
+  var current = slot && slot.querySelector(':scope > .card');
+  if (!current || !current.querySelector('.inline-feedback.error')) return false;
+
+  var template = document.createElement('template');
+  template.innerHTML = html;
+  var incoming = template.content.querySelector('.card');
+  if (!incoming) return false;
+  if (!preserveLifecycleErrorForSameStatus(current, incoming)) return false;
+  current.replaceWith(incoming);
+  htmx.process(incoming);
+  document.dispatchEvent(new CustomEvent('devbox:card-updated'));
+  return true;
+}
+
+// Do not let a live status update replace a lifecycle request's target.
+//
+// Start can legitimately spend up to the VM readiness deadline waiting for a
+// guest shell. During that window the watcher sees `stopped -> unreachable`
+// and publishes a fresh grid. If it replaces the card carrying the request,
+// htmx later swaps the final success/error response into a detached node and
+// the user never sees it. Keeping the current grid for the duration also keeps
+// the operation's buttons disabled, so Stop cannot race an in-flight Start.
+// This script runs in <head>, before `document.body` exists. The event bubbles
+// from the swap target, so the document is both early-safe and sufficient.
+document.addEventListener('htmx:sseBeforeMessage', function (e) {
+  var type = e.detail.type || '';
+  var removesBox =
+    type.indexOf('box-card-') === 0 &&
+    (e.detail.data || '').indexOf('data-box-removed="true"') !== -1;
+
+  // A retained-status GET starts as soon as its panel is installed. If a
+  // newer completion SSE wins that race, remember it so the older HTTP
+  // snapshot cannot arrive afterwards and overwrite the final result.
+  if (type.indexOf('build-status-') === 0 && e.target.dataset) {
+    e.target.dataset.sseSeen = 'true';
+  }
+
+  if (type === 'boxes' && document.getElementById('box-grid')) {
+    mergeBoxesSnapshot(e.detail.data || '');
+    e.preventDefault();
+    return;
+  }
+
+  if (
+    type.indexOf('box-card-') === 0 &&
+    !removesBox &&
+    document.querySelector('#detail-card-slot .htmx-request')
+  ) {
+    e.preventDefault();
+    return;
+  }
+
+  if (
+    type.indexOf('box-card-') === 0 &&
+    !removesBox &&
+    mergeDetailSnapshotPreservingError(e.detail.data || '')
+  ) {
+    e.preventDefault();
+  }
+});
+
+document.addEventListener('htmx:beforeSwap', function (e) {
+  var target = e.detail.target;
+  var xhr = e.detail.xhr;
+  if (
+    target &&
+    target.dataset &&
+    target.dataset.buildStatus &&
+    target.dataset.sseSeen === 'true' &&
+    xhr &&
+    xhr.responseURL.indexOf('/api/operations/') !== -1
+  ) {
+    e.detail.shouldSwap = false;
   }
 });
 

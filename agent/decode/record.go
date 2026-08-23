@@ -192,6 +192,8 @@ func (c Clock) Wall(monoNS uint64) string {
 }
 
 // DecodeExec parses an exec record and builds the canonical event.
+//
+//nolint:revive // The explicit Decode prefix keeps all wire decoders searchable together.
 func DecodeExec(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 	var r ExecRecord
 	if err := binary.Read(bytes.NewReader(raw), order, &r); err != nil {
@@ -214,6 +216,8 @@ func DecodeExec(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 }
 
 // DecodeNet parses a connect/accept record.
+//
+//nolint:revive // The explicit Decode prefix keeps all wire decoders searchable together.
 func DecodeNet(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 	var r NetRecord
 	if err := binary.Read(bytes.NewReader(raw), order, &r); err != nil {
@@ -244,6 +248,8 @@ func DecodeNet(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 }
 
 // DecodeFile parses a file-access record.
+//
+//nolint:revive // The explicit Decode prefix keeps all wire decoders searchable together.
 func DecodeFile(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 	var r FileRecord
 	if err := binary.Read(bytes.NewReader(raw), order, &r); err != nil {

@@ -1102,15 +1102,18 @@ not secrets. The prior justification — "a browser new enough to be steered int
 this attack is new enough to send the header" — was answering a threat model
 with a browser in it.
 
-**Decision.** Two per-launch secrets, and no ambient credential at all.
+**Decision.** Two per-launch secrets, no ambient credential, and a new browser
+origin for every launch.
 
 - `token` rides the printed URL (`?t=…`) and buys exactly one thing: a bootstrap
   page that installs the key. It is never authority for anything else.
-- `key` lives in `sessionStorage`, which is scoped to an origin — *port
-  included* — so another loopback service cannot read it, and to a single tab.
-  It is presented as `X-Devbox-Key`, or as `?k=` on the two channels that
-  cannot set a header (`EventSource`, `WebSocket`), and never on a navigable
-  page.
+- The printed URL uses a random `devbox-….localhost` hostname that resolves to
+  loopback, while the listener remains fixed at `127.0.0.1:<port>`. `key` lives
+  in `localStorage`, scoped to that one-time origin — *port included*. Tabs for
+  the current launch can share it; another loopback service, the stable
+  `127.0.0.1` origin, and earlier launches cannot read it. It is presented as
+  `X-Devbox-Key`, or as `?k=` on the two channels that cannot set a header
+  (`EventSource`, `WebSocket`), and never on a navigable page.
 - A navigation cannot present anything, so it is answered with a fixed,
   data-free shell that fetches the real page itself. The shell is served to
   anyone and discloses less than `/metrics` already does.
@@ -1126,30 +1129,403 @@ attaches by itself, and there no longer is one. The `Origin` and fetch-metadata
 guards stay as defence in depth — a WebSocket upgrade is exempt from CORS — but
 nothing load-bearing rests on them.
 
-**Why per tab, added in round 40.** Same origin is not the same program. The
-console binds a predictable port, so a page served earlier from that port by
-something since stopped shares this origin exactly. `localStorage` is shared by
-every tab on an origin and announces writes through the `storage` event, so such
-a page — still open — was handed the key the instant the console installed it,
-and could replay it same-origin against the terminal and lifecycle routes. That
-is the cookie's failure again in miniature: a credential readable by something
-that is not the console.
+**Why a random origin, revised in round 41.** Same origin is not the same
+program. `localStorage` was unsafe on predictable `127.0.0.1:7878`: a page
+served earlier from that port by something since stopped could still be open
+and would receive the key. Moving only to `sessionStorage` closed that leak but
+made an independently opened tab unusable, which is not a product-ready console.
 
-`sessionStorage` is per tab, so no other tab can read it and no cross-tab event
-fires. **The residual, recorded rather than hidden:** within one tab, history or
-bfcache could restore that earlier page into a tab whose storage now holds the
-key. Nothing available to a page on a fixed loopback origin closes that. An
-ephemeral port would remove the predictable precondition instead, and was
-weighed and declined here — it costs the stable URL §6.1 specifies, and narrows
-rather than eliminates.
+The stable loopback URL is now an entry point rather than the credential's
+origin. Bare page navigations redirect to this launch's unguessable
+`devbox-<128-bit hex>.localhost` name. An old fixed-origin page cannot know or
+observe its storage, while every real console tab can share it. API clients and
+health checks may still use the bound loopback address directly.
 
-**Cost, recorded honestly.** The console needs JavaScript and `sessionStorage`,
-and both failure modes say so on the page. Per-launch keys mean a relaunched
-console leaves every open tab holding a dead key; that is answered with a 401,
-which clears the key and prints what to do. A freshly typed URL or bookmark
-during a live launch has no key and gets the same notice — tabs opened *from*
-the console inherit it, and session restore keeps it, so this is narrower than
-it sounds, and a bookmark never outlived a relaunch in any case.
+**Cost, recorded honestly.** The console needs JavaScript and `localStorage`,
+and both failure modes say so on the page. A restart creates a new hostname, so
+old tabs retain only an expired key on an origin the new service does not
+accept. The user opens the newly printed launch URL once; after that, new tabs
+can use either the header shortcut or the stable loopback URL.
 
 **Revisit.** Unchanged from ADR-0004: if the console is ever exposed beyond
 loopback (N1), this must become real auth, not a longer key.
+
+---
+
+## ADR-0049: the console tails the store, and pushes a signal rather than rows
+
+**Date:** 2026-08-22
+
+**Context.** The Activity tab refreshed itself with `hx-get … every 2s` and
+`hx-swap="innerHTML"`: it re-read two hundred events, re-rendered them, and
+replaced the whole stream twice a second whether or not anything had happened.
+Scroll position and text selection died on every swap, a burst inside the
+window was never seen, and a quiet box paid the same price as a busy one.
+
+`Collector::subscribe()` — an in-process fan-out of every stored event — had
+existed since Phase 3 with no consumer, and `sse.rs` still promised "(from
+Phase 3) the observability event feed". It cannot be the mechanism. ADR-0031
+moved the collector into its own long-lived process precisely so capture would
+not stop when the browser did, and a `tokio::broadcast` does not cross a
+process boundary.
+
+**Decision.** The event store is the shared medium, and the cursor is a row id
+paired with the identity of the store it indexes.
+
+- `Query` gains `after_id` and `before_id`; `Store::max_id` and
+  `Store::tail_scan` expose the tail. A tail is `WHERE id > ? AND id <= ?` on
+  the primary key: O(new rows), and nothing on an idle box.
+- The row id, not a timestamp: `ts_wall` ties for events captured in the same
+  millisecond, and a tie makes a resume either repeat a row or drop one.
+- **Paired with the store's inode**, because a row id alone does not identify a
+  position. A box destroyed and recreated under the same name gets a different
+  store whose ids start again at one, and a page holding id 10 either waits for
+  the new box to reach 10 — skipping its first ten events — or, once it has,
+  interleaves two boxes' events in one timeline with nothing marking the seam.
+  A cursor whose store no longer matches is reset, and that response carries
+  `HX-Reswap: innerHTML` so the page *replaces* its stream rather than
+  appending to it.
+- `tail_scan` returns the highest id **examined**, not the highest decoded. A
+  row written by an older schema still parses as a row; anchoring on what
+  survived decoding hands the caller the same undecodable rows forever.
+- One `max_id` per request bounds the backlog count, the page, and the cursor
+  the page leaves with, so a batch committed mid-request cannot make any two of
+  them disagree.
+- `web::tail` polls `max_id` per box twice a second while a console is
+  connected, and publishes **a signal**, not rows.
+- A page that hears the signal issues one `hx-get` for what *it* is missing and
+  prepends the result, returning its new cursor out-of-band. `hx-sync` keeps a
+  filter change and a tail from racing on the same element.
+- A backlog larger than one page delivers the **newest** page and says how many
+  it jumped, rather than draining oldest-first: a live view that lags ten
+  minutes behind a burst is not a live view, and a silent gap is worse than a
+  stated one.
+
+**Why a signal and not the rows.** Pushing rendered rows is one round trip
+cheaper and wrong twice over. The anchor would be the server's, so a tab opened
+five minutes later sees duplicates or a gap depending on which side is ahead;
+and one rendered payload cannot serve readers whose filters differ. Both
+problems disappear when the cursor and the filter belong to the page.
+
+**Cost, recorded honestly.** A burst costs one HTTP round trip per page, and
+half a second of latency in the worst case. Server-side polling remains
+polling — it is simply polling something local and indexed instead of something
+remote and rendered. `every 20s` survives as a reconnect net, not as the
+mechanism.
+
+**What stays a snapshot, and what does not.** The stream is appended to; the
+density strip, the view switcher's counts and the six analysis views are one
+region re-read together on the same signal. Splitting them was tried and is
+wrong: a live strip above a table frozen at page load reports two different
+windows a few centimetres apart. One swap cannot both append and replace, which
+is why they are two regions and not one.
+
+**Revisit.** If the collector ever gains a control socket the console can dial,
+the signal becomes a push and this loop goes away. Nothing above the signal has
+to change for that.
+
+---
+
+## ADR-0050: an observability system that cannot report its own health has none
+
+**Date:** 2026-08-22
+
+**Context.** A box registered before v4 has no `devbox-obsd`. Its exec agent
+therefore closed immediately, the collector logged `agent closed the connection
+before saying hello` every thirty seconds for six days, and the Activity tab
+said: *No observability data yet*. That sentence was also what the tab said for
+a box that was merely stopped, for a box no collector had reached yet, and for
+a host with no collector daemon running at all.
+
+Every counter needed to tell those apart existed. `Stats` distinguishes
+`dropped` from `persist_failed` on purpose; `devbox doctor` already probes the
+guest for `agent=missing|broken|<version>`. None of it reached the console, so
+the product's answer to "why is the glass box empty?" was a log file the user
+had no reason to know about.
+
+**Decision.** The collector publishes per-box capture health to
+`boxes/<name>/capture.json`, replaced atomically, the same discipline
+`metrics/collector.json` already used. It records the state
+(`box_stopped`/`starting`/`streaming`/`failed`), the transport, the backends the
+agent reported in its hello, the agent's version, the attempt count, and — for
+a failure — **the agent's own last line of stderr**.
+
+`activity::capture_view` resolves that record, the daemon's lock, and the box's
+status into one status bar with a level, a headline, and where possible a
+remedy. It is a pure function, so all four situations are unit-testable without
+a runtime, a daemon, or a box.
+
+**Why the guest's stderr.** `agent closed the connection before saying hello` is
+the symptom, and it is identical for a missing binary, a `sudo` that wants a
+password, and a version-pinned rejection. `sh: /usr/local/bin/devbox-obsd: not
+found` is the cause, and it is the only one of the two that implies
+`devbox reprovision`. It existed on a pipe the supervisor was already reading
+and discarding one line at a time.
+
+**Why the daemon check outranks the record.** A stopped daemon stops updating
+every box's record, so an old `streaming` would read as healthy forever. The
+one reading that is definitely stale must not be the one shown.
+
+**Precedence, and why it is ordered this way.** The daemon's lock outranks the
+record; a probed `stopped` or `missing` box outranks a `streaming` record, since
+the host-side socket listener outlives the container that was dialling it. But
+`unreachable` and `unknown` do *not*: they mean the probe could not decide, and
+a powered-on Lima VM under load reads `unreachable` while its agent streams
+perfectly well. Contradicting a live stream is a worse answer than saying
+nothing.
+
+**Cost.** One small file per box, two cheap reads per Activity page load, and a
+`starting` record that carries the previous failure's text so a flapping agent
+does not blank its own diagnosis between retries. Deliberately *not* a stored
+row count: that was one `SELECT COUNT(*)` per status bar, a full scan on a store
+near its two-million-row retention limit, twice a second on the live path. The
+window's own event count sits directly below the bar and is the number a reader
+was looking for anyway.
+
+---
+
+## ADR-0051: the console reads ZTP through the substrate, not around it
+
+**Date:** 2026-08-23
+
+**Context.** `devbox lab up ztp-fabric` provisions blank nodes for real — DHCP
+options 66/67, a live `udhcpc` on each node, a rendered config fetched and
+applied, a self-check, and a convergence gate that waits for every catalogued
+serial. All of it was invisible in the console. `grep -rn "ztp" src/web/`
+found nothing: `/labs/ztp-fabric` drew the *planned* topology and the traffic
+counters in the local event stores, and the state machine — the thing the
+scenario exists to demonstrate — lived only in `ztpd`'s output, the CLI's, and
+Grafana.
+
+The obvious fix is to let the console dial `ztpd`. ADR-era `docs/ztp.md`
+already forbids it, and for a reason worth repeating: the operator listener
+binds `127.0.0.1:9090` *inside the service namespace* because a bare `:9090`
+binds every interface, the provisioning network included, and a ZTP server is
+multi-homed by definition. Its routes return the whole inventory — serials,
+names, roles, states, config hashes — unauthenticated, on the assumption that
+only a management network can reach them. Moving that assumption to satisfy a
+web page would undo a boundary that was got wrong once already.
+
+**Decision.** The console asks the substrate to fetch it, over the same exec
+channel every other lab operation uses:
+
+```
+ip netns exec <service-ns> wget -qO- http://127.0.0.1:9090/status
+```
+
+`lab::ztp_status` owns the read and the view model; `web::labs::ztp` resolves
+the substrate and the namespace from the scenario's own `ZtpPlan`, so the
+console never learns the address and the listener never moves.
+
+**Four phases, not seven states.** `discovered → identified → rendering →
+pushing → verifying → healthy/failed` is the machine's vocabulary. The reader's
+question is whether a node is done, moving, or stuck, so the view collapses
+them into `healthy`, `failed`, `waiting` (discovered only) and `working`
+(everything else) — and an *unrecognised* state is `working`, so a ztpd from
+another release cannot paint a healthy fabric red.
+
+**Serials the registry has never seen are rendered anyway.** `Summarize` can
+only describe nodes that have identified, so a node that never boots is
+invisible to it — the same trap `ztpd` documents having fallen into, where
+nineteen healthy out of an expected twenty reported `converged: true`. The
+view merges `missing` into the node list as `waiting`, saying plainly that the
+serial has never contacted the server.
+
+**Cost.** One exec round trip every two seconds while a lab page is open, and
+only for scenarios that declare a ZTP plan. Polled rather than driven by the
+collector's signal, because what is being watched is a service inside the
+substrate rather than a local store.
+
+**Revisit.** If `ztpd` ever gains an authenticated operator route, the console
+can dial it directly and this indirection goes away. Nothing above the read has
+to change for that.
+
+
+## ADR-0052 — `nix/sets/*.nix` is what the box installs
+
+**Status.** Accepted.
+
+**Context.** Three code paths wrote the same guest files, `/etc/devbox/sets/`:
+provisioning pushed the checked-in `nix/sets/*.nix` verbatim, while
+`write_set_modules` (Sets apply, the console's build) and `apply_config`
+(`devbox upgrade`) *regenerated* every module from `NIX_SETS`, the package-name
+index, as a flat list of attribute names.
+
+For thirteen of the fifteen sets the two agreed exactly, so the divergence was
+invisible. It was not invisible for the two where a set is more than a list of
+names. The AI sets wrap each optional tool in `tryEval`, because some of them
+are absent or broken on a given nixpkgs channel; `write_set_modules` knew this
+and exempted them, `apply_config` did not, so `devbox upgrade` could replace the
+guards and fail the rebuild of a box whose selection nobody had touched. And
+`network` builds a small derivation to symlink FRR's `zebra` and `bgpd` out of
+`libexec` — where a NixOS system profile does not look — onto PATH. That
+derivation cannot survive a round trip through a list of names.
+
+The result was a box that was correct when created and quietly wrong after its
+first Sets apply: `nixos-rebuild` reported success, and `devbox doctor` reported
+`lab: missing: zebra bgpd`. Every lab scenario was unreachable on the one image
+devbox builds by default.
+
+**Decision.** The checked-in module is the artifact. `NIX_SET_FILES` moves to
+`nix::sets` and all three paths push it, index included. A set is a Nix
+expression and some of them need to be.
+
+`NIX_SETS` keeps its own job — it is the package *index*: what the console
+lists, what `resolved_packages` diffs, what the non-NixOS `nix profile install`
+path consumes. It is no longer a second, lossy encoding of the same thing.
+
+**Consequences.** `generate_sets_default_nix` is gone; adding a set now means
+editing `nix/sets/default.nix` as well as adding its module, which
+`set_index_imports_every_set` fails on if forgotten.
+`every_checked_in_module_matches_the_catalog` compares both directions and
+skips parenthesised sub-expressions, so a module may carry a derivation without
+the test mistaking its tokens for packages.
+
+**Revisit.** If a set ever needs to vary by host architecture or by box, the
+module gains a parameter rather than the generator coming back.
+
+## ADR-0053 — a lab daemon must not hold the substrate's stdio
+
+**Status.** Accepted.
+
+**Context.** `lab up` blocked forever on the first `zebra`, with the fabric
+unstarted and no output. The daemon was up, healthy, and correctly detached —
+`ppid` 1, its own session — and `/proc/<pid>/fd` showed why: file descriptors 0
+and 1 were still the pipes it inherited.
+
+FRR's `-d` forks and detaches but deliberately keeps stdout and stderr, so a
+daemon that fails a moment after startup can still say so. Under a service
+manager that is right. Here the parent is `limactl shell`, and the ssh
+transport underneath holds the session open until every descriptor on the far
+end is closed. A daemon that runs forever holds one forever.
+
+It read as a slow lab rather than a hung one, which is the expensive part: the
+thing being waited on was working the whole time, and none of the obvious
+checks — is the process alive, did it error, is the namespace there — points at
+the descriptor.
+
+**Decision.** Start each daemon through `sh -c 'exec … </dev/null >/dev/null
+2>&1'`, inside the namespace. The redirect belongs on the daemon and not on the
+`ip netns exec` around it: that wrapper passes its own descriptors down, so
+redirecting the outer command closes the pipe before the process that must not
+hold it exists.
+
+**Consequences.** Early daemon output is discarded. That is the trade: it was
+never read — the exec's own stdout is what `lab up` inspects, and the daemons
+already log to their configured files. Arguments are quoted only when they need
+it, so the command in a failure message stays runnable by hand.
+
+**Revisit.** If a lab ever needs a daemon's startup diagnostics, redirect to a
+file under the node's run directory rather than to `/dev/null` — the same shape,
+one path different.
+
+## ADR-0054 — the lab's DNS answers, and a lab node must not ask glibc
+
+**Status.** Accepted.
+
+**Context.** Every blank node in `ztp-fabric` reached `verifying` and then
+failed on `DNS self-check failed`, three attempts each. BGP had converged, the
+config was applied, and the name resolved perfectly when asked by hand. Two
+independent faults, either of which alone would have produced the same message.
+
+**The lab's DNS refused what it could not answer.** dnsmasq was configured with
+`address=/ztp.devbox/10.0.0.0`, which answers A and forwards every other type
+— and the server runs `no-resolv` with no upstream, so an AAAA query came back
+REFUSED. Every stock resolver asks for A and AAAA together and treats a refusal
+on either leg as failure, so a name that had just resolved was reported
+missing. `local=/devbox/` alone only downgrades the refusal to NXDOMAIN, which
+is still false: the name exists. `host-record` plus `local` gives A for A and
+NODATA for AAAA — the true shape of an IPv4-only zone, and the one every
+resolver handles.
+
+**And the check asked a resolver that could not see the fabric.** The self-check
+used `getent hosts`. A NixOS substrate runs `nsncd`, and glibc hands every name
+lookup to it over a unix socket. `nsncd` lives in the root network namespace and
+answers from the host's `resolv.conf`, so a node inside a lab namespace was
+asking a resolver on the other side of the boundary the lab exists to draw. The
+tell was that `tcpdump` inside the node's namespace saw no DNS packet at all —
+the query never reached the network. The check now runs `nslookup -type=A`,
+which reads the namespace's `resolv.conf` and sends its own query.
+
+**Consequences.** The check tries three resolvers in order: `nslookup` on PATH,
+then `busybox nslookup`, then `getent`. That is not defensive padding — a
+substrate is whatever the user brought, and the first version of this fix
+assumed `nslookup` and broke the ZTP e2e fixture, a Debian slim image with
+`busybox` but no `dnsutils`. Both of the first two reach the same applet on the
+image devbox builds.
+
+`getent` stays as the last resort even though it is what this ADR exists to
+replace, because the two conditions do not overlap: the image that runs `nsncd`
+is the image that carries busybox, and a substrate with no DNS client at all is
+one where glibc's resolver is not being intercepted. Preferring the reliable
+method and keeping the fallback is more honest than failing a node's
+provisioning over a missing diagnostic tool.
+
+`-type=A` is explicit rather than incidental: the lab addresses IPv4 only, and
+a bare lookup would reintroduce the dual-query failure from the other
+direction.
+
+**Revisit.** If a lab ever addresses IPv6, the DNS records and this check change
+together — a `host-record` with both families, and a self-check that asks for
+both. They are one decision and should move as one.
+
+## ADR-0055 — every FRR daemon, and then `vtysh` to distribute the config
+
+**Status.** Accepted.
+
+**Context.** `ztpd` reported three healthy nodes and the fabric failed its
+reachability matrix: `leaf1 -> leaf2` never came up. BGP was Established on
+every session, each leaf was advertising a prefix, and each leaf's own
+`show bgp` had its loopback in the table — unmarked, not best, not installed.
+
+`ip addr` explained it. A ZTP-provisioned leaf had `127.0.0.1` on `lo` and
+nothing else, while its config plainly said `interface lo / ip address
+10.0.128.1/32`. Asking zebra for its running configuration returned no
+interface stanzas at all, and `zebra -C` on the same file said why, twice per
+line: *No such command on config line 8: interface lo*.
+
+FRR 10 moved interface configuration out of zebra and into `mgmtd`, the
+northbound datastore daemon. `lab up` started `zebra` and `bgpd`. Neither owns
+`interface`, so every address in every generated config was parsed, rejected,
+logged, and skipped — and the daemon carried on and reported success.
+
+Routed labs never noticed, because `wiring` assigns those addresses out of band
+with `ip addr add` before FRR starts. A ZTP node has no such step by design:
+the config it is handed is the only thing that configures it. So the fault was
+invisible everywhere except the one scenario the feature exists for, and there
+it presented as the most expensive shape available — every per-node check
+passing, and only the fabric-wide assertion failing.
+
+**Decision.** Start `mgmtd` first, then `zebra`, then `bgpd`; then apply the
+file with `vtysh -N <ns> -f <conf>`.
+
+The `vtysh` pass is not redundancy. A daemon's own `-f` keeps the commands it
+owns and silently drops the rest, so no single daemon reading the file ever
+applies all of it — that is what an *integrated* `frr.conf` means, and `vtysh`
+is the client that holds a session to every daemon and hands each line to
+whichever owns it. The per-daemon `-f` stays as well, so a daemon restarted by
+hand comes back with its own share.
+
+`mgmtd` takes no `-f`, which reads as an oversight and is not one: it is the
+same statement from the other side.
+
+**Consequences.** `mgmtd` joins the `frr-daemons` derivation, and `doctor`
+reports it missing — but only where its absence is a fault. It arrived in FRR 9
+and took interface configuration in 10; before that zebra owned it, and Debian
+bookworm still ships 8.4. Requiring it everywhere turned a working substrate
+into a lab that failed on its first daemon, which the routed e2e test caught on
+the run after this was written. So the start is guarded by `command -v` on the
+substrate, where the answer lives, and the preflight asks zebra its version
+before deciding whether to care.
+
+The guard is an `if`, not a `&&`: `command -v x && exec x` exits 1 when the
+test fails, and `lab up` reads a nonzero exit as the daemon having failed to
+start — the absent-and-fine case would have looked exactly like the broken one.
+
+`every_daemon_starts_before_the_config_is_distributed` pins the order, the
+absence of `-f` on mgmtd, and the guard.
+
+**Revisit.** If FRR moves more configuration into the northbound, this needs no
+change — `vtysh` already distributes whatever the file contains. What would
+need revisiting is the per-daemon `-f`, which becomes dead weight once nothing
+is left that only one daemon owns.

@@ -60,7 +60,7 @@ fn generate_commented_toml(
     // [sandbox]
     s.push_str("[sandbox]\n");
     s.push_str(&format!(
-        "runtime = \"{}\"           # \"auto\" | \"incus\" | \"lima\" | \"multipass\" | \"docker\"\n",
+        "runtime = \"{}\"           # \"auto\" | \"incus\" | \"lima\" | \"docker\"\n",
         config.sandbox.runtime
     ));
     s.push_str(&format!(

@@ -1,0 +1,9 @@
+# Raw browser captures can contain transient local state.
+source/*
+!source/.gitkeep
+capture/*
+!capture/.gitkeep
+
+.DS_Store
+*.tmp
+*.log

@@ -1,0 +1,7 @@
+# Drop this section into a project's devbox.toml, or use it as a complete
+# minimal project config. Package mirrors remain reachable; arbitrary egress
+# is blocked and recorded.
+[policy]
+egress = "mirror-only"
+allow = ["github.com", "10.0.0.0/8"]
+alert_on_violation = true

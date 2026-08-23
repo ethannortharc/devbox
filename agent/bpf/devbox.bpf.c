@@ -5,11 +5,10 @@
 // that package's tests — a silent layout drift would not fail to compile, it
 // would decode plausible-looking garbage.
 //
-// Filtering happens in-kernel, on cgroup id: a box is a cgroup, so the probes
-// discard everything outside the traced boxes before it ever reaches the ring
-// buffer. That is what keeps the overhead budget (§7.3, <3% CPU at 10k
-// events/s) achievable — the expensive part of tracing is the events you
-// forward, not the ones you skip.
+// The map supports in-kernel cgroup selection, but the current loader installs
+// its trace-all sentinel. eBPF runs only in a dedicated one-box VM kernel;
+// shared-kernel Docker uses proc+packet capture. The namespace boundary, not a
+// populated allow-map, is therefore the current containment mechanism.
 //
 // Built with bpf2go (see generate.go); requires clang, libbpf headers, and a
 // kernel with BTF. Loading is exercised only in the privileged Linux CI lane.
@@ -96,8 +95,8 @@ struct {
 	__uint(max_entries, RINGBUF_SIZE);
 } file_events SEC(".maps");
 
-// Cgroup ids the agent is watching. Userspace populates this on attach; an
-// empty map means "watch everything", which is what a single-box agent wants.
+// Cgroup ids the agent is watching. Key zero is the explicit trace-all
+// sentinel used by the current one-box VM loader; an empty map traces nothing.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 256);

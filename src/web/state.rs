@@ -11,6 +11,16 @@ use crate::sandbox::SandboxManager;
 /// browser starts losing them. Lag is reported, never silent (§7.3).
 pub const EVENT_BUFFER: usize = 512;
 
+/// How long a ZTP status read is reused before another is made.
+///
+/// Shorter than the page's poll interval, so a reader never sees a figure more
+/// than one interval stale, and long enough that the two elements refreshing
+/// together share one round trip into the substrate.
+pub const ZTP_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Lab/substrate pairs the ZTP cache will hold.
+pub const MAX_CACHED_ZTP_LABS: usize = 32;
+
 /// One message on the console's Server-Sent Events channel.
 ///
 /// `kind` becomes the SSE `event:` name that htmx matches with `sse-swap`;
@@ -50,10 +60,42 @@ pub struct AppState {
     /// either one recovers both — which is the whole failure this separation
     /// exists to prevent.
     pub key: Arc<str>,
+    /// Random per-launch browser host, e.g. `devbox-<random>.localhost`.
+    ///
+    /// The listener still binds only to `127.0.0.1`; this hostname gives each
+    /// launch a fresh browser origin. Tabs on the current origin can therefore
+    /// share the key without handing it to an unrelated page that previously
+    /// occupied the console's predictable loopback port.
+    pub browser_host: Arc<str>,
+    /// Actual bound port used when redirecting a bare loopback navigation to
+    /// [`AppState::browser_host`].
+    pub browser_port: u16,
     /// Fan-out hub for live console events.
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
     pub version: &'static str,
+    /// The last ZTP status read, per (lab, substrate), with when it was taken.
+    ///
+    /// The lab page has two elements that want it — the topology, to colour
+    /// its nodes, and the provisioning panel — and each polls on its own
+    /// interval. Reading twice means two `ip netns exec` round trips into the
+    /// substrate every two seconds per open page, for one answer.
+    pub ztp_cache: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                String,
+                (std::time::Instant, crate::lab::ztp_status::FabricView),
+            >,
+        >,
+    >,
+    /// The box statuses the watcher last probed, for readers that must not
+    /// probe themselves.
+    ///
+    /// A runtime status costs a shell-out to a runtime CLI. The watcher pays
+    /// for one every few seconds; the activity tail runs four times as often
+    /// and must not pay for it again — but without it, its capture bar
+    /// contradicted the page's, which had the status. One prober, one answer.
+    pub box_status: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     /// The last terminal build status per box, for replay.
     ///
     /// The broadcast channel has no history, and the request that starts a
@@ -93,12 +135,6 @@ pub struct AppState {
     /// runs none of that cleanup — the box is left mid-selection with its
     /// firewall down and nothing recording it.
     rebuilds_idle: Arc<tokio::sync::Notify>,
-    /// Collector counters, surfaced by `/metrics` (§7.7).
-    ///
-    /// Shared with the collector task when one is running; a console started
-    /// without a collector simply reports zeroes, which is honest — no agent
-    /// has connected.
-    pub collector_stats: Arc<crate::obs::collector::Stats>,
 }
 
 impl AppState {
@@ -107,18 +143,32 @@ impl AppState {
         token: impl Into<Arc<str>>,
         key: impl Into<Arc<str>>,
     ) -> Self {
+        Self::new_with_browser_origin(manager, token, key, "127.0.0.1", 7878)
+    }
+
+    /// Construct state for a live console's randomized browser origin.
+    pub fn new_with_browser_origin(
+        manager: Arc<SandboxManager>,
+        token: impl Into<Arc<str>>,
+        key: impl Into<Arc<str>>,
+        browser_host: impl Into<Arc<str>>,
+        browser_port: u16,
+    ) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
             manager,
             token: token.into(),
             key: key.into(),
+            browser_host: browser_host.into(),
+            browser_port,
             events,
             version: env!("CARGO_PKG_VERSION"),
             rebuilding: Arc::new(std::sync::Mutex::new(Default::default())),
             shutdown: Arc::new(tokio::sync::watch::channel(false).0),
             rebuilds_idle: Arc::new(tokio::sync::Notify::new()),
             build_status: Arc::new(std::sync::Mutex::new(Default::default())),
-            collector_stats: Arc::new(crate::obs::collector::Stats::default()),
+            box_status: Arc::new(std::sync::Mutex::new(Default::default())),
+            ztp_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -136,6 +186,15 @@ impl AppState {
             box_name: box_name.to_string(),
             idle: self.rebuilds_idle.clone(),
         })
+    }
+
+    /// Whether an asynchronous create/rebuild/lab operation already owns the
+    /// slot. Used to reconnect a refreshed page to the live status stream
+    /// instead of replacing that stream with a conflict notice.
+    pub fn is_rebuilding(&self, box_name: &str) -> bool {
+        self.rebuilding
+            .lock()
+            .is_ok_and(|in_flight| in_flight.contains(box_name))
     }
 
     /// Tell every live stream to finish.
@@ -207,9 +266,61 @@ impl AppState {
         self.events.send(event).unwrap_or(0)
     }
 
+    /// Record what the watcher's latest probe saw.
+    pub fn record_box_statuses(&self, boxes: &[(String, String)]) {
+        if let Ok(mut known) = self.box_status.lock() {
+            known.clear();
+            known.extend(boxes.iter().cloned());
+        }
+    }
+
+    /// The watcher's latest reading for a box, or empty when it has none.
+    ///
+    /// Empty means "not probed", which every reader treats as undecided rather
+    /// than as down.
+    pub fn known_box_status(&self, name: &str) -> String {
+        self.box_status
+            .lock()
+            .ok()
+            .and_then(|known| known.get(name).cloned())
+            .unwrap_or_default()
+    }
+
+    /// A ZTP status read within the last [`ZTP_CACHE_TTL`], if there is one.
+    pub fn cached_ztp(&self, key: &str) -> Option<crate::lab::ztp_status::FabricView> {
+        let cache = self.ztp_cache.lock().ok()?;
+        let (taken, view) = cache.get(key)?;
+        (taken.elapsed() < ZTP_CACHE_TTL).then(|| view.clone())
+    }
+
+    /// Remember a ZTP status read, for the other element that wants it.
+    pub fn cache_ztp(&self, key: &str, view: &crate::lab::ztp_status::FabricView) {
+        if let Ok(mut cache) = self.ztp_cache.lock() {
+            // Bounded: the key carries a request-supplied substrate name, and
+            // an unbounded map keyed on one is a way to spend memory.
+            if cache.len() >= MAX_CACHED_ZTP_LABS {
+                cache.clear();
+            }
+            cache.insert(key.to_string(), (std::time::Instant::now(), view.clone()));
+        }
+    }
+
     /// The last build status for a box, if one finished without being seen.
     pub fn retained_build_status(&self, box_name: &str) -> Option<String> {
         self.build_status.lock().ok()?.get(box_name).cloned()
+    }
+
+    /// Snapshot all terminal build states for an SSE replay.
+    pub fn retained_build_statuses(&self) -> Vec<(String, String)> {
+        self.build_status
+            .lock()
+            .map(|retained| {
+                retained
+                    .iter()
+                    .map(|(name, html)| (name.clone(), html.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Forget a box's retained status, when a new build starts.

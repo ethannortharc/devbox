@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+
+{% block title %}devbox — create box{% endblock %}
+
+{% block content %}
+<div class="breadcrumb"><a href="/">Boxes</a><span>/</span><strong>New box</strong></div>
+<section class="page-intro">
+  <span class="eyebrow">New workspace</span>
+  <h1>Turn a project into a protected environment.</h1>
+  <p>Choose the project, runtime shape, and tool sets. devbox keeps the host source mounted safely while the environment stays reproducible.</p>
+</section>
+
+<div class="create-shell">
+  <section class="panel create-panel">
+    <form hx-post="/api/boxes" hx-target="#create-result" hx-swap="innerHTML"
+          hx-disabled-elt="find button" hx-indicator="closest .create-shell"
+          hx-on::after-request="if (event.detail.successful) setTimeout(() => { const button = this.querySelector('button[type=submit]'); button.disabled = true; button.textContent = 'Creation running…'; })">
+      <fieldset class="form-section">
+        <legend><span>01</span><strong>Project</strong></legend>
+        <p class="section-copy">Point devbox at the code you want to isolate.</p>
+      <div class="fieldgrid">
+        <label class="field field-wide">
+          <span>Project directory</span>
+          <input class="text" type="text" name="project_dir" required
+                 placeholder="/Users/you/code/myapp" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Box name <small>(optional)</small></span>
+          <input class="text" type="text" name="name"
+                 placeholder="derived from directory" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Runtime</span>
+          <select class="text" name="runtime" id="create-runtime">
+            <option value="auto">auto-detect</option>
+            <option value="lima">Lima</option>
+            <option value="incus">Incus</option>
+            <option value="docker">Docker — bare Ubuntu / writable only</option>
+          </select>
+          <small id="docker-contract" hidden>Docker uses a shared kernel and is limited to a bare Ubuntu image with direct writable mounts. Choose Lima or Incus for host-protected overlay workspaces.</small>
+        </label>
+      </div>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend><span>02</span><strong>Runtime shape</strong></legend>
+        <p class="section-copy">Tune the isolation substrate. The safe defaults work for most projects.</p>
+      <div class="fieldgrid">
+        <label class="field">
+          <span>Image</span>
+          <select class="text" name="image" id="create-image">
+            <option value="nixos">NixOS — declarative</option>
+            <option value="ubuntu">Ubuntu — familiar + Nix</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Mount mode</span>
+          <select class="text" name="mount_mode" id="create-mount-mode">
+            <option value="overlay">overlay — host protected</option>
+            <option value="writable">writable — direct host writes</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>CPU <small>(0 = runtime default)</small></span>
+          <input class="text" type="number" name="cpu" value="0" min="0" max="256" />
+        </label>
+        <label class="field">
+          <span>Memory <small>(optional)</small></span>
+          <input class="text" type="text" name="memory" placeholder="4GiB" />
+        </label>
+      </div>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend><span>03</span><strong>Tool sets</strong></legend>
+        <p class="section-copy">Only selected sets are evaluated and built. You can change them later.</p>
+        {% for g in groups %}
+        <div class="set-section">
+          <div class="set-section-head">
+            <h2>{{ g.title }}</h2>
+            <p>{{ g.blurb }}</p>
+          </div>
+          <div class="setgrid">
+            {% for s in g.entries %}
+            <label class="setopt {% if s.locked %}locked{% endif %}">
+              <input type="checkbox" name="set" value="{{ s.name }}"
+                     {% if s.enabled %}checked{% endif %}
+                     {% if s.locked %}disabled checked{% endif %} />
+              <span class="setname">{{ s.name }}</span>
+              <span class="setcount">{{ s.package_count }} pkg</span>
+              {% if s.locked %}<span class="chip">always on</span>{% endif %}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend><span>04</span><strong>Finishing options</strong></legend>
+        <p class="section-copy">Add individual nixpkgs attributes or keep provisioning intentionally minimal.</p>
+        <label class="field">
+          <span>Extra packages</span>
+          <input class="text" type="text" name="packages"
+                 placeholder="hyperfine tokei" spellcheck="false" />
+          <small>Separate package attributes with spaces or commas.</small>
+        </label>
+        <label class="setopt compact">
+          <input type="checkbox" name="bare" id="create-bare" />
+          <span>base image only (skip all tool and guest setup)</span>
+        </label>
+      </fieldset>
+
+      <div class="form-submit">
+        <div><strong>Ready to provision?</strong><span>Progress continues safely if this tab is backgrounded.</span></div>
+        <div class="actions">
+          <a class="btn" href="/">Cancel</a>
+          <button class="btn btn-primary btn-large" type="submit">Create box <span aria-hidden="true">→</span></button>
+        </div>
+      </div>
+    </form>
+    <div id="create-result" role="status" aria-live="polite"></div>
+  </section>
+
+  <aside class="create-aside" aria-label="What devbox will do">
+    <span class="eyebrow">What happens next</span>
+    <ol class="process-list">
+      <li><span>1</span><div><strong>Validate locally</strong><p>Confirm the project and runtime before anything is created.</p></div></li>
+      <li><span>2</span><div><strong>Build the environment</strong><p>Compose only the selected Nix tool sets.</p></div></li>
+      <li><span>3</span><div><strong>Protect your source</strong><p>Overlay mode keeps host files read-only until you explicitly copy changes out.</p></div></li>
+    </ol>
+    <div class="aside-note"><span aria-hidden="true">◈</span><p><strong>Local by design.</strong> The console and control plane stay on loopback.</p></div>
+  </aside>
+</div>
+<script>
+  // Keep the form inside the contracts the backends actually implement. The
+  // server validates the same rules before create; this is the immediate UX.
+  (function () {
+    var runtime = document.getElementById("create-runtime");
+    var image = document.getElementById("create-image");
+    var mount = document.getElementById("create-mount-mode");
+    var bare = document.getElementById("create-bare");
+    var dockerHint = document.getElementById("docker-contract");
+
+    function applyRuntimeContract() {
+      var docker = runtime.value === "docker";
+      dockerHint.hidden = !docker;
+      if (docker) {
+        image.value = "ubuntu";
+        mount.value = "writable";
+        bare.checked = true;
+      }
+    }
+    runtime.addEventListener("change", applyRuntimeContract);
+    image.addEventListener("change", function () {
+      if (image.value === "ubuntu") mount.value = "writable";
+      applyRuntimeContract();
+    });
+    mount.addEventListener("change", function () {
+      if (mount.value === "overlay" && image.value === "ubuntu") image.value = "nixos";
+      if (mount.value === "overlay") bare.checked = false;
+      applyRuntimeContract();
+    });
+    bare.addEventListener("change", function () {
+      if (bare.checked) mount.value = "writable";
+      applyRuntimeContract();
+    });
+    applyRuntimeContract();
+  })();
+</script>
+{% endblock %}

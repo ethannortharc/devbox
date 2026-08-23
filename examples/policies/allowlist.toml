@@ -1,0 +1,5 @@
+# Domain names are resolved by the guest agent and synchronized into nftables.
+[policy]
+egress = "allowlist"
+allow = ["github.com", "api.anthropic.com", "10.0.0.0/8"]
+alert_on_violation = true

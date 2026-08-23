@@ -1,0 +1,19 @@
+{% include "_activity_rows.html" %}
+{%- if skipped > 0 -%}
+{#- Below the rows, not above them. The block is prepended newest-first, so
+    the gap sits between the oldest row this response delivered and the newest
+    row already on screen — which is where the events actually went missing.
+    A burst outrunning the view is worth saying: they are still in the store
+    and in every other view, and silence would leave a hole in a page whose
+    whole claim is that nothing is hidden. -#}
+<div class="ev ev-skip" role="status">
+  <span class="ev-ts">—</span>
+  <span class="ev-kind">skipped</span>
+  <span class="ev-proc"></span>
+  <span class="ev-summary">{{ skipped }} events arrived faster than this view could follow — they are in the store, and in the other views.</span>
+</div>
+{%- endif -%}
+{#- The page's own cursor, returned out-of-band. htmx replaces the input
+    before performing the main swap, so the next request resumes from exactly
+    what this response delivered. -#}
+<input type="hidden" id="act-anchor" name="after" value="{{ cursor }}" hx-swap-oob="true" />

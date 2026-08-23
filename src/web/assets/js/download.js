@@ -38,6 +38,7 @@
 
     var filename = link.getAttribute("data-download") || "devbox-export";
     fetch(link.href, {
+      method: link.getAttribute("data-method") || "GET",
       headers: { "X-Devbox-Key": key },
       credentials: "omit",
       cache: "no-store",

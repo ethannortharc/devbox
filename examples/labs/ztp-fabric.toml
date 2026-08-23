@@ -1,0 +1,44 @@
+# A service node, one preconfigured spine, and two genuinely blank leaves.
+[lab]
+name = "example-ztp"
+substrate = "auto"
+base = "10.40.0.0/16"
+asn_base = 65200
+
+[[nodes]]
+name = "svc"
+role = "service"
+sets = ["network"]
+
+[[nodes]]
+name = "spine1"
+role = "frr-router"
+sets = ["network"]
+
+[[nodes]]
+name = "leaf1"
+role = "ztp-blank"
+sets = ["network"]
+
+[[nodes]]
+name = "leaf2"
+role = "ztp-blank"
+sets = ["network"]
+
+[[links]]
+endpoints = ["svc:eth1", "spine1:eth1"]
+subnet = "10.40.0.0/31"
+
+# DHCP links need network, router, client, and broadcast addresses.
+[[links]]
+endpoints = ["spine1:eth2", "leaf1:eth1"]
+subnet = "10.40.0.4/30"
+
+[[links]]
+endpoints = ["spine1:eth3", "leaf2:eth1"]
+subnet = "10.40.0.8/30"
+
+[services]
+dns = true
+dhcp = true
+ntp = true

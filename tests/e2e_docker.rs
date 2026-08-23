@@ -11,9 +11,9 @@
 //! a machine without Docker stays green. CI always has Docker, so it always
 //! runs there.
 //!
-//! The base image is overridden with `DEVBOX_DOCKER_IMAGE` because the default
-//! `devbox-nixos:latest` must be built locally and is not on any registry;
-//! this test only needs a container that stays up and has a shell.
+//! The base image is overridden with `DEVBOX_DOCKER_IMAGE` to keep CI offline
+//! and deterministic. The product default is the published Ubuntu image; this
+//! fixture only needs a compatible container that stays up and has a shell.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -21,9 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use devbox::runtime::docker::DockerRuntime;
-use devbox::runtime::{CreateOpts, Runtime, SandboxStatus};
+use devbox::runtime::{Runtime, SandboxStatus};
 use devbox::sandbox::SandboxManager;
-use devbox::sandbox::state::SandboxState;
 use devbox::web::routes;
 use devbox::web::state::AppState;
 use futures::{SinkExt, StreamExt};
@@ -36,11 +35,10 @@ const BOX: &str = "e2e-console";
 
 /// Base image the test builds locally.
 ///
-/// `DockerRuntime::create` runs the image with no command, so the image itself
-/// has to stay up — exactly like the real `devbox-nixos` image, which runs an
-/// init. busybox is a few megabytes and its `sh` is enough to prove the pty
-/// bridge end to end.
-const IMAGE: &str = "devbox-e2e-base:latest";
+/// A custom override owns its command, unlike the stock Ubuntu path where
+/// `DockerRuntime::create` supplies `sleep infinity`. busybox is a few
+/// megabytes and its `sh` is enough to prove the pty bridge end to end.
+const IMAGE: &str = "devbox-e2e-base:v2";
 const BASE: &str = "busybox:stable";
 
 fn docker_available() -> bool {
@@ -74,7 +72,11 @@ fn ensure_image() -> bool {
     let dockerfile = dir.path().join("Dockerfile");
     if std::fs::write(
         &dockerfile,
-        format!("FROM {BASE}\nCMD [\"sleep\", \"infinity\"]\n"),
+        format!(
+            "FROM {BASE}\n\
+             RUN mkdir -p /usr/local/bin && printf '#!/bin/sh\\ntouch /tmp/devbox-policy-probed\\necho \"No such file or directory\" >&2\\nexit 1\\n' > /usr/local/bin/nft && chmod +x /usr/local/bin/nft\n\
+             CMD [\"sleep\", \"infinity\"]\n"
+        ),
     )
     .is_err()
     {
@@ -96,26 +98,6 @@ fn ensure_image() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn create_opts(project: &std::path::Path) -> CreateOpts {
-    CreateOpts {
-        name: BOX.to_string(),
-        mounts: vec![devbox::runtime::Mount {
-            host_path: project.to_path_buf(),
-            container_path: "/mnt/host".to_string(),
-            read_only: true,
-        }],
-        cpu: 0,
-        memory: String::new(),
-        env: Default::default(),
-        env_file: None,
-        sets: vec![],
-        tools: vec![],
-        bare: true,
-        writable: false,
-        image: "busybox".to_string(),
-    }
 }
 
 /// Serve the console on an ephemeral loopback port; returns its address.
@@ -336,33 +318,50 @@ async fn console_drives_a_real_docker_box_end_to_end() {
     let _ = runtime.destroy(BOX).await;
     let _guard = ContainerGuard;
 
-    // ── create ───────────────────────────────────────────
-    runtime
-        .create(&create_opts(project.path()))
-        .await
-        .expect("docker container is created");
-
-    // Registering the box is what `create_sandbox` does after provisioning;
-    // this test is about the console, not about Nix provisioning.
-    SandboxState {
-        schema: devbox::sandbox::state::SCHEMA,
-        package_sources: Default::default(),
-        name: BOX.to_string(),
-        runtime: "docker".to_string(),
-        project_dir: project.path().to_path_buf(),
-        created_at: "2026-08-06T00:00:00Z".to_string(),
-        mount_mode: "overlay".to_string(),
-        sets: vec!["system".to_string()],
-        languages: vec![],
-        image: "busybox".to_string(),
-        packages: vec![],
-    }
-    .save(state_dir.path())
-    .expect("box is registered");
-
     let addr = serve_console(state_dir.path().to_path_buf()).await;
     let base = format!("http://127.0.0.1:{}", addr.port());
     let http = client();
+
+    // ── create through the real Web control plane ─────────
+    let res = http.get(&format!("{base}/boxes/new"));
+    assert_eq!(res.status, 200, "create page: {}", res.body);
+    assert!(res.body.contains("hx-post=\"/api/boxes\""));
+
+    let stream = http.start_stream(&format!("{base}/api/stream"));
+    stream.wait_for(Duration::from_secs(5), |s| s.contains("event: tick"));
+    let form = form_urlencoded::Serializer::new(String::new())
+        .append_pair("project_dir", &project.path().display().to_string())
+        .append_pair("name", BOX)
+        .append_pair("runtime", "docker")
+        .append_pair("image", "ubuntu")
+        .append_pair("mount_mode", "writable")
+        .append_pair("cpu", "0")
+        .append_pair("set", "system")
+        .append_pair("bare", "on")
+        .finish();
+    let res = http.post_form(&format!("{base}/api/boxes"), &form);
+    assert_eq!(res.status, 202, "create: {}", res.body);
+    assert!(res.body.contains("build-status-e2e-console"));
+    let created = stream.wait_for(Duration::from_secs(30), |s| {
+        s.contains("build-status-e2e-console")
+    });
+    assert!(
+        created.contains("Box created"),
+        "Web create did not complete: {created}"
+    );
+    drop(stream);
+
+    // A successful create status is only published after the saved posture is
+    // applied. The test image's nft shim leaves this marker when the default
+    // open posture probes for an old table to clear.
+    let policy_probe = runtime
+        .exec_cmd(BOX, &["test", "-f", "/tmp/devbox-policy-probed"], false)
+        .await
+        .expect("policy probe reaches the created box");
+    assert_eq!(
+        policy_probe.exit_code, 0,
+        "Web create reported success before applying the saved egress posture"
+    );
 
     // ── list shows it running ────────────────────────
     let res = http.get(&format!("{base}/api/boxes"));

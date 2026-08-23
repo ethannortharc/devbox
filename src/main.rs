@@ -14,8 +14,16 @@ async fn main() -> Result<()> {
     let manager = SandboxManager::new()?;
 
     match cli.command {
-        Some(cmd) => cmd.run(&manager).await,
-        None => open_console_for_cwd(&manager, cli.tools.as_deref()).await,
+        Some(cmd) => {
+            if cmd.needs_collector() {
+                devbox::obs::daemon::ensure_running(&manager);
+            }
+            cmd.run(&manager).await
+        }
+        None => {
+            devbox::obs::daemon::ensure_running(&manager);
+            open_console_for_cwd(&manager, cli.tools.as_deref()).await
+        }
     }
 }
 

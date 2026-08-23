@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+
+{% block title %}devbox lab — {{ view.name }}{% endblock %}
+
+{% block content %}
+<div class="breadcrumb"><a href="/labs">Network labs</a><span>/</span><strong>{{ view.name }}</strong></div>
+<div class="lab-titlebar">
+  <div>
+    <span class="eyebrow">Scenario plan</span>
+    <h1>{{ view.name }}</h1>
+    <p>{{ view.summary }}</p>
+  </div>
+  <span class="spacer"></span>
+  <form class="scenario-pick" onsubmit="event.preventDefault(); location.href='/labs/'+this.elements.scenario.value">
+    <label for="lab-scenario">Scenario</label>
+    <select class="text" id="lab-scenario" name="scenario">
+      {% for scenario in scenarios %}
+      <option value="{{ scenario.name }}" {% if scenario.name == view.name %}selected{% endif %}>{{ scenario.name }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Open</button>
+  </form>
+</div>
+
+<div class="lab-intro"><span>What it demonstrates</span><p>{{ view.demonstrates }}</p></div>
+
+{#- Empty for a scenario with no ZTP in it; the endpoint answers with nothing
+    at all, and the polling attribute goes with it. -#}
+<div id="ztp-slot"
+     hx-get="/api/labs/{{ view.name|urlencode_strict }}/ztp"
+     hx-include="#lab-substrate"
+     hx-trigger="load"
+     hx-swap="innerHTML"></div>
+
+<div id="lab-view"
+     hx-get="/api/labs/{{ view.name|urlencode_strict }}/view"
+     hx-include="#lab-substrate"
+     hx-trigger="every 2s"
+     hx-swap="innerHTML">
+  {% include "_lab_view.html" %}
+</div>
+
+<section class="panel lab-controls" aria-labelledby="lab-controls-title">
+  <div class="control-head">
+    <div><span class="eyebrow">Run the experiment</span><h2 id="lab-controls-title">Lab controls</h2></div>
+    <label class="field substrate-field">
+      <span>Substrate box</span>
+      <select class="text" id="lab-substrate" name="substrate">
+        <option value="">auto / topology setting</option>
+        {% for b in boxes %}
+        <option value="{{ b.name }}">{{ b.name }} · {{ b.runtime }} · {{ b.status }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+
+  <div class="lab-control-section lab-lifecycle">
+    <div class="control-copy"><span>Step 1</span><div><h3>Topology lifecycle</h3><p>Create the namespaces and links before applying faults. Teardown removes only this lab's network resources.</p></div></div>
+    <div class="lab-actions">
+      <form hx-post="/api/labs/{{ view.name }}/up"
+            hx-include="#lab-substrate" hx-target="#lab-operation" hx-swap="innerHTML"
+            hx-disabled-elt="find button" hx-indicator="#lab-operation"
+            data-unlock-on-build="lab-{{ view.name }}"
+            hx-on::after-request="if (event.detail.successful) document.querySelectorAll('.lab-controls button').forEach(button => { button.disabled = true; })">
+        <button class="btn btn-primary" type="submit">Bring up topology</button>
+      </form>
+      <form hx-post="/api/labs/{{ view.name }}/down"
+            hx-include="#lab-substrate" hx-target="#lab-operation" hx-swap="innerHTML"
+            hx-disabled-elt="find button" hx-indicator="#lab-operation"
+            data-unlock-on-build="lab-{{ view.name }}"
+            hx-on::after-request="if (event.detail.successful) document.querySelectorAll('.lab-controls button').forEach(button => { button.disabled = true; })"
+            hx-confirm="Tear down every namespace in {{ view.name }}?">
+        <button class="btn btn-danger" type="submit">Tear down</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="lab-control-section">
+    <div class="control-copy"><span>Step 2</span><div><h3>Link conditions</h3><p>Target one link, then add latency, loss, a rate cap, or a complete partition. Heal restores normal traffic.</p></div></div>
+    <form class="fault-form" hx-post="/api/labs/{{ view.name }}/fault"
+          hx-include="#lab-substrate" hx-target="#lab-operation" hx-swap="innerHTML"
+          hx-disabled-elt="find button" hx-indicator="#lab-operation"
+          data-unlock-on-build="lab-{{ view.name }}"
+          hx-on::after-request="if (event.detail.successful) document.querySelectorAll('.lab-controls button').forEach(button => { button.disabled = true; })">
+      <label class="field field-link">
+        <span>Link</span>
+        <select class="text" name="link" required>
+          {% for link in view.links %}
+          <option value="{{ link.key }}">{{ link.a }} ↔ {{ link.b }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field"><span>Delay ms</span><input class="text" type="number" name="delay" min="0" placeholder="0" /></label>
+      <label class="field"><span>Loss %</span><input class="text" type="number" name="loss" min="0" max="100" step="0.1" placeholder="0" /></label>
+      <label class="field"><span>Rate kbit/s</span><input class="text" type="number" name="rate" min="1" placeholder="unlimited" /></label>
+      <label class="field">
+        <span>Direction</span>
+        <select class="text" name="direction"><option value="both">both</option><option value="a">A only</option><option value="b">B only</option></select>
+      </label>
+      <label class="setopt compact"><input type="checkbox" name="partition" /><span>full partition</span></label>
+      <div class="actions">
+        <button class="btn btn-primary" type="submit">Apply fault</button>
+        <button class="btn" type="submit" hx-post="/api/labs/{{ view.name }}/heal">Heal selected link</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="lab-operation" class="operation-status" role="status" aria-live="polite">
+    <p class="muted"
+       data-build-status="lab-{{ view.name }}"
+       hx-get="/api/operations/lab-{{ view.name|urlencode_strict }}/status"
+       hx-trigger="load"
+       sse-swap="build-status-lab-{{ view.name }}">{{ retained|safe }}</p>
+  </div>
+</section>
+{% endblock %}

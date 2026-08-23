@@ -8,5 +8,27 @@
 with pkgs;
 [
   tailscale mosh nmap tcpdump bandwhich trippy doggo
-  frr conntrack-tools
+  frr dnsmasq chrony busybox iproute2 conntrack-tools
+
+  # FRR's daemons, on PATH.
+  #
+  # The package keeps them in `libexec/frr/`, and a NixOS system profile links
+  # only bin, sbin, lib, etc and share — so installing `frr` gave the substrate
+  # `vtysh` and nothing to talk to. `lab up` invokes `zebra` and `bgpd` by
+  # name, and its preflight probes `command -v zebra`, so the whole reason this
+  # set carries frr was unreachable on the one image devbox builds by default.
+  #
+  # `mgmtd` is here for the same reason and is easy to miss: FRR 10 moved
+  # interface configuration into its northbound datastore, so without it a
+  # router loads its BGP configuration and none of its addresses.
+  #
+  # Symlinks rather than a full wrapper: the daemons find their own libraries
+  # through the store path they are linked from, and `-N`/`-z` already give
+  # each namespace its own sockets.
+  (runCommand "frr-daemons" { } ''
+    mkdir -p $out/bin
+    for daemon in mgmtd zebra bgpd; do
+      ln -s ${frr}/libexec/frr/$daemon $out/bin/$daemon
+    done
+  '')
 ]

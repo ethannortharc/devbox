@@ -594,11 +594,9 @@ pub async fn apply_selection(
     // it. Reprovision already re-applies the posture for exactly this reason;
     // this path did not, so a box could finish a rebuild reporting `isolated`
     // with open egress.
-    // `apply` rather than `apply_saved`: the latter reports and returns Ok by
-    // design (ADR-0044), because a *user asking for access* must not be locked
-    // out. A rebuild is not that — nobody is waiting at a prompt, and the
-    // console is about to print a verdict — so this path wants the strict
-    // form, which propagates.
+    // The strict rebuild form uses the claim already held by this worker and
+    // propagates any failure, so the console cannot report success while the
+    // saved egress posture is absent.
     if let Err(e) = crate::policy::enforce::restore_after_rebuild(manager, box_name, &claim).await {
         // Terminal status, not a log line among the build output. "rebuild
         // complete" printed underneath a warning nobody scrolled back to read
@@ -674,12 +672,19 @@ pub async fn apply_selection(
             "rebuilt the box, but its devbox.toml can no longer be read, so the new \
              selection could not be recorded",
         )?;
-        selection
-            .to_config(&latest)
-            .save(&sandbox.project_dir.join("devbox.toml"))
-            .context("rebuilt the box, but could not record the selection in devbox.toml")?;
+        let persisted = selection.to_config(&latest);
+        sandbox.sets = persisted.active_sets();
+        sandbox.languages = persisted.active_languages();
+        sandbox.package_sources = persisted
+            .custom_packages
+            .iter()
+            .filter(|(_, source)| source.as_str() != "nixpkgs")
+            .map(|(name, source)| (name.clone(), source.clone()))
+            .collect();
+        manager
+            .save_config_and_state(&persisted, &sandbox)
+            .context("rebuilt the box, but could not atomically record the new selection")?;
     }
-    sandbox.save(&manager.state_dir)?;
 
     state.publish(ConsoleEvent::new(
         status_event(box_name),
@@ -774,7 +779,18 @@ mod tests {
         async fn upgrade(&self, _: &str, _: &[String]) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn update_mounts(&self, _: &str, _: &[crate::runtime::Mount]) -> anyhow::Result<()> {
+        async fn update_mounts(
+            &self,
+            _: &str,
+            _: &[crate::runtime::Mount],
+        ) -> anyhow::Result<crate::runtime::MountUpdate> {
+            unimplemented!()
+        }
+        async fn rollback_mounts(
+            &self,
+            _: &str,
+            _: &crate::runtime::MountUpdate,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
     }

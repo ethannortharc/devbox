@@ -5,10 +5,9 @@ CO-RE programs that feed the observability plane (§7.1).
 | Program | Attach point | Produces |
 |---|---|---|
 | `handle_exec` | tracepoint `sched/sched_process_exec` | `exec` — path, argv, cwd |
-| `handle_tcp_v4_connect` | kprobe `tcp_v4_connect` | records the socket for the return probe |
-| `handle_tcp_v4_connect_ret` | kretprobe `tcp_v4_connect` | `connect` — 5-tuple |
-| `handle_tcp_v6_connect` | kprobe `tcp_v6_connect` | records the socket for the return probe |
-| `handle_tcp_v6_connect_ret` | kretprobe `tcp_v6_connect` | `connect` — 5-tuple |
+| `handle_tcp_v4_connect` | kprobe `tcp_v4_connect` | records the socket and process for completion |
+| `handle_tcp_v6_connect` | kprobe `tcp_v6_connect` | records the socket and process for completion |
+| `handle_tcp_finish_connect` | kprobe `tcp_finish_connect` | established outbound `connect` — 5-tuple |
 | `handle_accept` | kretprobe `inet_csk_accept` | `accept` — 5-tuple |
 | `handle_openat` | tracepoint `syscalls/sys_enter_openat` | `file` — path, flags, op |
 
@@ -19,14 +18,12 @@ userspace keeps the verifier's job small.
 
 ## Filtering
 
-Every probe checks `cgroup_is_traced` before reserving a ring-buffer slot. A
-box is a cgroup, so anything outside the traced boxes is discarded **in the
-kernel**, before it costs a copy or a wakeup. That is what makes the §7.3
-overhead budget (< 3% CPU at 10k events/s) reachable — the expense of tracing
-is the events you forward, not the ones you skip.
-
-Key `0` in `traced_cgroups` is a sentinel meaning "trace everything", which is
-what a single-box agent installs.
+Every probe checks `cgroup_is_traced` before reserving a ring-buffer slot, and
+the map can represent selected cgroups. The current loader deliberately writes
+key `0`, the "trace everything" sentinel: an eBPF agent runs inside a dedicated
+one-box VM kernel. Shared-kernel Docker does not enable eBPF and uses
+proc+packet capture instead. Selective cgroup population is future work, not a
+containment property of the current loader.
 
 ## Record layout
 
@@ -57,19 +54,19 @@ go generate -tags bpf2go ./agent/bpf/...
 - **Loading and attaching** — the `ebpf` job in `.github/workflows/ci.yml`, on
   a privileged Linux runner with BTF.
 
-On macOS the agent runs inside the Lima guest, so eBPF is available there even
-though the host cannot load it (§13).
+Release artifacts embed the generated CO-RE agent, which runs inside the Lima
+guest on macOS. A plain source build embeds the portable proc+packet agent.
 
-## Why connect needs both an entry and a return probe
+## Why connect needs both entry and handshake-completion probes
 
 At `tcp_v*_connect` **entry** the kernel has not yet copied the destination
 into `skc_daddr`/`skc_dport`, nor picked the local port. Reading the socket
 there yields zeroes or the previous connection's values — every outbound flow
 decoded wrong, plausibly enough that nothing looked broken. The entry probe
-therefore only stashes the socket pointer against the thread id, and the return
-probe reads the now-populated fields and emits the event. A non-zero return
-means the connect failed, so nothing is emitted: a destination that was never
-reached does not belong in the timeline.
+therefore stashes process identity against the socket pointer. The
+`tcp_finish_connect` probe runs on the SYN-ACK path, reads the now-populated
+fields, emits the event, and deletes that entry. Attempts which never complete
+produce no event; the bounded LRU map eventually evicts their stale entries.
 
 `fill_net` writes **every** field of the record, including `_pad`, the unused
 address bytes, and the byte/duration counters. `bpf_ringbuf_reserve` hands back

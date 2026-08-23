@@ -1,4 +1,5 @@
 ALL PHASES DONE
+IMPLEMENTATION COMPLETE — ALL V4 PHASES GREEN; PR-READY
 
 # devbox v4 — build log
 
@@ -23,7 +24,7 @@ ordered work list, §17 the quality bar).
 | 6 | Box lab: substrate & topology | **DONE** |
 | 7 | Fault injection & scenario library | **DONE** |
 | 8 | ZTP fabric + SoT + config-gen | **DONE** |
-| 9 | Polish, docs, examples | **DONE** |
+| 9 | Polish, docs, examples | **DONE** — external PR creation awaits explicit authorization |
 
 ## Environment notes
 
@@ -208,17 +209,19 @@ that lives in the privileged Linux CI lane.
   fixed-layout ring-buffer decoders with byte-size assertions against the C
   structs; hand-rolled DNS and TLS ClientHello parsers (ADR-0016) covering
   compression pointers, pointer loops, and truncation; three capture sources by
-  fidelity — eBPF, proc-polling, fixture replay (ADR-0017). The Go module has
-  **no third-party dependencies**.
+  fidelity — eBPF, proc-polling, fixture replay (ADR-0017). It uses
+  `cilium/ebpf` for the generated CO-RE loader and `x/sys` for packet capture.
 - **eBPF** (`agent/bpf`): CO-RE programs for exec, connect (v4/v6), accept, and
-  openat, filtering on cgroup id *in the kernel*. Behind a build tag so a plain
-  `go build` works on macOS; loading is the privileged Linux CI lane's job.
+  openat. The current one-box-per-VM loader traces its whole guest kernel; the
+  cgroup selection map exists but is not populated selectively. Behind a build
+  tag so a plain `go build` works on macOS; loading is the privileged Linux CI
+  lane's job.
 - **Collector** (`src/obs/`): unix-socket listener with the handshake, a bounded
   queue that drops **and counts**, batched SQLite writes, lifted+indexed filter
   columns with the raw event alongside, and correlation (per-process chains,
   the DNS reverse map, a depth-bounded process tree).
-- NixOS module supervising the agent with `CAP_BPF` only, `ProtectSystem=strict`,
-  and a CPU quota.
+- NixOS module supervising the agent with bounded BPF/perf, network, and kmsg
+  capabilities, `ProtectSystem=strict`, and a CPU quota.
 - CLI: `devbox watch [--type --pid --peer --path --since --tree --json]`.
 
 **e2e evidence** — `tests/obs_pipeline.rs` builds the real agent, runs it as a
@@ -503,10 +506,11 @@ README gains a v4 pointer and the one paragraph that explains the whole idea:
 
 ---
 
-# Final summary
+# Historical 2026-08-06 status summary
 
-**Phases 0–9: all DONE.** Every acceptance criterion in §16 is met or has its
-gap stated explicitly below.
+This was the completion assessment at that checkpoint. Later end-to-end review
+found the product-surface gaps listed below; they have since been completed.
+The phase table at the top is the current authority.
 
 ## Gate, as of the final commit
 
@@ -534,10 +538,9 @@ Four of those Rust tests are end-to-end against real infrastructure:
 - **pcap export per flow** (§7.5). Needs the tap capture that lands with the
   eBPF path. Writing a pcap file with no packets in it would be fabricating
   data, so it is not written.
-- **eBPF kernel load** is untested locally — the host is macOS. The decode and
-  transport layers are fully covered by fixtures; loading and attaching belong
-  to the privileged Linux CI lane (`ebpf` in `ci.yml`), which is present and
-  marked informational until it has a kernel to run against.
+- **eBPF kernel load** is untestable on the local macOS host. The mandatory
+  privileged Linux CI lane builds the CO-RE object and exercises real attach;
+  local Linux-tagged compilation runs in a container.
 - **Cross-fabric reachability** in `e2e_lab` stops at the wiring. Reaching a
   loopback *across* the fabric needs FRR running BGP in the substrate image;
   the generated config is covered by unit tests, and the CI lane is where the
@@ -552,15 +555,13 @@ Four of those Rust tests are end-to-end against real infrastructure:
 
 ## Where to start next
 
-1. The **Lab view** in the console. `Lab::summary()` already serialises
+1. Add the missing **create-box flow** and **Lab view** in the console.
+   `Lab::summary()` already serialises
    everything a topology graph needs, and the obs plane already has per-link
    byte counts — this is the highest-value remaining gap.
-2. **Wire the collector into `devbox web`.** `src/obs/collector.rs` is
-   complete and tested, but the console reads stores from disk rather than
-   running a collector itself; `AppState::collector_stats` is a placeholder
-   until it does, which is why `/metrics` reports zeroes for agent counters.
-3. **The privileged eBPF CI lane** needs a runner with BTF to stop being
-   informational.
+2. Implement **pcap export per flow** from the live packet tap.
+3. Add an FRR-enabled integration image so the e2e lab gate covers routed
+   cross-fabric reachability, not only namespace wiring.
 
 ## Decisions worth reading before changing anything
 
@@ -1689,3 +1690,266 @@ claim does not compile, a `ProjectClaim` cannot be passed where a `BoxClaim` is
 wanted, and the re-run census reads thirteen applications, zero unaccounted for.
 
 **Gate** — 533 Rust, 10 Go packages, 71 Python; six linters clean.
+
+## 2026-08-11T16:31Z — Final v4 implementation and verification
+
+All planned v4 phases and acceptance paths are implemented. The final pass
+closed the remaining production gaps: the long-lived host collector survives
+ordinary CLI use and replaces stale-release owners atomically; Web can create
+real boxes and strictly restores their saved egress posture before reporting
+success; Labs drive real routed namespaces, FRR convergence, DHCP/ZTP, faults,
+healing, and teardown; flow capture returns real AF_PACKET pcap data through
+both CLI and Web; observability, examples, doctor output, Grafana material, and
+the documented console flow are present.
+
+**Gate** — 576 Rust tests green, including real Docker, routed Lab, ZTP/Web/pcap,
+collector process, policy lifecycle, and HTTP console integration; Rust fmt,
+strict clippy, check, and release build green. Go fmt/test/vet green (plus
+golangci-lint when installed). Python ruff lint/format, strict mypy, and 71
+pytest tests green.
+
+**Adversarial review** — four exhaustive Claude Opus 5 xhigh passes reviewed
+the full tracked and untracked tree. The latest pass found only that the
+machine-readable `ALL PHASES DONE` sentinel had been reworded; the exact first
+line is restored and pinned by an integration test. Earlier necessary findings
+were repaired and re-gated rather than waived.
+
+**Next** — no planned implementation work remains. Reopen the loop only for a
+new necessary correctness, security, lifecycle, or acceptance finding;
+otherwise this tree is ready for human PR handoff. No external PR was opened
+without explicit authorization.
+
+## 2026-08-22T07:20Z — Activity: diagnosis, a real live stream, three layers
+
+Reopened for one necessary finding: **the console could not tell a reader why
+the Activity tab was empty.** A box registered before v4 has no
+`devbox-obsd`, so its exec agent closed before the handshake; the collector
+logged the same warning every 30 seconds for six days and the tab said "No
+observability data yet" — the identical sentence it showed for a stopped box, a
+stopped collector daemon, and a box no collector had reached.
+
+**Landed**
+
+- **`obs::health`** — per-box capture health published to
+  `boxes/<name>/capture.json`, atomically replaced like `collector.json`
+  (ADR-0050). `Collector::with_agent_hook` reports the accepted hello, so the
+  host records which backends actually attached; the supervisor keeps the
+  agent's own last line of stderr and puts it in the failure record, and
+  carries the previous failure's text into a retry so a flapping agent does not
+  blank its own diagnosis.
+- **`activity::capture_view`** — a pure function resolving daemon lock, box
+  status and health record into one status bar with a level, a headline, and a
+  remedy (`devbox reprovision` for a missing agent, `devbox doctor` for a
+  missing sudo or a dead daemon). All four situations unit-tested without a
+  runtime, a daemon or a box.
+- **A real live stream** (ADR-0049). `Query::after_id`, `Store::query_with_ids`
+  and `Store::max_id` make an id-anchored tail; `web::tail` watches the store
+  and publishes a *signal*; the page fetches only what it is missing and
+  prepends it, returning its own anchor out-of-band. Replaces
+  `every 2s` + `innerHTML`, which re-rendered and replaced the whole stream
+  twice a second and lost scroll and selection each time. A quiet box now
+  generates no traffic at all. `pause` holds the stream.
+- **Three layers.** Situation (density strip coloured by dominant domain,
+  window ends, counters including refused connections), seven views over one
+  load (stream, peers, flows, DNS, processes, files, policy), and a filtered
+  stream. Filters run *after* DNS correlation — the trap `cli::watch` already
+  documents — so `pypi` matches a connection that only recorded an address.
+  The strip, the switcher's counts and the six analysis views are one region
+  re-read together, because a live strip above a table frozen at page load
+  reports two different windows a few centimetres apart.
+- **Policy promoted.** Refused connections were reachable only inside a
+  collapsed `<details>` holding a `<pre>`. They are now a view, a counter, and
+  a marked row in the peers rollup — which includes peers that were refused
+  *before* connecting and therefore produced no flow at all.
+- Byte counts are rendered as sizes; the window heading and both ends of the
+  timeline axis now come from one source, so they cannot disagree.
+
+**Reviewed adversarially, twice.** Two Codex `gpt-5.6-sol` xhigh passes over
+the scoped diff raised 13 and then 14 findings; every one was accepted and
+fixed, and the second pass judged eight of the first round's fixes incomplete
+rather than wrong — which is the finding that mattered. The ones worth
+recording:
+
+- A tail anchored on the newest row that *decoded* wedged permanently the
+  moment an older schema left an undecodable row in front of it. The scan
+  position is a property of the scan, not of what survived it.
+- A row id alone cannot name a position. A box destroyed and recreated under
+  one name gets a new store starting again at id one; the cursor now carries
+  the store's inode and a mismatch replaces the stream instead of appending to
+  it.
+- `after=` arrives in a query string, so `-9223372036854775808` reached
+  `newest - anchor`: a panic in a checked build, a wrapped comparison in a
+  release one.
+- The status bar asked for a `SELECT COUNT(*)` — a full scan near the retention
+  limit — on every page load and twice a second on the live path.
+- `unreachable` is not `stopped`. A loaded Lima VM reads `unreachable` while
+  its agent streams, and the bar was reporting "nothing to capture" over a live
+  stream.
+- Overlapping agent connections let a departing one's notice overwrite an
+  arriving one's, reporting a healthy box as disconnected.
+
+**Gate** — 568 lib + 65 console + 20 integration + e2e (Docker, routed lab,
+ZTP, pcap) green; `cargo fmt`, `clippy -D warnings`, `go vet` clean.
+
+**Verified in the running console**, not only in tests: three events inserted
+into a live store appeared at the top of an open Activity tab within half a
+second, prepended, with every existing row untouched.
+
+**ZTP is in the console** (ADR-0051). `/labs/ztp-fabric` now shows the state
+machine as it runs: a convergence verdict with healthy/expected, failures,
+never-seen serials and provisioning p95; a node table carrying serial, state,
+attempts, config hash and failure reason, sorted so what needs attention reads
+first; and a topology whose blank nodes change colour as they provision — which
+is what makes "zero touch" something you watch rather than something you are
+told about afterwards.
+
+The operator listener did not move. It binds loopback inside the service
+namespace because a ZTP server is multi-homed and its inventory routes are
+unauthenticated; the console asks the substrate to fetch the status over the
+same exec channel every other lab operation uses.
+
+## 2026-08-23T04:10Z — Eleven adversarial review rounds, and ZTP in the console
+
+**Review** — eleven Codex `gpt-5.6-sol` xhigh passes over the scoped work
+raised 13, 14, 12, 12, 3, 2, 7, 8, 9, 14 and 14 findings. All 108 were accepted
+and fixed. The rounds that mattered most:
+
+- **A live stream that could wedge forever.** A tail anchored on the newest row
+  that *decoded* stopped the moment an older schema left an undecodable row in
+  front of it. The scan position is a property of the scan, not of what
+  survived it.
+- **Path traversal on three routes.** The activity fragments take a box name
+  straight from a URL and never look a sandbox up; `SandboxState::load` joined
+  whatever it was handed, while `save` and `remove` had always refused. Guarded
+  at the read path, so every caller is covered.
+- **A byte cap that counted characters.** SQLite's `LENGTH` on a TEXT value
+  counts characters, so a limit meant as 64 KiB admitted four times that for
+  any event carrying multibyte content.
+- **A retention sweep that emptied the store.** `page_count` measures the pages
+  the *file* holds, and freeing pages does not shrink it — so a size limit
+  compared against it could never be satisfied by deleting, and the trim loop
+  ran until the table was empty. Measured as pages in use, sized to the
+  overage, and guarded against any measure that does not respond to deletion.
+- **An audit summary that invented a posture.** A window holding no policy
+  event rendered as `open` egress — the most reassuring of the four, chosen as
+  the default for "not observed", in the tool whose selling point is an audit
+  trail.
+- **`pause` that did not pause.** htmx parses a trigger's `[...]` filter
+  immediately after the event name; written after `throttle:` it was never read
+  as a filter at all.
+
+Five findings in the last rounds were pre-existing hardening the new code was
+the first to exercise — retention sizing, pcap buffering, CLI name validation,
+agent version pinning, atomic-write temporary names. They were fixed rather
+than deferred, and are recorded here as such.
+
+**Gate** — 590 lib + 66 console + 20 integration + e2e (Docker, routed lab,
+ZTP, pcap) green; `cargo fmt`, `clippy -D warnings`, `go vet` clean; no stray
+collector daemons.
+
+**Also fixed: a test that leaked a daemon per run.** `CollectorCleanup` read
+the identity file at drop time, after the temporary home it lived in had
+already been deleted — so it never had a pid to signal. The strays accumulated,
+slowed the machine, and made the next run's timings look like a regression,
+which cost an hour of chasing one. Cleanup must not depend on the thing it
+cleans up outliving it.
+
+
+## The set that was correct until you touched it
+
+Bringing the ZTP flagship up on a freshly built box failed at the preflight:
+`devbox doctor` reported `lab: missing: zebra bgpd`, on a box whose `network`
+set was enabled and whose `nixos-rebuild` had reported success.
+
+Two bugs, stacked.
+
+**FRR hides its daemons in `libexec`.** The package puts `zebra` and `bgpd` in
+`libexec/frr/`, and a NixOS system profile links only `bin`, `sbin`, `lib`,
+`etc` and `share`. Installing `frr` gave the substrate `vtysh` and nothing for
+it to talk to. `lab up` invokes the daemons by name and its preflight probes
+`command -v zebra`, so the entire reason the `network` set carries FRR was
+unreachable on the default image. The set now builds a two-line derivation that
+symlinks them onto PATH.
+
+**And that fix could not reach a box.** Adding it to `nix/sets/network.nix` and
+re-applying changed nothing, because Sets apply does not push that file — it
+*regenerates* it from `NIX_SETS`, the package-name index, as a flat list. The
+derivation had nowhere to go in a list of names.
+
+The deeper shape is worth stating plainly: three code paths wrote the same
+guest files and two of them reconstructed those files from a lossier
+representation. For thirteen of fifteen sets the reconstruction was exact, so
+nothing looked wrong. The two exceptions were the two sets that need to be more
+than a list — the AI sets' `tryEval` guards, and `network`'s derivation. A box
+was therefore correct when created and quietly degraded by its first Sets
+apply, with a success message on both. `devbox upgrade` was worse: its path had
+no exemption at all, so it would strip the AI sets' guards too.
+
+ADR-0052 collapses it: the checked-in module is the artifact, all three paths
+push it, and `NIX_SETS` goes back to being only an index. Both drift directions
+are now pinned by a test, and the module→catalog direction skips parenthesised
+sub-expressions so a set may carry a derivation without its tokens being
+mistaken for packages.
+
+**Worth remembering.** The failure was invisible in exactly the cases that
+would have caught it early — a fresh box works, a rebuild reports success — and
+visible only as a third command's preflight complaining about something two
+steps removed. When two representations of one thing agree in every case you
+have tested, that is not evidence they agree; it is evidence you have only
+tested where they overlap.
+
+## Three faults between a healthy node and a working fabric
+
+The ZTP flagship did not work. Not "worked with a rough edge" — `lab up`
+blocked forever, and once unblocked it failed twice more, each time at a later
+stage and each time for an unrelated reason. All three were invisible to the
+test suite and to every per-node check.
+
+**`lab up` hung on the first daemon.** `zebra -d` detaches but keeps the
+descriptors it inherited, so FRR can still report an early failure. Over ssh
+that means the session never closes, and `lab up` waited on a daemon that was
+up and healthy the entire time. It read as a slow lab, not a hung one.
+(ADR-0053.)
+
+**Every blank node failed its DNS self-check.** Two independent faults, either
+sufficient. The lab's dnsmasq used `address=/name/v4`, which answers A and
+forwards everything else — with no upstream to forward to, so AAAA came back
+REFUSED and every stock resolver, which asks for both at once, called a
+resolvable name missing. And the check itself used `getent hosts`, which on a
+NixOS substrate is answered by `nsncd` in the root network namespace, from the
+host's `resolv.conf` — a resolver on the wrong side of the boundary the lab
+exists to draw. `tcpdump` inside the node saw no DNS packet at all. (ADR-0054.)
+
+**Then three healthy nodes could not reach each other.** FRR 10 moved interface
+configuration into `mgmtd`, and `lab up` started only zebra and bgpd. Zebra
+logged "No such command" for every line of every interface stanza and carried
+on, so each node came up with its BGP configuration and none of its addresses.
+Routed labs never noticed because wiring assigns addresses out of band; a ZTP
+node has no such step, by design. (ADR-0055.)
+
+**And the fix for the third broke a fourth thing.** Requiring `mgmtd` was
+right for the box devbox builds and wrong as a rule: it arrived in FRR 9, and
+Debian bookworm — which the routed e2e test runs on — ships 8.4, where zebra
+still owns interface configuration. The lab that had been working failed on its
+first daemon. The start is now guarded by `command -v` on the substrate, and
+`doctor` asks zebra its version before deciding whether a missing `mgmtd` is a
+fault.
+
+That failure was itself nearly missed: the run that surfaced it also had a
+flaky `e2e_docker` failure, and with test binaries running in parallel the
+first panic is the one that gets reported. The docker test passed alone and on
+re-run; the lab test failed both times. Two failures in one run are not one
+failure — the second has to be looked at after the first is explained.
+
+**Gate** — 593 lib + 68 console + 20 integration + e2e (Docker, routed lab,
+ZTP, pcap) green; `cargo fmt`, `clippy -D warnings`, `go build`, `go vet`,
+`go test` clean.
+
+**Worth remembering.** Every one of these announced success at the moment it
+failed. `nixos-rebuild` reported success on a rebuild that had dropped a
+package; zebra reported startup on a config it had discarded most of; `ztpd`
+reported three healthy nodes on a fabric where none could reach another. The
+common shape is a component that treats "I did the part I understood" as done.
+What caught all three was the same thing: running the feature end to end on a
+real box and looking at the state it actually produced, rather than at what
+each step said about itself.

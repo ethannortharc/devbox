@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#0b100c" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f5f8f3" media="(prefers-color-scheme: light)" />
+    <meta name="description" content="A local control plane for isolated development boxes and network labs." />
     <title>{% block title %}devbox{% endblock %}</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/assets/css/app.css" />
@@ -38,22 +41,43 @@
     <script src="/assets/js/download.js"></script>
   </head>
   <body hx-ext="sse" sse-connect="/api/stream">
+    {# Registers the replay-only inventory event without inserting its JSON
+       payload into the DOM. Detail pages use it to notice deletion across an
+       SSE disconnect. #}
+    <span hidden hx-trigger="sse:box-inventory"></span>
+    <a class="skip-link" href="#content">Skip to content</a>
     <header class="topbar">
-      <a class="brand" href="/">devbox <span class="v">v{{ version }}</span></a>
-      <nav class="nav">
-        <a href="/" {% if nav == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
-        <a href="/help" {% if nav == "help" %}aria-current="page"{% endif %}>Help</a>
-      </nav>
-      <span class="spacer"></span>
-      <span class="pulse" id="pulse">
-        <span class="dot"></span>
-        <span sse-swap="tick">connecting…</span>
-      </span>
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="devbox dashboard">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+          <span class="brand-name">devbox</span>
+          <span class="v">v{{ version }}</span>
+        </a>
+        <nav class="nav" aria-label="Primary navigation">
+          <a href="/" {% if nav == "dashboard" %}aria-current="page"{% endif %}>Boxes</a>
+          <a href="/labs" {% if nav == "labs" %}aria-current="page"{% endif %}>Network labs</a>
+          <a href="/help" {% if nav == "help" %}aria-current="page"{% endif %}>Guides</a>
+        </nav>
+        <span class="spacer"></span>
+        <a class="tab-launch" id="open-console-tab" href="" target="_blank"
+           rel="noopener" aria-label="Open this console in a new tab"
+           title="Open this console in a new tab">
+          <span class="tab-launch-icon" aria-hidden="true"></span>
+          <span class="tab-launch-label">New tab</span>
+        </a>
+        <span class="pulse" id="pulse" role="status" aria-live="polite">
+          <span class="dot" aria-hidden="true"></span>
+          <span sse-swap="tick">connecting…</span>
+        </span>
+      </div>
     </header>
 
-    <main>{% block content %}{% endblock %}</main>
+    <main id="content">{% block content %}{% endblock %}</main>
 
-    <footer>© 2026 Ethan H.B. Zhou</footer>
+    <footer>
+      <span>devbox · local-first development environments</span>
+      <span>© 2026 Ethan H.B. Zhou</span>
+    </footer>
 
     <script>
       // The heartbeat drives the "live" indicator: green while ticks arrive,
@@ -62,12 +86,35 @@
         var pulse = document.getElementById("pulse");
         var timer = null;
         document.body.addEventListener("htmx:sseMessage", function (e) {
+          if (e.detail.type === "box-inventory") {
+            var detail = document.getElementById("detail-card-slot");
+            if (!detail || !detail.dataset.boxName) return;
+            try {
+              var names = JSON.parse(e.detail.data || "[]");
+              if (names.indexOf(detail.dataset.boxName) === -1) {
+                window.location.assign("/");
+              }
+            } catch (_) {
+              pulse.classList.remove("live");
+            }
+            return;
+          }
           if (e.detail.type !== "tick") return;
           pulse.classList.add("live");
           clearTimeout(timer);
           timer = setTimeout(function () {
             pulse.classList.remove("live");
           }, 5000);
+        });
+        document.body.addEventListener("htmx:sseMessage", function (e) {
+          var box = (e.detail.type || "").replace(/^build-status-/, "");
+          if (!box || box === e.detail.type) return;
+          document.querySelectorAll("[data-unlock-on-build]").forEach(function (form) {
+            if (form.dataset.unlockOnBuild !== box) return;
+            form.querySelectorAll('button[type="submit"]').forEach(function (button) {
+              button.disabled = false;
+            });
+          });
         });
         document.body.addEventListener("htmx:sseError", function () {
           pulse.classList.remove("live");

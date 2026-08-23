@@ -9,8 +9,76 @@ permissions:
   contents: write
 
 jobs:
+  agent:
+    name: Agent linux/${{ matrix.goarch }}
+    # bpf2go compiles kprobe register access against the build host's BTF.
+    # Cross-compiling an arm64 object on an x86 runner therefore produces an
+    # invalid (and normally uncompilable) probe. Keep GOARCH and the runner's
+    # kernel architecture aligned.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            runner: ubuntu-latest
+            artifact: devbox-obsd-linux-amd64
+            ztpd_artifact: devbox-ztpd-linux-amd64
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
+            artifact: devbox-obsd-linux-arm64
+            ztpd_artifact: devbox-ztpd-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bpftool clang llvm libbpf-dev
+
+      - name: Generate CO-RE types and object
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
+          go generate -tags bpf2go ./agent/bpf
+
+      - name: Build version-pinned agent
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo version $package_version"
+            exit 1
+          fi
+          go build -trimpath -tags ebpf \
+            -ldflags "-s -w -X github.com/ethannortharc/devbox/internal/buildinfo.Version=$package_version -X github.com/ethannortharc/devbox/internal/buildinfo.Commit=${GITHUB_SHA::12}" \
+            -o ${{ matrix.artifact }} ./agent/cmd/obsd
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/ethannortharc/devbox/internal/buildinfo.Version=$package_version -X github.com/ethannortharc/devbox/internal/buildinfo.Commit=${GITHUB_SHA::12}" \
+            -o ${{ matrix.ztpd_artifact }} ./ztpd/cmd/ztpd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.ztpd_artifact }}
+          path: ${{ matrix.ztpd_artifact }}
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.target }}
+    needs: agent
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,9 +87,13 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: devbox-darwin-arm64
+            agent_name: devbox-obsd-linux-arm64
+            ztpd_name: devbox-ztpd-linux-arm64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             binary_name: devbox-linux-amd64
+            agent_name: devbox-obsd-linux-amd64
+            ztpd_name: devbox-ztpd-linux-amd64
 
     steps:
       - name: Checkout
@@ -32,6 +104,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.agent_name }}
+          path: embedded-agent
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.ztpd_name }}
+          path: embedded-ztpd
+
       - name: Install musl-tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -39,6 +121,10 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build
+        env:
+          DEVBOX_OBSD_BINARY: ${{ github.workspace }}/embedded-agent/${{ matrix.agent_name }}
+          DEVBOX_OBSD_EBPF: "1"
+          DEVBOX_ZTPD_BINARY: ${{ github.workspace }}/embedded-ztpd/${{ matrix.ztpd_name }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (macOS)

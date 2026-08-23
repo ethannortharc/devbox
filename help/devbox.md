@@ -18,7 +18,7 @@ everything the CLI does: manage boxes, browse overlay changes, and open a
 terminal in the browser.
 
 ## Workspace
-  devbox use /path/to/project      Remount different directory
+  cd /path/to/project && devbox use <name>   Remount a Lima/Incus box to the current directory
   devbox exec -- make test         Run one-off command
 
 ## Layer Management (OverlayFS)

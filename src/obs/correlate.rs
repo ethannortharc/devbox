@@ -217,6 +217,7 @@ fn dedup_in_order(items: impl Iterator<Item = String>) -> Vec<String> {
 /// (§7.3, "IPs reverse-mapped to the DNS name that produced them").
 pub fn dns_map(events: &[Event]) -> BTreeMap<String, Vec<(String, String)>> {
     let mut map: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut entries = 0usize;
     for event in events {
         if event.kind != EventType::Dns {
             continue;
@@ -225,7 +226,20 @@ pub fn dns_map(events: &[Event]) -> BTreeMap<String, Vec<(String, String)>> {
         if net.qname.is_empty() {
             continue;
         }
-        for answer in &net.answers {
+        // Bounded, because both halves of every entry are guest-supplied and
+        // this map is rebuilt on every render of the Activity tab. One lookup
+        // is allowed to answer with thousands of addresses, and each answer
+        // clones the name — so a single event well under the frame limit
+        // expanded into hundreds of megabytes of map.
+        if entries >= MAX_DNS_MAP_ENTRIES {
+            tracing::debug!(
+                limit = MAX_DNS_MAP_ENTRIES,
+                "dns correlation map is full; later answers are not indexed"
+            );
+            break;
+        }
+        for answer in net.answers.iter().take(MAX_DNS_ANSWERS_PER_LOOKUP) {
+            entries += 1;
             // Every answer, with when it was given. A single first-wins name
             // per address misattributed every connection once two domains
             // shared a CDN address — including connections that *preceded*
@@ -239,6 +253,19 @@ pub fn dns_map(events: &[Event]) -> BTreeMap<String, Vec<(String, String)>> {
     }
     map
 }
+
+/// Answers indexed from one lookup.
+///
+/// A resolver returning more than this is not describing a destination anyone
+/// is about to connect to.
+const MAX_DNS_ANSWERS_PER_LOOKUP: usize = 64;
+
+/// Entries the correlation map will hold for one window.
+///
+/// The map exists to give a connection a readable name. Past this many
+/// address-to-name pairs it has stopped being that and started being a way to
+/// spend the console's memory.
+const MAX_DNS_MAP_ENTRIES: usize = 50_000;
 
 /// Fill in `net.domain` on connections whose address a DNS answer explains.
 ///

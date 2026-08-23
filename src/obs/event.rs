@@ -156,6 +156,10 @@ pub struct Net {
     pub qtype: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<String>,
+    /// True only for a DNS answer correlated with a query observed from this
+    /// box. The policy enforcer never trusts query-shaped packets.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub response: bool,
 
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_tx: u64,
@@ -216,6 +220,9 @@ pub struct Policy {
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
+}
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0

@@ -1,0 +1,8 @@
+{%- for r in stream -%}
+<div class="ev ev-{{ r.domain }}">
+  <span class="ev-ts">{{ r.ts }}</span>
+  <span class="ev-kind">{{ r.kind }}</span>
+  <span class="ev-proc">{{ r.comm }}<span class="ev-pid">·{{ r.pid }}</span></span>
+  <span class="ev-summary">{{ r.summary }}</span>
+</div>
+{%- endfor -%}

@@ -1,11 +1,5 @@
-{%- for r in stream -%}
-<div class="ev ev-{{ r.domain }}">
-  <span class="ev-ts">{{ r.ts }}</span>
-  <span class="ev-kind">{{ r.kind }}</span>
-  <span class="ev-proc">{{ r.comm }}<span class="ev-pid">·{{ r.pid }}</span></span>
-  <span class="ev-summary">{{ r.summary }}</span>
-</div>
-{%- endfor -%}
+{% include "_activity_rows.html" %}
 {%- if stream.is_empty() -%}
-<p class="muted">No activity recorded yet.</p>
+<p class="muted">Nothing matches the current filter.</p>
 {%- endif -%}
+<input type="hidden" id="act-anchor" name="after" value="{{ cursor }}" hx-swap-oob="true" />

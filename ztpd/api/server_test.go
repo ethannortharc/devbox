@@ -573,7 +573,7 @@ func TestBootstrapRetriesAnActivationThatFailed(t *testing.T) {
 	}
 
 	restart := strings.Index(script, "service frr restart")
-	marker := strings.Index(script, `cp /etc/frr/frr.conf "$ACTIVATED"`)
+	marker := strings.Index(script, `cp "$FRR_CONF" "$ACTIVATED"`)
 	switch {
 	case restart < 0:
 		t.Fatal("could not find the FRR restart")
@@ -873,8 +873,8 @@ func TestTheSkipBranchRequiresTheInstalledConfigToMatchTheMarker(t *testing.T) {
 	cond := script[idx : idx+end]
 
 	for _, required := range []string{
-		`cmp -s /etc/frr/frr.conf "$ACTIVATED"`, // installed matches activated
-		"frr_answers",                           // and the daemon is up
+		`cmp -s "$FRR_CONF" "$ACTIVATED"`, // installed matches activated
+		"frr_answers",                     // and the daemon is up
 	} {
 		if !strings.Contains(cond, required) {
 			t.Errorf("the skip branch must also require %s:\n%s", required, cond)

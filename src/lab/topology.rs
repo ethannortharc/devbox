@@ -43,6 +43,13 @@ impl Role {
 
     /// Whether this role runs a routing daemon.
     pub fn routes(&self) -> bool {
+        matches!(self, Role::FrrRouter | Role::ZtpBlank)
+    }
+
+    /// Whether its routing daemon is present before orchestration starts.
+    /// A ZTP blank becomes a router, but starting it here would preconfigure
+    /// the very node the scenario is meant to provision.
+    pub fn preconfigured(&self) -> bool {
         matches!(self, Role::FrrRouter)
     }
 
@@ -341,6 +348,55 @@ impl Topology {
             );
         }
 
+        let service_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.role == Role::Service)
+            .count();
+        let blank_nodes: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|node| node.role == Role::ZtpBlank)
+            .collect();
+        if !blank_nodes.is_empty() {
+            if service_nodes != 1 {
+                bail!("a ZTP fabric needs exactly one `service` node, found {service_nodes}");
+            }
+            if !self.services.dhcp {
+                bail!("a `ztp-blank` node needs DHCP enabled to discover its bootstrap");
+            }
+            for blank in blank_nodes {
+                let interfaces = self.interfaces_of(&blank.name);
+                if interfaces.len() != 1 {
+                    bail!(
+                        "ZTP node '{}' must have exactly one bootstrap interface, found {}",
+                        blank.name,
+                        interfaces.len()
+                    );
+                }
+                let peer = self
+                    .links
+                    .iter()
+                    .filter_map(|link| link.parse_endpoints().ok())
+                    .find_map(|(a, b)| {
+                        if a.node == blank.name {
+                            Some(b.node)
+                        } else if b.node == blank.name {
+                            Some(a.node)
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|name| self.node(&name));
+                if peer.is_none_or(|node| node.role != Role::FrrRouter) {
+                    bail!(
+                        "ZTP node '{}' must attach directly to an `frr-router` that can serve DHCP",
+                        blank.name
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -378,6 +434,26 @@ impl Topology {
             .flat_map(|(a, b)| [a, b])
             .filter(|e| e.node == node)
             .map(|e| e.iface)
+            .collect()
+    }
+
+    /// Interfaces whose far end also participates in routing.
+    /// A router can face a host or service without expecting BGP from it.
+    pub fn routing_interfaces_of(&self, node: &str) -> Vec<String> {
+        self.links
+            .iter()
+            .filter_map(|link| link.parse_endpoints().ok())
+            .filter_map(|(a, b)| {
+                if a.node == node && self.node(&b.node).is_some_and(|peer| peer.role.routes()) {
+                    Some(a.iface)
+                } else if b.node == node
+                    && self.node(&a.node).is_some_and(|peer| peer.role.routes())
+                {
+                    Some(b.iface)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 

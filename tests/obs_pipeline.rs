@@ -24,6 +24,13 @@ use devbox::obs::correlate;
 use devbox::obs::event::EventType;
 use devbox::obs::store::{Query, Store};
 
+// These cases launch freshly linked Go binaries while the Rust process suite
+// is also running. macOS endpoint scanning and loaded CI hosts can delay the
+// child before `main` for well beyond ten seconds; the protocol assertions
+// remain bounded, but process startup gets the same generous allowance as the
+// collector-daemon integration test.
+const PROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -240,14 +247,14 @@ async fn go_agent_streams_into_the_rust_collector() {
     assert!(summary.dns_queries.contains("pypi.org"));
     assert_eq!(summary.egress_mode.as_deref(), Some("allowlist"));
     assert_eq!(summary.violations.len(), 1);
-    assert_eq!(summary.violations[0].target, "telemetry.example.com");
+    assert_eq!(summary.violations[0].target, "93.184.216.34:443");
     assert_eq!(summary.api_calls.len(), 1);
     assert_eq!(summary.api_calls[0].host, "api.anthropic.com");
     assert_eq!(summary.api_calls[0].tokens, 142_000);
 
     let md = behavior::render_markdown(&summary);
     assert!(md.contains("Behavior summary"));
-    assert!(md.contains("telemetry.example.com"));
+    assert!(md.contains("93.184.216.34:443"));
 
     // Diffing a run against itself finds nothing; against an empty window it
     // finds everything that left, but no *new* behaviour.
@@ -270,6 +277,131 @@ async fn go_agent_streams_into_the_rust_collector() {
 
     drop(store);
     serving.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vm_stdio_transport_carries_the_same_protocol() {
+    if !go_available() {
+        eprintln!("skipping: the Go toolchain is not available");
+        return;
+    }
+
+    let work = tempfile::tempdir().expect("temp dir");
+    let Some(agent) = build_agent(work.path()) else {
+        eprintln!("skipping: could not build devbox-obsd");
+        return;
+    };
+    let fixture = repo_root().join("agent/event/testdata/events.jsonl");
+    let expected = std::fs::read_to_string(&fixture)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+
+    let store = Store::open(&work.path().join("stdio-events.db")).unwrap();
+    let collector =
+        Arc::new(Collector::new(work.path().join("unused.sock"), store).for_box("stdio-box"));
+    let store_handle = collector.store();
+
+    let mut child = tokio::process::Command::new(agent)
+        .args(["-box-id", "stdio-box", "-stdio", "-fixture"])
+        .arg(fixture)
+        .arg("-once")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("stdio agent starts");
+    let agent_in = child.stdin.take().expect("agent stdin");
+    let agent_out = child.stdout.take().expect("agent stdout");
+    let serving = tokio::spawn(Arc::clone(&collector).run_agent_stream(agent_out, agent_in));
+
+    let status = tokio::time::timeout(PROCESS_TEST_TIMEOUT, child.wait())
+        .await
+        .expect("stdio agent timed out")
+        .expect("stdio agent wait");
+    assert!(status.success(), "stdio agent exited with {status}");
+    tokio::time::timeout(PROCESS_TEST_TIMEOUT, serving)
+        .await
+        .expect("stdio collector timed out")
+        .expect("stdio collector task")
+        .expect("stdio collector failed");
+
+    assert_eq!(
+        store_handle.lock().await.count().unwrap() as usize,
+        expected,
+        "stdio must carry every fixture event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_stdio_agent_exits_when_the_host_session_disappears() {
+    if !go_available() {
+        eprintln!("skipping: the Go toolchain is not available");
+        return;
+    }
+
+    let work = tempfile::tempdir().expect("temp dir");
+    let Some(agent) = build_agent(work.path()) else {
+        eprintln!("skipping: could not build devbox-obsd");
+        return;
+    };
+    let fixture = repo_root().join("agent/event/testdata/events.jsonl");
+    let expected = std::fs::read_to_string(&fixture)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as u64;
+    let collector = Arc::new(
+        Collector::new(
+            work.path().join("unused-idle.sock"),
+            Store::open(&work.path().join("idle-events.db")).unwrap(),
+        )
+        .for_box("idle-box"),
+    );
+    let store = collector.store();
+
+    let mut child = tokio::process::Command::new(agent)
+        .args(["-box-id", "idle-box", "-stdio", "-fixture"])
+        .arg(fixture)
+        // Deliberately no -once: after replay this is an idle, live agent.
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("stdio agent starts");
+    let agent_in = child.stdin.take().expect("agent stdin");
+    let agent_out = child.stdout.take().expect("agent stdout");
+    let serving = tokio::spawn(Arc::clone(&collector).run_agent_stream(agent_out, agent_in));
+
+    let stats = collector.stats();
+    let arrived = tokio::time::timeout(PROCESS_TEST_TIMEOUT, async {
+        loop {
+            if store.lock().await.count().unwrap() == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if arrived.is_err() {
+        let stored = store.lock().await.count().unwrap();
+        let snapshot = stats.snapshot();
+        let child_status = child.try_wait().expect("inspect idle agent");
+        panic!(
+            "fixture events never reached the collector: expected {expected}, stored {stored}, \
+             stats {snapshot:?}, child status {child_status:?}"
+        );
+    }
+
+    // Dropping both host pipe ends must reap the otherwise-idle in-guest
+    // process; killing only docker/limactl on the host is not sufficient.
+    serving.abort();
+    let _ = serving.await;
+    let _status = tokio::time::timeout(PROCESS_TEST_TIMEOUT, child.wait())
+        .await
+        .expect("orphaned stdio agent survived its host session")
+        .expect("wait for stdio agent");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -8,6 +8,7 @@
 //! that many bytes of payload. The payload is JSON today and versioned so it
 //! can become protobuf without changing the framer (ADR-0015).
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,15 +16,29 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixListener;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::event::Event;
 use super::store::{Retention, Store};
 
 /// Protocol version, matching `transport.ProtocolVersion` in Go.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// How long an accepted connection has to say hello.
+///
+/// A socket the guest can reach is a socket a compromised guest can open and
+/// then hold silent. Without a deadline each one occupies a task and a file
+/// descriptor for as long as it likes.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most connections one collector will serve at once.
+///
+/// One agent per box is the design; a handful covers a restart overlapping its
+/// predecessor. Beyond that the far side is not an agent, and refusing is
+/// better than running the daemon out of descriptors.
+pub const MAX_CONNECTIONS: usize = 8;
 
 /// Maximum accepted frame, matching `transport.MaxFrameSize`.
 ///
@@ -46,6 +61,15 @@ pub const BATCH_LINGER: Duration = Duration::from_millis(200);
 /// dropped and *counted*, never silently discarded and never allowed to grow
 /// into unbounded memory.
 pub const QUEUE_DEPTH: usize = 8192;
+
+/// Bytes of queued events one collector will hold.
+///
+/// A depth is not a bound on memory. One event may be a whole frame, so eight
+/// thousand of them is eight gigabytes — reachable by a guest that simply
+/// sends large events faster than SQLite accepts them, and reached long before
+/// the depth limit starts counting drops. Whichever limit binds first wins;
+/// both drop and count.
+pub const QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The agent's opening frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +126,7 @@ impl Stats {
 }
 
 /// A point-in-time copy of [`Stats`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub received: u64,
     pub stored: u64,
@@ -208,6 +232,14 @@ pub fn evaluate_hello(hello: &Hello, expected_box: Option<&str>) -> HelloAck {
     // A development build (`0.0.0`, or any version containing `-dev`) is
     // exempt: that is someone running a locally built agent against a locally
     // built collector on purpose.
+    if hello.version.is_empty() {
+        return HelloAck {
+            protocol: PROTOCOL_VERSION,
+            accepted: false,
+            reason: "hello names no agent version; event layouts are pinned per release"
+                .to_string(),
+        };
+    }
     let host_version = env!("CARGO_PKG_VERSION");
     if !is_development_build(&hello.version)
         && !is_development_build(host_version)
@@ -233,8 +265,26 @@ pub fn evaluate_hello(hello: &Hello, expected_box: Option<&str>) -> HelloAck {
 
 /// Is this a build that should skip the release pin?
 fn is_development_build(version: &str) -> bool {
-    version.is_empty() || version == "0.0.0" || version.contains("-dev")
+    // An *absent* version is not one. It used to be treated as a development
+    // build, which meant an agent that simply omitted the field skipped the
+    // release pin entirely — the one check standing between a mismatched
+    // event layout and a store full of plausible nonsense.
+    version == "0.0.0" || version.contains("-dev")
 }
+
+/// Called when an accepted agent arrives (`Some`) and again when its
+/// connection ends (`None`), identified by a connection number.
+///
+/// Both edges matter. Only the exec transport's supervisor notices a departure
+/// on its own — its child dies with the box. A host-side socket listener
+/// outlives the container that was dialling it, so without the closing call
+/// its box would be reported as capturing for as long as the console ran.
+///
+/// The number is what lets a consumer tell *which* connection left. Counting
+/// them was not enough: an agent restarting overlaps its predecessor, and when
+/// the newer one then died the older one's box kept advertising the newer
+/// one's capture backends.
+type AgentHook = Arc<dyn Fn(u64, Option<&Hello>) + Send + Sync>;
 
 /// A running collector.
 pub struct Collector {
@@ -245,6 +295,21 @@ pub struct Collector {
     live: tokio::sync::broadcast::Sender<Event>,
     box_id: Option<String>,
     retention: Retention,
+    /// Called once per accepted agent, with what it said about itself.
+    on_agent: Option<AgentHook>,
+    /// Numbers accepted connections, so the hook can tell them apart.
+    connections: AtomicU64,
+    /// Bytes of events accepted into the queue and not yet written.
+    queued_bytes: std::sync::atomic::AtomicUsize,
+}
+
+/// An event on its way to the store, with the size it arrived as.
+///
+/// The size travels with it so the writer can release exactly what the reader
+/// reserved — re-measuring it there would drift from what was counted in.
+struct Queued {
+    event: Event,
+    size: usize,
 }
 
 impl Collector {
@@ -258,6 +323,9 @@ impl Collector {
             live,
             box_id: None,
             retention: Retention::default(),
+            on_agent: None,
+            connections: AtomicU64::new(0),
+            queued_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -267,9 +335,33 @@ impl Collector {
         self
     }
 
+    /// Share counters with sibling collectors.
+    ///
+    /// The console runs one listener per box but exposes one `/metrics`
+    /// endpoint. Supplying the same counter set to every collector makes that
+    /// endpoint the aggregate rather than the counters of whichever box was
+    /// started last.
+    pub fn with_stats(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = stats;
+        self
+    }
+
     /// Override the retention policy.
     pub fn with_retention(mut self, retention: Retention) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Observe every accepted agent's hello.
+    ///
+    /// The handshake is the only moment the host learns which capture
+    /// backends attached; nothing downstream of it carries that. The hook runs
+    /// on the connection's task, so it must not block.
+    pub fn with_agent_hook(
+        mut self,
+        hook: impl Fn(u64, Option<&Hello>) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_agent = Some(Arc::new(hook));
         self
     }
 
@@ -293,6 +385,12 @@ impl Collector {
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
+            // The collector trusts the box id in the handshake, so the local
+            // endpoint itself is an authority boundary. A world-searchable
+            // box directory plus a writable socket lets another host user
+            // inject a forged timeline for any known box.
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to protect {}", parent.display()))?;
         }
         // A previous run that was killed leaves the socket file behind; bind
         // would then fail with EADDRINUSE even though nothing is listening.
@@ -300,17 +398,58 @@ impl Collector {
             std::fs::remove_file(&self.socket_path)
                 .with_context(|| format!("failed to remove {}", self.socket_path.display()))?;
         }
-        UnixListener::bind(&self.socket_path)
-            .with_context(|| format!("failed to listen on {}", self.socket_path.display()))
+        let listener = UnixListener::bind(&self.socket_path)
+            .with_context(|| format!("failed to listen on {}", self.socket_path.display()))?;
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", self.socket_path.display()))?;
+        Ok(listener)
     }
 
-    /// Accept agents until the listener fails.
-    pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
-        let (tx, rx) = mpsc::channel::<Event>(QUEUE_DEPTH);
-        let writer = tokio::spawn(Arc::clone(&self).write_loop(rx));
+    /// Accept agents until the listener fails, or until told to stop.
+    ///
+    /// `stop` matters for shutdown, not for tidiness. Aborting the task that
+    /// runs this skips everything after the accept loop: the writer's handle
+    /// is dropped rather than awaited, so its final batch — up to a linger
+    /// interval of events — is still in memory when the process exits. Asked
+    /// to stop, it drains instead.
+    pub async fn run_until(
+        self: Arc<Self>,
+        listener: UnixListener,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel::<Queued>(QUEUE_DEPTH);
+
+        // The writer lives in a set of its own, and the reason is its Drop.
+        // Spawned bare, its handle was *dropped* rather than aborted when this
+        // task was — detaching it, so a writer still flushing could run
+        // alongside its replacement. A `JoinSet` aborts what it holds when it
+        // is dropped, which is what an abort of this task now reaches.
+        //
+        // Its own set, not the connections': every connection holds a sender,
+        // so the writer cannot finish until they are gone. Waiting for it in
+        // the same set deadlocks — the writer is the last thing to end, by
+        // construction.
+        //
+        // Connections are owned by this loop too, not detached from it.
+        //
+        // Aborting the task that runs `run` only ever stopped the accept loop;
+        // every connection it had spawned kept reading and kept writing into
+        // the store. A box whose `state.json` is rewritten — which an ordinary
+        // atomic save does — retires this collector and starts its
+        // replacement, and the old agent then wrote alongside the new one,
+        // duplicating every event. A `JoinSet` aborts what it holds when it is
+        // dropped, which is what an abort of this task now reaches.
+        let mut connections = tokio::task::JoinSet::new();
+        let mut writer = tokio::task::JoinSet::new();
+        writer.spawn(Arc::clone(&self).write_loop(rx));
 
         loop {
-            let (stream, _) = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopping| *stopping) => break,
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, _) = match accepted {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::error!(error = %e, "collector accept failed");
@@ -318,39 +457,161 @@ impl Collector {
                 }
             };
 
+            // Finished connections are reaped here rather than accumulating
+            // for the life of the console.
+            while connections.try_join_next().is_some() {}
+            if connections.len() >= MAX_CONNECTIONS {
+                // One agent per box is the design. Something opening more than
+                // a handful is not one, and the honest response is to close
+                // rather than to hold a descriptor for it.
+                tracing::warn!(
+                    open = connections.len(),
+                    "refusing an agent connection: too many already open"
+                );
+                drop(stream);
+                continue;
+            }
+
             let me = Arc::clone(&self);
             let tx = tx.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 // Counted inside `serve_agent`, once the hello is accepted.
                 // Incrementing here counted malformed clients and agents
                 // rejected for the wrong box, so a retry loop inflated the
                 // metric without a single agent ever connecting.
-                if let Err(e) = me.serve_agent(stream, tx).await {
+                let (mut reader, mut writer) = stream.into_split();
+                if let Err(e) = me
+                    .serve_agent(&mut reader, &mut writer, tx, None, false)
+                    .await
+                {
                     tracing::warn!(error = %e, "agent connection ended");
                 }
             });
         }
 
+        // Connections first — each holds a sender, and the writer ends when
+        // the last one is dropped. Then ours. Then the writer drains what is
+        // still queued and returns on its own.
+        connections.shutdown().await;
         drop(tx);
-        let _ = writer.await;
+        while writer.join_next().await.is_some() {}
         Ok(())
     }
 
+    /// Serve one agent carried by a runtime's authenticated exec stdio.
+    ///
+    /// VM kernels cannot connect to a host AF_UNIX inode exposed through 9p or
+    /// virtiofs. Lima, Multipass and Incus already provide a bidirectional,
+    /// authenticated exec stream, so the same framed protocol rides that
+    /// stream without opening a host network listener.
+    pub async fn run_agent_stream<R, W>(self: Arc<Self>, mut reader: R, mut writer: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        self.run_agent_stream_inner(&mut reader, &mut writer, None)
+            .await
+    }
+
+    /// Serve an exec stream and signal once its handshake is accepted.
+    ///
+    /// The supervisor uses this exact boundary to reset retry backoff. A child
+    /// merely spawning is not success: a missing agent, rejected version or
+    /// closed stdin can all fail before one event is trustworthy.
+    ///
+    pub(crate) async fn run_agent_stream_ready<R, W>(
+        self: Arc<Self>,
+        mut reader: R,
+        mut writer: W,
+        ready: oneshot::Sender<()>,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        self.run_agent_stream_inner(&mut reader, &mut writer, Some(ready))
+            .await
+    }
+
+    async fn run_agent_stream_inner<R, W>(
+        self: Arc<Self>,
+        reader: &mut R,
+        writer: &mut W,
+        ready: Option<oneshot::Sender<()>>,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let (tx, rx) = mpsc::channel::<Queued>(QUEUE_DEPTH);
+        // A set rather than a bare handle, for its Drop. Aborting the task
+        // that runs this dropped the handle instead of the writer, detaching
+        // it — so a writer still flushing could outlive the collector it
+        // belonged to and modify the store alongside its replacement.
+        let mut store_writer = tokio::task::JoinSet::new();
+        store_writer.spawn(Arc::clone(&self).write_loop(rx));
+        let served = self.serve_agent(reader, writer, tx, ready, true).await;
+        // `tx` was moved into `serve_agent` and is gone by now, so the queue
+        // is closed and the writer drains and returns on its own.
+        while store_writer.join_next().await.is_some() {}
+        served
+    }
+
+    /// Accept agents until the listener fails.
+    pub async fn run(self: Arc<Self>, listener: UnixListener) -> Result<()> {
+        let (keep, never) = tokio::sync::watch::channel(false);
+        // Held for the call, so the receiver never sees its sender drop.
+        let result = self.run_until(listener, never).await;
+        drop(keep);
+        result
+    }
+
     /// Handshake with one agent, then read its event stream.
-    async fn serve_agent(&self, mut stream: UnixStream, tx: mpsc::Sender<Event>) -> Result<()> {
-        let Some(frame) = read_frame(&mut stream).await? else {
+    async fn serve_agent<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        tx: mpsc::Sender<Queued>,
+        ready: Option<oneshot::Sender<()>>,
+        send_heartbeats: bool,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let hello_frame = tokio::time::timeout(HELLO_TIMEOUT, read_frame(reader))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "agent did not say hello within {}s",
+                    HELLO_TIMEOUT.as_secs()
+                )
+            })??;
+        let Some(frame) = hello_frame else {
             bail!("agent closed the connection before saying hello");
         };
         let hello: Hello =
             serde_json::from_slice(&frame).context("agent sent a malformed hello")?;
 
         let ack = evaluate_hello(&hello, self.box_id.as_deref());
-        write_frame(&mut stream, &serde_json::to_vec(&ack)?).await?;
+        write_frame(writer, &serde_json::to_vec(&ack)?).await?;
         if !ack.accepted {
             bail!("rejected agent: {}", ack.reason);
         }
         // Only now: an accepted agent is what the metric claims to count.
         self.stats.agents_connected.fetch_add(1, Ordering::Relaxed);
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
+        // Both transports pass through here, so both report. The readiness
+        // channel deliberately stays a bare boundary marker: it exists to
+        // reset retry backoff for one exec child, and only the exec path has
+        // one. Who connected, with which backends, is a different question
+        // that the accept loop must answer too.
+        let connection = self.connections.fetch_add(1, Ordering::Relaxed);
+        if let Some(hook) = &self.on_agent {
+            hook(connection, Some(&hello));
+        }
 
         tracing::info!(
             box_id = %hello.box_id,
@@ -359,8 +620,33 @@ impl Collector {
             "agent connected"
         );
 
-        let box_id = hello.box_id.clone();
-        while let Some(frame) = read_frame(&mut stream).await? {
+        let box_id = hello.box_id;
+        let served = if send_heartbeats {
+            tokio::select! {
+                result = self.read_event_stream(reader, tx, &box_id) => result,
+                result = write_heartbeats(writer) => result,
+            }
+        } else {
+            self.read_event_stream(reader, tx, &box_id).await
+        };
+        // The closing edge, reported only for an agent that was accepted — a
+        // refused one never claimed to be capturing.
+        if let Some(hook) = &self.on_agent {
+            hook(connection, None);
+        }
+        served
+    }
+
+    async fn read_event_stream<R>(
+        &self,
+        reader: &mut R,
+        tx: mpsc::Sender<Queued>,
+        box_id: &str,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
+        while let Some(frame) = read_frame(reader).await? {
             if frame.is_empty() {
                 continue; // keepalive
             }
@@ -382,18 +668,38 @@ impl Collector {
             // Accepting an event that names a different one would let a
             // compromised agent write into another box's timeline.
             if event.box_id != box_id {
-                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    expected = %box_id,
-                    claimed = %event.box_id,
-                    "agent sent an event for another box"
-                );
+                let seen = self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                // Logged once, then counted only.
+                //
+                // The claimed id is guest-controlled, and this is an
+                // append-only log: an agent streaming small mismatched events
+                // wrote unbounded attacker-chosen text to the host's disk. The
+                // counter is the honest record of how often it happened.
+                if seen == 0 {
+                    tracing::warn!(
+                        expected = %box_id,
+                        claimed = %event.box_id.escape_debug().to_string(),
+                        "agent sent an event for another box; further ones are counted only"
+                    );
+                }
                 continue;
             }
 
             // Never block the socket reader: a full queue means the store
             // cannot keep up, and the honest response is to drop and count.
-            if tx.try_send(event).is_err() {
+            //
+            // Measured in bytes as well as in events, using the frame this
+            // arrived in. The count alone bounded how many events could be
+            // waiting and not how large they were.
+            let size = frame.len();
+            let queued = self.queued_bytes.fetch_add(size, Ordering::Relaxed) + size;
+            if queued > QUEUE_BYTES {
+                self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if tx.try_send(Queued { event, size }).is_err() {
+                self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -401,8 +707,10 @@ impl Collector {
     }
 
     /// Drain the queue into the store in batches.
-    async fn write_loop(self: Arc<Self>, mut rx: mpsc::Receiver<Event>) {
+    async fn write_loop(self: Arc<Self>, mut rx: mpsc::Receiver<Queued>) {
         let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
+        // What the reader reserved for everything now in `batch`.
+        let mut batch_bytes = 0usize;
         // When the *oldest* queued event must be on disk by.
         //
         // The timeout used to be recreated on every receive, so it measured
@@ -419,7 +727,7 @@ impl Collector {
                 .unwrap_or(BATCH_LINGER);
             let got = tokio::time::timeout(wait, rx.recv()).await;
             match got {
-                Ok(Some(event)) => {
+                Ok(Some(Queued { event, size })) => {
                     // Publish live before storing: the console should not wait
                     // on a disk write to show what just happened.
                     let _ = self.live.send(event.clone());
@@ -427,6 +735,11 @@ impl Collector {
                         deadline = Some(tokio::time::Instant::now() + BATCH_LINGER);
                     }
                     batch.push(event);
+                    // Still reserved. Releasing here put the batch outside the
+                    // budget — two hundred and fifty-six maximal events could
+                    // sit in it while the queue happily accepted another
+                    // budget's worth behind them.
+                    batch_bytes += size;
                     if batch.len() < BATCH_SIZE {
                         continue;
                     }
@@ -440,10 +753,15 @@ impl Collector {
                 // Channel closed: flush and stop.
                 Ok(None) => {
                     self.flush(&mut batch).await;
+                    self.queued_bytes.fetch_sub(batch_bytes, Ordering::Relaxed);
                     return;
                 }
             }
             self.flush(&mut batch).await;
+            // Released only once the events are on disk, so the budget
+            // describes everything the collector is still holding.
+            self.queued_bytes.fetch_sub(batch_bytes, Ordering::Relaxed);
+            batch_bytes = 0;
             // The next batch starts its own clock when its first event lands.
             deadline = None;
         }
@@ -488,14 +806,61 @@ impl Collector {
     }
 }
 
+const EXEC_HEARTBEAT: Duration = Duration::from_secs(5);
+
+async fn write_heartbeats<W>(writer: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    // The first tick from `interval` is immediate. Sending a control frame at
+    // that instant races a healthy `-once` agent which has already delivered
+    // its final event and is closing, turning an ordinary EOF into EPIPE.
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + EXEC_HEARTBEAT, EXEC_HEARTBEAT);
+    loop {
+        interval.tick().await;
+        write_frame(writer, &[]).await?;
+    }
+}
+
+/// Directory exposed to the observed box.
+///
+/// The SQLite store deliberately lives one level above this. Mounting the
+/// whole box directory gave the subject write access to its own audit record.
+pub fn endpoint_dir(state_dir: &Path, box_id: &str) -> PathBuf {
+    state_dir.join("boxes").join(box_id).join("endpoint")
+}
+
 /// Default socket path for a box's agent.
 pub fn socket_path(state_dir: &Path, box_id: &str) -> PathBuf {
-    state_dir.join("boxes").join(box_id).join("obsd.sock")
+    endpoint_dir(state_dir, box_id).join("obsd.sock")
 }
 
 /// Default event-database path for a box.
 pub fn store_path(state_dir: &Path, box_id: &str) -> PathBuf {
     state_dir.join("boxes").join(box_id).join("events.db")
+}
+
+/// Remove every host-side observability artifact owned by a destroyed box.
+///
+/// These files deliberately live outside `sandboxes/<name>` so a compromised
+/// guest cannot reach its audit record. That separation also means sandbox
+/// state removal cannot clean them implicitly; destroy must call this too or
+/// a later box with the same name inherits an unrelated timeline.
+pub fn remove_box_data(state_dir: &Path, box_id: &str) -> Result<()> {
+    if !crate::sandbox::state::is_safe_name(box_id) {
+        bail!("refusing to remove observability data for unsafe box name {box_id:?}");
+    }
+    let directory = state_dir.join("boxes").join(box_id);
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).with_context(|| {
+            format!(
+                "failed to remove observability data at {}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -531,11 +896,24 @@ mod tests {
     }
 
     #[test]
+    fn destroyed_box_data_is_removed_without_allowing_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = store_path(dir.path(), "old-box");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"old timeline").unwrap();
+
+        remove_box_data(dir.path(), "old-box").unwrap();
+        assert!(!database.exists());
+        assert!(remove_box_data(dir.path(), "../escape").is_err());
+        assert!(dir.path().exists());
+    }
+
+    #[test]
     fn paths_are_scoped_per_box() {
         let dir = Path::new("/home/x/.devbox");
         assert_eq!(
             socket_path(dir, "myapp"),
-            PathBuf::from("/home/x/.devbox/boxes/myapp/obsd.sock")
+            PathBuf::from("/home/x/.devbox/boxes/myapp/endpoint/obsd.sock")
         );
         assert_eq!(
             store_path(dir, "myapp"),
@@ -634,6 +1012,88 @@ mod tests {
         assert!(read_frame(&mut reader).await.is_err());
     }
 
+    #[tokio::test]
+    async fn the_queue_releases_every_byte_it_reserved() {
+        // The queue is bounded by bytes as well as by depth — a depth bounds
+        // how many events can be waiting, not how large they are, and one
+        // frame may be a megabyte. The bound is only as good as the release:
+        // a reservation that outlives its event accumulates until the
+        // collector refuses everything, permanently and silently.
+        let collector = Arc::new(
+            Collector::new(
+                std::path::PathBuf::from("/unused"),
+                Store::open_in_memory().unwrap(),
+            )
+            .for_box("alpha"),
+        );
+        let stats = collector.stats();
+
+        let (mut agent, host) = tokio::io::duplex(1 << 20);
+        let (host_reader, host_writer) = tokio::io::split(host);
+        let served =
+            tokio::spawn(Arc::clone(&collector).run_agent_stream(host_reader, host_writer));
+
+        let hello = Hello {
+            protocol: PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            box_id: "alpha".into(),
+            capture: vec![],
+            ebpf: false,
+        };
+        write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        let _ = read_frame(&mut agent).await;
+
+        // Each event carries a large, valid payload.
+        let mut event = crate::obs::Event {
+            ts_wall: "2026-08-06T22:14:01.000Z".into(),
+            ts_mono_ns: 1,
+            box_id: "alpha".into(),
+            cgroup_id: 1,
+            pid: 1,
+            tid: 1,
+            ppid: 1,
+            comm: "x".repeat(200_000),
+            uid: 0,
+            kind: crate::obs::EventType::Exec,
+            net: None,
+            exec: Some(crate::obs::event::Exec {
+                path: "/bin/true".into(),
+                ..Default::default()
+            }),
+            file: None,
+            api: None,
+            policy: None,
+        };
+        for i in 0..600u64 {
+            // 200 KB each: six hundred of them is well past the byte budget,
+            // and how many survive depends on how fast the writer drains.
+            event.ts_mono_ns = i + 1;
+            write_frame(&mut agent, &serde_json::to_vec(&event).unwrap())
+                .await
+                .unwrap();
+        }
+        drop(agent);
+        let _ = served.await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.received, 600, "every event arrived");
+        assert_eq!(
+            collector
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a drained queue still holds a reservation"
+        );
+        // Whatever the writer could not keep up with was dropped and counted,
+        // never silently discarded.
+        assert_eq!(
+            snapshot.stored + snapshot.dropped + snapshot.persist_failed,
+            snapshot.received
+        );
+    }
+
     #[test]
     fn stats_snapshot_reads_every_counter() {
         let stats = Stats::default();
@@ -649,5 +1109,90 @@ mod tests {
         // one counter for both would have reported a full disk as backpressure.
         assert_eq!(snap.persist_failed, 3);
         assert_eq!(snap.stored, 0);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_agent_reports_its_capture_backends_to_the_hook() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<Hello>>::new()));
+        let sink = seen.clone();
+        let collector = Arc::new(
+            Collector::new(
+                std::path::PathBuf::from("/unused"),
+                Store::open_in_memory().unwrap(),
+            )
+            .for_box("alpha")
+            .with_agent_hook(move |_, hello| sink.lock().unwrap().push(hello.cloned())),
+        );
+
+        let (mut agent, host) = tokio::io::duplex(4096);
+        let (host_reader, host_writer) = tokio::io::split(host);
+        let served = tokio::spawn(collector.run_agent_stream(host_reader, host_writer));
+
+        let hello = Hello {
+            protocol: PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            box_id: "alpha".into(),
+            capture: vec!["ebpf".into(), "packet".into()],
+            ebpf: true,
+        };
+        write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        // The ack proves the handshake completed, so the hook has run.
+        let ack: HelloAck =
+            serde_json::from_slice(&read_frame(&mut agent).await.unwrap().unwrap()).unwrap();
+        assert!(ack.accepted, "{}", ack.reason);
+        drop(agent);
+        let _ = served.await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one arrival and one departure");
+        let arrived = seen[0].as_ref().expect("the arrival carries the hello");
+        assert!(
+            arrived.ebpf,
+            "the console cannot infer this from anywhere else"
+        );
+        assert_eq!(arrived.capture, vec!["ebpf", "packet"]);
+        // The closing edge: without it a host-side socket listener would keep
+        // reporting a stopped box as capturing.
+        assert!(seen[1].is_none(), "the departure is reported too");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_agent_is_never_reported_as_capturing() {
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let sink = seen.clone();
+        let collector = Arc::new(
+            Collector::new(
+                std::path::PathBuf::from("/unused"),
+                Store::open_in_memory().unwrap(),
+            )
+            .for_box("alpha")
+            .with_agent_hook(move |_, hello| {
+                if hello.is_some() {
+                    *sink.lock().unwrap() += 1;
+                }
+            }),
+        );
+
+        let (mut agent, host) = tokio::io::duplex(4096);
+        let (host_reader, host_writer) = tokio::io::split(host);
+        let served = tokio::spawn(collector.run_agent_stream(host_reader, host_writer));
+
+        let hello = Hello {
+            protocol: PROTOCOL_VERSION + 1,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            box_id: "alpha".into(),
+            capture: vec![],
+            ebpf: false,
+        };
+        write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        let _ = read_frame(&mut agent).await;
+        drop(agent);
+        let _ = served.await;
+
+        assert_eq!(*seen.lock().unwrap(), 0, "a refused agent captures nothing");
     }
 }

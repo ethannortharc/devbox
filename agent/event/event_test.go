@@ -71,11 +71,11 @@ func TestTimestampsSortLexicographically(t *testing.T) {
 	base := time.Date(2026, 8, 6, 22, 14, 7, 0, time.UTC)
 	earlier := Now(base)
 	later := Now(base.Add(time.Millisecond))
-	if !(earlier < later) {
+	if earlier >= later {
 		t.Errorf("timestamps must sort as strings: %q !< %q", earlier, later)
 	}
 	// Across a second boundary too.
-	if !(Now(base.Add(999*time.Millisecond)) < Now(base.Add(time.Second))) {
+	if Now(base.Add(999*time.Millisecond)) >= Now(base.Add(time.Second)) {
 		t.Error("timestamps must sort across a second boundary")
 	}
 }

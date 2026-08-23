@@ -19,6 +19,10 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         anyhow::bail!("Sandbox '{}' not found.", name);
     }
 
+    // Reprovision mutates the same VM configuration as `devbox use`, Sets,
+    // Start, and Stop. Take the claim before the state read and keep this one
+    // claim through the rebuild and posture restore.
+    let claim = crate::web::build::claim_box(&manager.state_dir, &name)?;
     let state = manager.get_sandbox(&name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
@@ -29,7 +33,6 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
         SandboxStatus::Stopped => {
             println!("Starting sandbox '{name}'...");
             runtime.start(&name).await?;
-            crate::policy::enforce::apply_saved_or_step_aside(manager, &name).await?;
         }
         SandboxStatus::NotFound => {
             anyhow::bail!(
@@ -40,10 +43,19 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
                 name
             );
         }
+        SandboxStatus::Unreachable(reason) => {
+            anyhow::bail!(
+                "Sandbox '{name}' is powered on but its guest shell is unreachable: {reason}. Run `devbox stop {name}`, then try again."
+            );
+        }
         SandboxStatus::Unknown(s) => {
             anyhow::bail!("Sandbox '{}' is in unknown state: {}", name, s);
         }
     }
+
+    // Starting a stopped box removes any ambiguity about its live posture;
+    // an already-running box may also have returned outside devbox.
+    crate::policy::enforce::apply_saved(manager, &name, &claim).await?;
 
     // Read the posture *before* provisioning — as a precondition, not as the
     // value to reinstate.
@@ -76,17 +88,6 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // Re-run full provisioning with the (migrated) sets/languages
     // Pass mount_mode so NixOS module sets up overlay declaratively
     let image = state.image.as_str();
-    // The same claim the Sets paths take: this rewrites the box's generated
-    // configuration too, so a console rebuild running beside it would
-    // interleave writes and leave the active generation and the recorded
-    // selection describing different things.
-    let claim = crate::web::build::claim_box(&manager.state_dir, &name)?;
-    // Re-read under the claim. The copy above was taken for validation, long
-    // before this claim existed, and a `devbox use` completing in the gap
-    // releases its own claim — so this one succeeds over a snapshot naming the
-    // project the box has just stopped belonging to.
-    let state = manager.get_sandbox(&name)?;
-
     // Resolved once, and used for both the rebuild and the state written after
     // it. A v3 box has no `packages`, so these come out of its project file —
     // and the save below stamps the schema, which is what makes recording them
@@ -153,7 +154,7 @@ pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> 
     // captured up front means a file that became unreadable *during* the
     // rebuild cannot leave the box unrestricted either.
 
-    println!("Re-provisioning complete. Run `devbox shell --name {name}` to attach.");
+    println!("Re-provisioning complete. Run `devbox shell {name}` to attach.");
     Ok(())
 }
 

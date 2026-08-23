@@ -142,7 +142,6 @@ func (e *Enforcer) WithGeneration(generation string) *Enforcer {
 	return e
 }
 
-// New builds an enforcer for a set of allowlisted domains.
 // SetsFor names the allow sets a policy generation owns.
 //
 // The generation is in the name so that an enforcer which has been superseded
@@ -162,6 +161,7 @@ func SetsFor(generation string) (v4, v6 string) {
 	return SetV4 + "_" + generation, SetV6 + "_" + generation
 }
 
+// New builds an enforcer for a set of allowlisted domains.
 func New(applier Applier, domains []string, mirrorOnly bool) *Enforcer {
 	// `*.example.com` means subdomains, which is what the console says it
 	// means. Stripping the prefix and forgetting it had been there made the
@@ -237,7 +237,7 @@ func (e *Enforcer) Permits(name string) bool {
 //
 // Returns the addresses it added, so the caller can log or count them.
 func (e *Enforcer) OnDNS(ctx context.Context, ev *event.Event) ([]string, error) {
-	if ev == nil || ev.Type != event.TypeDNS || ev.Net == nil {
+	if ev == nil || ev.Type != event.TypeDNS || ev.Net == nil || !ev.Net.Response {
 		return nil, nil
 	}
 	if !e.Permits(ev.Net.QName) {

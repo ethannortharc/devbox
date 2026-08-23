@@ -5,9 +5,109 @@
 //! help output, config commands, and error handling.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+// The collector is a separate copy of the debug binary. On macOS and on
+// loaded CI hosts, launching that binary can take substantially longer when
+// the rest of this process-based integration suite is running in parallel.
+// This is only the test's process-start allowance; the production replacement
+// deadline remains intentionally bounded in `obs::daemon`.
+const COLLECTOR_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[test]
+fn completed_v4_progress_keeps_the_overnight_termination_sentinel() {
+    let progress = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/PROGRESS.md"));
+    assert_eq!(
+        progress.lines().next(),
+        Some("ALL PHASES DONE"),
+        "run-overnight.sh reads only PROGRESS.md line 1 to stop spawning review sessions"
+    );
+}
 
 fn devbox() -> Command {
     Command::new(env!("CARGO_BIN_EXE_devbox"))
+}
+
+fn collector_identity(path: &std::path::Path) -> Option<(i32, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid = text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))?
+        .parse()
+        .ok()?;
+    let version = text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("version="))?
+        .to_string();
+    Some((pid, version))
+}
+
+fn wait_for_collector(path: &std::path::Path) -> (i32, String) {
+    let deadline = Instant::now() + COLLECTOR_TEST_TIMEOUT;
+    loop {
+        if let Some(identity) = collector_identity(path) {
+            return identity;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "collector never claimed the lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_replacement(path: &std::path::Path, old_pid: i32) -> (i32, String) {
+    let deadline = Instant::now() + COLLECTOR_TEST_TIMEOUT;
+    loop {
+        if let Some(identity) = collector_identity(path)
+            && identity.0 != old_pid
+            && identity.1 == env!("CARGO_PKG_VERSION")
+        {
+            return identity;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement collector never claimed the lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Stops whichever collector owns the lock when the test ends.
+///
+/// The pid is recorded as the test observes it, not read back at drop time.
+/// The temporary home is declared first, so it is deleted first — and reading
+/// the identity file *after* that found nothing to signal, leaving the
+/// replacement daemon running after every run. Strays accumulate, slow the
+/// machine, and make the next run's timings look like a regression.
+#[derive(Default)]
+struct CollectorCleanup {
+    pids: std::cell::RefCell<Vec<i32>>,
+}
+
+impl CollectorCleanup {
+    fn watch(&self, pid: i32) {
+        self.pids.borrow_mut().push(pid);
+    }
+
+    /// Stop watching a process the test has already reaped.
+    ///
+    /// Signalling a reaped pid is not harmless: the number is free for reuse
+    /// the moment it is waited on, so a teardown that fires later can land on
+    /// an unrelated process.
+    fn forget(&self, pid: i32) {
+        self.pids.borrow_mut().retain(|watched| *watched != pid);
+    }
+}
+
+impl Drop for CollectorCleanup {
+    fn drop(&mut self) {
+        for pid in self.pids.borrow().iter() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+    }
 }
 
 #[test]
@@ -16,6 +116,50 @@ fn version_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("devbox"));
+}
+
+#[test]
+fn a_lifecycle_command_replaces_an_outdated_collector_daemon() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let identity = home.path().join(".devbox/locks/collector-daemon.owner");
+    let cleanup = CollectorCleanup::default();
+
+    let mut original = devbox();
+    let mut original = original
+        .arg("__collector")
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start original collector");
+    // Recorded at spawn, not after it claims the lock: if that wait times out
+    // and panics, the child is dropped without ever being killed.
+    cleanup.watch(original.id() as i32);
+    let (old_pid, _) = wait_for_collector(&identity);
+
+    // The process still owns the advisory lock; only its published release is
+    // made stale, exactly as it is after replacing the devbox executable.
+    std::fs::write(&identity, format!("pid={old_pid} version=0.0.0-old\n"))
+        .expect("publish simulated old release");
+
+    let trigger = devbox()
+        .args(["lab", "list"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run lifecycle command");
+    assert!(
+        trigger.status.success(),
+        "replacement trigger failed: {}",
+        String::from_utf8_lossy(&trigger.stderr)
+    );
+
+    let (new_pid, new_version) = wait_for_replacement(&identity, old_pid);
+    cleanup.watch(new_pid);
+    assert_ne!(new_pid, old_pid, "the outdated process still owns the lock");
+    assert_eq!(new_version, env!("CARGO_PKG_VERSION"));
+    original.wait().expect("reap original collector");
+    cleanup.forget(original.id() as i32);
 }
 
 #[test]
@@ -80,6 +224,53 @@ fn guide_specific_tool() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("git"));
+}
+
+#[test]
+fn devbox_guide_documents_the_real_use_command_shape() {
+    let output = devbox().args(["guide", "devbox"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cd /path/to/project && devbox use <name>"));
+    assert!(stdout.contains("Lima/Incus"));
+    assert!(!stdout.contains("devbox use /path/to/project"));
+}
+
+#[test]
+fn shipped_guidance_uses_positional_lifecycle_box_names() {
+    let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+    let quickstart = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/QUICKSTART.md"));
+    let reprovision = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/cli/reprovision.rs"
+    ));
+    let sandbox = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/sandbox/mod.rs"));
+    for stale in [
+        "devbox shell --name",
+        "devbox stop --name",
+        "devbox destroy --name",
+        "devbox destroy --force --name",
+        "devbox shell --writable",
+    ] {
+        for (source, contents) in [
+            ("README", readme),
+            ("quickstart", quickstart),
+            ("reprovision guidance", reprovision),
+            ("sandbox recovery guidance", sandbox),
+        ] {
+            assert!(
+                !contents.contains(stale),
+                "{source} still documents {stale}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lima_readiness_guidance_names_both_diagnostic_logs() {
+    let lima = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/lima.rs"));
+    assert!(lima.contains("ha.stderr.log"));
+    assert!(lima.contains("serial*.log"));
 }
 
 #[test]

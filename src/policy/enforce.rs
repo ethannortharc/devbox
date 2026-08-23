@@ -26,6 +26,9 @@ pub const RULESET_PATH: &str = "/etc/devbox/devbox.nft";
 /// list — not just the compiled ruleset.
 pub const POLICY_PATH: &str = "/etc/devbox/policy.json";
 
+/// Atomic effective-capability status published by the supervised agent.
+pub const AGENT_STATUS_PATH: &str = "/run/devbox/obsd-status.json";
+
 /// Push the policy into the box and load it.
 ///
 /// Idempotent, because the generated ruleset destroys the devbox table before
@@ -111,9 +114,9 @@ pub async fn apply(runtime: &dyn Runtime, sandbox_name: &str, policy: &Policy) -
             "box '{sandbox_name}' has no DNS-capturing devbox-obsd, so a domain-based \
              posture cannot be enforced: nftables matches addresses, and only the \
              agent turns the allowlisted names into addresses as they resolve. \
-             (An agent in `-no-ebpf` mode sees no DNS, and one started without \
-             `-policy` never reads the allowlist — restart it after the first \
-             policy is written.) \
+             (The agent reports its effective capture after kernel preflight; \
+             requested flags are not enough. Restart or reprovision an older \
+             agent that has no status file.) \
              Applying it anyway would block {}.\n\n  \
              Use CIDRs instead, or `isolated`, both of which need no agent.",
             if domains.is_empty() {
@@ -312,14 +315,15 @@ fn clear_command() -> String {
 /// populate a single allow-set entry — leaving a default-deny ruleset that
 /// blocks every domain it promised to permit.
 ///
-/// Probed rather than assumed: the agent is not yet part of provisioning, so
-/// on most boxes the answer is no.
+/// Probed rather than assumed: an older or manually started agent may be live
+/// without the packet source the current provisioner enables explicitly.
 async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
-    // The agent's own command line is the authority on which source it chose.
-    // `-no-ebpf` and `-fixture` both mean no DNS; anything else means the eBPF
-    // source, whose domains include it.
+    // Requested argv is not authority: AF_PACKET can fail after
+    // `-packet=true` was parsed. The supervised agent atomically publishes the
+    // effective Domains list, including transitions made by its in-process
+    // packet retry loop.
     let Ok(result) = runtime
-        .exec_cmd(sandbox_name, &["pgrep", "-a", "-x", "devbox-obsd"], false)
+        .exec_cmd(sandbox_name, &["cat", AGENT_STATUS_PATH], false)
         .await
     else {
         return false;
@@ -327,12 +331,33 @@ async fn agent_resolves_dns(runtime: &dyn Runtime, sandbox_name: &str) -> bool {
     if result.exit_code != 0 {
         return false;
     }
-    let cmdline = result.stdout;
-    // Three things have to be true, not one. The agent must be up, capturing
-    // DNS (the proc source sees none), *and* started with `-policy` — an agent
-    // launched before the policy file existed has an empty `cfg.policy` and
-    // will never add a single element, however healthy it looks.
-    cmdline.contains("-policy") && !cmdline.contains("-no-ebpf") && !cmdline.contains("-fixture")
+    let Some(status) = parse_agent_status(&result.stdout) else {
+        return false;
+    };
+    if !status.policy_configured || !status.capture.iter().any(|domain| domain == "dns") {
+        return false;
+    }
+
+    // A hard-killed process cannot remove its status file. Tie the snapshot
+    // to the process which published it so the short systemd restart window
+    // never admits a default-deny policy on stale capabilities.
+    let proc_comm = format!("/proc/{}/comm", status.pid);
+    runtime
+        .exec_cmd(sandbox_name, &["cat", &proc_comm], false)
+        .await
+        .is_ok_and(|r| r.exit_code == 0 && r.stdout.trim() == "devbox-obsd")
+}
+
+#[derive(serde::Deserialize)]
+struct AgentStatus {
+    pid: u32,
+    capture: Vec<String>,
+    policy_configured: bool,
+}
+
+fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
+    let status: AgentStatus = serde_json::from_str(raw).ok()?;
+    (status.pid > 0).then_some(status)
 }
 
 /// The shell that loads the ruleset and drops connections it no longer allows.
@@ -550,44 +575,11 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// Load the box's saved egress posture, if it has one.
-///
-/// A firewall does not survive a box restart, so a posture that is only applied
-/// when it is *set* is enforced until the first reboot and then silently gone —
-/// while `devbox.toml` and the console both keep reporting it. This is the
-/// shared start path, so every route into a running box goes through it.
-///
-/// **Who is asking decides what failure means.**
-///
-/// ADR-0034 said this must not be fatal, then ADR-0037 made it fatal, and both
-/// were half right — which produced a box the user could not get into. The
-/// resolution is that the two callers are asking different questions:
-///
-/// * `policy set` / `policy allow` — "make this true." Failure is the answer
-///   to the question, and it must reach the exit status, or a script cannot
-///   tell a saved posture from an enforced one. Those call [`apply`] directly.
-/// * start / attach / exec / console — "let me in." The user is not asking
-///   about policy at all. Locking them out of a *running* box because its
-///   firewall could not be installed strands them with no way to fix the very
-///   thing that failed — and the box is no more exposed than it was a moment
-///   earlier, when it was running without the posture and nobody was blocked.
-///
-/// So this returns `Ok` after reporting loudly. It never returns `Ok` silently:
-/// the warning names the posture that is *not* in force, so the failure cannot
-/// be mistaken for enforcement.
 /// Restore a box's posture after a rebuild, strictly.
 ///
-/// [`apply_saved`] is lenient on purpose (ADR-0044): a user asking for *access*
-/// must never be locked out of a running box because its firewall could not be
-/// installed. A rebuild is the opposite situation — nobody is waiting at a
-/// prompt, a command is about to print a verdict or a script is about to read
-/// an exit status, and "rebuilt successfully" for a box whose firewall is gone
-/// is the lie this whole subsystem exists to prevent.
-///
-/// The two callers want opposite things from the same failure, so the choice
-/// is named once here rather than re-decided at each call site — which is how
-/// three rebuild paths came to use the lenient form and report success over an
-/// unrestricted box.
+/// A successful rebuild must not be reported while the saved firewall posture
+/// is absent. The caller already holds the box claim, so this variant restores
+/// the posture without trying to claim the box a second time.
 pub async fn restore_after_rebuild(
     manager: &crate::sandbox::SandboxManager,
     name: &str,
@@ -702,6 +694,12 @@ pub async fn apply_saved_or_step_aside(
     apply_saved(manager, name, &claim).await
 }
 
+/// Load and strictly apply the box's saved egress posture.
+///
+/// A firewall does not survive a restart. Every access path therefore restores
+/// the saved posture before declaring the box usable. An unreadable config or
+/// enforcement failure is returned to the caller; start/use paths then stop the
+/// box fail-closed so the UI and CLI cannot expose an unrestricted shell.
 pub async fn apply_saved(
     manager: &crate::sandbox::SandboxManager,
     name: &str,
@@ -758,7 +756,11 @@ pub async fn apply_saved(
                  egress posture is unknown and none was applied.\n  {e}\n  Fix the \
                  file, or set one explicitly with `devbox policy set <posture>`.\n"
             );
-            return Ok(());
+            return Err(e).with_context(|| {
+                format!(
+                    "box '{name}' has an unreadable devbox.toml, so its egress posture is unknown"
+                )
+            });
         }
     };
     let runtime = manager.runtime_for_sandbox(state)?;
@@ -770,19 +772,21 @@ pub async fn apply_saved(
     // observe-and-warn on start, on attach, and on access — every routine
     // operation — until someone set the policy again. Restating a rule in a
     // second place is how it goes stale; there is one statement of it now.
-    let outcome = apply(runtime.as_ref(), name, &config.policy).await;
-
-    if let Err(e) = outcome {
+    if let Err(e) = apply(runtime.as_ref(), name, &config.policy).await {
         let posture = config.policy.egress;
         tracing::error!(box_id = %name, %posture, error = ?e, "egress posture not applied");
-        // stderr as well as the log: the log is off by default, and a user who
-        // is about to type into this box needs to know its posture is not in
-        // force. Loud, and not fatal — see the note above.
+        // stderr as well as the returned error: the log is off by default, and
+        // a CLI user needs the same actionable explanation the browser card
+        // receives. This used to return success after printing the warning,
+        // which made Start and Terminal claim an unrestricted box was ready.
         eprintln!(
             "\ndevbox: WARNING — box '{name}' is running WITHOUT its '{posture}' egress \
              posture.\n  {e}\n  Traffic is unrestricted. Fix the cause, then \
              `devbox policy set {posture}` to apply it.\n"
         );
+        return Err(e).with_context(|| {
+            format!("box '{name}' could not apply its '{posture}' egress posture")
+        });
     }
     Ok(())
 }
@@ -873,6 +877,28 @@ mod tests {
         // Nothing unparseable reaches a root-loaded ruleset.
         assert!(parse_resolvers("nameserver $(reboot)").is_empty());
         assert!(parse_resolvers("").is_empty());
+    }
+
+    #[test]
+    fn only_effective_live_dns_status_can_satisfy_the_policy_guard() {
+        let ready = parse_agent_status(
+            r#"{"pid":42,"capture":["exec","dns","tls"],"policy_configured":true}"#,
+        )
+        .expect("valid status");
+        assert_eq!(ready.pid, 42);
+        assert!(ready.capture.iter().any(|domain| domain == "dns"));
+        assert!(ready.policy_configured);
+
+        let degraded = parse_agent_status(
+            r#"{"pid":42,"capture":["exec","connect"],"policy_configured":true}"#,
+        )
+        .expect("valid degraded status");
+        assert!(!degraded.capture.iter().any(|domain| domain == "dns"));
+
+        assert!(
+            parse_agent_status(r#"{"pid":0,"capture":["dns"],"policy_configured":true}"#).is_none()
+        );
+        assert!(parse_agent_status("not json").is_none());
     }
 
     #[test]

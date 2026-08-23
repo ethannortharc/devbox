@@ -3,16 +3,20 @@
 //! Handlers stay thin: they call [`super::service`] and render. Anything with
 //! real logic belongs in the service layer so the CLI can reuse it.
 
+use anyhow::Context as _;
 use askama::Template;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use serde::Deserialize;
 
-use super::activity::{self, Activity, Flow, Lookup, StreamRow, TreeRow};
+use super::activity::{
+    self, Activity, Bucket, CaptureView, Cursor, DomainChip, FileWrite, Filter, Flow, Lookup, Peer,
+    Refusal, StreamRow, Totals, TreeRow,
+};
 use super::help::{self, Topic};
 use super::service::{self, BoxSummary, FileChange, PolicyView, SetGroup};
 use super::state::AppState;
@@ -25,11 +29,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         // pages
         .route("/", get(dashboard))
+        .route("/boxes/new", get(create_box_page))
         .route("/boxes/{name}", get(box_detail))
+        .route("/labs", get(lab_index))
+        .route("/labs/{name}", get(lab_detail))
         .route("/help", get(help_index))
         .route("/help/{topic}", get(help_topic))
         // json + fragments
-        .route("/api/boxes", get(api_boxes))
+        .route("/api/boxes", get(api_boxes).post(create_box))
         .route("/api/boxes/{name}", get(api_box))
         .route("/api/boxes/{name}/start", post(start_box))
         .route("/api/boxes/{name}/stop", post(stop_box))
@@ -39,8 +46,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/boxes/{name}/files", get(box_files))
         .route("/api/boxes/{name}/term", get(box_terminal))
         .route("/api/boxes/{name}/activity", get(box_activity))
+        .route("/api/boxes/{name}/activity/tail", get(box_activity_tail))
+        .route("/api/boxes/{name}/activity/live", get(box_activity_live))
         .route("/api/boxes/{name}/behavior", get(box_behavior))
+        .route("/api/operations/{name}/status", get(operation_status))
+        .route("/api/boxes/{name}/flows/pcap", post(capture_flow_pcap))
         .route("/api/stream", get(sse::stream))
+        .route("/api/labs/{name}/view", get(lab_view))
+        .route("/api/labs/{name}/ztp", get(lab_ztp))
+        .route("/api/labs/{name}/up", post(lab_up))
+        .route("/api/labs/{name}/down", post(lab_down))
+        .route("/api/labs/{name}/fault", post(lab_fault))
+        .route("/api/labs/{name}/heal", post(lab_heal))
         // static
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -69,10 +86,19 @@ struct DashboardTemplate {
 /// Human-readable summary line under the page title.
 pub fn dashboard_subtitle(boxes: &[BoxSummary]) -> String {
     let running = boxes.iter().filter(|b| b.status == "running").count();
+    let attention = boxes
+        .iter()
+        .filter(|b| matches!(b.status.as_str(), "unreachable" | "missing" | "unknown"))
+        .count();
     match boxes.len() {
         0 => "nothing registered yet".to_string(),
         1 if running == 1 => "1 box · running".to_string(),
+        1 if attention == 1 => "1 box · needs attention".to_string(),
         1 => "1 box · not running".to_string(),
+        n if attention == 1 => format!("{n} boxes · {running} running · 1 needs attention"),
+        n if attention > 1 => {
+            format!("{n} boxes · {running} running · {attention} need attention")
+        }
         n => format!("{n} boxes · {running} running"),
     }
 }
@@ -91,6 +117,580 @@ async fn dashboard(State(state): State<AppState>) -> Response {
     })
 }
 
+// ── create box ───────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "create_box.html")]
+struct CreateBoxTemplate {
+    version: &'static str,
+    nav: &'static str,
+    groups: Vec<SetGroup>,
+}
+
+#[derive(Template)]
+#[template(path = "_create_panel.html")]
+struct CreatePanelFragment {
+    name: String,
+    summary: String,
+    retained: String,
+}
+
+async fn create_box_page(State(state): State<AppState>) -> Response {
+    let defaults = crate::sandbox::config::DevboxConfig::default();
+    let selection = Selection::new(defaults.active_sets(), std::iter::empty());
+    render(CreateBoxTemplate {
+        version: state.version,
+        nav: "dashboard",
+        groups: service::set_groups(&selection),
+    })
+}
+
+/// `POST /api/boxes` — validate synchronously, then create in the background.
+///
+/// Provisioning can take minutes. The response installs an SSE log panel and
+/// the task holds the same drain guard as a Sets rebuild, so Ctrl-C cannot
+/// silently cancel it between making the runtime object and saving state.
+async fn create_box(State(state): State<AppState>, body: String) -> Response {
+    let spec = match service::parse_create_form(&state.manager, &body) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_notice(&format!("Invalid box configuration: {error}")),
+            )
+                .into_response();
+        }
+    };
+    if state.is_rebuilding(&spec.name) {
+        return render_status(
+            CreatePanelFragment {
+                retained: state.retained_build_status(&spec.name).unwrap_or_default(),
+                summary: format!("{} (creation already in progress)", spec.name),
+                name: spec.name,
+            },
+            StatusCode::CONFLICT,
+        );
+    }
+    if state.manager.sandbox_exists(&spec.name) {
+        return (
+            StatusCode::CONFLICT,
+            error_notice(&format!("box '{}' already exists", spec.name)),
+        )
+            .into_response();
+    }
+    let runtime = match state.manager.resolve_runtime(spec.runtime.as_deref()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_notice(&format!("No usable runtime: {error}")),
+            )
+                .into_response();
+        }
+    };
+    let Some(guard) = state.claim_rebuild(&spec.name) else {
+        return (
+            StatusCode::CONFLICT,
+            error_notice("A create operation is already running for that box name."),
+        )
+            .into_response();
+    };
+
+    let name = spec.name.clone();
+    let summary = format!(
+        "{} on {} with {} set(s)",
+        name,
+        runtime.name(),
+        spec.config.active_sets().len()
+    );
+    state.clear_build_status(&name);
+
+    let bg = state.clone();
+    let task_name = name.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let line = |message: &str| {
+            bg.publish(crate::web::state::ConsoleEvent::new(
+                build::output_event(&task_name),
+                build::line_fragment(message),
+            ));
+        };
+        line(&format!("project: {}", spec.project_dir.to_string_lossy()));
+        line(&format!("runtime: {}", runtime.name()));
+        line("creating runtime and provisioning selected tools…");
+
+        let result = bg
+            .manager
+            .create_sandbox_at(
+                &spec.project_dir,
+                &task_name,
+                runtime.as_ref(),
+                &spec.config,
+                &[],
+                &Default::default(),
+                None,
+                spec.bare,
+                Some(&line),
+            )
+            .await;
+
+        let status = match result {
+            Ok(()) => {
+                let href = format!("/boxes/{}", crate::web::encode_segment(&task_name));
+                let policy_result = match build::claim_box(&bg.manager.state_dir, &task_name) {
+                    Ok(claim) => {
+                        crate::policy::enforce::restore_after_rebuild(
+                            &bg.manager,
+                            &task_name,
+                            &claim,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error.context(
+                        "the box was created, but its egress policy could not be applied",
+                    )),
+                };
+
+                match policy_result {
+                    Ok(()) => format!(
+                        "<span class=\"term-ok\">Box created.</span> \
+                         <a class=\"btn btn-primary\" href=\"{}\">Open {}</a>",
+                        href,
+                        build::escape_html(&task_name)
+                    ),
+                    Err(error) => {
+                        // A saved restrictive posture that failed to load must
+                        // not leave a fresh box running unrestricted. Stopping
+                        // is reversible, preserves the completed create, and
+                        // gives the user a safe place to repair the policy.
+                        let stop_error = runtime.stop(&task_name).await.err();
+                        tracing::warn!(
+                            box_id = %task_name,
+                            error = ?error,
+                            stop_error = ?stop_error,
+                            "web create completed but policy enforcement failed"
+                        );
+                        let safety = match stop_error {
+                            None => " The box was stopped for safety.".to_string(),
+                            Some(stop_error) => format!(
+                                " The box could not be stopped and may still be running unrestricted: {}",
+                                build::escape_html(&stop_error.to_string())
+                            ),
+                        };
+                        format!(
+                            "<span class=\"term-err\">Box created, but its egress policy \
+                             could not be applied: {}{}</span> \
+                             <a class=\"btn btn-primary\" href=\"{}\">Open {}</a>",
+                            build::escape_html(&error.to_string()),
+                            safety,
+                            href,
+                            build::escape_html(&task_name)
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(box_id = %task_name, error = ?error, "web create failed");
+                if bg.manager.sandbox_exists(&task_name) {
+                    let href = format!("/boxes/{}", crate::web::encode_segment(&task_name));
+                    format!(
+                        "<span class=\"term-err\">The box exists, but setup did not complete: \
+                         {}</span> <a class=\"btn\" href=\"{}\">Inspect {}</a>",
+                        build::escape_html(&error.to_string()),
+                        href,
+                        build::escape_html(&task_name)
+                    )
+                } else {
+                    format!(
+                        "<span class=\"term-err\">Create failed: {}</span>",
+                        build::escape_html(&error.to_string())
+                    )
+                }
+            }
+        };
+        bg.publish(crate::web::state::ConsoleEvent::new(
+            build::status_event(&task_name),
+            status,
+        ));
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        render(CreatePanelFragment {
+            retained: state.retained_build_status(&name).unwrap_or_default(),
+            name,
+            summary,
+        }),
+    )
+        .into_response()
+}
+
+// ── labs ─────────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "labs.html")]
+struct LabsTemplate {
+    version: &'static str,
+    nav: &'static str,
+    scenarios: Vec<super::labs::ScenarioCard>,
+}
+
+#[derive(Template)]
+#[template(path = "lab_detail.html")]
+struct LabTemplate {
+    version: &'static str,
+    nav: &'static str,
+    view: super::labs::LabView,
+    scenarios: Vec<super::labs::ScenarioCard>,
+    boxes: Vec<BoxSummary>,
+    retained: String,
+}
+
+#[derive(Template)]
+#[template(path = "_lab_view.html")]
+struct LabViewFragment {
+    view: super::labs::LabView,
+}
+
+async fn lab_index(State(state): State<AppState>) -> Response {
+    render(LabsTemplate {
+        version: state.version,
+        nav: "labs",
+        scenarios: super::labs::scenarios(),
+    })
+}
+
+async fn lab_detail(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let view = match super::labs::load(&state.manager, &name) {
+        Ok(view) => view,
+        Err(error) => return not_found(&name, &error),
+    };
+    let boxes = service::list_boxes(&state.manager)
+        .await
+        .unwrap_or_default();
+    render(LabTemplate {
+        version: state.version,
+        nav: "labs",
+        view,
+        scenarios: super::labs::scenarios(),
+        boxes,
+        retained: state
+            .retained_build_status(&format!("lab-{name}"))
+            .unwrap_or_default(),
+    })
+}
+
+async fn lab_view(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let mut view = match super::labs::load(&state.manager, &name) {
+        Ok(view) => view,
+        Err(error) => return not_found(&name, &error),
+    };
+
+    // Best effort. A topology that refused to draw because a provisioning
+    // service was unreachable would be useless exactly when someone is trying
+    // to work out why it is unreachable.
+    let substrate = substrate_from(query.as_deref());
+    if let Some(fabric) = ztp_shared(&state, &name, &substrate).await {
+        super::labs::apply_phases(&mut view, &fabric);
+    }
+    render(LabViewFragment { view })
+}
+
+/// One ZTP read, shared between the elements on a lab page that want it.
+///
+/// The topology and the provisioning panel refresh on their own triggers and
+/// both need the same answer; without this, each open page made two round
+/// trips into the substrate every two seconds for one status.
+async fn ztp_shared(
+    state: &AppState,
+    name: &str,
+    substrate: &str,
+) -> Option<crate::lab::ztp_status::FabricView> {
+    let key = format!("{name}\u{1}{substrate}");
+    if let Some(cached) = state.cached_ztp(&key) {
+        return Some(cached);
+    }
+    match super::labs::ztp(&state.manager, name, Some(substrate)).await {
+        Ok(Some(view)) => {
+            state.cache_ztp(&key, &view);
+            Some(view)
+        }
+        // Not a ZTP scenario. There is no panel for this lab, and there never
+        // will be — distinct from the case below, which is a panel with
+        // nothing to report yet.
+        Ok(None) => None,
+        Err(error) => {
+            // A substrate that cannot be reached is a state the panel shows
+            // and keeps polling from. Folding this into the case above made
+            // the whole panel vanish rather than say the lab is not running.
+            // Deliberately not cached: the next tick should try again.
+            tracing::debug!(lab = %name, %error, "could not read ZTP status");
+            Some(crate::lab::ztp_status::FabricView::default())
+        }
+    }
+}
+
+/// Read the substrate a lab request names, or empty when it names none.
+fn substrate_from(query: Option<&str>) -> String {
+    query
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "substrate")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Template)]
+#[template(path = "_ztp_panel.html")]
+struct ZtpPanelFragment {
+    ztp_lab: String,
+    ztp: crate::lab::ztp_status::FabricView,
+}
+
+/// `GET /api/labs/{name}/ztp` — one fabric's provisioning state.
+///
+/// Polled rather than driven by the collector's signal: this reads a service
+/// inside the substrate, not a local store, and the thing being watched is a
+/// state machine that moves on its own. Two seconds is fast enough to watch a
+/// node go from discovered to healthy and slow enough to cost nothing.
+async fn lab_ztp(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let substrate = substrate_from(query.as_deref());
+    match ztp_shared(&state, &name, &substrate).await {
+        Some(ztp) => render(ZtpPanelFragment { ztp_lab: name, ztp }),
+        // Not a ZTP scenario, or one whose substrate could not answer. The
+        // first has nothing to render at all; the second is a state the panel
+        // shows and keeps polling from, not a page failure.
+        None => Html(String::new()).into_response(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LabAction {
+    Up,
+    Down,
+    Fault,
+    Heal,
+}
+
+async fn lab_up(State(state): State<AppState>, Path(name): Path<String>, body: String) -> Response {
+    start_lab_action(state, name, body, LabAction::Up).await
+}
+
+async fn lab_down(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
+    start_lab_action(state, name, body, LabAction::Down).await
+}
+
+async fn lab_fault(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
+    start_lab_action(state, name, body, LabAction::Fault).await
+}
+
+async fn lab_heal(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
+    start_lab_action(state, name, body, LabAction::Heal).await
+}
+
+async fn start_lab_action(
+    state: AppState,
+    name: String,
+    body: String,
+    action: LabAction,
+) -> Response {
+    if crate::lab::scenarios::find(&name).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            error_notice(&format!("no such built-in scenario: {name}")),
+        )
+            .into_response();
+    }
+    let fields: std::collections::HashMap<String, String> = form_urlencoded::parse(body.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let field = |key: &str| fields.get(key).map(String::as_str).unwrap_or("").trim();
+    let substrate = (!field("substrate").is_empty()).then(|| field("substrate").to_string());
+    let link = field("link").to_string();
+    if matches!(action, LabAction::Fault | LabAction::Heal) && link.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            error_notice("Choose a link before applying or healing a fault."),
+        )
+            .into_response();
+    }
+    let number = |key: &str| -> anyhow::Result<Option<u32>> {
+        let value = field(key);
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value.parse().with_context(|| {
+                format!("{key} must be a non-negative integer")
+            })?))
+        }
+    };
+    let percentage = |key: &str| -> anyhow::Result<Option<f64>> {
+        let value = field(key);
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            let parsed: f64 = value
+                .parse()
+                .with_context(|| format!("{key} must be a percentage"))?;
+            if !(0.0..=100.0).contains(&parsed) {
+                anyhow::bail!("{key} must be between 0 and 100");
+            }
+            Ok(Some(parsed))
+        }
+    };
+    let fault = if matches!(action, LabAction::Fault) {
+        let parsed = (|| -> anyhow::Result<crate::cli::lab::FaultArgs> {
+            Ok(crate::cli::lab::FaultArgs {
+                target: name.clone(),
+                link: link.clone(),
+                delay: number("delay")?,
+                jitter: number("jitter")?,
+                loss: percentage("loss")?,
+                reorder: percentage("reorder")?,
+                duplicate: percentage("duplicate")?,
+                rate: number("rate")?,
+                partition: fields.contains_key("partition"),
+                direction: match field("direction") {
+                    "" => "both".to_string(),
+                    value @ ("a" | "b" | "both") => value.to_string(),
+                    value => anyhow::bail!("direction must be a, b, or both, got '{value}'"),
+                },
+                substrate: substrate.clone(),
+                dry_run: false,
+            })
+        })();
+        match parsed {
+            Ok(fault) => Some(fault),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    error_notice(&format!("Invalid fault: {error}")),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let operation = format!("lab-{name}");
+    let Some(guard) = state.claim_rebuild(&operation) else {
+        let retained = state.retained_build_status(&operation).unwrap_or_default();
+        let status_href = format!(
+            "/api/operations/{}/status",
+            crate::web::encode_segment(&operation)
+        );
+        return (
+            StatusCode::CONFLICT,
+            Html(format!(
+                "<div class=\"notice error\" role=\"alert\">Another operation is already changing this lab.</div>\
+                 <p class=\"muted\" data-build-status=\"{}\" hx-get=\"{}\" hx-trigger=\"load\" sse-swap=\"{}\">{}</p>",
+                build::escape_html(&operation),
+                status_href,
+                build::status_event(&operation),
+                retained
+            )),
+        )
+            .into_response();
+    };
+    state.clear_build_status(&operation);
+    let bg = state.clone();
+    let task_name = name.clone();
+    let operation_name = operation.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = match action {
+            LabAction::Up => {
+                crate::cli::lab::up(
+                    crate::cli::lab::UpArgs {
+                        target: task_name.clone(),
+                        substrate,
+                        dry_run: false,
+                    },
+                    &bg.manager,
+                )
+                .await
+            }
+            LabAction::Down => {
+                crate::cli::lab::down(
+                    crate::cli::lab::DownArgs {
+                        target: task_name.clone(),
+                        substrate,
+                        dry_run: false,
+                    },
+                    &bg.manager,
+                )
+                .await
+            }
+            LabAction::Fault => crate::cli::lab::inject(fault.expect("parsed"), &bg.manager).await,
+            LabAction::Heal => {
+                crate::cli::lab::heal(
+                    crate::cli::lab::HealArgs {
+                        target: task_name.clone(),
+                        link,
+                        substrate,
+                        dry_run: false,
+                    },
+                    &bg.manager,
+                )
+                .await
+            }
+        };
+        let message = match result {
+            Ok(()) => format!(
+                "<span class=\"term-ok\">{} completed.</span>",
+                match action {
+                    LabAction::Up => "Lab bring-up",
+                    LabAction::Down => "Lab teardown",
+                    LabAction::Fault => "Fault injection",
+                    LabAction::Heal => "Link heal",
+                }
+            ),
+            Err(error) => format!(
+                "<span class=\"term-err\">{}</span>",
+                build::escape_html(&error.to_string())
+            ),
+        };
+        bg.publish(crate::web::state::ConsoleEvent::new(
+            build::status_event(&operation_name),
+            message,
+        ));
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Html(format!(
+            "<p class=\"muted\" data-build-status=\"{}\" hx-get=\"/api/operations/{}/status\" hx-trigger=\"load\" sse-swap=\"{}\">Working…</p>",
+            build::escape_html(&operation),
+            crate::web::encode_segment(&operation),
+            build::status_event(&operation)
+        )),
+    )
+        .into_response()
+}
+
 // ── box detail ───────────────────────────────────────────
 
 #[derive(Template)]
@@ -99,14 +699,31 @@ struct BoxDetailTemplate {
     version: &'static str,
     nav: &'static str,
     tab: &'static str,
+    /// SSE event name for this card, encoded exactly as the watcher emits it.
+    box_event: String,
     boxinfo: BoxSummary,
     groups: Vec<SetGroup>,
     extra_packages: String,
     policy: PolicyView,
+    /// Repeated for the Activity partial, which is included rather than
+    /// rendered on its own and so cannot reach `boxinfo`.
+    boxname: String,
+    capture: CaptureView,
+    capture_event: String,
+    activity_event: String,
+    timeline: Vec<Bucket>,
+    totals: Totals,
     stream: Vec<StreamRow>,
+    peers: Vec<Peer>,
     flows: Vec<Flow>,
     lookups: Vec<Lookup>,
     tree: Vec<TreeRow>,
+    files: Vec<FileWrite>,
+    violations: Vec<Refusal>,
+    egress_mode: Option<String>,
+    domains: Vec<DomainChip>,
+    filter_query: String,
+    cursor: String,
     behavior: String,
     has_store: bool,
     /// A build status published before this page loaded.
@@ -137,6 +754,7 @@ async fn box_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<TabQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
     let tab = resolve_tab(q.tab.as_deref());
 
@@ -175,19 +793,24 @@ async fn box_detail(
     };
 
     // Only the Activity tab pays for reading the event store.
-    let act = if tab == "activity" {
-        activity::load(&state.manager, &name, activity::INITIAL_EVENTS).unwrap_or_else(|e| {
-            tracing::warn!(box_id = %name, error = %e, "could not load activity");
-            empty_activity()
-        })
+    let filter = Filter::from_query(raw_query.as_deref().unwrap_or_default());
+    let (act, capture) = if tab == "activity" {
+        let act = activity::load(&state.manager, &name, activity::INITIAL_EVENTS, &filter)
+            .unwrap_or_else(|e| {
+                tracing::warn!(box_id = %name, error = %e, "could not load activity");
+                Activity::default()
+            });
+        (act, capture_bar(&state, &name, &boxinfo.status))
     } else {
-        empty_activity()
+        // The bar is part of the Activity tab, so the probes it needs are too.
+        (Activity::default(), CaptureView::default())
     };
 
     render(BoxDetailTemplate {
         version: state.version,
         nav: "dashboard",
         tab,
+        box_event: super::watch::box_card_event(&name),
         groups: service::set_groups(&selection),
         extra_packages: selection
             .packages
@@ -203,27 +826,82 @@ async fn box_detail(
             Ok(policy) => service::policy_view(&policy),
             Err(e) => service::policy_view_error(&e.to_string()),
         },
-        boxinfo,
         behavior: crate::obs::behavior::render_markdown(&act.summary),
+        boxname: boxinfo.name.clone(),
+        capture,
+        capture_event: super::tail::capture_event(&name),
+        activity_event: super::tail::activity_event(&name),
+        domains: activity::domain_chips(&act.events, &filter),
+        filter_query: filter.query.clone(),
+        cursor: act.cursor,
+        timeline: act.timeline,
+        totals: act.totals,
         stream: act.stream,
+        peers: act.peers,
         flows: act.flows,
         lookups: act.lookups,
         tree: act.tree,
+        files: act.files,
+        violations: act.violations,
+        egress_mode: act.summary.egress_mode.clone(),
         has_store: act.has_store,
+        boxinfo,
         retained_build: state.retained_build_status(&name).unwrap_or_default(),
     })
 }
 
-fn empty_activity() -> Activity {
-    Activity {
-        events: vec![],
-        stream: vec![],
-        flows: vec![],
-        lookups: vec![],
-        tree: vec![],
-        summary: Default::default(),
-        has_store: false,
-    }
+/// Whether a box is registered, for the routes that never look one up.
+///
+/// The activity fragments and the behaviour export read a store by name, and
+/// the observability files deliberately live outside `sandboxes/<name>` so a
+/// compromised guest cannot reach its own audit record. That separation means
+/// a crash between removing a sandbox and removing its store leaves an orphan
+/// — and without this check `/api/boxes/ghost/behavior` hands over that box's
+/// entire retained history while `/boxes/ghost` says it does not exist.
+///
+/// `is_safe_name` bounds *where* a name can point; this bounds *what* it may
+/// name.
+fn registered(state: &AppState, name: &str) -> bool {
+    state.manager.get_sandbox(name).is_ok()
+}
+
+/// The first line of a truncated JSONL export.
+///
+/// A record rather than a comment, because JSON Lines has no comments and a
+/// consumer that splits on newlines and parses each line must not choke on it.
+const TRUNCATION_RECORD: &str = r#"{"devbox":"truncated","note":"the scan stopped before the end of this window; narrow it with `since`"}"#;
+
+/// Largest export one request will read out of the store.
+///
+/// Not the request's peak memory: every format summarizes the decoded events
+/// and then builds a body from them, so a request costs some multiple of this.
+/// It is set low enough that the multiple is still bounded, and high enough
+/// for a real audit trail — tens of thousands of ordinary events.
+const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A 404 for a fragment route, which has no page to render.
+fn fragment_not_found(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Html(format!(
+            "<p class=\"muted\">No box named {}.</p>",
+            build::escape_html(name)
+        )),
+    )
+        .into_response()
+}
+
+/// Resolve the capture status bar for one box.
+///
+/// Two cheap reads — an advisory-lock probe and a small JSON file —
+/// deliberately kept out of the other tabs, which have no bar to show and
+/// should not pay for one.
+fn capture_bar(state: &AppState, name: &str, box_status: &str) -> CaptureView {
+    let daemon_running = crate::obs::daemon::status(&state.manager)
+        .map(|owner| owner.is_some())
+        .unwrap_or(false);
+    let health = crate::obs::health::load(&state.manager.state_dir, name).unwrap_or_default();
+    activity::capture_view(daemon_running, box_status, health.as_ref())
 }
 
 // ── activity ─────────────────────────────────────────────
@@ -232,13 +910,138 @@ fn empty_activity() -> Activity {
 #[template(path = "_activity_stream.html")]
 struct ActivityStreamFragment {
     stream: Vec<StreamRow>,
+    cursor: String,
 }
 
-/// `GET /api/boxes/{name}/activity` — the live stream fragment, refreshed by
-/// htmx while the tab is open.
-async fn box_activity(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    match activity::load(&state.manager, &name, activity::INITIAL_EVENTS) {
-        Ok(act) => render(ActivityStreamFragment { stream: act.stream }),
+#[derive(Template)]
+#[template(path = "_activity_tail.html")]
+struct ActivityTailFragment {
+    stream: Vec<StreamRow>,
+    cursor: String,
+    /// Events jumped over because a burst outran the page.
+    skipped: u64,
+}
+
+/// `GET /api/boxes/{name}/activity` — the whole stream, re-read.
+///
+/// What a filter change asks for: the selection changed, so the window has to
+/// be re-derived rather than appended to.
+async fn box_activity(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !registered(&state, &name) {
+        return fragment_not_found(&name);
+    }
+    let filter = Filter::from_query(query.as_deref().unwrap_or_default());
+    match activity::load(&state.manager, &name, activity::INITIAL_EVENTS, &filter) {
+        Ok(act) => render(ActivityStreamFragment {
+            stream: act.stream,
+            cursor: act.cursor,
+        }),
+        Err(e) => server_error("failed to read the event store", &e),
+    }
+}
+
+#[derive(Template)]
+#[template(path = "_activity_live_response.html")]
+struct ActivityLiveFragment {
+    domains: Vec<DomainChip>,
+    boxname: String,
+    timeline: Vec<Bucket>,
+    totals: Totals,
+    peers: Vec<Peer>,
+    flows: Vec<Flow>,
+    lookups: Vec<Lookup>,
+    tree: Vec<TreeRow>,
+    files: Vec<FileWrite>,
+    violations: Vec<Refusal>,
+    egress_mode: Option<String>,
+}
+
+/// `GET /api/boxes/{name}/activity/live` — everything that describes the
+/// loaded window: the density strip, the switcher's counts, and the six
+/// analysis views.
+///
+/// One region and one read, because they have to agree. Kept out of the tail
+/// so the stream is appended to while this is replaced — one swap cannot do
+/// both, and replacing the stream is the behaviour this whole change exists
+/// to remove. Throttled by the page, so an active box re-renders it every few
+/// seconds rather than on every burst.
+async fn box_activity_live(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if !registered(&state, &name) {
+        return fragment_not_found(&name);
+    }
+    match activity::load(
+        &state.manager,
+        &name,
+        activity::INITIAL_EVENTS,
+        &Filter::default(),
+    ) {
+        Ok(act) => render(ActivityLiveFragment {
+            // Counts only: the fragment sends no checkbox state, so the
+            // filter this request was made under does not matter.
+            domains: activity::domain_chips(&act.events, &Filter::default()),
+            boxname: name,
+            timeline: act.timeline,
+            totals: act.totals,
+            peers: act.peers,
+            flows: act.flows,
+            lookups: act.lookups,
+            tree: act.tree,
+            files: act.files,
+            violations: act.violations,
+            egress_mode: act.summary.egress_mode.clone(),
+        }),
+        Err(e) => server_error("failed to read the event store", &e),
+    }
+}
+
+/// `GET /api/boxes/{name}/activity/tail?after=N` — only what is new.
+///
+/// Answers the collector's signal. The anchor comes from the page and goes
+/// back out-of-band, so two consoles opened minutes apart each resume from
+/// their own position instead of sharing one cursor.
+async fn box_activity_tail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !registered(&state, &name) {
+        return fragment_not_found(&name);
+    }
+    let query = query.unwrap_or_default();
+    let filter = Filter::from_query(&query);
+    let cursor = form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "after")
+        .map(|(_, value)| Cursor::parse(&value))
+        .unwrap_or_default();
+
+    match activity::tail(&state.manager, &name, cursor, &filter) {
+        Ok(page) => {
+            // Newest first: the block is prepended whole, so its own order is
+            // what decides which row ends up on top.
+            let mut stream = page.rows;
+            stream.reverse();
+            let reset = page.reset;
+            let mut response = render(ActivityTailFragment {
+                stream,
+                cursor: page.cursor,
+                skipped: page.skipped,
+            });
+            if reset {
+                // The page is holding rows from a store that no longer exists.
+                // Appending to them would interleave two different boxes'
+                // events in one timeline with nothing to mark the seam, so
+                // this response replaces the stream instead of extending it.
+                response.headers_mut().insert(
+                    HeaderName::from_static("hx-reswap"),
+                    HeaderValue::from_static("innerHTML"),
+                );
+            }
+            response
+        }
         Err(e) => server_error("failed to read the event store", &e),
     }
 }
@@ -258,6 +1061,9 @@ async fn box_behavior(
     Path(name): Path<String>,
     Query(q): Query<BehaviorQuery>,
 ) -> Response {
+    if !registered(&state, &name) {
+        return fragment_not_found(&name);
+    }
     let store = match activity::open_store(&state.manager, &name) {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -270,23 +1076,25 @@ async fn box_behavior(
         Err(e) => return server_error("failed to open the event store", &e),
     };
 
-    let events = match store.query(&crate::obs::store::Query {
-        since: q.since.clone(),
-        limit: Some(crate::obs::store::Query::MAX_LIMIT),
-        ..Default::default()
-    }) {
-        Ok(e) => e,
+    // Bounded by rows and by bytes. A row limit alone does not bound memory:
+    // the transport accepts frames up to a megabyte, so fifty thousand rows is
+    // fifty gigabytes in the worst case, and a guest that emits maximal events
+    // could end the console by asking it for an audit trail.
+    let (events, truncated) = match store.export(
+        q.since.as_deref(),
+        crate::obs::store::Query::MAX_LIMIT,
+        MAX_EXPORT_BYTES,
+    ) {
+        Ok(pair) => pair,
         Err(e) => return server_error("failed to query events", &e),
     };
 
-    // Say so when the window was cut off.
-    //
-    // `MAX_LIMIT` rows means the query stopped, not that the box did, and this
-    // endpoint serves both a rendered summary and a JSONL export. Returning
-    // either as though it covered the whole window lets a consumer mistake a
-    // partial audit for a complete one — the same failure the CLI refuses
-    // outright, except an export has no reader to warn.
-    let truncated = events.len() >= crate::obs::store::Query::MAX_LIMIT;
+    // `truncated` means the window was cut off — by the row limit, by the byte
+    // budget, or by a row that no longer decodes. This endpoint serves both a
+    // rendered summary and a JSONL export, and returning either as though it
+    // covered the whole window lets a consumer mistake a partial audit for a
+    // complete one: the same failure the CLI refuses outright, except an
+    // export has no reader to warn.
 
     let summary = crate::obs::behavior::summarize(&name, &events);
 
@@ -298,13 +1106,13 @@ async fn box_behavior(
             if truncated {
                 body.insert_str(
                     0,
-                    &format!(
-                        "> **Incomplete.** This window holds at least {} events, which \
-                         is where the query stops. What follows covers the oldest {} \
-                         only — narrow the window with `since`.\n\n",
-                        crate::obs::store::Query::MAX_LIMIT,
-                        crate::obs::store::Query::MAX_LIMIT
-                    ),
+                    // Deliberately names no count. The scan stops at a row
+                    // limit, at a byte budget, or at a row that no longer
+                    // decodes, and a warning that always blamed the first was
+                    // wrong for a window of a few hundred large events.
+                    "> **Incomplete.** The scan stopped before the end of this \
+                     window. What follows covers the oldest events it reached \
+                     — narrow the window with `since`.\n\n",
                 );
             }
             (
@@ -317,17 +1125,33 @@ async fn box_behavior(
                 .into_response()
         }
         Some("jsonl") => match crate::obs::behavior::render_jsonl(&events) {
-            Ok(body) => (
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    "application/x-ndjson; charset=utf-8",
-                )],
-                body,
-            )
-                .into_response(),
+            Ok(mut body) => {
+                // In the body, not only in a header. These exports are saved
+                // by a keyed fetch that writes the bytes to a file — the
+                // response headers do not survive it, so a partial window
+                // reached the disk looking complete.
+                if truncated {
+                    body.insert_str(0, &format!("{}\n", TRUNCATION_RECORD));
+                }
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-ndjson; charset=utf-8",
+                    )],
+                    body,
+                )
+                    .into_response()
+            }
             Err(e) => server_error("failed to export events", &anyhow::Error::from(e)),
         },
-        _ => Json(summary).into_response(),
+        _ => {
+            // Same reason as the JSONL case: the saved file has to carry it.
+            let mut value = serde_json::to_value(&summary).unwrap_or_default();
+            if truncated && let Some(object) = value.as_object_mut() {
+                object.insert("truncated".into(), serde_json::Value::Bool(true));
+            }
+            Json(value).into_response()
+        }
     };
 
     // A header as well as the prose: the export has no reader to warn, and a
@@ -338,6 +1162,63 @@ async fn box_behavior(
             HeaderValue::from_static("true"),
         );
     }
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct PcapQuery {
+    proto: String,
+    saddr: Option<std::net::IpAddr>,
+    sport: Option<u16>,
+    daddr: std::net::IpAddr,
+    dport: u16,
+    duration: Option<u64>,
+    packets: Option<u16>,
+}
+
+/// `POST /api/boxes/{name}/flows/pcap` — a bounded real packet capture.
+async fn capture_flow_pcap(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<PcapQuery>,
+) -> Response {
+    let filter = crate::obs::pcap::FlowFilter {
+        proto: query.proto,
+        saddr: query.saddr,
+        sport: query.sport.filter(|port| *port != 0),
+        daddr: query.daddr,
+        dport: query.dport,
+        duration: std::time::Duration::from_secs(
+            query
+                .duration
+                .unwrap_or(crate::obs::pcap::DEFAULT_DURATION.as_secs()),
+        ),
+        packets: query.packets.unwrap_or(crate::obs::pcap::DEFAULT_PACKETS),
+    };
+    let capture = match crate::obs::pcap::capture(&state.manager, &name, &filter).await {
+        Ok(capture) => capture,
+        Err(error) => return action_error("capture a flow from", &name, &error),
+    };
+    let filename = format!(
+        "attachment; filename=\"devbox-{}-flow.pcap\"",
+        crate::web::encode_segment(&name)
+    );
+    let mut response = (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.tcpdump.pcap",
+            ),
+            (axum::http::header::CONTENT_DISPOSITION, &filename),
+        ],
+        capture.bytes,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-devbox-packets"),
+        HeaderValue::from_str(&capture.packets.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
     response
 }
 
@@ -368,7 +1249,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
     }
 
     let body = crate::metrics::render(&crate::metrics::Snapshot {
-        collector: state.collector_stats.snapshot(),
+        collector: crate::obs::daemon::stats_snapshot(&state.manager).unwrap_or_default(),
         events_by_type: by_type.into_iter().collect(),
         boxes_by_status: by_status.into_iter().collect(),
         version: state.version.to_string(),
@@ -390,35 +1271,94 @@ async fn metrics(State(state): State<AppState>) -> Response {
 #[template(path = "_box_card.html")]
 struct BoxCardFragment {
     b: BoxSummary,
+    notice: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StartQuery {
+    #[serde(default)]
+    terminal: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DestroyQuery {
+    #[serde(default)]
+    force: bool,
 }
 
 /// Re-render a box's card, which is what every lifecycle action swaps in.
 async fn card_after_action(state: &AppState, name: &str) -> Response {
     match service::get_box(&state.manager, name).await {
-        Ok(b) => render(BoxCardFragment { b }),
+        Ok(b) => render(BoxCardFragment {
+            b,
+            notice: String::new(),
+        }),
         Err(e) => not_found(name, &e),
     }
 }
 
-async fn start_box(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+/// Keep the lifecycle controls in place when an action fails. The htmx target
+/// is the whole card, so returning only an error notice would erase every
+/// button and leave the dashboard unusable until a full reload.
+async fn card_action_error(
+    state: &AppState,
+    verb: &str,
+    name: &str,
+    err: &anyhow::Error,
+) -> Response {
+    tracing::warn!(box_id = %name, error = ?err, "failed to {verb} box");
+    match service::get_box(&state.manager, name).await {
+        Ok(b) => render_status(
+            BoxCardFragment {
+                b,
+                // Alternate formatting includes the full anyhow chain. The
+                // top-level context is often just "failed to start box"; the
+                // actionable readiness timeout or recovery command is in its
+                // source and must reach the person clicking the button.
+                notice: format!("Could not {verb} {name}: {err:#}"),
+            },
+            StatusCode::CONFLICT,
+        ),
+        Err(_) => action_error(verb, name, err),
+    }
+}
+
+async fn start_box(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<StartQuery>,
+) -> Response {
     if let Err(e) = service::start_box(&state.manager, &name).await {
-        return action_error("start", &name, &e);
+        if query.terminal {
+            return card_action_error(&state, "start", &name, &e).await;
+        }
+        return card_action_error(&state, "start", &name, &e).await;
+    }
+    if query.terminal {
+        // The terminal uses fetch rather than htmx. Return the same fresh card
+        // as an explicit Start so the detail header and controls immediately
+        // reflect a successful lazy-start instead of remaining "stopped".
+        return card_after_action(&state, &name).await;
     }
     card_after_action(&state, &name).await
 }
 
 async fn stop_box(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if let Err(e) = service::stop_box(&state.manager, &name).await {
-        return action_error("stop", &name, &e);
+        return card_action_error(&state, "stop", &name, &e).await;
     }
     card_after_action(&state, &name).await
 }
 
-async fn destroy_box(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+async fn destroy_box(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DestroyQuery>,
+) -> Response {
     // The claim is taken inside `destroy_sandbox`, so the CLI path is covered
     // by the same rule rather than by a second copy of it here.
-    if let Err(e) = service::destroy_box(&state.manager, &name, false).await {
-        return action_error("destroy", &name, &e);
+    if let Err(e) = service::destroy_box(&state.manager, &name, query.force).await {
+        return card_action_error(&state, "destroy", &name, &e).await;
     }
 
     // The box is gone, so there is no card to swap in. Empty body removes the
@@ -481,11 +1421,14 @@ async fn apply_sets(
     // One rebuild per box at a time: two concurrent ones would overwrite the
     // same generated config and then each persist its own selection.
     let Some(guard) = state.claim_rebuild(&name) else {
-        return (
+        return render_status(
+            BuildPanelFragment {
+                retained: state.retained_build_status(&name).unwrap_or_default(),
+                name,
+                summary: format!("{summary} (rebuild already in progress)"),
+            },
             StatusCode::CONFLICT,
-            error_notice("A rebuild is already running for this box. Wait for it to finish."),
-        )
-            .into_response();
+        );
     };
 
     let bg = state.clone();
@@ -667,8 +1610,10 @@ async fn box_terminal(
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // The box must be live before a shell can attach.
-    if let Err(e) = service::ensure_running(&state.manager, &name).await {
+    // Pure attach: the terminal page's authenticated Start POST is the sole
+    // lifecycle transition. Auto-starting again here could undo an explicit
+    // Stop that landed between the POST and WebSocket handshake.
+    if let Err(e) = service::require_running(&state.manager, &name).await {
         return action_error("open a terminal in", &name, &e);
     }
 
@@ -715,7 +1660,7 @@ async fn help_topic(State(state): State<AppState>, Path(topic): Path<String>) ->
     let Some(markdown) = help::source(&topic) else {
         return (
             StatusCode::NOT_FOUND,
-            format!("no cheat sheet for '{topic}'"),
+            error_notice(&format!("no cheat sheet for '{topic}'")),
         )
             .into_response();
     };
@@ -753,6 +1698,15 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Replay the latest terminal status after an htmx panel is installed.
+///
+/// SSE has no history. A fast background failure can publish between the HTTP
+/// response being rendered and the browser attaching `sse-swap`; this load
+/// hook closes that narrow gap without polling indefinitely.
+async fn operation_status(State(state): State<AppState>, Path(name): Path<String>) -> Html<String> {
+    Html(state.retained_build_status(&name).unwrap_or_default())
+}
+
 // ── helpers ──────────────────────────────────────────────
 
 /// Render an askama template, turning a template failure into a 500 rather
@@ -768,11 +1722,21 @@ fn render<T: Template>(template: T) -> Response {
     }
 }
 
+fn render_status<T: Template>(template: T, status: StatusCode) -> Response {
+    match template.render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "template render failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "template render failed").into_response()
+        }
+    }
+}
+
 fn server_error(context: &str, err: &anyhow::Error) -> Response {
     tracing::error!(error = ?err, "{context}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("{context}: {err}"),
+        error_notice(&format!("{context}: {err}")),
     )
         .into_response()
 }
@@ -807,7 +1771,7 @@ fn not_found(name: &str, err: &anyhow::Error) -> Response {
 /// is safe must not be that whoever wrote it remembered.
 fn error_notice(message: &str) -> Html<String> {
     Html(format!(
-        "<div class=\"notice error\">{}</div>",
+        "<div class=\"notice error\" role=\"alert\">{}</div>",
         build::escape_html(message)
     ))
 }
@@ -822,9 +1786,9 @@ fn action_error(verb: &str, name: &str, err: &anyhow::Error) -> Response {
     (
         StatusCode::CONFLICT,
         Html(format!(
-            "<div class=\"notice error\">Could not {verb} <strong>{}</strong>: {}</div>",
+            "<div class=\"notice error\" role=\"alert\">Could not {verb} <strong>{}</strong>: {}</div>",
             build::escape_html(name),
-            build::escape_html(&err.to_string())
+            build::escape_html(&format!("{err:#}"))
         )),
     )
         .into_response()
@@ -861,8 +1825,16 @@ mod tests {
             "1 box · not running"
         );
         assert_eq!(
+            dashboard_subtitle(&[summary("a", "unreachable")]),
+            "1 box · needs attention"
+        );
+        assert_eq!(
             dashboard_subtitle(&[summary("a", "running"), summary("b", "stopped")]),
             "2 boxes · 1 running"
+        );
+        assert_eq!(
+            dashboard_subtitle(&[summary("a", "running"), summary("b", "unknown")]),
+            "2 boxes · 1 running · 1 needs attention"
         );
     }
 
@@ -890,6 +1862,8 @@ mod tests {
         assert!(html.contains("beta"));
         assert!(html.contains("status-running"));
         assert!(html.contains("status-stopped"));
+        assert!(html.contains("data-box-status=\"running\""));
+        assert!(html.contains("data-box-status=\"stopped\""));
         assert!(html.contains("sse-connect=\"/api/stream\""));
     }
 
@@ -923,9 +1897,10 @@ mod tests {
     }
 
     #[test]
-    fn start_button_is_disabled_only_when_running() {
+    fn lifecycle_buttons_follow_operable_status() {
         let running = BoxCardFragment {
             b: summary("a", "running"),
+            notice: String::new(),
         }
         .render()
         .unwrap();
@@ -933,24 +1908,61 @@ mod tests {
         assert!(running.contains("/api/boxes/a/start"));
         let start_idx = running.find("/api/boxes/a/start").unwrap();
         let stop_idx = running.find("/api/boxes/a/stop").unwrap();
-        assert!(running[start_idx..stop_idx].contains("disabled"));
+        assert!(running[start_idx..stop_idx].contains("disabled>Start"));
         assert!(
             !running[stop_idx..]
                 .split("</button>")
                 .next()
                 .unwrap()
-                .contains("disabled")
+                .contains("disabled>Stop")
         );
 
         let stopped = BoxCardFragment {
             b: summary("a", "stopped"),
+            notice: String::new(),
         }
         .render()
         .unwrap();
         let start_idx = stopped.find("/api/boxes/a/start").unwrap();
         let stop_idx = stopped.find("/api/boxes/a/stop").unwrap();
-        assert!(!stopped[start_idx..stop_idx].contains("disabled"));
-        assert!(stopped[stop_idx..].contains("disabled"));
+        assert!(!stopped[start_idx..stop_idx].contains("disabled>Start"));
+        assert!(stopped[stop_idx..].contains("disabled>Stop"));
+
+        let unreachable = BoxCardFragment {
+            b: summary("a", "unreachable"),
+            notice: String::new(),
+        }
+        .render()
+        .unwrap();
+        let start_idx = unreachable.find("/api/boxes/a/start").unwrap();
+        let stop_idx = unreachable.find("/api/boxes/a/stop").unwrap();
+        assert!(unreachable[start_idx..stop_idx].contains("disabled>Start"));
+        assert!(
+            !unreachable[stop_idx..]
+                .split("</button>")
+                .next()
+                .unwrap()
+                .contains("disabled>Stop")
+        );
+
+        // Unknown means the status probe could not prove the box healthy.
+        // Starting would be unsafe, but Stop is the explicit recovery path.
+        let unknown = BoxCardFragment {
+            b: summary("a", "unknown"),
+            notice: String::new(),
+        }
+        .render()
+        .unwrap();
+        let start_idx = unknown.find("/api/boxes/a/start").unwrap();
+        let stop_idx = unknown.find("/api/boxes/a/stop").unwrap();
+        assert!(unknown[start_idx..stop_idx].contains("disabled>Start"));
+        assert!(
+            !unknown[stop_idx..]
+                .split("</button>")
+                .next()
+                .unwrap()
+                .contains("disabled>Stop")
+        );
     }
 
     fn detail(tab: &'static str) -> BoxDetailTemplate {
@@ -960,14 +1972,28 @@ mod tests {
             version: "0.1.3",
             nav: "dashboard",
             tab,
+            box_event: "box-card-alpha".into(),
             groups: service::set_groups(&selection),
             extra_packages: String::new(),
             policy: service::policy_view(&crate::policy::Policy::default()),
             boxinfo: summary("alpha", "running"),
+            boxname: "alpha".into(),
+            capture: activity::capture_view(true, "running", None),
+            capture_event: crate::web::tail::capture_event("alpha"),
+            activity_event: crate::web::tail::activity_event("alpha"),
+            timeline: vec![],
+            totals: Totals::default(),
             stream: vec![],
+            peers: vec![],
             flows: vec![],
             lookups: vec![],
             tree: vec![],
+            files: vec![],
+            violations: vec![],
+            egress_mode: None,
+            domains: vec![],
+            filter_query: String::new(),
+            cursor: "0:0".into(),
             behavior: String::new(),
             has_store: false,
         }
@@ -987,6 +2013,9 @@ mod tests {
         }];
         page.flows = vec![Flow {
             peer: "pypi.org".into(),
+            saddr: "10.0.0.2".into(),
+            capture_saddr: Some("10.0.0.2".into()),
+            sport: 42000,
             addr: "151.101.0.223".into(),
             port: 443,
             proto: "tcp".into(),
@@ -1055,7 +2084,12 @@ mod tests {
         ] {
             let html = detail(tab).render().expect("template renders");
             assert!(html.contains(needle), "tab {tab} missing {needle}");
+            assert!(html.contains("id=\"detail-live-status\""));
         }
+
+        let overview = detail("overview").render().unwrap();
+        assert!(overview.contains("id=\"overview-live-status\""));
+        assert!(overview.contains("sse-swap=\"box-card-alpha\""));
     }
 
     #[test]
@@ -1078,27 +2112,82 @@ mod tests {
     }
 
     #[test]
-    fn activity_tab_shows_an_empty_state_before_any_capture() {
-        let html = detail("activity").render().unwrap();
-        assert!(html.contains("No observability data yet"));
-        assert!(html.contains("devbox-obsd"));
+    fn an_empty_activity_tab_says_which_of_the_four_reasons_it_is_empty() {
+        // The whole point of the capture bar. "Nothing here" used to be the
+        // page's entire answer for a stopped daemon, a stopped box, a box that
+        // never had an agent, and an agent failing every attempt.
+        let mut page = detail("activity");
+        page.capture = activity::capture_view(false, "running", None);
+        let down = page.render().unwrap();
+        assert!(down.contains("Collector is not running"));
+        assert!(down.contains("capture-down"));
+
+        let mut page = detail("activity");
+        page.capture = activity::capture_view(true, "stopped", None);
+        let stopped = page.render().unwrap();
+        assert!(stopped.contains("Box is stopped"));
+        assert!(stopped.contains("capture-warn"));
+    }
+
+    #[test]
+    fn a_failed_agent_names_the_command_that_fixes_it() {
+        use crate::obs::health::{CaptureHealth, CaptureState};
+
+        let health = CaptureHealth::new("alpha", CaptureState::Failed).with_detail(
+            "agent closed the connection before saying hello — the agent said: \
+             sh: /usr/local/bin/devbox-obsd: not found",
+        );
+        let mut page = detail("activity");
+        page.capture = activity::capture_view(true, "running", Some(&health));
+
+        let html = page.render().unwrap();
+        assert!(html.contains("The agent could not start"));
+        // The guest's own words, not just the collector's symptom.
+        assert!(html.contains("devbox-obsd: not found"));
+        // And what to do about it.
+        assert!(html.contains("devbox reprovision"));
     }
 
     #[test]
     fn activity_tab_renders_every_view() {
         let html = detail_with_activity().render().unwrap();
 
-        // Live stream is refreshed by htmx, scoped to this box.
-        assert!(html.contains("hx-get=\"/api/boxes/alpha/activity\""));
-        // Flow table.
+        // The stream is driven by the collector's signal, not by a clock.
+        assert!(html.contains("hx-get=\"/api/boxes/alpha/activity/tail\""));
+        assert!(html.contains("sse:activity-alpha"));
+        // …and stops while paused, or a paused stream is not paused.
+        assert!(html.contains("act-pause"));
+        // Flow table, with sizes a person can compare at a glance.
         assert!(html.contains("pypi.org"));
-        assert!(html.contains("831720"));
+        assert!(html.contains("812 KB"), "raw byte counts are not a size");
         // DNS log.
         assert!(html.contains("151.101.0.223"));
         // Behaviour summary with its exports.
         assert!(html.contains("Behavior summary"));
         assert!(html.contains("behavior?format=markdown"));
         assert!(html.contains("behavior?format=jsonl"));
+        assert!(html.contains("data-method=\"POST\""));
+        assert!(html.contains("flows/pcap?proto=tcp"));
+        assert!(html.contains("saddr=10.0.0.2"));
+        assert!(!html.contains("sport=42000"));
+    }
+
+    #[test]
+    fn activity_capture_omits_an_unspecified_listener_address() {
+        let mut page = detail_with_activity();
+        page.flows[0].saddr = "0.0.0.0".into();
+        page.flows[0].capture_saddr = None;
+
+        let html = page.render().unwrap();
+        let capture = html
+            .split("flows/pcap?")
+            .nth(1)
+            .and_then(|tail| tail.split("\">pcap").next())
+            .expect("capture link");
+        assert!(!capture.contains("saddr="), "got: {capture}");
+        assert!(!capture.contains("sport="), "got: {capture}");
+        assert!(capture.contains("daddr=151.101.0.223"));
+        assert!(capture.contains("dport=443"));
     }
 
     #[test]
@@ -1112,6 +2201,7 @@ mod tests {
                 comm: "pip".into(),
                 summary: "dns pypi.org".into(),
             }],
+            cursor: "7:41".into(),
         }
         .render()
         .unwrap();
@@ -1124,8 +2214,112 @@ mod tests {
 
     #[test]
     fn activity_stream_fragment_has_an_empty_state() {
-        let html = ActivityStreamFragment { stream: vec![] }.render().unwrap();
-        assert!(html.contains("No activity recorded yet"));
+        let html = ActivityStreamFragment {
+            stream: vec![],
+            cursor: "0:0".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("Nothing matches the current filter"));
+    }
+
+    fn fabric(json: &str) -> crate::lab::ztp_status::FabricView {
+        crate::lab::ztp_status::view(serde_json::from_str(json).ok())
+    }
+
+    #[test]
+    fn a_lab_that_was_never_brought_up_invites_rather_than_alarms() {
+        let html = ZtpPanelFragment {
+            ztp_lab: "ztp-fabric".into(),
+            ztp: crate::lab::ztp_status::FabricView::default(),
+        }
+        .render()
+        .unwrap();
+
+        assert!(html.contains("Not running"));
+        assert!(html.contains("Bring this lab up"));
+        // No verdict at all rather than "not converged": a fabric that was
+        // never asked to converge has not failed to.
+        assert!(!html.contains("not converged"));
+    }
+
+    #[test]
+    fn a_provisioning_fabric_shows_what_is_still_moving() {
+        let html = ZtpPanelFragment {
+            ztp_lab: "ztp-fabric".into(),
+            ztp: fabric(
+                r#"{"nodes":[
+                     {"serial":"SN-1","name":"leaf1","role":"leaf","state":"healthy",
+                      "attempts":1,"config_hash":"deadbeefcafe"},
+                     {"serial":"SN-2","name":"leaf2","role":"leaf","state":"pushing",
+                      "attempts":3}],
+                   "healthy":1,"failed":0,"expected":3,"missing":["SN-3"],
+                   "converged":false,"p95_secs":8.25}"#,
+            ),
+        }
+        .render()
+        .unwrap();
+
+        assert!(html.contains("Provisioning"));
+        assert!(html.contains("not converged"));
+        assert!(
+            html.contains("8.2s"),
+            "the p95 that the SLO is written against"
+        );
+        // The serial the source of truth expects and has never heard from.
+        assert!(html.contains("SN-3"));
+        assert!(html.contains("never seen"));
+        // Attempts above one is the recovery the chaos test exists to prove.
+        assert!(html.contains("<b>3</b>"));
+        // A config hash, shortened — enough to compare two nodes at a glance.
+        assert!(html.contains("deadbeef"));
+        assert!(!html.contains("deadbeefcafe"));
+    }
+
+    #[test]
+    fn a_converged_fabric_says_so_once_and_plainly() {
+        let html = ZtpPanelFragment {
+            ztp_lab: "ztp-fabric".into(),
+            ztp: fabric(
+                r#"{"nodes":[{"serial":"SN-1","name":"leaf1","state":"healthy","attempts":1}],
+                    "healthy":1,"failed":0,"expected":1,"missing":[],
+                    "converged":true,"p95_secs":4.0}"#,
+            ),
+        }
+        .render()
+        .unwrap();
+
+        assert!(html.contains("Converged"));
+        assert!(html.contains("verdict-allowed"));
+        assert!(!html.contains("never seen"));
+    }
+
+    #[test]
+    fn the_topology_colours_a_blank_node_by_what_provisioning_did_to_it() {
+        // Three grey outlines going green is the demonstration; a topology
+        // that draws them identically throughout shows nothing happening.
+        let mut view = super::super::labs::load(
+            &std::sync::Arc::new(crate::sandbox::SandboxManager {
+                state_dir: std::path::PathBuf::from("/tmp/devbox-ztp-render-test"),
+            }),
+            "ztp-fabric",
+        )
+        .expect("the built-in scenario loads");
+        assert!(view.nodes.iter().all(|node| node.phase.is_empty()));
+
+        super::super::labs::apply_phases(
+            &mut view,
+            &fabric(
+                r#"{"nodes":[{"serial":"SN-1","name":"leaf1","state":"healthy"},
+                             {"serial":"SN-2","name":"leaf2","state":"failed"}]}"#,
+            ),
+        );
+
+        let html = LabViewFragment { view }.render().unwrap();
+        assert!(html.contains("topo-node node-healthy"));
+        assert!(html.contains("topo-node node-failed"));
+        // A node the fabric said nothing about keeps the plain class.
+        assert!(html.contains("class=\"topo-node \""));
     }
 
     #[test]
@@ -1135,6 +2329,9 @@ mod tests {
         let terminal = detail("terminal").render().unwrap();
         assert!(terminal.contains("/assets/js/xterm.js"));
         assert!(terminal.contains("/assets/js/term.js"));
+        assert!(terminal.contains("data-start-endpoint=\"/api/boxes/alpha/start?terminal=true\""));
+        assert!(!terminal.contains("hx-swap=\"none\""));
+        assert!(terminal.contains("devbox:box-status"));
     }
 
     #[test]
@@ -1148,7 +2345,22 @@ mod tests {
         .unwrap();
         assert!(html.contains("sse-swap=\"build-alpha\""));
         assert!(html.contains("sse-swap=\"build-status-alpha\""));
+        assert!(html.contains("data-build-status=\"alpha\""));
+        assert!(html.contains("/api/operations/alpha/status"));
         assert!(html.contains("3 set(s)"));
+    }
+
+    #[test]
+    fn create_panel_protects_its_completion_from_a_stale_replay() {
+        let html = CreatePanelFragment {
+            retained: String::new(),
+            name: "alpha".into(),
+            summary: "a bare box".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("data-build-status=\"alpha\""));
+        assert!(html.contains("sse-swap=\"build-status-alpha\""));
     }
 
     #[test]

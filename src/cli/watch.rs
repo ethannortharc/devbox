@@ -49,16 +49,28 @@ pub struct WatchArgs {
     pub json: bool,
 }
 
+/// Largest event a widened `--peer` scan will decode.
+///
+/// The scan reads `MAX_LIMIT` rows because the filter cannot be applied until
+/// after correlation, and at the transport's frame limit that is tens of
+/// gigabytes. Anything above this is still in the store and still exported;
+/// it is only left out of a scan that was widened on the reader's behalf.
+const WIDENED_SCAN_MAX_BYTES: usize = 64 * 1024;
+
 pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.name.as_deref())?;
+    // `store_path` only joins. An explicit `--name` reaches here untouched, so
+    // `devbox watch /some/dir` pointed `Store::open` at an unrelated database
+    // and wrote this schema's tables and pragmas into it.
+    if !crate::sandbox::state::is_safe_name(&name) {
+        anyhow::bail!("{name:?} is not a box name");
+    }
     let path = crate::obs::collector::store_path(&manager.state_dir, &name);
 
-    if !path.exists() {
-        println!("No events recorded for box '{name}' yet.");
-        println!("The observability agent writes to {}.", path.display());
-        return Ok(());
-    }
-
+    // Before the store is consulted. Validated after it, whether the command
+    // was accepted depended on whether the box had recorded anything yet:
+    // `devbox watch --type nonsense` succeeded on a quiet box and failed on
+    // the same box an hour later.
     let kinds = args
         .types
         .iter()
@@ -66,7 +78,20 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("unknown --type; valid values: exec, exit, connect, accept, dns, tls, file, syscall, api, policy")?;
 
+    if !path.exists() {
+        println!("No collected events are available for box '{name}'.");
+        println!("Start the box with a devbox command to collect its timeline.");
+        println!("The collector store is {}.", path.display());
+        return Ok(());
+    }
+
     let store = Store::open(&path)?;
+    if store.count()? == 0 {
+        println!("No collected events are available for box '{name}'.");
+        println!("Start the box with a devbox command to collect its timeline.");
+        println!("The collector store is {}.", path.display());
+        return Ok(());
+    }
 
     // With `--peer`, *every* filter waits until after correlation.
     //
@@ -92,6 +117,14 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         // DNS row that would have named the address, and
         // `watch --pid <app> --peer <name>` matched nothing.
         pid: if filtering_late { None } else { args.pid },
+        after_id: None,
+        before_id: None,
+        // Bounded only when the scan is widened. `--peer` defers filtering
+        // until after correlation, so it asks for `MAX_LIMIT` rows rather than
+        // `--limit` — and at the frame limit that is fifty gigabytes. An
+        // unwidened query keeps the whole record, which is what the CLI is
+        // for.
+        max_bytes: filtering_late.then_some(WIDENED_SCAN_MAX_BYTES),
         kinds: if filtering_late {
             Vec::new()
         } else {

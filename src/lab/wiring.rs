@@ -163,45 +163,11 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
         }
     }
 
-    // A host's default route.
-    //
-    // A fresh namespace has only the /31 it was just given, so a host in a
-    // routed scenario (`wan-lossy`, `client-proxy-server`) can reach its
-    // directly attached router and nothing beyond it — the far site stays
-    // unreachable however well BGP converges. Routers do not get one: they
-    // learn everything from BGP, and a default would mask a fabric that has
-    // not converged behind a route that always resolves.
-    //
-    // Nor does a blank node, for the same reason it gets no address: its
-    // default route is supposed to arrive with the lease, and giving it one
-    // here is the test answering its own question.
-    for link in &plan.links {
-        for (end, peer) in [(&link.a, &link.b), (&link.b, &link.a)] {
-            if topology
-                .node(&end.node)
-                .is_none_or(|n| n.role.routes() || n.role.blank())
-            {
-                continue;
-            }
-            cmds.push(privileged(vec![
-                "ip".into(),
-                "netns".into(),
-                "exec".into(),
-                netns(lab, &end.node),
-                "ip".into(),
-                "route".into(),
-                "replace".into(),
-                "default".into(),
-                "via".into(),
-                peer.addr.to_string(),
-                "dev".into(),
-                end.iface.clone(),
-            ]));
-        }
-    }
-
     // Router loopbacks, which BGP uses as its router-id.
     for (node, addr) in &plan.loopbacks {
+        if topology.node(node).is_some_and(|node| node.role.blank()) {
+            continue;
+        }
         cmds.push(privileged(vec![
             "ip".into(),
             "netns".into(),
@@ -229,6 +195,37 @@ pub fn up_commands(topology: &Topology, plan: &Plan) -> Result<Vec<Vec<String>>>
                 "set".into(),
                 end.iface.clone(),
                 "up".into(),
+            ]));
+        }
+    }
+
+    // A host's default route, after its interface is up. Linux refuses a
+    // gateway through a DOWN device even when it is explicitly on-link.
+    //
+    // A fresh namespace has only its connected subnet, so a host in a routed
+    // scenario cannot reach the far site without this. Routers learn routes
+    // from BGP, and a blank node receives its default route from DHCP.
+    for link in &plan.links {
+        for (end, peer) in [(&link.a, &link.b), (&link.b, &link.a)] {
+            if topology
+                .node(&end.node)
+                .is_none_or(|n| n.role.routes() || n.role.blank())
+            {
+                continue;
+            }
+            cmds.push(privileged(vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                netns(lab, &end.node),
+                "ip".into(),
+                "route".into(),
+                "replace".into(),
+                "default".into(),
+                "via".into(),
+                peer.addr.to_string(),
+                "dev".into(),
+                end.iface.clone(),
             ]));
         }
     }
@@ -270,9 +267,12 @@ pub fn down_commands(topology: &Topology) -> Vec<Vec<String>> {
                     "sh".into(),
                     "-c".into(),
                     format!(
-                        "ip netns pids {ns} 2>/dev/null | xargs -r kill 2>/dev/null; \
+                        "for p in /run/devbox/lab/{}/{}/*.supervisor.pid; do \
+                           [ -f \"$p\" ] && kill \"$(cat \"$p\")\" 2>/dev/null || true; \
+                         done; \
+                         ip netns pids {ns} 2>/dev/null | xargs -r kill 2>/dev/null; \
                          rm -rf /run/devbox/lab/{}/{}; exit 0",
-                        topology.lab.name, node.name
+                        topology.lab.name, node.name, topology.lab.name, node.name
                     ),
                 ]),
                 privileged(vec!["ip".into(), "netns".into(), "del".into(), ns]),

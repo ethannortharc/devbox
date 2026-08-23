@@ -6,6 +6,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::obs::behavior;
 use crate::obs::store::{Query, Store};
@@ -24,6 +27,9 @@ pub enum BehaviorCommand {
 
     /// Compare two windows of a box's activity
     Diff(DiffArgs),
+
+    /// Capture a real pcap for one network flow
+    Pcap(PcapArgs),
 }
 
 #[derive(Args, Debug)]
@@ -62,22 +68,106 @@ pub struct DiffArgs {
     pub json: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct PcapArgs {
+    /// Sandbox name (default: current directory's sandbox)
+    pub name: Option<String>,
+
+    /// Transport protocol
+    #[arg(long, value_parser = ["tcp", "udp"])]
+    pub proto: String,
+
+    /// Optional local/source address
+    #[arg(long)]
+    pub saddr: Option<IpAddr>,
+
+    /// Optional local/source port
+    #[arg(long)]
+    pub sport: Option<u16>,
+
+    /// Remote/destination address
+    #[arg(long)]
+    pub daddr: IpAddr,
+
+    /// Remote/destination port
+    #[arg(long)]
+    pub dport: u16,
+
+    /// Capture window in seconds
+    #[arg(long, default_value_t = crate::obs::pcap::DEFAULT_DURATION.as_secs())]
+    pub seconds: u64,
+
+    /// Maximum number of packets
+    #[arg(long, default_value_t = crate::obs::pcap::DEFAULT_PACKETS)]
+    pub packets: u16,
+
+    /// Output path (default: <box>-flow.pcap)
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
 pub async fn run(args: BehaviorArgs, manager: &SandboxManager) -> Result<()> {
     match args.command {
         BehaviorCommand::Summary(a) => summary(a, manager),
         BehaviorCommand::Diff(a) => diff(a, manager),
+        BehaviorCommand::Pcap(a) => pcap(a, manager).await,
     }
 }
 
+async fn pcap(args: PcapArgs, manager: &SandboxManager) -> Result<()> {
+    let name = manager.resolve_name(args.name.as_deref())?;
+    let filter = crate::obs::pcap::FlowFilter {
+        proto: args.proto,
+        saddr: args.saddr,
+        sport: args.sport.filter(|port| *port != 0),
+        daddr: args.daddr,
+        dport: args.dport,
+        duration: Duration::from_secs(args.seconds),
+        packets: args.packets,
+    };
+    let capture = crate::obs::pcap::capture(manager, &name, &filter).await?;
+    let output = args
+        .output
+        .unwrap_or_else(|| PathBuf::from(format!("{name}-flow.pcap")));
+    std::fs::write(&output, &capture.bytes)
+        .with_context(|| format!("write flow capture to {}", output.display()))?;
+    println!(
+        "Captured {} packet(s) to {}",
+        capture.packets,
+        output.display()
+    );
+    Ok(())
+}
+
+/// Largest window one behaviour command will read out of a store.
+///
+/// The row ceiling is not a size: at the transport's frame limit, fifty
+/// thousand rows is fifty gigabytes. Generous for a real audit trail, and
+/// finite — and when it binds, the command says so rather than pretending the
+/// window ended there.
+const MAX_SCAN_BYTES: usize = 256 * 1024 * 1024;
+
 /// Open a box's store, with a message rather than an error when there is none.
 fn open(manager: &SandboxManager, name: &str) -> Result<Option<Store>> {
+    // `store_path` only joins, and this name can come from an explicit flag.
+    if !crate::sandbox::state::is_safe_name(name) {
+        anyhow::bail!("{name:?} is not a box name");
+    }
     let path = crate::obs::collector::store_path(&manager.state_dir, name);
     if !path.exists() {
-        println!("No events recorded for box '{name}' yet.");
-        println!("Observability writes to {}.", path.display());
+        println!("No collected events are available for box '{name}'.");
+        println!("Start the box with a devbox command to collect its timeline.");
+        println!("The collector store is {}.", path.display());
         return Ok(None);
     }
-    Store::open(&path).map(Some)
+    let store = Store::open(&path)?;
+    if store.count()? == 0 {
+        println!("No collected events are available for box '{name}'.");
+        println!("Start the box with a devbox command to collect its timeline.");
+        println!("The collector store is {}.", path.display());
+        return Ok(None);
+    }
+    Ok(Some(store))
 }
 
 fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
@@ -86,22 +176,21 @@ fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     };
 
-    let events = store
-        .query(&Query {
-            since: args.since.clone(),
-            limit: Some(Query::MAX_LIMIT),
-            ..Default::default()
-        })
+    // `export` rather than `query`: it is bounded by bytes as well as rows,
+    // and it reports truncation from what the scan *reached* rather than from
+    // how many rows happened to decode. Counting decoded rows meant one row
+    // written by an older schema turned a cut-off window into a short one that
+    // claimed to be complete.
+    let (events, truncated) = store
+        .export(args.since.as_deref(), Query::MAX_LIMIT, MAX_SCAN_BYTES)
         .context("failed to query the event store")?;
 
     // A summary that silently covers only part of a window is worse than one
     // that says so: it reports "no violations" for a run that had them.
-    if events.len() >= Query::MAX_LIMIT {
+    if truncated {
         eprintln!(
-            "warning: this window has at least {} events, which is the query ceiling. \
-             The summary below covers the oldest {} only — narrow it with --since.",
-            Query::MAX_LIMIT,
-            Query::MAX_LIMIT
+            "warning: the scan stopped before the end of this window. The summary \
+             below covers the oldest events it reached — narrow it with --since."
         );
     }
 
@@ -145,17 +234,19 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
     };
     let boundary = Some(boundary);
 
-    let earlier = store.query(&Query {
-        since: Some(args.from.clone()),
-        until: boundary.clone(),
-        limit: Some(Query::MAX_LIMIT),
-        ..Default::default()
-    })?;
-    let later = store.query(&Query {
-        since: boundary,
-        limit: Some(Query::MAX_LIMIT),
-        ..Default::default()
-    })?;
+    // Bounded and honest on both sides, for the reason spelled out below:
+    // a window this command believes is complete when it is not produces the
+    // one answer it must never get wrong.
+    let (earlier, earlier_cut) =
+        store.export(Some(&args.from), Query::MAX_LIMIT, MAX_SCAN_BYTES)?;
+    let earlier: Vec<_> = match boundary.as_deref() {
+        Some(at) => earlier
+            .into_iter()
+            .filter(|event| event.ts_wall.as_str() < at)
+            .collect(),
+        None => earlier,
+    };
+    let (later, later_cut) = store.export(boundary.as_deref(), Query::MAX_LIMIT, MAX_SCAN_BYTES)?;
 
     // A capped window is not a window.
     //
@@ -167,16 +258,14 @@ fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
     //
     // Refused rather than warned. A diff nobody can trust is worth less than
     // no diff, and the fix is a narrower window, which the message names.
-    for (label, window) in [("--from", &earlier), ("the later window", &later)] {
-        if window.len() >= Query::MAX_LIMIT {
+    for (label, cut) in [("--from", earlier_cut), ("the later window", later_cut)] {
+        if cut {
             bail!(
-                "{label} holds at least {} events, which is where the query stops \
-                 — so anything after that point would be reported as absent, and \
-                 a diff that says 'nothing new' when there is would be worse than \
-                 none.\n\n  \
+                "the scan of {label} stopped before the end of it — so anything \
+                 after that point would be reported as absent, and a diff that \
+                 says 'nothing new' when there is would be worse than none.\n\n  \
                  Narrow it with `--from` and `--at`, or summarize the halves \
-                 separately with `devbox behavior summary --since`.",
-                Query::MAX_LIMIT
+                 separately with `devbox behavior summary --since`."
             );
         }
     }

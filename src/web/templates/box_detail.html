@@ -4,18 +4,27 @@
 {% block title %}devbox — {{ boxinfo.name }}{% endblock %}
 
 {% block content %}
-<div class="page-head">
-  <h1>{{ boxinfo.name }}</h1>
-  <span class="sub">{{ boxinfo.runtime }} · {{ boxinfo.image }}</span>
-  <span class="spacer"></span>
-  <a class="btn" href="/">← all boxes</a>
-</div>
+<div class="breadcrumb"><a href="/">Boxes</a><span>/</span><strong>{{ boxinfo.name }}</strong></div>
+<section class="workspace-titlebar">
+  <div>
+    <span class="eyebrow">Managed environment</span>
+    <h1>{{ boxinfo.name }}</h1>
+    <p>{{ boxinfo.runtime }} runtime · {{ boxinfo.image }} image · {{ boxinfo.mount_mode }} mount</p>
+  </div>
+  <span id="detail-live-status">{% call m::status_badge(boxinfo.status) %}{% endcall %}</span>
+</section>
 
 <div class="detail">
-  {% call m::box_card(boxinfo) %}{% endcall %}
+  <div id="detail-card-slot"
+       class="detail-card-slot"
+       data-box-name="{{ boxinfo.name }}"
+       sse-swap="{{ box_event }}"
+       hx-swap="innerHTML">
+    {% call m::box_card(boxinfo, "") %}{% endcall %}
+  </div>
 
   <section class="panel">
-    <nav class="tabs">
+    <nav class="tabs" aria-label="Box sections">
       <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=overview"
          {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
       <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=activity"
@@ -32,205 +41,79 @@
 
     <div class="tabpanel">
       {% if tab == "overview" %}
-      <dl class="meta wide">
-        <dt>status</dt>
-        <dd>{{ boxinfo.status }}</dd>
-        <dt>runtime</dt>
-        <dd>{{ boxinfo.runtime }}</dd>
-        <dt>image</dt>
-        <dd>{{ boxinfo.image }}</dd>
-        <dt>mount mode</dt>
-        <dd>{{ boxinfo.mount_mode }}</dd>
-        <dt>project</dt>
-        <dd>{{ boxinfo.project_dir }}</dd>
-        <dt>created</dt>
-        <dd>{{ boxinfo.created_at }}</dd>
-        <dt>sets</dt>
-        <dd>{% if boxinfo.sets.is_empty() %}—{% else %}{{ boxinfo.sets|join(", ") }}{% endif %}</dd>
-        <dt>languages</dt>
-        <dd>{% if boxinfo.languages.is_empty() %}—{% else %}{{ boxinfo.languages|join(", ") }}{% endif %}</dd>
+      <div class="overview-intro">
+        <div><span class="eyebrow">At a glance</span><h2>Workspace configuration</h2></div>
+        <p>The persisted state below is reconciled with the live runtime status each time this page loads.</p>
+      </div>
+      <div class="overview-metrics">
+        <div><span>Status</span><strong id="overview-live-status">{{ boxinfo.status }}</strong></div>
+        <div><span>Runtime</span><strong>{{ boxinfo.runtime }}</strong></div>
+        <div><span>Image</span><strong>{{ boxinfo.image }}</strong></div>
+        <div><span>mount mode</span><strong>{{ boxinfo.mount_mode }}</strong></div>
+      </div>
+      <dl class="overview-list">
+        <div><dt>Project directory</dt><dd>{{ boxinfo.project_dir }}</dd></div>
+        <div><dt>Created</dt><dd>{{ boxinfo.created_at }}</dd></div>
+        <div><dt>Tool sets</dt><dd>{% if boxinfo.sets.is_empty() %}None selected{% else %}{{ boxinfo.sets|join(", ") }}{% endif %}</dd></div>
+        <div><dt>Languages</dt><dd>{% if boxinfo.languages.is_empty() %}Not detected{% else %}{{ boxinfo.languages|join(", ") }}{% endif %}</dd></div>
       </dl>
 
       {% elif tab == "activity" %}
-      {% if !has_store %}
-      <div class="empty">
-        <h2>No observability data yet</h2>
-        <p>
-          Nothing has been captured for this box. The agent
-          (<code>devbox-obsd</code>) streams into
-          <code>~/.devbox/boxes/{{ boxinfo.name|urlencode_strict }}/events.db</code> once the box
-          is provisioned with observability enabled.
-        </p>
-      </div>
-      {% else %}
-
-      <div class="actsplit">
-        <section>
-          <h3 class="acthead">Live stream</h3>
-          {#- Refreshed by htmx while the tab is open; the SSE channel carries
-              the heartbeat, this carries the events. -#}
-          {#- Server-rendered for the first paint, then refreshed by htmx.
-              The SSE channel carries the heartbeat; this carries events. -#}
-          <div class="stream"
-               id="activity-stream"
-               hx-get="/api/boxes/{{ boxinfo.name|urlencode_strict }}/activity"
-               hx-trigger="every 2s"
-               hx-swap="innerHTML">
-            {% for r in stream %}
-            <div class="ev ev-{{ r.domain }}">
-              <span class="ev-ts">{{ r.ts }}</span>
-              <span class="ev-kind">{{ r.kind }}</span>
-              <span class="ev-proc">{{ r.comm }}<span class="ev-pid">·{{ r.pid }}</span></span>
-              <span class="ev-summary">{{ r.summary }}</span>
-            </div>
-            {% endfor %}
-            {% if stream.is_empty() %}
-            <p class="muted">No activity recorded yet.</p>
-            {% endif %}
-          </div>
-        </section>
-
-        <section>
-          <h3 class="acthead">Flows</h3>
-          {% if flows.is_empty() %}
-          <p class="muted">No connections recorded.</p>
-          {% else %}
-          <div class="tablewrap">
-            <table class="data">
-              <thead>
-                <tr>
-                  <th>peer</th><th>port</th><th>proto</th><th>alpn</th>
-                  <th>↑</th><th>↓</th><th>process</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for f in flows %}
-                <tr>
-                  <td title="{{ f.addr }}">{{ f.peer }}</td>
-                  <td>{{ f.port }}</td>
-                  <td>{{ f.proto }}</td>
-                  <td>{{ f.alpn }}</td>
-                  <td>{{ f.bytes_tx }}</td>
-                  <td>{{ f.bytes_rx }}</td>
-                  <td>{{ f.comm }}·{{ f.pid }}</td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-          {% endif %}
-
-          <h3 class="acthead">DNS</h3>
-          {% if lookups.is_empty() %}
-          <p class="muted">No lookups recorded.</p>
-          {% else %}
-          <div class="tablewrap">
-            <table class="data">
-              <thead><tr><th>time</th><th>name</th><th>type</th><th>answers</th></tr></thead>
-              <tbody>
-                {% for l in lookups %}
-                <tr>
-                  <td>{{ l.ts }}</td>
-                  <td>{{ l.name }}</td>
-                  <td>{{ l.qtype }}</td>
-                  <td>{{ l.answers|join(", ") }}</td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-          {% endif %}
-
-          <h3 class="acthead">Processes</h3>
-          {% if tree.is_empty() %}
-          <p class="muted">No processes recorded.</p>
-          {% else %}
-          <ul class="ptree">
-            {% for row in tree %}
-            <li style="padding-left: {{ row.depth }}rem">
-              <span class="ev-proc">{{ row.chain.comm }}<span class="ev-pid">·{{ row.chain.pid }}</span></span>
-              {% if let Some(cmd) = row.chain.command %}<code>{{ cmd }}</code>{% endif %}
-              {% if !row.chain.peers.is_empty() %}
-              <span class="muted">→ {{ row.chain.peers|join(", ") }}</span>
-              {% endif %}
-            </li>
-            {% endfor %}
-          </ul>
-          {% endif %}
-        </section>
-      </div>
-
-      <details class="behavior">
-        <summary>Behavior summary — what this box has done</summary>
-        <pre>{{ behavior }}</pre>
-        {#- `data-download` makes these keyed fetches rather than navigations.
-            A navigation cannot present the console key and `/api/` is not
-            shell-eligible, so as plain links all three returned 401. See
-            `download.js` for why the key does not simply go in the href. -#}
-        <p class="muted">
-          Export:
-          <a data-download="{{ boxinfo.name }}-behavior.md"
-             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=markdown">Markdown</a> ·
-          <a data-download="{{ boxinfo.name }}-behavior.jsonl"
-             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior?format=jsonl">JSONL</a> ·
-          <a data-download="{{ boxinfo.name }}-behavior.json"
-             href="/api/boxes/{{ boxinfo.name|urlencode_strict }}/behavior">JSON</a>
-        </p>
-      </details>
-      {% endif %}
+      {% include "_activity_panel.html" %}
 
       {% elif tab == "sets" %}
-      <p class="muted">
+      <div class="tab-intro"><span class="eyebrow">Environment composition</span><h2>Tool sets</h2><p>
         Toggle what this box has. Nix builds only what is checked, so an
         unchecked set costs nothing — no download, no closure, no disk.
-      </p>
+      </p></div>
       {% call m::set_checklist(boxinfo.name, groups, extra_packages) %}{% endcall %}
 
       {#- Build output streams in here over SSE; `beforeend` appends rather
           than replacing, so the log accumulates. -#}
-      <div id="build-panel">
+      <div id="build-panel" role="status" aria-live="polite">
         <div class="buildlog"
              sse-swap="build-{{ boxinfo.name }}"
              hx-swap="beforeend scroll:bottom"></div>
-        <p class="muted" sse-swap="build-status-{{ boxinfo.name }}">{{ retained_build|safe }}</p>
+        <p class="muted"
+           data-build-status="{{ boxinfo.name }}"
+           hx-get="/api/operations/{{ boxinfo.name|urlencode_strict }}/status"
+           hx-trigger="load"
+           sse-swap="build-status-{{ boxinfo.name }}">{{ retained_build|safe }}</p>
       </div>
 
       {% elif tab == "policy" %}
-      <p class="muted">
-        What this box is allowed to reach. Changes are saved to
-        <code>devbox.toml</code>; the agent applies them on the next
-        provision or reprovision.
-      </p>
+      <div class="tab-intro"><span class="eyebrow">Network guardrails</span><h2>Egress policy</h2><p>
+        Changes are saved to <code>devbox.toml</code> and enforced immediately
+        when the box is running. Stopped boxes apply the policy on next start.
+      </p></div>
       {% call m::policy_editor(boxinfo.name, policy) %}{% endcall %}
 
       {% elif tab == "files" %}
-      <p class="muted">
+      <div class="tab-intro"><span class="eyebrow">Protected source</span><h2>Overlay changes</h2><p>
         Changes written inside the box, on top of the read-only host mount.
         Nothing here has touched your project directory yet.
-      </p>
+      </p></div>
       <div id="files"
            hx-get="/api/boxes/{{ boxinfo.name|urlencode_strict }}/files"
            hx-trigger="load, every 5s">
-        <p class="muted">Loading…</p>
+        <div class="loading-state" role="status"><span></span><span></span><span></span><em>Checking the overlay…</em></div>
       </div>
 
       {% elif tab == "terminal" %}
-      <p class="muted">
+      <div class="tab-intro"><span class="eyebrow">Interactive shell</span><h2>Terminal</h2><p>
         A shell inside the box. The box starts automatically if it is stopped.
-      </p>
+      </p></div>
       {#- The box is started by this POST, not by the GET that rendered the
           page. A side-effecting GET can be triggered by a hostile page on
           another loopback port: it is same-site enough for the browser to
           send the session cookie, and a subresource request carries no
           `Origin` for the middleware to reject. POST is origin-checked. -#}
-      <div hx-post="/api/boxes/{{ boxinfo.name|urlencode_strict }}/start"
-           hx-trigger="load"
-           hx-swap="none"></div>
       <div id="terminal"
            class="terminal"
            data-box="{{ boxinfo.name }}"
+           data-start-endpoint="/api/boxes/{{ boxinfo.name|urlencode_strict }}/start?terminal=true"
            data-endpoint="/api/boxes/{{ boxinfo.name|urlencode_strict }}/term"></div>
-      <p class="muted" id="term-status">connecting…</p>
+      <p class="terminal-status muted" id="term-status" role="status" aria-live="polite">connecting…</p>
       {% endif %}
     </div>
   </section>
@@ -256,4 +139,41 @@
 <script src="/assets/js/xterm-addon-fit.js"></script>
 <script src="/assets/js/term.js"></script>
 {% endif %}
+<script>
+  // Lifecycle actions replace the control card rather than the whole detail
+  // page. Keep the two compact status readouts in agreement with that single
+  // live source of truth, and tell the terminal when a user stops its box.
+  function syncDetailStatus() {
+    var badge = document.querySelector("#detail-card-slot > .card .status");
+    if (!badge) return;
+
+    var status = badge.textContent.trim();
+    var title = document.getElementById("detail-live-status");
+    if (title) title.replaceChildren(badge.cloneNode(true));
+
+    var overview = document.getElementById("overview-live-status");
+    if (overview) overview.textContent = status;
+
+    document.dispatchEvent(
+      new CustomEvent("devbox:box-status", { detail: { status: status } }),
+    );
+  }
+
+  document.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.detail && event.detail.target;
+    if (!target || !target.matches || !target.matches(".card")) return;
+    syncDetailStatus();
+  });
+  document.addEventListener("htmx:sseMessage", function (event) {
+    if ((event.detail.type || "").indexOf("box-card-") !== 0) return;
+    if (document.querySelector("#detail-card-slot [data-box-removed]")) {
+      window.location.assign("/");
+      return;
+    }
+    syncDetailStatus();
+  });
+  document.addEventListener("devbox:card-updated", function () {
+    syncDetailStatus();
+  });
+</script>
 {% endblock %}

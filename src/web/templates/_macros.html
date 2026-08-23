@@ -18,46 +18,56 @@
     in five places; `closest .card` cannot be got wrong, and needs no
     agreement with whatever the id happens to be. -#}
 {% macro box_actions(b) %}
-<div class="actions">
+<div class="actions box-actions" role="group" aria-label="Actions for {{ b.name }}">
   <button class="btn btn-primary"
           hx-post="/api/boxes/{{ b.name|urlencode_strict }}/start"
           hx-target="closest .card"
           hx-swap="outerHTML"
           hx-indicator="closest .card"
-          {% if b.status == "running" %}disabled{% endif %}>Start</button>
+          hx-disabled-elt="this"
+          {% if b.status == "running" || b.status == "unreachable" || b.status == "unknown" %}disabled{% endif %}>Start</button>
 
   <button class="btn"
           hx-post="/api/boxes/{{ b.name|urlencode_strict }}/stop"
           hx-target="closest .card"
           hx-swap="outerHTML"
           hx-indicator="closest .card"
-          {% if b.status != "running" %}disabled{% endif %}>Stop</button>
+          hx-disabled-elt="this"
+          {% if b.status != "running" && b.status != "unreachable" && b.status != "unknown" %}disabled{% endif %}>Stop</button>
 
   <a class="btn" href="/boxes/{{ b.name|urlencode_strict }}?tab=terminal">Terminal</a>
 
   <button class="btn btn-danger"
-          hx-post="/api/boxes/{{ b.name|urlencode_strict }}/destroy"
-          hx-confirm="Destroy box &quot;{{ b.name }}&quot;? The box and its overlay are removed. Your project directory on the host is untouched."
+          hx-post="/api/boxes/{{ b.name|urlencode_strict }}/destroy?force=true"
+          hx-confirm="Permanently destroy box &quot;{{ b.name }}&quot;? All guest data, including uncommitted and stashed overlay changes, will be discarded. Your project directory on the host is untouched."
           hx-target="closest .card"
-          hx-swap="outerHTML">Destroy</button>
+          hx-swap="outerHTML"
+          hx-indicator="closest .card"
+          hx-disabled-elt="this">Destroy</button>
 </div>
 {% endmacro %}
 
-{% macro box_card(b) %}
-<article class="card" id="box-{{ b.name }}">
+{% macro box_card(b, notice) %}
+<article class="card" id="box-{{ b.name }}" data-box-name="{{ b.name }}" data-box-status="{{ b.status }}">
   <div class="card-head">
-    <h2><a href="/boxes/{{ b.name|urlencode_strict }}">{{ b.name }}</a></h2>
+    <div class="box-identity">
+      <span class="box-glyph" aria-hidden="true">⌁</span>
+      <div>
+        <h2><a href="/boxes/{{ b.name|urlencode_strict }}">{{ b.name }}</a></h2>
+        <span class="box-runtime">{{ b.runtime }} · {{ b.image }}</span>
+      </div>
+    </div>
     <span class="spacer"></span>
     {% call status_badge(b.status) %}{% endcall %}
   </div>
 
-  <dl class="meta">
-    <dt>runtime</dt>
-    <dd>{{ b.runtime }}</dd>
+  <dl class="meta box-meta">
     <dt>project</dt>
     <dd>{{ b.project_dir }}</dd>
     <dt>mount</dt>
     <dd>{{ b.mount_mode }}</dd>
+    <dt>created</dt>
+    <dd>{{ b.created_at }}</dd>
   </dl>
 
   {% if !b.sets.is_empty() %}
@@ -67,18 +77,28 @@
   {% endif %}
 
   {% call box_actions(b) %}{% endcall %}
+  {% if b.status == "unreachable" && notice.is_empty() %}
+  <div class="inline-feedback warning" role="status">
+    The VM is powered on, but its guest shell is not responding. Stop it, then start it again.
+  </div>
+  {% endif %}
+  {% if !notice.is_empty() %}
+  <div class="inline-feedback error" role="alert">{{ notice }}</div>
+  {% endif %}
 </article>
 {% endmacro %}
 
 {% macro box_grid(boxes) %}
 {% if boxes.is_empty() %}
 <div class="empty">
+  <span class="empty-mark" aria-hidden="true">＋</span>
   <h2>No boxes yet</h2>
-  <p>Create one from a project directory:</p>
-  <pre>cd ~/code/myapp &amp;&amp; devbox create</pre>
+  <p>Create an isolated workspace here, or bootstrap one from a project directory.</p>
+  <div class="empty-actions"><a class="btn btn-primary" href="/boxes/new">Create your first box</a></div>
+  <pre><span>$</span> cd ~/code/myapp &amp;&amp; devbox create</pre>
 </div>
 {% else %}
-{% for b in boxes %}{% call box_card(b) %}{% endcall %}{% endfor %}
+{% for b in boxes %}{% call box_card(b, "") %}{% endcall %}{% endfor %}
 {% endif %}
 {% endmacro %}
 
@@ -88,7 +108,11 @@
 <form id="set-form"
       hx-post="/api/boxes/{{ name|urlencode_strict }}/sets"
       hx-target="#build-panel"
-      hx-swap="innerHTML">
+      hx-swap="innerHTML"
+      hx-disabled-elt="find button"
+      hx-indicator="this"
+      data-unlock-on-build="{{ name }}"
+      hx-on::after-request="if (event.detail.successful) setTimeout(() => { this.querySelector('button[type=submit]').disabled = true; })">
   {% for g in groups %}
   <fieldset class="setgroup">
     <legend>{{ g.title }}</legend>
@@ -150,7 +174,9 @@
 {%- else %}
 <form hx-put="/api/boxes/{{ name|urlencode_strict }}/policy"
       hx-target="#policy-result"
-      hx-swap="innerHTML">
+      hx-swap="innerHTML"
+      hx-disabled-elt="find button"
+      hx-indicator="this">
   <fieldset class="setgroup">
     <legend>Egress posture</legend>
     {% for p in view.postures %}

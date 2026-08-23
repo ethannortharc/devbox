@@ -231,7 +231,7 @@ impl DevboxConfig {
     /// Save to devbox.toml.
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        std::fs::write(path, content)
+        super::state::write_atomically(path, content.as_bytes(), "devbox config")
             .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }

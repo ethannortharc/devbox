@@ -2,9 +2,12 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/ethannortharc/devbox/agent/event"
@@ -170,12 +173,82 @@ func TestAnUnreadableRingBufferDoesNotKillCapture(t *testing.T) {
 	}
 }
 
-func asErrUnsupported(err error, target **ErrUnsupported) bool {
-	u, ok := err.(*ErrUnsupported)
-	if ok {
-		*target = u
+func TestANonrecoverableRingReadDoesNotKillPrimaryCapture(t *testing.T) {
+	t.Parallel()
+
+	// A genuinely nonrecoverable reader failure still classifies as loss of the
+	// supplementary violation feed, not failure of its primary siblings.
+	src := &Blocked{
+		BoxID: "myapp",
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(io.MultiReader(
+				strings.NewReader(kmsgBlocked+"\n"),
+				iotest.ErrReader(io.ErrUnexpectedEOF),
+			)), nil
+		},
 	}
-	return ok
+
+	out := make(chan *event.Event, 1)
+	err := src.Run(context.Background(), out)
+	var unsupported *ErrUnsupported
+	if !asErrUnsupported(err, &unsupported) {
+		t.Fatalf("want ErrUnsupported so Multi can keep its siblings alive, got %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("event captured before the overrun was lost; queue length = %d", len(out))
+	}
+}
+
+type epipeOnceReader struct {
+	payload []byte
+	stage   int
+}
+
+func (r *epipeOnceReader) Read(p []byte) (int, error) {
+	switch r.stage {
+	case 0:
+		r.stage++
+		return 0, syscall.EPIPE
+	case 1:
+		r.stage++
+		return copy(p, r.payload), nil
+	default:
+		return 0, io.EOF
+	}
+}
+
+func (*epipeOnceReader) Close() error { return nil }
+
+func TestKmsgOverrunResumesAtTheNextRetainedRecord(t *testing.T) {
+	t.Parallel()
+
+	boot := time.Unix(1_700_000_000, 0)
+	now := boot.Add(45 * time.Second)
+	src := &Blocked{
+		BoxID: "myapp",
+		Boot:  boot,
+		Open: func() (io.ReadCloser, error) {
+			return &epipeOnceReader{payload: []byte(kmsgBlocked + "\n")}, nil
+		},
+		now: func() time.Time { return now },
+	}
+
+	out := make(chan *event.Event, 1)
+	if err := src.Run(context.Background(), out); err != nil {
+		t.Fatalf("recoverable EPIPE stopped the feed: %v", err)
+	}
+	select {
+	case got := <-out:
+		if got.TSMonoNS != uint64((45 * time.Second).Nanoseconds()) {
+			t.Fatalf("monotonic timestamp = %d", got.TSMonoNS)
+		}
+	default:
+		t.Fatal("record after the overrun was not captured")
+	}
+}
+
+func asErrUnsupported(err error, target **ErrUnsupported) bool {
+	return errors.As(err, target)
 }
 
 func TestRepeatedRefusalsOfOneFlowAreOneEvent(t *testing.T) {

@@ -25,11 +25,33 @@ pub struct Query {
     /// Exclusive upper bound on `ts_wall`.
     pub until: Option<String>,
     pub pid: Option<u32>,
+    /// Exclusive lower bound on the row id.
+    ///
+    /// The live tail's anchor. `ts_wall` cannot serve: it ties for events
+    /// captured in the same millisecond, so resuming from the last timestamp
+    /// either repeats a row or skips one. `id` is the insertion order and is
+    /// unique by construction.
+    pub after_id: Option<i64>,
+    /// Inclusive upper bound on the row id.
+    ///
+    /// Pins a page to the store as it was when its high-water mark was read.
+    /// Without it, rows written between reading the mark and running the query
+    /// are inside the page but outside the cursor it advances to, and are
+    /// therefore delivered twice.
+    pub before_id: Option<i64>,
     pub kinds: Vec<EventType>,
     /// Substring match against the peer (domain, SNI, or address).
     pub peer: Option<String>,
     /// Substring match against the path.
     pub path: Option<String>,
+    /// Drop rows whose stored JSON is larger than this from the result.
+    ///
+    /// A row limit bounds the *count*, not the bytes. The frame limit lets one
+    /// event be a megabyte, so two hundred of them is two hundred megabytes —
+    /// cloned into several derived views and rendered into HTML, on a timer.
+    /// The console asks for a size bound; exports and the CLI do not, because
+    /// they are the tools you reach for when you want the whole record.
+    pub max_bytes: Option<usize>,
     /// Maximum rows to return. Defaults to [`Query::DEFAULT_LIMIT`].
     pub limit: Option<usize>,
     /// Newest first when true, which is what a live view wants.
@@ -57,15 +79,20 @@ impl Query {
 #[derive(Debug, Clone, Copy)]
 pub struct Retention {
     pub max_events: u64,
+    /// Bytes the database file may occupy before the oldest events go.
+    pub max_bytes: u64,
 }
 
 impl Default for Retention {
     fn default() -> Self {
-        // Roughly the 500 MiB the design suggests, at a few hundred bytes per
-        // event. Counting rows rather than bytes keeps enforcement a single
-        // cheap statement instead of a page-count query per insert.
         Self {
             max_events: 2_000_000,
+            // A row count alone is not a size. The transport accepts frames up
+            // to a megabyte, so two million rows is two terabytes in the worst
+            // case — a guest can fill the host volume without ever reaching
+            // the row limit that was supposed to bound it. The page count is
+            // a pragma, so asking is cheap.
+            max_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -88,6 +115,12 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // A second process should normally be excluded by the supervisor's
+        // per-box flock. Readers and a handoff can still overlap briefly; wait
+        // for SQLite's WAL writer instead of turning SQLITE_BUSY into a lost
+        // event batch immediately.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("failed to set SQLite busy timeout")?;
         // WAL keeps the collector's writes from blocking the console's reads,
         // which happen on every SSE-driven refresh.
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -122,9 +155,30 @@ impl Store {
             CREATE INDEX IF NOT EXISTS events_type  ON events (type);
             CREATE INDEX IF NOT EXISTS events_peer  ON events (peer);
             CREATE INDEX IF NOT EXISTS events_path  ON events (path);
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
         )
         .context("failed to create the event schema")?;
+
+        // A generation, written once when the store is created.
+        //
+        // Readers need to tell one store from another: a box destroyed and
+        // recreated under the same name gets a fresh database whose ids start
+        // again at one, and a console holding a position in the old one must
+        // notice rather than carry on. File metadata cannot answer that. The
+        // inode is reused; `ctime` is the inode-change time, so an ordinary
+        // WAL checkpoint moves it and every reader concludes the store was
+        // replaced. This is the identity of the store as a thing, not as a
+        // file, and it is read back through the same handle as the rows.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('generation', ?)",
+            params![rand::random::<u64>().max(1).to_string()],
+        )
+        .context("failed to stamp the store generation")?;
 
         Ok(Self { conn })
     }
@@ -202,10 +256,81 @@ impl Store {
         Ok(written)
     }
 
+    /// Read the next page of a live tail, within `(after_id, up_to_id]`.
+    ///
+    /// Returns the decoded events *and the highest row id examined*, which are
+    /// not the same thing: a row written by an older schema no longer decodes,
+    /// and anchoring on the newest row that happened to decode would hand the
+    /// caller the same undecodable rows on every request forever. The scan
+    /// position is a property of the scan, not of what survived it.
+    ///
+    /// Bounded above so a caller that has already decided how big the backlog
+    /// is reads exactly the backlog it measured — otherwise a batch committed
+    /// between the two makes the page and the decision disagree.
+    pub fn tail_scan(
+        &self,
+        after_id: i64,
+        up_to_id: i64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<Event>, i64)> {
+        // The size test is in the projection, not the predicate: an oversized
+        // row must still advance the scan, or it wedges the tail exactly the
+        // way an undecodable one did.
+        let mut stmt = self
+            .conn
+            .prepare(
+                // Not `LENGTH(raw)`. On a TEXT value SQLite's `LENGTH` counts
+                // *characters*, so a cap meant as sixty-four kilobytes admitted
+                // four times that for any event carrying multibyte content —
+                // which a command line or a domain name routinely does. The
+                // cast measures storage.
+                "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END
+                   FROM events WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
+            )
+            .context("failed to prepare the tail scan")?;
+        let rows = stmt
+            .query_map(
+                params![max_bytes as i64, after_id, up_to_id, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .context("failed to run the tail scan")?;
+
+        let mut events = Vec::new();
+        let mut scanned_to = after_id;
+        for row in rows {
+            let (id, raw) = row.context("failed to read a row")?;
+            scanned_to = scanned_to.max(id);
+            let Some(raw) = raw else {
+                tracing::debug!(id, "skipping an oversized event in a live tail");
+                continue;
+            };
+            match serde_json::from_str(&raw) {
+                Ok(event) => events.push(event),
+                Err(e) => tracing::warn!(error = %e, "stored event no longer decodes"),
+            }
+        }
+        Ok((events, scanned_to))
+    }
+
     /// Run a query.
     pub fn query(&self, q: &Query) -> Result<Vec<Event>> {
-        let mut sql = String::from("SELECT raw FROM events WHERE 1=1");
+        // The size cap is a projection, not a predicate, so it costs nothing
+        // before `LIMIT`. As a predicate it turned `LIMIT 200` into "scan
+        // until two hundred small rows are found", which on a store whose
+        // recent history is all oversized is a scan of the whole two million.
+        let mut sql = match q.max_bytes {
+            Some(_) => String::from(
+                "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END \
+                 FROM events WHERE 1=1",
+            ),
+            None => String::from("SELECT id, raw FROM events WHERE 1=1"),
+        };
+        // Placeholders are positional, so the projection's binds first.
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(max_bytes) = q.max_bytes {
+            args.push(Box::new(max_bytes as i64));
+        }
 
         // `ts_wall` is compared as text, which only works if both sides are in
         // the same normal form. A user-supplied `--since 2026-08-06T14:00:00+02:00`
@@ -223,6 +348,14 @@ impl Store {
         if let Some(pid) = q.pid {
             sql.push_str(" AND pid = ?");
             args.push(Box::new(pid));
+        }
+        if let Some(after) = q.after_id {
+            sql.push_str(" AND id > ?");
+            args.push(Box::new(after));
+        }
+        if let Some(before) = q.before_id {
+            sql.push_str(" AND id <= ?");
+            args.push(Box::new(before));
         }
         if !q.kinds.is_empty() {
             let holes = vec!["?"; q.kinds.len()].join(",");
@@ -254,13 +387,17 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql).context("failed to prepare query")?;
         let rows = stmt
             .query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
             })
             .context("failed to run query")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let raw = row.context("failed to read a row")?;
+            let (_, raw) = row.context("failed to read a row")?;
+            // Nulled by the size cap. A window that is mostly oversized comes
+            // back short, which is the honest answer: those events are in the
+            // store and in every view that does not re-read itself on a timer.
+            let Some(raw) = raw else { continue };
             match serde_json::from_str(&raw) {
                 Ok(event) => out.push(event),
                 // A row that no longer parses is a schema drift, not a reason
@@ -269,6 +406,104 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// This store's generation — its identity as a thing rather than a file.
+    ///
+    /// Stable for the life of the database and different for its replacement,
+    /// which is exactly what a page's cursor has to be able to check. Never
+    /// zero: readers use zero for "no store at all".
+    pub fn generation(&self) -> Result<u64> {
+        let raw: String = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
+                r.get(0)
+            })
+            .context("failed to read the store generation")?;
+        Ok(raw.parse::<u64>().unwrap_or(1).max(1))
+    }
+
+    /// Read a window for export, bounded by rows *and* by bytes.
+    ///
+    /// Returns the events and whether the window was cut short. Two limits,
+    /// because a row limit does not bound memory: the transport accepts frames
+    /// up to a megabyte, so fifty thousand rows is fifty gigabytes in the worst
+    /// case — enough to end the process that was asked for an audit trail.
+    ///
+    /// Truncation is reported from what the scan *reached*, not from what
+    /// decoded. A single row written by an older schema is dropped on the way
+    /// out, and inferring "not truncated" from a short result then let an
+    /// export claim to be complete while missing its tail.
+    pub fn export(
+        &self,
+        since: Option<&str>,
+        rows: usize,
+        bytes: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let mut sql = String::from("SELECT raw FROM events WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = since {
+            sql.push_str(" AND ts_wall >= ?");
+            args.push(Box::new(normalize_ts(since)));
+        }
+        // One more than asked for, so "there is another row" is observed
+        // rather than inferred. Scanning exactly the limit told a window that
+        // happened to hold precisely fifty thousand events that it had been
+        // cut off, and stamped a complete audit as partial.
+        sql.push_str(" ORDER BY id ASC LIMIT ?");
+        args.push(Box::new(rows as i64 + 1));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare export")?;
+        let mut scanned = 0usize;
+        let mut budget = bytes;
+        let mut truncated = false;
+        let mut out = Vec::new();
+        let mut cursor = stmt
+            .query(params_from_iter(args.iter().map(|a| a.as_ref())))
+            .context("failed to run export")?;
+        while let Some(row) = cursor.next().context("failed to read a row")? {
+            if scanned == rows {
+                // The extra row exists, so the window really was cut off.
+                truncated = true;
+                break;
+            }
+            scanned += 1;
+            let raw: String = row.get(0)?;
+            match budget.checked_sub(raw.len()) {
+                Some(left) => budget = left,
+                None => {
+                    truncated = true;
+                    break;
+                }
+            }
+            match serde_json::from_str(&raw) {
+                Ok(event) => out.push(event),
+                Err(e) => {
+                    // The export is now missing an event it was asked for.
+                    // Silence here let an incomplete audit present itself as a
+                    // complete one, which is the one thing this flag exists to
+                    // prevent.
+                    truncated = true;
+                    tracing::warn!(error = %e, "stored event no longer decodes");
+                }
+            }
+        }
+        Ok((out, truncated))
+    }
+
+    /// The highest row id, or zero for an empty store.
+    ///
+    /// A live tail starts here so it shows what happens *next* rather than
+    /// replaying the whole database into a console that already rendered it.
+    pub fn max_id(&self) -> Result<i64> {
+        let id: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(id) FROM events", [], |r| r.get(0))
+            .context("failed to read the newest event id")?;
+        Ok(id.unwrap_or(0))
     }
 
     /// Total events stored.
@@ -341,7 +576,7 @@ impl Store {
     ///
     /// Returns how many rows were removed.
     pub fn enforce_retention(&self, retention: Retention) -> Result<u64> {
-        let removed = self
+        let mut removed = self
             .conn
             .execute(
                 "DELETE FROM events WHERE id <= (
@@ -350,9 +585,94 @@ impl Store {
                 params![retention.max_events as i64],
             )
             .context("failed to enforce retention")?;
+
+        // Then by size. A row count is not a size: at the frame limit, two
+        // million rows is two terabytes, so a guest sending large events fills
+        // the volume without ever approaching the count that was meant to stop
+        // it. Trimmed in slices rather than in one statement, because the file
+        // only shrinks as pages are freed and one oversized batch should not
+        // take the whole window with it.
+        let mut size = self.size_bytes()?;
+        for _ in 0..RETENTION_TRIM_PASSES {
+            if size <= retention.max_bytes {
+                break;
+            }
+            let rows: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .context("failed to count events for a size trim")?;
+            if rows <= 0 {
+                break;
+            }
+
+            // Sized to the overage, not a fixed slab.
+            //
+            // A constant batch is only ever right for one row size. At the
+            // frame limit five hundred events fill the ceiling, and deleting
+            // two thousand of them took the entire history to reclaim a little
+            // — a retention sweep is supposed to bound the store, not empty
+            // it. Estimating from the average makes one pass remove roughly
+            // the excess whatever the events weigh, and the halving cap keeps
+            // a bad estimate from running away.
+            let average = (size / rows as u64).max(1);
+            let excess = size.saturating_sub(retention.max_bytes);
+            let want = excess.div_ceil(average).clamp(1, (rows as u64).div_ceil(2));
+
+            let cut = self
+                .conn
+                .execute(
+                    "DELETE FROM events WHERE id IN (
+                         SELECT id FROM events ORDER BY id ASC LIMIT ?1
+                     )",
+                    params![want as i64],
+                )
+                .context("failed to trim the store to its size limit")?;
+            if cut == 0 {
+                break;
+            }
+            removed += cut;
+
+            // Stop if deleting did not move the measure. Any size that does
+            // not respond to deletion, put in a loop that deletes, empties the
+            // store — which is how the first version of this behaved, because
+            // `page_count` counts the pages the *file* holds and freeing them
+            // does not shrink it.
+            let after = self.size_bytes()?;
+            if after >= size {
+                break;
+            }
+            size = after;
+        }
         Ok(removed as u64)
     }
+
+    /// Bytes the database's live data occupies, from SQLite's page counters.
+    ///
+    /// Pages *in use*, not pages the file holds. Deleting rows moves pages to
+    /// the freelist and leaves `page_count` where it was, so a limit compared
+    /// against it can never be satisfied by deleting — the trim loop simply
+    /// runs until the table is empty. Subtracting the freelist measures what
+    /// the data is actually costing, which is the number retention is for.
+    ///
+    /// Three pragmas rather than a scan, so this can be asked after a batch.
+    fn size_bytes(&self) -> Result<u64> {
+        let pragma = |name: &str| -> Result<i64> {
+            self.conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .with_context(|| format!("failed to read the store's {name}"))
+        };
+        let pages = pragma("page_count")?.max(0) as u64;
+        let free = pragma("freelist_count")?.max(0) as u64;
+        let size = pragma("page_size")?.max(0) as u64;
+        Ok(pages.saturating_sub(free).saturating_mul(size))
+    }
 }
+
+/// Most trim passes one enforcement will make.
+///
+/// Bounded so a single batch cannot spend unbounded time deleting; whatever is
+/// still over the limit is trimmed after the next one.
+const RETENTION_TRIM_PASSES: usize = 16;
 
 /// Put an RFC 3339 timestamp into the same normal form the store writes.
 ///
@@ -374,6 +694,16 @@ fn normalize_ts(ts: &str) -> String {
 mod tests {
     use super::*;
     use crate::obs::event::{Exec, Net};
+
+    #[test]
+    fn writers_wait_for_a_short_sqlite_handoff_instead_of_dropping_immediately() {
+        let store = Store::open_in_memory().unwrap();
+        let timeout: u64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
+    }
 
     fn event(kind: EventType, pid: u32, ts: &str) -> Event {
         Event {
@@ -632,6 +962,46 @@ mod tests {
     }
 
     #[test]
+    fn retention_trims_by_size_as_well_as_by_count() {
+        // A row count is not a size: at the transport's frame limit, the
+        // default two million rows is two terabytes, so a guest sending large
+        // events fills the volume without ever approaching the count.
+        let store = Store::open_in_memory().unwrap();
+        let retention = Retention {
+            max_events: 1_000_000,
+            max_bytes: 256 * 1024,
+        };
+        for pid in 1..=400u32 {
+            let mut e = event(EventType::Exec, pid, "2026-08-06T22:14:01.000Z");
+            e.comm = "x".repeat(2048);
+            store.insert(&e).unwrap();
+            store.enforce_retention(retention).unwrap();
+        }
+
+        assert!(
+            store.count().unwrap() < 400,
+            "nothing was trimmed, so the count was doing all the work"
+        );
+        assert!(
+            store.count().unwrap() > 20,
+            "a sweep meant to bound the store emptied it instead"
+        );
+        assert!(
+            store.size_bytes().unwrap() <= retention.max_bytes * 2,
+            "the store stayed far above its byte ceiling"
+        );
+        // And the survivors are the newest ones.
+        let newest = store
+            .query(&Query {
+                limit: Some(1),
+                newest_first: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(newest[0].pid, 400);
+    }
+
+    #[test]
     fn retention_drops_the_oldest() {
         let mut store = Store::open_in_memory().unwrap();
         let many: Vec<Event> = (1..=100)
@@ -640,7 +1010,10 @@ mod tests {
         store.insert_batch(&many).unwrap();
 
         let removed = store
-            .enforce_retention(Retention { max_events: 10 })
+            .enforce_retention(Retention {
+                max_events: 10,
+                ..Retention::default()
+            })
             .unwrap();
         assert_eq!(removed, 90);
         assert_eq!(store.count().unwrap(), 10);
@@ -652,7 +1025,10 @@ mod tests {
         // Running it again with room to spare removes nothing.
         assert_eq!(
             store
-                .enforce_retention(Retention { max_events: 1000 })
+                .enforce_retention(Retention {
+                    max_events: 1000,
+                    ..Retention::default()
+                })
                 .unwrap(),
             0
         );
@@ -672,5 +1048,300 @@ mod tests {
 
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.count().unwrap(), 1, "the store survived a reopen");
+    }
+
+    #[test]
+    fn a_stores_generation_is_stable_for_its_life_and_new_for_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+
+        let first = Store::open(&path).unwrap();
+        let generation = first.generation().unwrap();
+        assert_ne!(generation, 0, "zero means no store at all");
+
+        // Writing, and the checkpointing that follows it, must not change it —
+        // file metadata does, which is why this does not come from the file.
+        first
+            .insert(&event(EventType::Exec, 1, "2026-08-06T22:14:01.000Z"))
+            .unwrap();
+        first
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .unwrap();
+        assert_eq!(
+            first.generation().unwrap(),
+            generation,
+            "a write is not a replacement"
+        );
+        drop(first);
+        assert_eq!(
+            Store::open(&path).unwrap().generation().unwrap(),
+            generation
+        );
+
+        // A box destroyed and recreated under the same name gets a new one.
+        std::fs::remove_file(&path).unwrap();
+        assert_ne!(
+            Store::open(&path).unwrap().generation().unwrap(),
+            generation
+        );
+    }
+
+    #[test]
+    fn an_empty_store_has_a_tail_anchor_of_zero() {
+        // Zero rather than an error or an Option: a live tail's first request
+        // is `id > 0`, which is every row there will ever be.
+        assert_eq!(Store::open_in_memory().unwrap().max_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn tailing_from_an_anchor_returns_only_what_arrived_after_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&event(EventType::Exec, 1, "2026-08-06T22:14:01.000Z"))
+            .unwrap();
+        let anchor = store.max_id().unwrap();
+        store
+            .insert(&event(EventType::Exec, 2, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+        store
+            .insert(&event(EventType::Exec, 3, "2026-08-06T22:14:03.000Z"))
+            .unwrap();
+
+        let (fresh, scanned_to) = store
+            .tail_scan(anchor, store.max_id().unwrap(), 100, 1 << 20)
+            .unwrap();
+
+        assert_eq!(fresh.len(), 2, "the anchored row is excluded");
+        assert_eq!(fresh[0].pid, 2, "oldest first, so the console appends");
+        assert_eq!(scanned_to, store.max_id().unwrap(), "the next anchor");
+    }
+
+    #[test]
+    fn a_tail_advances_past_rows_it_could_not_decode() {
+        // Otherwise an upgrade that leaves undecodable rows in front of the
+        // anchor wedges the live stream permanently: every request rediscovers
+        // the same rows, discards them, returns nothing, and never moves.
+        let store = Store::open_in_memory().unwrap();
+        let anchor = store.max_id().unwrap();
+        for _ in 0..3 {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events
+                       (ts_wall, ts_mono_ns, box_id, cgroup_id, pid, tid, ppid, comm, uid,
+                        type, peer, dport, path, raw)
+                     VALUES ('2026-08-06T22:14:01.000Z',1,'myapp',1,1,1,1,'x',0,
+                             'exec',NULL,NULL,NULL,'{\"from\":\"the future\"}')",
+                    [],
+                )
+                .unwrap();
+        }
+        store
+            .insert(&event(EventType::Exec, 9, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+
+        // A page-sized scan that only reaches the undecodable rows still moves.
+        let (events, scanned_to) = store
+            .tail_scan(anchor, store.max_id().unwrap(), 3, 1 << 20)
+            .unwrap();
+        assert!(events.is_empty(), "none of them decode");
+        assert!(scanned_to > anchor, "but the scan position advanced");
+
+        let (events, _) = store
+            .tail_scan(scanned_to, store.max_id().unwrap(), 3, 1 << 20)
+            .unwrap();
+        assert_eq!(events.len(), 1, "and the next page reaches the good row");
+        assert_eq!(events[0].pid, 9);
+    }
+
+    #[test]
+    fn two_events_in_the_same_millisecond_both_survive_a_tail() {
+        // The reason the anchor is an id and not a timestamp. A `ts_wall`
+        // anchor either repeats the tied row or drops it; neither is a live
+        // stream anyone can trust.
+        let store = Store::open_in_memory().unwrap();
+        let anchor = store.max_id().unwrap();
+        store
+            .insert(&event(EventType::Exec, 7, "2026-08-06T22:14:01.412Z"))
+            .unwrap();
+        store
+            .insert(&event(EventType::Connect, 7, "2026-08-06T22:14:01.412Z"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .tail_scan(anchor, store.max_id().unwrap(), 100, 1 << 20)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_export_is_bounded_by_bytes_and_says_when_it_was_cut() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 1..=6u32 {
+            let mut e = event(EventType::Exec, i, "2026-08-06T22:14:01.000Z");
+            e.comm = "x".repeat(400);
+            store.insert(&e).unwrap();
+        }
+
+        // Whole window, no cut.
+        let (all, truncated) = store.export(None, 100, 1 << 20).unwrap();
+        assert_eq!(all.len(), 6);
+        assert!(!truncated);
+
+        // A byte budget stops it, and says so — a row limit alone bounds the
+        // count and not the memory.
+        let (some, truncated) = store.export(None, 100, 900).unwrap();
+        assert!(some.len() < 6);
+        assert!(truncated, "a cut window must not read as a complete one");
+    }
+
+    #[test]
+    fn an_export_reports_truncation_from_the_scan_not_from_what_decoded() {
+        // A row an older schema wrote is dropped on the way out. Inferring
+        // "not truncated" from a short result then let an export claim to
+        // cover a window whose tail it had never reached.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events
+                   (ts_wall, ts_mono_ns, box_id, cgroup_id, pid, tid, ppid, comm, uid,
+                    type, peer, dport, path, raw)
+                 VALUES ('2026-08-06T22:14:01.000Z',1,'myapp',1,1,1,1,'x',0,
+                         'exec',NULL,NULL,NULL,'{\"from\":\"the future\"}')",
+                [],
+            )
+            .unwrap();
+        store
+            .insert(&event(EventType::Exec, 2, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+        store
+            .insert(&event(EventType::Exec, 3, "2026-08-06T22:14:03.000Z"))
+            .unwrap();
+
+        let (events, truncated) = store.export(None, 2, 1 << 20).unwrap();
+        assert_eq!(events.len(), 1, "one of the two scanned rows decoded");
+        assert!(truncated, "the scan stopped at its row limit");
+
+        // And a window that ends exactly on the limit is complete, not cut.
+        let (events, truncated) = store.export(None, 3, 1 << 20).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            truncated,
+            "still incomplete: one row of the three did not decode"
+        );
+        let clean = Store::open_in_memory().unwrap();
+        for pid in 1..=3u32 {
+            clean
+                .insert(&event(EventType::Exec, pid, "2026-08-06T22:14:01.000Z"))
+                .unwrap();
+        }
+        let (events, truncated) = clean.export(None, 3, 1 << 20).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(!truncated, "exactly the limit is not a cut-off window");
+    }
+
+    #[test]
+    fn an_oversized_event_is_skipped_without_stalling_the_scan() {
+        // The transport accepts frames up to a megabyte. A row limit bounds
+        // the count and not the bytes, so the console asks for a size bound —
+        // but an oversized row must still advance the scan, or it wedges the
+        // tail the way an undecodable one did.
+        let store = Store::open_in_memory().unwrap();
+        let anchor = store.max_id().unwrap();
+        let mut fat = event(EventType::Exec, 1, "2026-08-06T22:14:01.000Z");
+        fat.comm = "x".repeat(4096);
+        store.insert(&fat).unwrap();
+        store
+            .insert(&event(EventType::Exec, 2, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+
+        let newest = store.max_id().unwrap();
+        let (events, scanned_to) = store.tail_scan(anchor, newest, 10, 1024).unwrap();
+        assert_eq!(events.len(), 1, "only the small one is rendered");
+        assert_eq!(events[0].pid, 2);
+        assert_eq!(scanned_to, newest, "the scan still reached the end");
+
+        // Measured in bytes. SQLite's `LENGTH` on TEXT counts characters, so
+        // a cap enforced that way lets a multibyte payload through at several
+        // times its stated size.
+        let mut wide = event(EventType::Exec, 3, "2026-08-06T22:14:03.000Z");
+        wide.comm = "\u{1f600}".repeat(400); // 400 chars, 1600 bytes
+        store.insert(&wide).unwrap();
+        let bounded = store
+            .query(&Query {
+                max_bytes: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            bounded.iter().all(|e| e.pid != 3),
+            "a 1600-byte comm passed a 1 KiB cap"
+        );
+
+        // The same bound as a plain filter, for the window query.
+        let window = store
+            .query(&Query {
+                max_bytes: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(window.len(), 1);
+
+        // And nothing is lost: the export path asks for no bound.
+        assert_eq!(store.query(&Query::default()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_page_can_be_pinned_to_the_store_as_it_was() {
+        // The truncation path reads the high-water mark, then queries. Without
+        // an upper bound, a row inserted between the two is inside the page
+        // but outside the cursor the page advances to — and arrives twice.
+        let store = Store::open_in_memory().unwrap();
+        let anchor = store.max_id().unwrap();
+        store
+            .insert(&event(EventType::Exec, 1, "2026-08-06T22:14:01.000Z"))
+            .unwrap();
+        let mark = store.max_id().unwrap();
+        store
+            .insert(&event(EventType::Exec, 2, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+
+        let page = store
+            .query(&Query {
+                after_id: Some(anchor),
+                before_id: Some(mark),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.len(), 1, "the later row is not in this page");
+        assert_eq!(page[0].pid, 1);
+    }
+
+    #[test]
+    fn a_tail_anchor_composes_with_the_other_filters() {
+        let store = Store::open_in_memory().unwrap();
+        let anchor = store.max_id().unwrap();
+        store
+            .insert(&event(EventType::Exec, 1, "2026-08-06T22:14:01.000Z"))
+            .unwrap();
+        store
+            .insert(&event(EventType::Connect, 1, "2026-08-06T22:14:02.000Z"))
+            .unwrap();
+
+        let fresh = store
+            .query(&Query {
+                after_id: Some(anchor),
+                kinds: vec![EventType::Connect],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(fresh.len(), 1, "a filtered live view stays filtered");
+        assert_eq!(fresh[0].kind, EventType::Connect);
     }
 }

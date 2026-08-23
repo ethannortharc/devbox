@@ -25,14 +25,25 @@ devbox web --port 8080 --no-open
 
 | View | What it does |
 |---|---|
-| **Dashboard** | Every box, live status, start/stop/destroy inline. |
+| **Dashboard** | Every box, live status, start/stop/destroy inline, plus **New box** for creating one from any project directory. |
 | **Overview** | Runtime, image, mount mode, sets, project directory. |
 | **Activity** | The glass box: live event stream, flow table, DNS log, process tree, behaviour summary. |
 | **Sets** | A checklist of Nix sets. Only what is checked gets built. |
 | **Policy** | Egress posture and allowlist, editable live. |
 | **Files** | Overlay changes — what the box wrote, before you commit it. |
 | **Terminal** | A real shell, over a real pty. |
+| **Labs** | Built-in scenarios, a live topology/traffic graph, bring-up/down, faults and healing. |
 | **Help** | The cheat sheets, rendered in the browser. |
+
+Open as many console tabs as you need. **New tab** in the header is a shortcut,
+but separately typing or bookmarking the bound loopback address printed by
+`devbox web` works too (`http://127.0.0.1:7878` by default; a later port is
+chosen if it is busy). The server redirects it to the random `.localhost`
+browser origin created for the current launch. Tabs on that origin share the
+current key; restarting `devbox web` creates a new origin and requires its
+printed launch URL once per browser profile. Chrome, an embedded browser, and a
+private window keep separate storage, so authorize each one with that launch
+URL before opening additional tabs there.
 
 Everything there has a CLI equivalent (§6.4); the console is a client of the
 same control plane.
@@ -52,6 +63,7 @@ devbox sets apply --set system --set git --set lang-rust --dry-run
 devbox watch --type dns --tree
 devbox behavior summary
 devbox behavior diff --from 2026-08-06T20:00:00Z --at 2026-08-06T22:00:00Z
+devbox behavior pcap --proto tcp --daddr 93.184.216.34 --dport 443 --seconds 5
 
 # what the box may reach
 devbox policy show
@@ -65,6 +77,15 @@ devbox lab up clos-3node --substrate mybox
 devbox lab fault clos-3node leaf1-spine1 --loss 5 --delay 20
 devbox lab heal clos-3node leaf1-spine1
 ```
+
+The Activity flow table has a **pcap** action too. It starts a bounded live
+capture for that exact five-tuple and downloads a classic Ethernet pcap; it
+does not synthesize packets from stored metadata.
+
+To create without first changing directories, open **New box** in the console,
+choose an existing project path, runtime/image/mount mode and sets, then follow
+the streamed build log. The browser and CLI both call the same lifecycle code,
+including duplicate-project and overlay safety checks.
 
 ## What changed from v3
 

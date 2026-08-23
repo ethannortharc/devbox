@@ -15,9 +15,24 @@ devbox lab up clos-3node --dry-run    # exactly what would run
 devbox lab up clos-3node --substrate mybox
 ```
 
-The substrate is one Linux box holding the namespaces — a Lima VM on macOS, the
-host on Linux. It is the only heavyweight thing a lab needs, and it is reused
-across labs.
+The substrate is one registered Linux box holding the namespaces — normally a
+Lima VM on macOS, or a Lima/Incus/Multipass VM on Linux. It is the only
+heavyweight thing a lab needs, and it is reused across labs. Ordinary devbox
+Docker boxes intentionally lack the `CAP_SYS_ADMIN` needed for persistent
+network namespaces; the orchestrator rejects them during preflight. A
+separately privileged Docker box can act as a test substrate after it passes an
+actual create/delete-netns capability probe.
+
+`lab up` is a convergence operation, not just a wiring command. It preflights
+the substrate, creates namespaces/veths, starts FRR and declared services, then
+waits until every ordered node pair can reach the address that proves routing
+(router loopbacks, endpoint interface addresses). A failed matrix returns an
+error instead of reporting a half-working lab as up.
+
+The console's **Labs** view exposes the same scenario library and operations.
+Each detail page draws the planned topology, overlays stored traffic counts and
+bytes per link, and streams action progress while bring-up, faults, heals, and
+tear-down run in the background.
 
 ## The scenarios
 
@@ -57,6 +72,11 @@ dhcp = false
 ntp = true
 ```
 
+Runnable files live in [`../examples/labs`](../examples/labs). CI loads every
+one from a clean checkout, allocates it, renders all FRR/service configuration,
+and renders both up/down command plans so schema drift cannot turn the examples
+into stale prose.
+
 Validation is strict on purpose. A reused interface, a self-link, an
 unconnected node, or a name that is not interface-safe all fail *before*
 anything is created — a topology that half-comes-up wastes an hour debugging a
@@ -69,7 +89,15 @@ network that was never going to work.
   same lab.
 - **Routing** — eBGP-unnumbered with ECMP, 3/9 timers so it converges while you
   watch, and `no bgp ebgp-requires-policy` without which modern FRR reports "BGP
-  up" and advertises nothing.
+  up" and advertises nothing. IPv6 link-local peering advertises IPv4 routes via
+  RFC 5549 extended nexthop.
+- **Services** — `dnsmasq` authoritative records for every reachable node plus
+  `ztp.devbox`, and `chronyd` for lab-local time. If no explicit `service` node
+  exists, the first nonblank node hosts them deterministically. ZTP scenarios
+  additionally render one DHCP server per blank-node link with options 66/67.
+- **Lifecycle** — per-node supervisor PIDs live under `/run/devbox/lab/<lab>`
+  and are stopped before namespaces are removed, so repeated up/down cycles do
+  not leave FRR, dnsmasq, chronyd, or ztpd behind.
 
 ```bash
 devbox lab config clos-3node leaf1     # the generated frr.conf
@@ -99,5 +127,10 @@ sixteen halves a whole job while every node looks healthy. Given the
 observability plane's flow records, devbox names the culprit link, quantifies
 it against the median, and reports achieved versus potential throughput — which
 is the §9.5 demo in one sentence.
+
+The `network` set includes the runtime tools the orchestrator actually invokes:
+FRR, dnsmasq, chrony, BusyBox DHCP, iproute2, conntrack-tools, and the
+packet/debug utilities. `devbox doctor` lists any missing Lab binaries
+inside a running substrate before you spend time debugging topology symptoms.
 
 © 2026 Ethan H.B. Zhou

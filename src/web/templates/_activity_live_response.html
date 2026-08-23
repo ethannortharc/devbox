@@ -1,0 +1,9 @@
+{% include "_activity_live.html" %}
+{#- Only the counts travel, never the checkboxes. Replacing a checkbox from a
+    response prepared before the reader's last click would silently restore the
+    selection they just changed, and the stream would keep appending rows the
+    controls no longer describe. The chip set is fixed, so counts alone are
+    enough to keep it honest. -#}
+{%- for d in domains -%}
+<b id="chip-count-{{ d.name }}" hx-swap-oob="true">{{ d.count }}</b>
+{%- endfor -%}

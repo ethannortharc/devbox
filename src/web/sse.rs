@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 
 use super::state::AppState;
@@ -29,24 +29,39 @@ pub fn tick_payload(now: chrono::DateTime<chrono::Local>) -> String {
 pub async fn stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Subscribe before rendering the replay. Any state transition that lands
+    // during the runtime probes is queued and follows the snapshot, so the
+    // newer event always wins.
+    let receiver = state.events.subscribe();
+
     let ticks = IntervalStream::new(tokio::time::interval(HEARTBEAT)).map(|_| {
         Ok(Event::default()
             .event("tick")
             .data(tick_payload(chrono::Local::now())))
     });
 
-    let events = BroadcastStream::new(state.events.subscribe()).filter_map(|item| async move {
-        match item {
-            Ok(ev) => Some(Ok(Event::default().event(ev.kind).data(ev.data))),
-            // A lagging browser drops events rather than stalling the server.
-            // Surface it instead of hiding it: the page can show a "reconnect
-            // to catch up" hint, and the count is a real signal.
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                tracing::warn!(dropped = n, "console SSE subscriber lagged");
-                Some(Ok(Event::default().event("lagged").data(n.to_string())))
+    let initial_state = state.clone();
+    let replay = stream::once(async move { super::watch::snapshot_events(&initial_state).await })
+        .flat_map(|events| stream::iter(events.into_iter().map(console_event)));
+    let recovery_state = state.clone();
+    let events = BroadcastStream::new(receiver)
+        .then(move |item| {
+            let state = recovery_state.clone();
+            async move {
+                match item {
+                    Ok(event) => vec![event],
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            dropped = n,
+                            "console SSE subscriber lagged; replaying current state"
+                        );
+                        super::watch::snapshot_events(&state).await
+                    }
+                }
             }
-        }
-    });
+        })
+        .flat_map(|events| stream::iter(events.into_iter().map(console_event)));
+    let state_events = replay.chain(events);
 
     // Ends when the console is asked to stop.
     //
@@ -54,8 +69,12 @@ pub async fn stream(
     // — and axum's graceful shutdown waits for every accepted connection once
     // its signal resolves. With a dashboard open, which `devbox web` opens by
     // default, Ctrl-C waited on a stream that was never going to end.
-    let live = futures::stream::select(ticks, events).take_until(state.shutting_down());
+    let live = futures::stream::select(ticks, state_events).take_until(state.shutting_down());
     Sse::new(live).keep_alive(KeepAlive::default())
+}
+
+fn console_event(event: super::state::ConsoleEvent) -> Result<Event, Infallible> {
+    Ok(Event::default().event(event.kind).data(event.data))
 }
 
 #[cfg(test)]

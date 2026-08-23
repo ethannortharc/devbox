@@ -21,6 +21,9 @@ task_plan.md
 /agent/bin/
 /ztpd/bin/
 *.o
+/agent/bpf/vmlinux.h
+/agent/bpf/devbox_*_bpfel.go
+/agent/bpf/devbox_*_bpfeb.go
 
 # Python
 __pycache__/

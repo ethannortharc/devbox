@@ -2,7 +2,9 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::cmd::{run_cmd, run_interactive, run_ok};
-use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
+use super::{
+    CreateOpts, ExecResult, MountUpdate, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo,
+};
 
 /// Multipass runtime — secondary on macOS (Canonical's VM manager).
 pub struct MultipassRuntime;
@@ -70,7 +72,7 @@ impl Runtime for MultipassRuntime {
             name: opts.name.clone(),
             status: SandboxStatus::Running,
             runtime: "multipass".to_string(),
-            created_at: Some(chrono_now()),
+            created_at: Some(super::now_rfc3339()),
             ip_address: None,
         })
     }
@@ -226,20 +228,16 @@ impl Runtime for MultipassRuntime {
     }
 
     async fn upgrade(&self, _name: &str, _tools: &[String]) -> Result<()> {
-        todo!("Phase 5: Multipass upgrade")
+        bail!("Runtime-level upgrades are not supported by Multipass")
     }
 
-    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<()> {
+    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<MountUpdate> {
         bail!("Updating mounts is not supported for the Multipass runtime")
     }
-}
 
-fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s-since-epoch", now.as_secs())
+    async fn rollback_mounts(&self, _name: &str, _update: &MountUpdate) -> Result<()> {
+        bail!("Mount rollback is not supported for the Multipass runtime")
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +247,11 @@ mod tests {
     #[test]
     fn vm_name_prefix() {
         assert_eq!(MultipassRuntime::vm_name("myapp"), "devbox-myapp");
+    }
+
+    #[test]
+    fn project_mount_switches_are_rejected_before_runtime_mutation() {
+        assert!(!MultipassRuntime.supports_mount_updates());
     }
 
     #[test]

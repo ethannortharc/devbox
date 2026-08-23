@@ -56,12 +56,10 @@ fn every_network_disturbing_call_site_restores_the_posture() {
         if !disturbs {
             continue;
         }
-        // `apply_saved` is the restore; `enforce::apply` is the direct form
-        // used where the policy is already in hand.
-        // `restore_after_rebuild` is the strict form rebuild paths use;
-        // `apply_saved` is the lenient one for access paths (ADR-0044). Either
-        // counts as restoring — the guard is about *whether* the posture goes
-        // back on, not which semantics the caller chose.
+        // `apply_saved` is the strict access-path restore; `enforce::apply` is
+        // the direct form used where the policy is already in hand, and
+        // `restore_after_rebuild` reuses the claim held by a rebuild. Each
+        // counts here because this guard is about whether the posture returns.
         let restores = body.contains("apply_saved")
             || body.contains("restore_after_rebuild")
             || body.contains("enforce::apply(");

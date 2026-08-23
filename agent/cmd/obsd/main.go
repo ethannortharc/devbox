@@ -2,7 +2,8 @@
 //
 // It captures activity inside a box — process execs, network connections, DNS
 // lookups, TLS SNI, file access — and streams it to the Rust collector on the
-// host over a unix socket (container substrate) or vsock (VM runtimes).
+// host over a Unix socket (native Linux Docker) or authenticated runtime-exec
+// stdio (Docker Desktop and VM runtimes).
 //
 // Capture source is chosen by fidelity: eBPF where the kernel has BTF,
 // /proc polling where it does not (`-no-ebpf`), and a recorded fixture for
@@ -19,6 +20,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,10 +35,23 @@ import (
 
 // config is the agent's runtime configuration, parsed from flags.
 type config struct {
-	showVersion bool
-	socket      string
-	boxID       string
-	noEBPF      bool
+	showVersion  bool
+	socket       string
+	boxID        string
+	noEBPF       bool
+	packet       bool
+	stdio        bool
+	noTransport  bool
+	restore      bool
+	statusFile   string
+	pcap         bool
+	pcapProto    string
+	pcapSAddr    string
+	pcapSPort    uint
+	pcapDAddr    string
+	pcapDPort    uint
+	pcapDuration time.Duration
+	pcapPackets  int
 	// fixture replays a recorded JSONL file instead of capturing. Used by the
 	// cross-language integration test and by demos.
 	fixture string
@@ -59,11 +74,20 @@ type config struct {
 const defaultQueue = 4096
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
+	out := io.Writer(os.Stdout)
+	for _, arg := range os.Args[1:] {
+		if arg == "-stdio" || arg == "--stdio" || arg == "-stdio=true" || arg == "--stdio=true" {
+			// Stdout is the framed data channel in this mode. A single log byte
+			// there corrupts the protocol, so every diagnostic goes to stderr.
+			out = os.Stderr
+			break
+		}
+	}
+	if err := run(os.Args[1:], out); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "devbox-obsd: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "devbox-obsd: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -82,15 +106,88 @@ func run(args []string, out io.Writer) error {
 		return errors.New("-box-id is required: events must be attributable to a box")
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if cfg.pcap {
+		_, err := capture.CapturePCAP(ctx, capture.PCAPFilter{
+			Proto:      cfg.pcapProto,
+			SAddr:      cfg.pcapSAddr,
+			SPort:      uint16(cfg.pcapSPort),
+			DAddr:      cfg.pcapDAddr,
+			DPort:      uint16(cfg.pcapDPort),
+			Duration:   cfg.pcapDuration,
+			MaxPackets: cfg.pcapPackets,
+		}, out)
+		return err
+	}
+
 	source, err := chooseSource(cfg)
 	if err != nil {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	stopStatus := startCaptureStatus(ctx, cfg, source, out)
+	defer stopStatus()
 
+	if cfg.noTransport {
+		return captureOnly(ctx, cfg, source, out)
+	}
 	return stream(ctx, cfg, source, out)
+}
+
+// captureOnly keeps policy enforcement and its DNS feed alive when no host
+// collector is attached. VM services use this between console sessions; the
+// host starts a second, stdio-connected agent while the console is open.
+func captureOnly(ctx context.Context, cfg config, source capture.Source, out io.Writer) error {
+	defer func() { _ = capture.Close(source) }()
+	enforcer, err := loadEnforcer(cfg, ownsPolicy(cfg))
+	if err != nil {
+		return err
+	}
+	stamp := policyFingerprint(cfg.policy)
+	events := make(chan *event.Event, cfg.queue)
+	sourceCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- source.Run(sourceCtx, events)
+		close(events)
+	}()
+
+	stopSource := func() error {
+		cancel()
+		_ = capture.Close(source)
+		err := <-done
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	defer cancel()
+
+	_, _ = fmt.Fprintln(out, "devbox-obsd: capture and policy active; host transport is detached")
+	for {
+		select {
+		case captured, ok := <-events:
+			if !ok {
+				return <-done
+			}
+			if cfg.policy != "" {
+				if reloaded, changed := reloadEnforcer(cfg, stamp, out); reloaded.stamp != "" {
+					stamp = reloaded.stamp
+					if changed {
+						enforcer = reloaded.enforcer
+					}
+				}
+			}
+			if enforcer != nil && ownsPolicy(cfg) && captured.Type == event.TypeDNS {
+				if added, err := enforcer.OnDNS(ctx, captured); err != nil {
+					_, _ = fmt.Fprintf(out, "devbox-obsd: could not allow %v: %v\n", added, err)
+				}
+			}
+		case <-ctx.Done():
+			return stopSource()
+		}
+	}
 }
 
 // chooseSource picks the capture source with the highest fidelity available,
@@ -116,6 +213,7 @@ func chooseSource(cfg config) (capture.Source, error) {
 	}
 	blocked := &capture.Blocked{
 		BoxID: cfg.boxID,
+		Boot:  bootTime(),
 		Mode:  func() string { return posture(cfg.policy) },
 	}
 	// Probed before the handshake, not discovered during the run.
@@ -127,7 +225,7 @@ func chooseSource(cfg config) (capture.Source, error) {
 	// `kernel.dmesg_restrict` is set, which is most places, and the symptom of
 	// lacking it is a box that appears never to have violated its policy.
 	if err := blocked.Available(); err != nil {
-		fmt.Fprintf(os.Stderr,
+		_, _ = fmt.Fprintf(os.Stderr,
 			"devbox-obsd: no policy events — cannot read %s (%v). "+
 				"The posture is still enforced by the kernel; only the record of "+
 				"refusals is missing.\n", capture.KmsgPath, err)
@@ -164,15 +262,165 @@ func primarySource(cfg config) (capture.Source, error) {
 			Interval: cfg.replayInterval,
 		}, nil
 	}
+	boot := bootTime()
+	var primary capture.Source
+	var err error
 	if cfg.noEBPF {
-		return &capture.Proc{BoxID: cfg.boxID, Boot: bootTime()}, nil
+		primary = &capture.Proc{BoxID: cfg.boxID, Boot: boot}
+	} else {
+		// Privileged capture is best-effort at boot. Restoring the persisted
+		// firewall must not depend on every kprobe being attachable: kernels,
+		// container capabilities and lockdown policy differ. Falling back to
+		// /proc keeps enforcement alive, and the handshake below advertises the
+		// source that actually survived this preflight.
+		primary, err = capture.NewEBPF(cfg.boxID, boot)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "devbox-obsd: eBPF capture unavailable (%v); using /proc\n", err)
+			primary = &capture.Proc{BoxID: cfg.boxID, Boot: boot}
+		}
 	}
-	// The eBPF source lands with the compiled programs; until then, refusing
-	// is better than silently falling back to a source that sees less, because
-	// a quiet timeline would read as "the box did nothing".
-	return nil, errors.New(
-		"eBPF capture is not built into this binary; re-run with -no-ebpf for the " +
-			"degraded proc-polling path, or -fixture to replay a recording")
+	if !cfg.packet {
+		return primary, nil
+	}
+	// Keep the tap in the composition even when its eager preflight fails.
+	// Its Domains list is empty while unavailable and updates when the retrying
+	// wrapper acquires AF_PACKET, so the status file always reports the
+	// effective capability rather than the requested flag.
+	return capture.NewMulti(primary, capture.NewRetryingPacket(cfg.boxID, boot)), nil
+}
+
+// sourceIncludes reports what survived capture preflight. Source names are a
+// '+'-separated composition (for example "ebpf+packet+netfilter"), so an
+// exact component match avoids claiming eBPF merely because a future source
+// happens to contain those letters.
+func sourceIncludes(source capture.Source, want string) bool {
+	for _, name := range strings.Split(source.Name(), "+") {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+type captureStatus struct {
+	PID              int      `json:"pid"`
+	BoxID            string   `json:"box_id"`
+	Source           string   `json:"source"`
+	Capture          []string `json:"capture"`
+	EBPF             bool     `json:"ebpf"`
+	PolicyConfigured bool     `json:"policy_configured"`
+}
+
+func currentCaptureStatus(cfg config, source capture.Source) captureStatus {
+	domains := source.Domains()
+	captureNames := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		captureNames = append(captureNames, string(domain))
+	}
+	return captureStatus{
+		PID:              os.Getpid(),
+		BoxID:            cfg.boxID,
+		Source:           source.Name(),
+		Capture:          captureNames,
+		EBPF:             sourceIncludes(source, "ebpf"),
+		PolicyConfigured: cfg.policy != "",
+	}
+}
+
+// startCaptureStatus publishes what capture actually survived preflight.
+//
+// Requested flags are not evidence: AF_PACKET can fail even when
+// `-packet=true` is present. The host policy guard reads this atomic status
+// file and refuses a DNS-backed default-deny table until "dns" is live. The
+// retrying packet source changes Domains in-process, and this loop publishes
+// that transition without restarting the agent or clearing nftables sets.
+func startCaptureStatus(ctx context.Context, cfg config, source capture.Source, out io.Writer) func() {
+	if cfg.statusFile == "" {
+		return func() {}
+	}
+	statusCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	write := func(last *string) {
+		status := currentCaptureStatus(cfg, source)
+		encoded, err := json.Marshal(status)
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "devbox-obsd: encode capture status: %v\n", err)
+			return
+		}
+		if string(encoded) == *last {
+			return
+		}
+		if err := writeCaptureStatus(cfg.statusFile, encoded); err != nil {
+			_, _ = fmt.Fprintf(out, "devbox-obsd: publish capture status: %v\n", err)
+			return
+		}
+		*last = string(encoded)
+	}
+
+	last := ""
+	write(&last)
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				write(&last)
+			case <-statusCtx.Done():
+				return
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+		removeCaptureStatus(cfg.statusFile, os.Getpid())
+	}
+}
+
+func writeCaptureStatus(path string, encoded []byte) (returnErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".obsd-status-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if returnErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(encoded); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func removeCaptureStatus(path string, pid int) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var status captureStatus
+	if json.Unmarshal(raw, &status) == nil && status.PID == pid {
+		_ = os.Remove(path)
+	}
 }
 
 // bootTime is the wall-clock time of monotonic zero — the kernel's boot.
@@ -211,6 +459,15 @@ func readUptime(path string) (time.Duration, error) {
 
 // stream connects, handshakes, and pumps events until the context ends.
 func stream(ctx context.Context, cfg config, source capture.Source, out io.Writer) error {
+	// Privileged sources are prepared before this function so their advertised
+	// capabilities are truthful. Always release them, including when policy
+	// restoration or the first handshake fails before Source.Run starts.
+	defer func() {
+		if err := capture.Close(source); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "devbox-obsd: close capture source: %v\n", err)
+		}
+	}()
+
 	// The firewall first, before anything that can fail for unrelated reasons.
 	//
 	// This used to happen after the collector connection, so a collector that
@@ -222,7 +479,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	//
 	// Observability depends on the collector. Enforcement does not, and tying
 	// them together made the weaker dependency govern the stronger guarantee.
-	enforcer, err := loadEnforcer(cfg, true)
+	enforcer, err := loadEnforcer(cfg, ownsPolicy(cfg))
 	if err != nil {
 		return err
 	}
@@ -236,7 +493,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		Version: buildinfo.Version,
 		BoxID:   cfg.boxID,
 		Capture: domains,
-		EBPF:    !cfg.noEBPF && cfg.fixture == "",
+		EBPF:    sourceIncludes(source, "ebpf"),
 	}
 
 	// Capture starts before the collector is reachable, and keeps running when
@@ -270,7 +527,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	// default-deny with an empty allow set, so `allowlist` and `mirror-only`
 	// block everything they promise to permit.
 	if enforcer != nil {
-		fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
+		_, _ = fmt.Fprintf(out, "devbox-obsd: enforcing egress policy from %s\n", cfg.policy)
 	}
 
 	// The transport is dialed off to one side, so a collector that is not
@@ -278,10 +535,11 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	var conn net.Conn
 	defer func() {
 		if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	linked := make(chan link, 1)
+	stdioLost := make(chan error, 1)
 	dialing := false
 	connect := func() {
 		if dialing {
@@ -293,7 +551,13 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 			// never has to know the difference between "not listening yet" and
 			// "listened, then went away mid-handshake".
 			for {
-				c, err := dialCollector(ctx, cfg.socket, out)
+				var c net.Conn
+				var err error
+				if cfg.stdio {
+					c, err = newStdioConn()
+				} else {
+					c, err = dialCollector(ctx, cfg.socket, out)
+				}
 				if err != nil {
 					linked <- link{} // shutting down
 					return
@@ -302,12 +566,16 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				// parks this goroutine for good — and with it every hope of
 				// reconnecting, because `dialing` stays set.
 				if err := c.SetDeadline(time.Now().Add(collectorTimeout)); err != nil {
-					c.Close()
+					_ = c.Close()
 					linked <- link{fatal: fmt.Errorf("set a handshake deadline: %w", err)}
 					return
 				}
 				if err := transport.Handshake(c, hello); err != nil {
-					c.Close()
+					_ = c.Close()
+					if cfg.stdio {
+						linked <- link{fatal: fmt.Errorf("handshake over stdio: %w", err)}
+						return
+					}
 					// Only a *refusal* is fatal: the collector saying this
 					// agent is not who it claims to be, or speaks a version it
 					// will not accept. Retrying either forever would turn a
@@ -325,7 +593,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 						linked <- link{fatal: fmt.Errorf("handshake with the collector: %w", err)}
 						return
 					}
-					fmt.Fprintf(out, "devbox-obsd: handshake did not complete (%v); retrying\n", err)
+					_, _ = fmt.Fprintf(out, "devbox-obsd: handshake did not complete (%v); retrying\n", err)
 					select {
 					case <-ctx.Done():
 						linked <- link{}
@@ -339,8 +607,8 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				// it would end a perfectly healthy session; writes take their
 				// own deadline per frame instead.
 				if err := c.SetDeadline(time.Time{}); err != nil {
-					c.Close()
-					fmt.Fprintf(out, "devbox-obsd: could not clear the handshake deadline (%v); retrying\n", err)
+					_ = c.Close()
+					_, _ = fmt.Fprintf(out, "devbox-obsd: could not clear the handshake deadline (%v); retrying\n", err)
 					select {
 					case <-ctx.Done():
 						linked <- link{}
@@ -349,8 +617,15 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 					}
 					continue
 				}
-				fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
-					cfg.socket, cfg.boxID, source.Name())
+				endpoint := cfg.socket
+				if cfg.stdio {
+					endpoint = "runtime stdio"
+				}
+				_, _ = fmt.Fprintf(out, "devbox-obsd: connected to %s as %q via %s capture\n",
+					endpoint, cfg.boxID, source.Name())
+				if cfg.stdio {
+					go func() { stdioLost <- monitorStdio(ctx, c) }()
+				}
 				linked <- link{conn: c}
 				return
 			}
@@ -380,7 +655,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 	}
 	defer func() {
 		if dropped > 0 {
-			fmt.Fprintf(out, "devbox-obsd: %d event(s) dropped while the collector was away\n", dropped)
+			_, _ = fmt.Fprintf(out, "devbox-obsd: %d event(s) dropped while the collector was away\n", dropped)
 		}
 	}()
 
@@ -410,8 +685,11 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				continue
 			}
 			if err := writeFrame(conn, pending[0]); err != nil {
-				conn.Close()
+				_ = conn.Close()
 				conn = nil
+				if cfg.stdio {
+					return fmt.Errorf("write to stdio collector: %w", err)
+				}
 				connect()
 				continue
 			}
@@ -439,7 +717,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 					cancelSrc()
 					return err
 				}
-				fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
+				_, _ = fmt.Fprintf(out, "devbox-obsd: %d event(s) sent\n", sent)
 				if cfg.once {
 					return nil
 				}
@@ -448,8 +726,13 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				// effect at all. A fixture replay that finishes without it
 				// stays connected and waits for a signal, so the collector
 				// keeps a live agent rather than seeing it hang up.
-				<-ctx.Done()
-				return ctx.Err()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case err := <-stdioLost:
+					cancelSrc()
+					return fmt.Errorf("runtime stdio collector disconnected: %w", err)
+				}
 			}
 			// Reload when the control plane rewrites the policy. `devbox
 			// policy allow` recreates the nftables sets empty and writes a
@@ -466,18 +749,23 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 					}
 				}
 			}
-			if enforcer != nil && e.Type == event.TypeDNS {
+			// A VM service is the single owner of DNS-driven nftables
+			// mutations. The console also starts a stdio agent so it can
+			// observe the box, but that process uses -restore-policy=false:
+			// letting both delete+add the same set element creates a brief
+			// default-deny window and a false blocked event.
+			if enforcer != nil && ownsPolicy(cfg) && e.Type == event.TypeDNS {
 				if added, err := enforcer.OnDNS(ctx, e); err != nil {
 					// A failed insertion means one domain stays blocked, not
 					// that capture should stop. It is worth saying out loud,
 					// because the symptom otherwise looks like a network fault.
-					fmt.Fprintf(out, "devbox-obsd: could not allow %v: %v\n", added, err)
+					_, _ = fmt.Fprintf(out, "devbox-obsd: could not allow %v: %v\n", added, err)
 				}
 			}
 			payload, err := e.Encode()
 			if err != nil {
 				// One unencodable event must not kill the stream.
-				fmt.Fprintf(os.Stderr, "devbox-obsd: skipping an event: %v\n", err)
+				_, _ = fmt.Fprintf(os.Stderr, "devbox-obsd: skipping an event: %v\n", err)
 				continue
 			}
 			if conn == nil {
@@ -486,11 +774,15 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 				continue
 			}
 			if err := writeFrame(conn, payload); err != nil {
+				if cfg.stdio {
+					cancelSrc()
+					return fmt.Errorf("write to stdio collector: %w", err)
+				}
 				// Not fatal any more. Returning here ended the process, and
 				// systemd restarting it re-ran the ruleset load — which wipes
 				// the allow sets this agent had spent the session filling.
-				fmt.Fprintf(out, "devbox-obsd: lost the collector (%v); capture and enforcement continue\n", err)
-				conn.Close()
+				_, _ = fmt.Fprintf(out, "devbox-obsd: lost the collector (%v); capture and enforcement continue\n", err)
+				_ = conn.Close()
 				conn = nil
 				hold(payload)
 				connect()
@@ -509,8 +801,12 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 			// anything newer.
 			for len(pending) > 0 && conn != nil {
 				if err := writeFrame(conn, pending[0]); err != nil {
-					fmt.Fprintf(out, "devbox-obsd: lost the collector again (%v)\n", err)
-					conn.Close()
+					if cfg.stdio {
+						cancelSrc()
+						return fmt.Errorf("write to stdio collector: %w", err)
+					}
+					_, _ = fmt.Fprintf(out, "devbox-obsd: lost the collector again (%v)\n", err)
+					_ = conn.Close()
 					conn = nil
 					connect()
 					break
@@ -521,24 +817,77 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 
 		case <-ctx.Done():
 			cancelSrc()
-			fmt.Fprintf(out, "devbox-obsd: stopping after %d event(s)\n", sent)
+			_, _ = fmt.Fprintf(out, "devbox-obsd: stopping after %d event(s)\n", sent)
 			return nil
+
+		case err := <-stdioLost:
+			cancelSrc()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("runtime stdio collector disconnected: %w", err)
+		}
+	}
+}
+
+// monitorStdio is the control half of the exec transport.
+//
+// The host sends empty framed heartbeats after the accepted handshake. A read
+// error, EOF, or missed heartbeat means the runtime-exec session is gone, even
+// when the box is otherwise idle and has no event whose write would discover
+// it. Ending the agent prevents one privileged capture process from being
+// orphaned inside the guest after every console session.
+func monitorStdio(ctx context.Context, conn net.Conn) error {
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(4 * collectorHeartbeat)); err != nil {
+			return fmt.Errorf("set stdio heartbeat deadline: %w", err)
+		}
+		frame, err := transport.ReadFrame(conn)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		if len(frame) != 0 {
+			return fmt.Errorf("collector sent an unexpected %d-byte control frame", len(frame))
 		}
 	}
 }
 
 func parseFlags(args []string, out io.Writer) (config, error) {
-	cfg := config{queue: defaultQueue}
+	cfg := config{queue: defaultQueue, packet: true, restore: true}
 
 	fs := flag.NewFlagSet("devbox-obsd", flag.ContinueOnError)
 	fs.SetOutput(out)
 	fs.BoolVar(&cfg.showVersion, "version", false, "print version and exit")
 	fs.StringVar(&cfg.socket, "socket", "/run/devbox/obsd.sock",
-		"unix socket path or vsock address to stream events to")
+		"unix socket path to stream events to")
 	fs.StringVar(&cfg.boxID, "box-id", "",
 		"box identifier stamped onto every event")
 	fs.BoolVar(&cfg.noEBPF, "no-ebpf", false,
 		"degraded mode: proc polling and tap-based DNS/flow only")
+	fs.BoolVar(&cfg.packet, "packet", true,
+		"capture DNS and TLS ClientHello packets (requires CAP_NET_RAW)")
+	fs.BoolVar(&cfg.stdio, "stdio", false,
+		"stream framed events on stdin/stdout (host-managed VM transport)")
+	fs.BoolVar(&cfg.noTransport, "no-transport", false,
+		"capture and enforce without exporting events")
+	fs.BoolVar(&cfg.restore, "restore-policy", true,
+		"own persisted nftables restoration and DNS allow-set updates")
+	fs.StringVar(&cfg.statusFile, "status-file", "",
+		"atomically publish effective capture capabilities for the host control plane")
+	fs.BoolVar(&cfg.pcap, "pcap", false,
+		"write a bounded pcap for one transport flow to stdout")
+	fs.StringVar(&cfg.pcapProto, "pcap-proto", "tcp", "pcap flow protocol: tcp or udp")
+	fs.StringVar(&cfg.pcapSAddr, "pcap-saddr", "", "optional pcap source address")
+	fs.UintVar(&cfg.pcapSPort, "pcap-sport", 0, "optional pcap source port")
+	fs.StringVar(&cfg.pcapDAddr, "pcap-daddr", "", "pcap destination address")
+	fs.UintVar(&cfg.pcapDPort, "pcap-dport", 0, "pcap destination port")
+	fs.DurationVar(&cfg.pcapDuration, "pcap-duration", 10*time.Second,
+		"maximum pcap capture duration")
+	fs.IntVar(&cfg.pcapPackets, "pcap-packets", 256,
+		"maximum packets in one pcap")
 	fs.StringVar(&cfg.fixture, "fixture", "",
 		"replay a recorded JSONL event file instead of capturing")
 	fs.DurationVar(&cfg.replayInterval, "replay-interval", 0,
@@ -555,6 +904,15 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	}
 	if cfg.queue < 1 {
 		return config{}, fmt.Errorf("-queue must be at least 1, got %d", cfg.queue)
+	}
+	if cfg.stdio && cfg.noTransport {
+		return config{}, errors.New("-stdio and -no-transport are mutually exclusive")
+	}
+	if cfg.pcap && (cfg.stdio || cfg.noTransport || cfg.fixture != "") {
+		return config{}, errors.New("-pcap cannot be combined with streaming, detached, or fixture modes")
+	}
+	if cfg.pcapSPort > 65535 || cfg.pcapDPort > 65535 {
+		return config{}, errors.New("pcap ports must be between 0 and 65535")
 	}
 	if cfg.socket != "" && strings.HasPrefix(cfg.socket, "vsock://") {
 		return config{}, errors.New("vsock transport lands with the VM runtimes; use a unix socket")
@@ -624,6 +982,13 @@ func loadEnforcer(cfg config, loadRuleset bool) (*policy.Enforcer, error) {
 	return enforcer, nil
 }
 
+// ownsPolicy identifies the one process allowed to change firewall state.
+//
+// The lifecycle flag deliberately covers both startup restoration and later
+// DNS allow-set mutations: an exec observer with restoration disabled must not
+// become a second writer after startup.
+func ownsPolicy(cfg config) bool { return cfg.restore }
+
 // Pacing shared by the dial and the handshake retry: both are waiting for the
 // same collector to come back, and two different rhythms would only make the
 // log harder to read.
@@ -643,6 +1008,9 @@ const (
 	// Generous, because the collector is on the other side of a unix socket on
 	// the same machine: anything approaching this is a fault, not load.
 	collectorTimeout = 10 * time.Second
+	// Exec transports are bidirectional. Empty frames from the host prove the
+	// console still owns the other end and let an idle agent detect disconnects.
+	collectorHeartbeat = 5 * time.Second
 )
 
 // writeFrame sends one frame, bounded.
@@ -699,14 +1067,14 @@ func dialCollector(ctx context.Context, socket string, out io.Writer) (net.Conn,
 		conn, err := net.Dial("unix", socket)
 		if err == nil {
 			if attempt > 1 {
-				fmt.Fprintf(out, "devbox-obsd: collector reachable again after %s\n",
+				_, _ = fmt.Fprintf(out, "devbox-obsd: collector reachable again after %s\n",
 					time.Since(started).Round(time.Second))
 			}
 			return conn, nil
 		}
 
 		if lastReport.IsZero() || time.Since(lastReport) >= reportEvery {
-			fmt.Fprintf(out,
+			_, _ = fmt.Fprintf(out,
 				"devbox-obsd: collector at %s is not answering (%v); egress policy stays enforced, retrying\n",
 				socket, err)
 			lastReport = time.Now()
@@ -757,20 +1125,20 @@ func reloadEnforcer(cfg config, stamp string, out io.Writer) (reloadState, bool)
 	// they lived out the TTL. Absent means enforce nothing until a new policy
 	// appears; the table's own default-deny still applies.
 	if _, statErr := os.Stat(cfg.policy); os.IsNotExist(statErr) {
-		fmt.Fprintf(out, "devbox-obsd: policy withdrawn; adding no further addresses\n")
+		_, _ = fmt.Fprintf(out, "devbox-obsd: policy withdrawn; adding no further addresses\n")
 		return reloadState{stamp: current}, true
 	}
 
 	enforcer, err := loadEnforcer(cfg, false)
 	if err != nil {
-		fmt.Fprintf(out, "devbox-obsd: policy reload failed, keeping the old one: %v\n", err)
+		_, _ = fmt.Fprintf(out, "devbox-obsd: policy reload failed, keeping the old one: %v\n", err)
 		// Stamped, so a persistently broken file is not retried on every event
 		// — but reported as *not* changed, so the caller keeps the enforcer it
 		// has. Returning a nil enforcer with `changed` would have been read as
 		// "policy reloaded to nothing" and silently stopped enforcement.
 		return reloadState{stamp: current}, false
 	}
-	fmt.Fprintf(out, "devbox-obsd: policy reloaded from %s\n", cfg.policy)
+	_, _ = fmt.Fprintf(out, "devbox-obsd: policy reloaded from %s\n", cfg.policy)
 	return reloadState{enforcer: enforcer, stamp: current}, true
 }
 

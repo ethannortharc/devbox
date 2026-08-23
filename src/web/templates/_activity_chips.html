@@ -1,0 +1,6 @@
+{%- for d in domains -%}
+<label class="chip chip-{{ d.name }}">
+  <input type="checkbox" name="domain" value="{{ d.name }}" {% if d.on %}checked{% endif %} />
+  <span>{{ d.name }}</span><b id="chip-count-{{ d.name }}">{{ d.count }}</b>
+</label>
+{%- endfor -%}

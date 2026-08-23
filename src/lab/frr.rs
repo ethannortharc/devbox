@@ -30,6 +30,9 @@ pub fn render(topology: &Topology, plan: &Plan, node: &Node) -> Option<String> {
     let mut interfaces = topology.interfaces_of(&node.name);
     interfaces.sort();
     interfaces.dedup();
+    let mut routing_interfaces = topology.routing_interfaces_of(&node.name);
+    routing_interfaces.sort();
+    routing_interfaces.dedup();
 
     let mut conf = String::new();
     let _ = writeln!(
@@ -70,8 +73,14 @@ pub fn render(topology: &Topology, plan: &Plan, node: &Node) -> Option<String> {
     let _ = writeln!(conf, " bgp bestpath as-path multipath-relax");
     let _ = writeln!(conf, " timers bgp 3 9");
 
-    for iface in &interfaces {
+    for iface in &routing_interfaces {
         let _ = writeln!(conf, " neighbor {iface} interface remote-as external");
+        // Interface peers discover one another over IPv6 link-local
+        // addresses. Carrying IPv4 NLRI over that session is RFC 5549 and
+        // requires the extended-nexthop capability; without it sessions are
+        // Established and counters move, but received IPv4 routes never enter
+        // the RIB — the most convincing possible false-positive convergence.
+        let _ = writeln!(conf, " neighbor {iface} capability extended-nexthop");
     }
 
     let _ = writeln!(conf, " !");
@@ -80,7 +89,7 @@ pub fn render(topology: &Topology, plan: &Plan, node: &Node) -> Option<String> {
     for addr in plan.addrs_of(&node.name) {
         let _ = writeln!(conf, "  network {}", subnet_of(addr));
     }
-    for iface in &interfaces {
+    for iface in &routing_interfaces {
         let _ = writeln!(conf, "  neighbor {iface} activate");
     }
     // ECMP across every spine, which is the whole point of a Clos fabric.
@@ -123,6 +132,24 @@ pub fn daemons() -> &'static str {
     "zebra=yes\nbgpd=yes\nospfd=no\nospf6d=no\nripd=no\nripngd=no\nisisd=no\n\
      pimd=no\nldpd=no\nnhrpd=no\neigrpd=no\nbabeld=no\nsharpd=no\npbrd=no\n\
      bfdd=no\nfabricd=no\nvrrpd=no\n"
+}
+
+/// Prepare the minimal account database FRR requires on a package-only
+/// substrate.
+///
+/// Installing `pkgs.frr` exposes binaries but does not run the NixOS/systemd
+/// module that normally creates `frrvty`.  Even `-u root -g root` is rejected
+/// when the compiled-in VTY group exists but root is not a member.  This is a
+/// runtime-only lab identity; teardown can leave the harmless group in place.
+pub fn identity_commands() -> Vec<Vec<String>> {
+    vec![vec![
+        "sudo".into(),
+        "sh".into(),
+        "-c".into(),
+        "getent group frrvty >/dev/null 2>&1 || groupadd --system frrvty; \
+         id -nG root | tr ' ' '\n' | grep -qx frrvty || usermod -a -G frrvty root"
+            .into(),
+    ]]
 }
 
 /// The command that checks whether BGP has converged on a node.
@@ -231,6 +258,7 @@ mod tests {
         let conf = config_for("spine1");
         assert!(conf.contains("neighbor eth1 interface remote-as external"));
         assert!(conf.contains("neighbor eth2 interface remote-as external"));
+        assert!(conf.contains("neighbor eth1 capability extended-nexthop"));
         assert!(conf.contains("neighbor eth1 activate"));
         assert!(!conf.contains("neighbor 10."), "no addressed peers: {conf}");
     }
@@ -326,6 +354,28 @@ mod tests {
     }
 }
 
+/// Quote an argument for `sh -c`, if it needs it.
+///
+/// Every argument here is built from a lab and node name the CLI has already
+/// validated, so nothing needs quoting today. The check runs anyway: the cost
+/// is one function, and the alternative is a shell string whose safety is an
+/// invariant held two modules away.
+///
+/// Quiet on the ordinary case so the command stays readable — these strings
+/// appear verbatim in `lab up`'s failure messages, which exist to be re-run by
+/// hand.
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./=:@,+-".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
 /// Commands that start the routing daemons inside a router's namespace.
 ///
 /// `zebra` then `bgpd`: zebra owns the kernel routing table and bgpd talks to
@@ -344,12 +394,24 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
     let run = format!("/run/devbox/lab/{lab}/{node}");
 
     let daemon = |name: &str, extra: &[&str]| -> Vec<String> {
+        // Only if the substrate has it.
+        //
+        // `mgmtd` arrived in FRR 9 and owns interface configuration from 10.
+        // Before that zebra owned it, and a substrate running FRR 8 — Debian
+        // bookworm ships 8.4 — has no such binary. Requiring it unconditionally
+        // turned a working lab into a hard failure on the first daemon.
+        //
+        // The test is left to the shell rather than probed from here, because
+        // the substrate is where the answer lives and it can change under a
+        // box between one `lab up` and the next.
+        let optional = name == "mgmtd";
+        // `mgmtd` takes no `-f`. It is not an oversight in FRR: an integrated
+        // `frr.conf` is meant to be applied through `vtysh`, which is what
+        // this function does once every daemon is up. Passing it anyway is a
+        // hard startup failure, so the flag is conditional rather than
+        // universal.
+        let takes_config = name != "mgmtd";
         let mut argv = vec![
-            "sudo".to_string(),
-            "ip".to_string(),
-            "netns".to_string(),
-            "exec".to_string(),
-            ns.clone(),
             name.to_string(),
             // As root, explicitly.
             //
@@ -370,8 +432,6 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             "-g".to_string(),
             "root".to_string(),
             "-d".to_string(),
-            "-f".to_string(),
-            format!("{dir}/frr.conf"),
             "-i".to_string(),
             format!("{run}/{name}.pid"),
             // Per-namespace socket directory: every namespace runs its own
@@ -385,8 +445,48 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             "-N".to_string(),
             ns.clone(),
         ];
+        if takes_config {
+            argv.push("-f".to_string());
+            argv.push(format!("{dir}/frr.conf"));
+        }
         argv.extend(extra.iter().map(|s| s.to_string()));
-        argv
+
+        // Detached from the caller's stdio, through a shell.
+        //
+        // `-d` daemonizes but does not close the descriptors it inherited:
+        // FRR keeps stdout and stderr so early failures still reach whoever
+        // started it. That is fine under a service manager and fatal here.
+        // `lab up` reaches the substrate over ssh, and the transport holds the
+        // session open until every descriptor on the far end is closed — so a
+        // daemon that lives forever holds the channel forever, and `lab up`
+        // blocked on the first `zebra` with the whole fabric unstarted. It
+        // looked like a slow lab rather than a hung one, because the daemon it
+        // was waiting on was up and healthy the entire time.
+        //
+        // The redirect goes on the daemon, not on the exec: `ip netns exec`
+        // passes its own descriptors down, so redirecting the outer command
+        // would close the pipe before the process that must not hold it is
+        // even started.
+        let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+        let launch = format!("exec {} </dev/null >/dev/null 2>&1", quoted.join(" "));
+        let script = if optional {
+            // `if`, not `&&`: an absent daemon must leave the shell exiting 0,
+            // and `command -v x && exec x` exits 1 when the test fails — which
+            // `lab up` reads as the daemon having failed to start.
+            format!("if command -v {name} >/dev/null 2>&1; then {launch}; fi")
+        } else {
+            launch
+        };
+        vec![
+            "sudo".to_string(),
+            "ip".to_string(),
+            "netns".to_string(),
+            "exec".to_string(),
+            ns.clone(),
+            "sh".to_string(),
+            "-c".to_string(),
+            script,
+        ]
     };
 
     vec![
@@ -399,15 +499,112 @@ pub fn start_commands(lab: &str, node: &str) -> Vec<Vec<String>> {
             // state directory rather than from `-z`, and creates neither — on
             // a box without `services.frr` nothing else ever has.
             format!("/run/frr/{ns}"),
+            // `vtysh -N` also searches for a pathspace-specific vtysh.conf.
+            // An absent optional file is only a warning, but it contaminates
+            // machine-readable JSON when a caller combines stdout/stderr.
+            format!("/etc/frr/{ns}"),
         ],
+        vec![
+            "sudo".to_string(),
+            "touch".to_string(),
+            format!("/etc/frr/{ns}/vtysh.conf"),
+        ],
+        // `mgmtd` first, then zebra, then bgpd — FRR's own order, and it
+        // matters for more than tidiness.
+        //
+        // FRR 10 moved interface configuration out of zebra and into mgmtd's
+        // northbound datastore. Without mgmtd running, `interface lo` is not a
+        // command zebra knows: it logged "No such command" for every line of
+        // every interface stanza and carried on, so a router came up with its
+        // BGP configuration and none of its addresses. Routed labs did not
+        // notice, because wiring assigns those addresses out of band with `ip
+        // addr add` — but a ZTP node is provisioned by the config it is
+        // handed, and nothing else configures it. Its loopback never appeared,
+        // so the prefix it advertised was never valid, so no other leaf could
+        // reach it. `ztpd` reported three healthy nodes and the reachability
+        // matrix failed, which is the most expensive way for this to present:
+        // every individual check passes.
+        daemon("mgmtd", &[]),
         daemon("zebra", &[]),
         daemon("bgpd", &[]),
+        // And then hand the whole file to `vtysh`, which is how an integrated
+        // config is meant to be applied.
+        //
+        // Each daemon's own `-f` parses only the commands that daemon owns and
+        // discards the rest without failing, so no single daemon reading the
+        // file ever applies all of it. `vtysh` holds a session to all of them
+        // at once and distributes each line to whichever owns it. Keeping the
+        // per-daemon `-f` as well costs nothing and means a daemon restarted
+        // by hand still comes back with its own share.
+        vec![
+            "sudo".to_string(),
+            "ip".to_string(),
+            "netns".to_string(),
+            "exec".to_string(),
+            ns.clone(),
+            "vtysh".to_string(),
+            "-N".to_string(),
+            ns.clone(),
+            "-f".to_string(),
+            format!("{dir}/frr.conf"),
+        ],
     ]
 }
 
 #[cfg(test)]
 mod start_tests {
     use super::*;
+
+    /// Every daemon FRR needs, in FRR's order, and then the config.
+    ///
+    /// `mgmtd` owns interface configuration in FRR 10. Starting only zebra and
+    /// bgpd gave a router its BGP session and none of its addresses, silently
+    /// — zebra logs "No such command" per line and carries on. And no daemon's
+    /// own `-f` applies the whole file, so the `vtysh` pass is not a
+    /// belt-and-braces extra: it is the step that makes the config take.
+    #[test]
+    fn every_daemon_starts_before_the_config_is_distributed() {
+        let commands = start_commands("clos", "leaf1");
+        let flat: Vec<String> = commands.iter().map(|c| c.join(" ")).collect();
+        let ns = crate::lab::wiring::netns("clos", "leaf1");
+
+        let at = |needle: &str| {
+            flat.iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("nothing runs `{needle}`: {flat:?}"))
+        };
+
+        assert!(
+            at("mgmtd") < at("zebra"),
+            "interface configuration is mgmtd's, and zebra drops it if mgmtd \
+             is not up: {flat:?}"
+        );
+
+        let vtysh = at("vtysh -N");
+        assert!(
+            vtysh > at("bgpd"),
+            "the config is distributed once every daemon can receive it: {flat:?}"
+        );
+        assert!(
+            flat[vtysh].contains(&format!("-N {ns} -f ")),
+            "the distributing pass needs the node's own pathspace and file: {flat:?}"
+        );
+
+        // `mgmtd` has no `-f`, and passing one is a startup failure.
+        let mgmtd = &flat[at("mgmtd")];
+        assert!(
+            !mgmtd.contains(" -f "),
+            "mgmtd takes no config file: {mgmtd}"
+        );
+
+        // And it is started only where it exists. FRR 8 has no mgmtd and does
+        // not need one — zebra still owns interface config there — so an
+        // unconditional start fails the whole lab on its first daemon.
+        assert!(
+            mgmtd.contains("command -v mgmtd") && mgmtd.contains("if "),
+            "starting mgmtd must be conditional on the substrate having it: {mgmtd}"
+        );
+    }
 
     #[test]
     fn zebra_starts_before_bgpd_in_its_own_namespace() {
@@ -462,7 +659,20 @@ mod start_tests {
         );
         assert!(
             flat.iter()
+                .any(|c| c.contains(&format!("/etc/frr/{ns}/vtysh.conf"))),
+            "vtysh's optional pathspace config should not pollute JSON stderr: {flat:?}"
+        );
+        assert!(
+            flat.iter()
                 .any(|c| c.contains("mkdir -p /run/devbox/lab/clos/leaf1"))
         );
+    }
+
+    #[test]
+    fn package_only_substrates_get_the_vty_group_frr_requires() {
+        let commands = identity_commands();
+        let rendered = commands[0].join(" ");
+        assert!(rendered.contains("groupadd --system frrvty"));
+        assert!(rendered.contains("usermod -a -G frrvty root"));
     }
 }

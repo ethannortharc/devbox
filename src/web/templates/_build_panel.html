@@ -7,4 +7,8 @@
 {#- Any status published before this element existed. The broadcast has no
     history, so a build that failed in preflight — faster than htmx can install
     this panel — would otherwise leave it reading "Rebuilding…" forever. -#}
-<p class="muted" sse-swap="build-status-{{ name }}">{{ retained|safe }}</p>
+<p class="muted"
+   data-build-status="{{ name }}"
+   hx-get="/api/operations/{{ name|urlencode_strict }}/status"
+   hx-trigger="load"
+   sse-swap="build-status-{{ name }}">{{ retained|safe }}</p>

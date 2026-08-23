@@ -19,9 +19,11 @@ pub mod fault;
 pub mod frr;
 pub mod ipam;
 pub mod scenarios;
+pub mod services;
 pub mod straggler;
 pub mod topology;
 pub mod wiring;
+pub mod ztp_status;
 
 use std::collections::BTreeMap;
 

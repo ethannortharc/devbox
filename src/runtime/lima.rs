@@ -1,8 +1,12 @@
-use anyhow::{Result, bail};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use super::cmd::{run_cmd, run_interactive, run_ok};
-use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
+use super::{
+    CreateOpts, ExecResult, MountUpdate, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo,
+};
 
 /// Lima runtime — primary on macOS (HVF-based VM).
 pub struct LimaRuntime;
@@ -12,6 +16,16 @@ const NIXOS_LIMA_VERSION: &str = "v0.0.4";
 
 /// Ubuntu version for cloud images
 const UBUNTU_VERSION: &str = "24.04";
+
+/// Lima can report `Running` while the guest is still booting or has wedged.
+/// Product operations need a working control channel, not merely a VM process.
+const GUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const LIST_TIMEOUT: Duration = Duration::from_secs(4);
+const START_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+const START_READY_TIMEOUT: Duration = Duration::from_secs(90);
+const STOP_GRACE_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_FORCE_TIMEOUT: Duration = Duration::from_secs(15);
+const READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 impl LimaRuntime {
     /// All Lima VMs managed by devbox are prefixed with "devbox-".
@@ -133,6 +147,90 @@ containerd:
         }
         infos
     }
+
+    /// Convert the process-level Lima state into the state devbox can use.
+    async fn live_status(vm: &str, value: &serde_json::Value) -> SandboxStatus {
+        match value["status"].as_str().unwrap_or("") {
+            "Running" => {
+                // `limactl list` only says that the host process is alive.
+                // A no-op shell command verifies the same path used by CLI
+                // exec, the web terminal, policy application, and rebuilds.
+                let probe = tokio::time::timeout(
+                    GUEST_PROBE_TIMEOUT,
+                    run_cmd(
+                        "limactl",
+                        &["shell", "--workdir", "/home", vm, "--", "true"],
+                    ),
+                )
+                .await;
+
+                match probe {
+                    Ok(Ok(result)) if result.exit_code == 0 => SandboxStatus::Running,
+                    Ok(Ok(result)) => {
+                        let detail = result
+                            .stderr
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or("guest shell probe failed")
+                            .trim();
+                        SandboxStatus::Unreachable(detail.to_string())
+                    }
+                    Ok(Err(error)) => SandboxStatus::Unreachable(error.to_string()),
+                    Err(_) => SandboxStatus::Unreachable(format!(
+                        "guest shell did not respond within {} seconds",
+                        GUEST_PROBE_TIMEOUT.as_secs()
+                    )),
+                }
+            }
+            "Stopped" => SandboxStatus::Stopped,
+            other => SandboxStatus::Unknown(other.to_string()),
+        }
+    }
+
+    async fn list_json() -> Result<String> {
+        tokio::time::timeout(LIST_TIMEOUT, run_ok("limactl", &["list", "--json"]))
+            .await
+            .context("timed out while asking Lima for VM status")?
+    }
+
+    async fn wait_until_ready(&self, name: &str, started: Instant) -> Result<()> {
+        let deadline = started + START_READY_TIMEOUT;
+        let mut last_status = SandboxStatus::Unknown("not probed yet".to_string());
+
+        while Instant::now() < deadline {
+            last_status = match self.status(name).await {
+                Ok(status) => status,
+                // Lima briefly rewrites sockets while a VM starts. A single
+                // failed status read is not proof that the start failed; keep
+                // it as the last diagnostic and retry until the same bounded
+                // readiness deadline.
+                Err(error) => SandboxStatus::Unknown(format!("status probe failed: {error:#}")),
+            };
+            match &last_status {
+                SandboxStatus::Running => return Ok(()),
+                SandboxStatus::NotFound => {
+                    bail!(
+                        "Lima VM '{}' disappeared while starting",
+                        Self::vm_name(name)
+                    );
+                }
+                SandboxStatus::Stopped
+                | SandboxStatus::Unreachable(_)
+                | SandboxStatus::Unknown(_) => {
+                    tokio::time::sleep(READY_POLL_INTERVAL).await;
+                }
+            }
+        }
+
+        bail!(
+            "Lima VM '{}' did not expose a usable guest shell within {} seconds (last state: {:?}). Stop it and start it again; if the problem persists, inspect ~/.lima/{}/ha.stderr.log and ~/.lima/{}/serial*.log",
+            Self::vm_name(name),
+            START_READY_TIMEOUT.as_secs(),
+            last_status,
+            Self::vm_name(name),
+            Self::vm_name(name)
+        )
+    }
 }
 
 #[async_trait]
@@ -190,7 +288,7 @@ impl Runtime for LimaRuntime {
         .await?;
 
         println!("Starting {image_label} VM '{vm}'...");
-        run_ok("limactl", &["start", &vm]).await?;
+        self.start(&opts.name).await?;
 
         // Clean up temp config
         let _ = std::fs::remove_file(&config_path);
@@ -199,21 +297,108 @@ impl Runtime for LimaRuntime {
             name: opts.name.clone(),
             status: SandboxStatus::Running,
             runtime: "lima".to_string(),
-            created_at: Some(chrono_now()),
+            created_at: Some(super::now_rfc3339()),
             ip_address: None,
         })
     }
 
     async fn start(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
-        run_ok("limactl", &["start", &vm]).await?;
-        Ok(())
+        let started = Instant::now();
+        let command =
+            tokio::time::timeout(START_COMMAND_TIMEOUT, run_ok("limactl", &["start", &vm])).await;
+
+        match command {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                // Another caller may have won the start race. Readiness is the
+                // source of truth. An unreachable guest may just be in the
+                // middle of that other start, so give it the normal readiness
+                // window rather than failing at the process-level state.
+                match self.status(name).await? {
+                    SandboxStatus::Running => return Ok(()),
+                    SandboxStatus::Unreachable(_) => {}
+                    _ => {
+                        return Err(error)
+                            .with_context(|| format!("failed to start Lima VM '{vm}'"));
+                    }
+                }
+            }
+            Err(_) => {
+                // The subprocess is killed on drop. The VM may nevertheless
+                // have reached readiness just before the deadline, so probe it
+                // once before reporting the command timeout.
+                match self.status(name).await? {
+                    SandboxStatus::Running => return Ok(()),
+                    SandboxStatus::Unreachable(_) => {}
+                    _ => {
+                        bail!(
+                            "timed out after {} seconds while starting Lima VM '{vm}'",
+                            START_COMMAND_TIMEOUT.as_secs()
+                        );
+                    }
+                }
+            }
+        }
+
+        self.wait_until_ready(name, started).await
     }
 
     async fn stop(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
-        run_ok("limactl", &["stop", &vm]).await?;
-        Ok(())
+        match self.status(name).await {
+            Ok(SandboxStatus::Stopped) => return Ok(()),
+            Ok(SandboxStatus::NotFound) => bail!("Lima VM '{vm}' does not exist"),
+            Ok(
+                SandboxStatus::Running | SandboxStatus::Unreachable(_) | SandboxStatus::Unknown(_),
+            ) => {}
+            // Stop is the recovery operation for a stale runtime. If even the
+            // status command is unhealthy, still attempt the bounded graceful
+            // stop and force fallback instead of making recovery impossible.
+            Err(error) => {
+                tracing::warn!(vm = %vm, error = %error, "Lima status probe failed before stop")
+            }
+        }
+
+        let graceful =
+            tokio::time::timeout(STOP_GRACE_TIMEOUT, run_cmd("limactl", &["stop", &vm])).await;
+
+        if matches!(graceful, Ok(Ok(ref result)) if result.exit_code == 0) {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            vm = %vm,
+            "graceful Lima stop failed or timed out; forcing the VM off"
+        );
+        let forced = tokio::time::timeout(
+            STOP_FORCE_TIMEOUT,
+            run_cmd("limactl", &["stop", "--force", &vm]),
+        )
+        .await;
+
+        match forced {
+            Ok(Ok(result)) if result.exit_code == 0 => Ok(()),
+            Ok(Ok(result)) => {
+                // A stop can race with an external stop. Confirm the desired
+                // end state before turning a harmless non-zero exit into an
+                // error, but keep the force-stop error if that probe also
+                // fails.
+                if matches!(self.status(name).await, Ok(SandboxStatus::Stopped)) {
+                    return Ok(());
+                }
+                bail!(
+                    "limactl stop --force {vm} failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                )
+            }
+            Ok(Err(error)) => Err(error).context("failed to force-stop the Lima VM"),
+            Err(_) => bail!(
+                "timed out after {} seconds while force-stopping Lima VM '{vm}'",
+                STOP_FORCE_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     async fn exec_cmd(&self, name: &str, cmd: &[&str], interactive: bool) -> Result<ExecResult> {
@@ -248,24 +433,20 @@ impl Runtime for LimaRuntime {
     async fn destroy(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         // Stop first if running (ignore errors)
-        let _ = run_cmd("limactl", &["stop", &vm]).await;
+        let _ = self.stop(name).await;
         run_ok("limactl", &["delete", &vm, "--force"]).await?;
         Ok(())
     }
 
     async fn status(&self, name: &str) -> Result<SandboxStatus> {
         let vm = Self::vm_name(name);
-        let result = run_cmd("limactl", &["list", "--json"]).await?;
+        let output = Self::list_json().await?;
 
-        for line in result.stdout.lines() {
+        for line in output.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim())
                 && v["name"].as_str() == Some(&vm)
             {
-                return Ok(match v["status"].as_str().unwrap_or("") {
-                    "Running" => SandboxStatus::Running,
-                    "Stopped" => SandboxStatus::Stopped,
-                    other => SandboxStatus::Unknown(other.to_string()),
-                });
+                return Ok(Self::live_status(&vm, &v).await);
             }
         }
 
@@ -310,25 +491,29 @@ impl Runtime for LimaRuntime {
         Ok(())
     }
 
-    async fn update_mounts(&self, name: &str, mounts: &[super::Mount]) -> Result<()> {
+    fn supports_mount_updates(&self) -> bool {
+        true
+    }
+
+    async fn update_mounts(&self, name: &str, mounts: &[super::Mount]) -> Result<MountUpdate> {
         let vm = Self::vm_name(name);
-
-        // 1. Stop the VM
-        println!("Stopping VM '{vm}'...");
-        let _ = run_cmd("limactl", &["stop", &vm]).await;
-
-        // 2. Read existing Lima YAML
         let home = dirs::home_dir().unwrap_or_default();
         let yaml_path = home.join(format!(".lima/{vm}/lima.yaml"));
-        let yaml_content = std::fs::read_to_string(&yaml_path).map_err(|e| {
+
+        // Read and validate everything before stopping the VM. A missing or
+        // malformed config is a preflight failure, not a reason to power off a
+        // healthy box.
+        let yaml_bytes = std::fs::read(&yaml_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to read Lima config at {}: {}",
                 yaml_path.display(),
                 e
             )
         })?;
+        let yaml_content = std::str::from_utf8(&yaml_bytes).with_context(|| {
+            format!("Lima config at {} is not valid UTF-8", yaml_path.display())
+        })?;
 
-        // 3. Replace the mounts section in the YAML
         let mut new_mounts_yaml = String::from("mounts:\n");
         for m in mounts {
             let host = m.host_path.display();
@@ -381,24 +566,99 @@ impl Runtime for LimaRuntime {
             format!("{}\n{}", yaml_content.trim_end(), new_mounts_yaml)
         };
 
-        // 4. Write back
-        std::fs::write(&yaml_path, &updated)
-            .map_err(|e| anyhow::anyhow!("Failed to write Lima config: {}", e))?;
+        let was_running = match self.status(name).await? {
+            SandboxStatus::Running => true,
+            SandboxStatus::Stopped => false,
+            SandboxStatus::NotFound => bail!("Lima VM '{vm}' does not exist"),
+            SandboxStatus::Unreachable(detail) | SandboxStatus::Unknown(detail) => {
+                bail!("cannot safely update mounts for Lima VM '{vm}': {detail}")
+            }
+        };
 
-        // 5. Start the VM
+        if was_running {
+            println!("Stopping VM '{vm}'...");
+            self.stop(name).await?;
+        }
+
+        // Replace the config atomically. The original bytes remain our
+        // rollback record until the VM has proved it can start with the new
+        // mounts; `devbox use` must never leave Lima on a project that local
+        // state still says it does not use.
+        if let Err(write_error) = crate::sandbox::state::write_atomically(
+            &yaml_path,
+            updated.as_bytes(),
+            "Lima mount config",
+        ) {
+            if was_running && let Err(start_error) = self.start(name).await {
+                bail!(
+                    "writing the new Lima mounts failed: {write_error:#}; the original config is intact, but restarting VM '{vm}' also failed: {start_error:#}"
+                );
+            }
+            return Err(write_error).context("write new Lima mount config");
+        }
+
+        // `devbox use` provisions and restores policy before attaching, so it
+        // needs a running guest even when the box began stopped.
         println!("Starting VM '{vm}'...");
-        run_ok("limactl", &["start", &vm]).await?;
+        if let Err(start_error) = self.start(name).await {
+            // `start` can fail on readiness after the VM process is already
+            // alive. Force it down before changing the config underneath it.
+            let stop_error = self.stop(name).await.err();
+            if let Err(rollback_error) = crate::sandbox::state::write_atomically(
+                &yaml_path,
+                &yaml_bytes,
+                "original Lima mount config",
+            ) {
+                bail!(
+                    "Lima could not start with the new mounts: {start_error:#}; restoring the original config also failed: {rollback_error:#}. The VM may still reference the new project; inspect {} before starting it",
+                    yaml_path.display()
+                );
+            }
+            if let Some(stop_error) = stop_error {
+                bail!(
+                    "Lima could not start with the new mounts: {start_error:#}; the original config was restored, but force-stopping VM '{vm}' also failed: {stop_error:#}. The VM may still be using the uncommitted mounts"
+                );
+            }
+            if was_running && let Err(restart_error) = self.start(name).await {
+                bail!(
+                    "Lima could not start with the new mounts: {start_error:#}; the original config was restored, but restarting VM '{vm}' on its original mounts also failed: {restart_error:#}"
+                );
+            }
+            return Err(start_error).context(format!(
+                "Lima could not start with the new mounts; the original config and prior running state of VM '{vm}' were restored"
+            ));
+        }
 
+        Ok(MountUpdate::Lima {
+            yaml_path,
+            original: yaml_bytes,
+        })
+    }
+
+    async fn rollback_mounts(&self, name: &str, update: &MountUpdate) -> Result<()> {
+        let (yaml_path, original) = match update {
+            MountUpdate::Lima {
+                yaml_path,
+                original,
+            } => (yaml_path, original),
+            MountUpdate::Incus { .. } => {
+                bail!("received an Incus mount rollback token in the Lima runtime")
+            }
+        };
+
+        // Stop first so the running guest cannot keep using the new mount set
+        // after host state has refused to record it. Even if stopping fails,
+        // restore the on-disk YAML so the next successful start is consistent.
+        let stop_error = self.stop(name).await.err();
+        crate::sandbox::state::write_atomically(yaml_path, original, "Lima mount config rollback")?;
+        if let Some(stop_error) = stop_error {
+            bail!(
+                "the original Lima YAML was restored, but VM '{}' could not be stopped and may still be using the uncommitted mounts: {stop_error:#}. Run `devbox stop {name}` immediately",
+                Self::vm_name(name)
+            );
+        }
         Ok(())
     }
-}
-
-fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s-since-epoch", now.as_secs())
 }
 
 #[cfg(test)]
@@ -409,6 +669,11 @@ mod tests {
     #[test]
     fn vm_name_prefix() {
         assert_eq!(LimaRuntime::vm_name("myapp"), "devbox-myapp");
+    }
+
+    #[test]
+    fn project_mount_switches_are_supported() {
+        assert!(LimaRuntime.supports_mount_updates());
     }
 
     #[test]

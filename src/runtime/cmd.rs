@@ -9,6 +9,10 @@ use super::ExecResult;
 pub async fn run_cmd(program: &str, args: &[&str]) -> Result<ExecResult> {
     let output = Command::new(program)
         .args(args)
+        // Callers put deadlines around runtime CLIs that can wedge on stale
+        // sockets. Without this, dropping the timed-out future leaves the
+        // child alive and it can keep a lifecycle claim locked indefinitely.
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -119,9 +119,10 @@ type Net struct {
 	ALPN   string `json:"alpn,omitempty"`
 
 	// QName/QType/Answers are populated for `dns` events.
-	QName   string   `json:"qname,omitempty"`
-	QType   string   `json:"qtype,omitempty"`
-	Answers []string `json:"answers,omitempty"`
+	QName    string   `json:"qname,omitempty"`
+	QType    string   `json:"qtype,omitempty"`
+	Answers  []string `json:"answers,omitempty"`
+	Response bool     `json:"response,omitempty"`
 
 	BytesTX uint64 `json:"bytes_tx,omitempty"`
 	BytesRX uint64 `json:"bytes_rx,omitempty"`
@@ -216,7 +217,7 @@ func (e *Event) Validate() error {
 	return nil
 }
 
-// MarshalJSON is the wire encoding. Declared explicitly so the encoding is a
+// Encode produces the JSON wire encoding. It is explicit so the encoding is a
 // named part of the contract rather than an implementation detail.
 func (e *Event) Encode() ([]byte, error) {
 	return json.Marshal(e)

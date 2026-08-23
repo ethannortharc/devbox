@@ -22,6 +22,20 @@ blank node boots
 Nothing on the node is pre-seeded. A `ztp-blank` node in a topology boots with
 no configuration at all — pre-configuring it would make the demonstration a lie.
 
+The built-in scenario creates a service namespace, one preconfigured spine and
+blank leaves on explicit /30 bootstrap links. `/31` remains the default for
+router-to-router links, but DHCP needs distinct network, router, client and
+broadcast addresses. `lab up` starts DNS/NTP, installs and supervises the
+embedded `devbox-ztpd`, starts per-link DHCP, runs a real `udhcpc` client on
+each blank node, verifies option 67, and only then launches the downloaded
+bootstrap script.
+
+Success means more than nodes posting `healthy`: devbox waits for the operator
+status API to report every catalogued serial healthy, then runs the full routed
+reachability matrix. DNS resolution, NTP reachability, live FRR processes and
+BGP establishment are part of the node self-check. Any failure leaves the
+service and bootstrap logs named in the error.
+
 ## The pieces
 
 | Piece | Language | Job |
@@ -35,6 +49,10 @@ no configuration at all — pre-configuring it would make the demonstration a li
 The split is deliberate: rendering stays in Python where templating is
 ergonomic, and HTTP stays in Go where a long-running service belongs. They meet
 at a directory of rendered files plus a `serials.json`.
+
+The production binary embeds both Linux executables (`devbox-obsd` and
+`devbox-ztpd`) and release CI builds architecture-matched amd64/arm64 artifacts.
+Source builds compile portable Go versions automatically.
 
 ## The source of truth
 
@@ -105,6 +123,38 @@ ok, why = no_egress_outside(destinations, allowed=["10.0.0.0/8"]);  assert ok, w
 
 Each returns a verdict *and* an explanation, so a failing test names the node
 rather than printing `False`.
+
+## Watching it happen
+
+`/labs/ztp-fabric` in the console shows the state machine as it runs:
+
+- a verdict — **converged** or not — with healthy against *expected*, failures,
+  serials never seen, and the provisioning p95 the SLO is written against;
+- a node table with each serial's state, attempt count, config hash and failure
+  reason, ordered so a node that needs attention reads first;
+- a topology whose blank nodes change colour as they provision. Three grey
+  outlines going green is the demonstration.
+
+Seven states are drawn as four: healthy, failed, waiting, and working. The
+question a reader has is whether a node is done, moving, or stuck, and an
+unrecognised state counts as working — a `ztpd` from another release must not
+paint a healthy fabric red.
+
+A serial the source of truth expects and the registry has never heard from is
+shown too, as `not seen`. Rendering only the nodes that identified is exactly
+how a fabric with a dead node reads as complete.
+
+The console does not dial `ztpd`. The operator listener stays where it is —
+loopback inside the service namespace — and the page asks the substrate to
+fetch the status over the same exec channel every other lab operation uses
+(ADR-0051).
+
+Import [`grafana/devbox-ztp.json`](grafana/devbox-ztp.json) for convergence,
+p95 provisioning time, missing/failed nodes, unknown serials and retry counts.
+The operator listener is loopback-only inside the service namespace by default;
+run the scraper in that namespace or deliberately bind `-metrics` to a separate
+management address. Do not expose the inventory routes on the provisioning
+listener.
 
 ## Chaos
 

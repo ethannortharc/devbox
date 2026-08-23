@@ -2,9 +2,11 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::cmd::{run_cmd, run_interactive, run_ok};
-use super::{CreateOpts, ExecResult, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo};
+use super::{
+    CreateOpts, ExecResult, MountUpdate, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo,
+};
 
-/// Docker runtime — fallback (weaker isolation, shared kernel).
+/// Docker runtime — explicit restricted mode (weaker isolation, shared kernel).
 pub struct DockerRuntime;
 
 impl DockerRuntime {
@@ -13,8 +15,8 @@ impl DockerRuntime {
         format!("devbox-{name}")
     }
 
-    /// Default base image for Docker boxes.
-    pub const DEFAULT_IMAGE: &'static str = "devbox-nixos:latest";
+    /// Published base used by the supported Docker product shape.
+    pub const DEFAULT_UBUNTU_IMAGE: &'static str = "ubuntu:24.04";
 
     /// Environment variable that overrides the base image.
     pub const IMAGE_ENV: &str = "DEVBOX_DOCKER_IMAGE";
@@ -24,11 +26,22 @@ impl DockerRuntime {
     /// Overridable so an e2e run (or anyone with their own base image) can
     /// point at something other than the NixOS image, which has to be built
     /// locally and is not on any registry.
-    fn image_name() -> String {
-        std::env::var(Self::IMAGE_ENV)
+    fn image_name(requested: &str) -> Result<(String, bool)> {
+        if let Some(custom) = std::env::var(Self::IMAGE_ENV)
             .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| Self::DEFAULT_IMAGE.to_string())
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok((custom, false));
+        }
+        match requested {
+            // The stock Ubuntu image has no long-running default command, so
+            // the bool asks create() to supply one after the image name.
+            "ubuntu" => Ok((Self::DEFAULT_UBUNTU_IMAGE.to_string(), true)),
+            other => bail!(
+                "Docker has no published devbox image for '{other}'. Choose `--image ubuntu --writable --bare`, or set {} to a compatible custom image",
+                Self::IMAGE_ENV
+            ),
+        }
     }
 }
 
@@ -48,6 +61,7 @@ impl Runtime for DockerRuntime {
 
     async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
         let container = Self::container_name(&opts.name);
+        let (image, needs_keepalive) = Self::image_name(&opts.image)?;
 
         // Check if container already exists
         let result = run_cmd("docker", &["container", "inspect", &container]).await?;
@@ -83,6 +97,11 @@ impl Runtime for DockerRuntime {
             // posture is a guard rail for what runs in the box, not a cage
             // around someone actively trying to leave it.
             "--cap-add=NET_ADMIN".to_string(),
+            // The observability agent's DNS/TLS source opens an AF_PACKET
+            // socket. Without NET_RAW every Docker box silently degrades to
+            // process-only capture and domain allowlists cannot learn the
+            // resolver's addresses after a reboot.
+            "--cap-add=NET_RAW".to_string(),
         ];
 
         // CPU/memory limits
@@ -121,7 +140,11 @@ impl Runtime for DockerRuntime {
         args.push("devbox=true".to_string());
 
         // Image
-        args.push(Self::image_name());
+        args.push(image);
+        if needs_keepalive {
+            args.push("sleep".to_string());
+            args.push("infinity".to_string());
+        }
 
         println!("Creating Docker container '{container}'...");
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -131,7 +154,7 @@ impl Runtime for DockerRuntime {
             name: opts.name.clone(),
             status: SandboxStatus::Running,
             runtime: "docker".to_string(),
-            created_at: Some(chrono_now()),
+            created_at: Some(super::now_rfc3339()),
             ip_address: None,
         })
     }
@@ -152,6 +175,9 @@ impl Runtime for DockerRuntime {
         let container = Self::container_name(name);
 
         if interactive {
+            // Only CLI callers request an inherited interactive terminal.
+            // Web provisioning uses `Runtime::argv(..., false)` with piped
+            // stdio so it cannot seize the terminal that launched the server.
             let mut args = vec!["exec", "-it", &container];
             args.extend_from_slice(cmd);
             run_interactive("docker", &args).await
@@ -166,6 +192,12 @@ impl Runtime for DockerRuntime {
         let mut argv = vec!["docker".to_string(), "exec".to_string()];
         if interactive {
             argv.push("-it".to_string());
+        } else {
+            // Non-interactive callers may still own a protocol on stdin. In
+            // particular, Docker Desktop boxes carry observability over the
+            // exec stream because their Linux VM cannot connect to a macOS
+            // Unix socket exposed through virtiofs.
+            argv.push("-i".to_string());
         }
         argv.push(Self::container_name(name));
         argv.extend(cmd.iter().map(|s| s.to_string()));
@@ -249,32 +281,34 @@ impl Runtime for DockerRuntime {
     }
 
     async fn snapshot_create(&self, _name: &str, _snap: &str) -> Result<()> {
-        todo!("Phase 6: Docker snapshot create via docker commit")
+        bail!(
+            "Snapshots are not supported by the Docker runtime. Use Lima, Incus, or Multipass for VM snapshots."
+        )
     }
 
     async fn snapshot_restore(&self, _name: &str, _snap: &str) -> Result<()> {
-        todo!("Phase 6: Docker snapshot restore")
+        bail!(
+            "Snapshots are not supported by the Docker runtime. Use Lima, Incus, or Multipass for VM snapshots."
+        )
     }
 
     async fn snapshot_list(&self, _name: &str) -> Result<Vec<SnapshotInfo>> {
-        todo!("Phase 6: Docker snapshot list")
+        bail!(
+            "Snapshots are not supported by the Docker runtime. Use Lima, Incus, or Multipass for VM snapshots."
+        )
     }
 
     async fn upgrade(&self, _name: &str, _tools: &[String]) -> Result<()> {
-        todo!("Phase 5: Docker upgrade")
+        bail!("Runtime-level upgrades are not supported by Docker")
     }
 
-    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<()> {
+    async fn update_mounts(&self, _name: &str, _mounts: &[super::Mount]) -> Result<MountUpdate> {
         bail!("Updating mounts is not supported for the Docker runtime")
     }
-}
 
-fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s-since-epoch", now.as_secs())
+    async fn rollback_mounts(&self, _name: &str, _update: &MountUpdate) -> Result<()> {
+        bail!("Mount rollback is not supported for the Docker runtime")
+    }
 }
 
 #[cfg(test)]
@@ -287,8 +321,26 @@ mod tests {
     }
 
     #[test]
-    fn image_name_is_set() {
-        assert_eq!(DockerRuntime::image_name(), "devbox-nixos:latest");
+    fn project_mount_switches_are_rejected_before_runtime_mutation() {
+        assert!(!DockerRuntime.supports_mount_updates());
+    }
+
+    #[test]
+    fn published_ubuntu_image_is_used_without_an_override() {
+        if std::env::var_os(DockerRuntime::IMAGE_ENV).is_none() {
+            assert_eq!(
+                DockerRuntime::image_name("ubuntu").unwrap(),
+                ("ubuntu:24.04".to_string(), true)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_snapshots_return_errors_instead_of_panicking() {
+        let runtime = DockerRuntime;
+        assert!(runtime.snapshot_create("box", "snap").await.is_err());
+        assert!(runtime.snapshot_restore("box", "snap").await.is_err());
+        assert!(runtime.snapshot_list("box").await.is_err());
     }
 
     #[test]
@@ -299,7 +351,7 @@ mod tests {
         );
         assert_eq!(
             DockerRuntime.argv("myapp", &["true"], false),
-            vec!["docker", "exec", "devbox-myapp", "true"]
+            vec!["docker", "exec", "-i", "devbox-myapp", "true"]
         );
     }
 }

@@ -53,12 +53,15 @@
   }
 
   function relaunch(summary) {
-    notice(summary, "Re-open the URL printed by `devbox web`.");
+    notice(
+      summary,
+      "Each browser profile must open the launch URL once. Open the URL printed by `devbox web` in this browser; after that, every tab in it can use the bound loopback address."
+    );
   }
 
   var key = window.devboxKey.get();
   if (!key) {
-    relaunch("This tab holds no key for the console on this port.");
+    relaunch("This browser profile is not authorized for this console launch.");
     return;
   }
 

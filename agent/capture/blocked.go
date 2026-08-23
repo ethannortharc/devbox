@@ -3,11 +3,13 @@ package capture
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ethannortharc/devbox/agent/event"
@@ -227,6 +229,9 @@ func (p BlockedPacket) Event(boxID, mode string) *event.Event {
 // producer.
 type Blocked struct {
 	BoxID string
+	// Boot anchors kernel-ring events to the same monotonic timeline as every
+	// other source. The log record has wall time but no boot-relative field.
+	Boot time.Time
 	// Mode reports the posture in force, for the event's `mode` field.
 	//
 	// A function rather than a string because the posture changes under a
@@ -291,7 +296,7 @@ func (b *Blocked) Run(ctx context.Context, out chan<- *event.Event) error {
 	if err != nil {
 		return &ErrUnsupported{Source: "netfilter", Reason: err.Error()}
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// Start at the end, not at the oldest record the ring buffer still holds.
 	//
@@ -321,39 +326,59 @@ func (b *Blocked) Run(ctx context.Context, out chan<- *event.Event) error {
 		now = time.Now
 	}
 
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		pkt, ok := ParseBlocked(scanner.Text())
-		if !ok {
-			continue
-		}
+	for {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			pkt, ok := ParseBlocked(scanner.Text())
+			if !ok {
+				continue
+			}
 
-		at := now()
-		flow := pkt.Flow()
-		if last, ok := seen[flow]; ok && at.Sub(last) < DedupeWindow {
-			continue
-		}
-		seen[flow] = at
-		// Bounded: a box under sustained refusal would otherwise accumulate a
-		// map entry per flow for as long as the agent runs.
-		if len(seen) > maxTrackedFlows {
-			for k, t := range seen {
-				if at.Sub(t) >= DedupeWindow {
-					delete(seen, k)
+			at := now()
+			flow := pkt.Flow()
+			if last, ok := seen[flow]; ok && at.Sub(last) < DedupeWindow {
+				continue
+			}
+			seen[flow] = at
+			// Bounded: a box under sustained refusal would otherwise accumulate a
+			// map entry per flow for as long as the agent runs.
+			if len(seen) > maxTrackedFlows {
+				for k, t := range seen {
+					if at.Sub(t) >= DedupeWindow {
+						delete(seen, k)
+					}
 				}
 			}
-		}
 
-		mode := ""
-		if b.Mode != nil {
-			mode = b.Mode()
+			mode := ""
+			if b.Mode != nil {
+				mode = b.Mode()
+			}
+			captured := pkt.Event(b.BoxID, mode)
+			captured.TSWall = event.Now(at)
+			if !b.Boot.IsZero() {
+				mono := at.Sub(b.Boot)
+				if mono < 0 {
+					mono = 0
+				}
+				captured.TSMonoNS = uint64(mono.Nanoseconds())
+			}
+			if err := Send(ctx, out, captured); err != nil {
+				return err
+			}
 		}
-		if err := Send(ctx, out, pkt.Event(b.BoxID, mode)); err != nil {
-			return err
+		if ctx.Err() != nil {
+			return nil
 		}
-	}
-	if ctx.Err() != nil {
+		if err := scanner.Err(); err != nil {
+			// A /dev/kmsg reader which falls behind gets EPIPE once and is then
+			// positioned at the next retained record. A fresh Scanner clears its
+			// latched error and resumes on that same descriptor.
+			if errors.Is(err, syscall.EPIPE) {
+				continue
+			}
+			return &ErrUnsupported{Source: "netfilter", Reason: err.Error()}
+		}
 		return nil
 	}
-	return scanner.Err()
 }

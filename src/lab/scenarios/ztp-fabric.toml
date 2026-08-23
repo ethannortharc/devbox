@@ -36,12 +36,15 @@ endpoints = ["svc:eth1", "spine1:eth1"]
 
 [[links]]
 endpoints = ["leaf1:eth1", "spine1:eth2"]
+subnet = "10.0.2.0/30"
 
 [[links]]
 endpoints = ["leaf2:eth1", "spine1:eth3"]
+subnet = "10.0.3.0/30"
 
 [[links]]
 endpoints = ["leaf3:eth1", "spine1:eth4"]
+subnet = "10.0.4.0/30"
 
 [services]
 dns = true

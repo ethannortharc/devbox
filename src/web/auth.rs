@@ -21,19 +21,13 @@
 //! Headers are not secrets. The only repair is a credential that never reaches
 //! the other port at all.
 //!
-//! `sessionStorage` is that credential. It is scoped to an origin, *port
-//! included*, so `127.0.0.1:3000` cannot read what `127.0.0.1:7878` stored, and
-//! nothing attaches it automatically — page script must choose to send it. That
-//! second property is what retires CSRF here as a class: an ambient credential
-//! is the thing forgery rides, and there no longer is one.
-//!
-//! Per *tab*, not per browser, and that is the second half of the scoping. The
-//! console binds a predictable port, so a page served earlier from that same
-//! port by something since stopped shares this origin exactly. `localStorage`
-//! would have handed such a page the key — every tab on an origin shares it,
-//! and the `storage` event announces each write — leaving it free to replay
-//! same-origin against the terminal and lifecycle routes. See ADR-0048 for the
-//! one residual this leaves.
+//! The printed URL uses a fresh random `devbox-….localhost` hostname on every
+//! launch. The key lives in `localStorage` on that one-time origin, *port
+//! included*, so tabs for the current console share it while `127.0.0.1:3000`,
+//! the fixed `127.0.0.1:7878` origin, and every earlier console origin cannot
+//! read it. Nothing attaches it automatically — page script must choose to send
+//! it. That second property is what retires CSRF here as a class: an ambient
+//! credential is the thing forgery rides, and there no longer is one.
 //!
 //! ## The two secrets, and why they are two
 //!
@@ -86,6 +80,19 @@ pub const TOKEN_PARAM: &str = "t";
 pub fn generate_token() -> String {
     let bytes: [u8; 32] = rand::random();
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Generate the browser hostname for one console launch.
+///
+/// `.localhost` is reserved for the loopback interface. A hostname-safe hex
+/// label avoids base64url's `_`, which is valid in a token but not a DNS label.
+pub fn generate_browser_host() -> String {
+    let bytes: [u8; 16] = rand::random();
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("devbox-{suffix}.localhost")
 }
 
 /// Compare two tokens without leaking their contents through timing.
@@ -285,6 +292,18 @@ pub fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Hostname component without a port.
+fn host_name(host: &str) -> &str {
+    match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    }
+}
+
+fn is_console_host(host: &str, state: &AppState) -> bool {
+    is_loopback_host(host) || host_name(host).eq_ignore_ascii_case(&state.browser_host)
+}
+
 /// Axum middleware enforcing the loopback host and the token on every
 /// non-public route.
 pub async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
@@ -296,13 +315,44 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    if !is_loopback_host(&host) {
+    if !is_console_host(&host, &state) {
         return wrong_host();
     }
 
     let path = req.uri().path().to_string();
     if is_public(&path) {
         return no_framing(next.run(req).await);
+    }
+
+    let has_valid_launch_token =
+        query_token(req.uri().query()).is_some_and(|token| tokens_match(token, &state.token));
+
+    // `127.0.0.1:<port>` is the stable address people type and bookmark. It
+    // is intentionally not the origin that holds the key: a stale page from
+    // an unrelated process could have occupied that predictable origin. Move
+    // bare page navigations to this launch's random `.localhost` origin before
+    // bootstrapping or serving the shell. Once one launch URL has installed
+    // the key there, every independently opened tab is immediately usable.
+    //
+    // Keyed clients and all API routes keep working through loopback. The
+    // redirect carries no credential and preserves the original path/query.
+    if req.method() == Method::GET
+        && is_page_path(&path)
+        && is_loopback_host(&host)
+        && !host_name(&host).eq_ignore_ascii_case(&state.browser_host)
+        && presented_key(&req).is_none()
+    {
+        // Do not turn the stable address into a cross-site bounce toward an
+        // already-authorized origin. A genuine typed/bookmarked navigation is
+        // `none`; a console navigation is `same-origin`. The one exception is
+        // the valid launch URL: possession of its token already grants the key
+        // and it must remain clickable from a terminal, chat, or mail client.
+        if !has_valid_launch_token
+            && (!origin_is_self(&req) || foreign_initiated(&req) || embedded(&req))
+        {
+            return unauthorized();
+        }
+        return browser_origin_redirect(&state, req.uri());
     }
 
     // The printed URL, spent on the one page that installs the key.
@@ -322,7 +372,7 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
     //
     // This is the check that has to be re-examined if the token ever becomes
     // guessable, cacheable, or reusable across launches.
-    if query_token(req.uri().query()).is_some_and(|t| tokens_match(t, &state.token)) {
+    if has_valid_launch_token {
         return bootstrap(&state.key, safe_target(&strip_token(req.uri())));
     }
 
@@ -365,6 +415,24 @@ pub async fn require_token(State(state): State<AppState>, req: Request, next: Ne
     }
 
     no_framing(next.run(req).await)
+}
+
+fn browser_origin_redirect(state: &AppState, uri: &Uri) -> Response {
+    let path_and_query = uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let location = format!(
+        "http://{}:{}{}",
+        state.browser_host, state.browser_port, path_and_query
+    );
+    no_framing(
+        Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(header::LOCATION, location)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 /// A redirect target that cannot leave this origin.
@@ -477,7 +545,7 @@ fn bootstrap(key: &str, target: &str) -> Response {
 fn wrong_host() -> Response {
     (
         StatusCode::MISDIRECTED_REQUEST,
-        "the devbox console only answers to a loopback host name",
+        "the devbox console only answers to loopback and its current launch host",
     )
         .into_response()
 }
@@ -570,6 +638,21 @@ mod tests {
         assert_ne!(a, b);
         // 32 bytes base64url without padding = 43 chars.
         assert_eq!(a.len(), 43);
+    }
+
+    #[test]
+    fn browser_hosts_are_random_and_hostname_safe() {
+        let a = generate_browser_host();
+        let b = generate_browser_host();
+        assert_ne!(a, b);
+        for host in [a, b] {
+            let suffix = host
+                .strip_prefix("devbox-")
+                .and_then(|value| value.strip_suffix(".localhost"))
+                .expect("expected the per-launch localhost name");
+            assert_eq!(suffix.len(), 32);
+            assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     #[test]

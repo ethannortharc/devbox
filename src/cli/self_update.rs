@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::os::unix::fs::PermissionsExt;
+
+use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::sandbox::SandboxManager;
@@ -14,8 +16,7 @@ pub struct SelfUpdateArgs {
     pub version: Option<String>,
 }
 
-const REPO: &str = "northarc/devbox";
-const BINARY_NAME: &str = "devbox";
+const REPO: &str = "ethannortharc/devbox";
 
 pub async fn run(args: SelfUpdateArgs, _manager: &SandboxManager) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
@@ -73,7 +74,7 @@ async fn fetch_latest_version() -> Result<String> {
             // Fallback to curl
             let output = tokio::process::Command::new("curl")
                 .args([
-                    "-sL",
+                    "-fsSL",
                     &format!("https://api.github.com/repos/{REPO}/releases/latest"),
                 ])
                 .output()
@@ -97,57 +98,52 @@ async fn fetch_latest_version() -> Result<String> {
 }
 
 async fn install_version(version: &str) -> Result<()> {
-    let target = detect_target()?;
-    let asset = format!("{BINARY_NAME}-{target}.tar.gz");
+    let asset = detect_target()?;
     let url = format!("https://github.com/{REPO}/releases/download/v{version}/{asset}");
 
     println!("Downloading {asset}...");
 
-    // Download to temp location
-    let temp_dir = std::env::temp_dir().join("devbox-update");
-    std::fs::create_dir_all(&temp_dir)?;
-    let archive_path = temp_dir.join(&asset);
+    // The temporary must be beside the installed binary. Rename is atomic and
+    // can replace an executing file on Unix; copying bytes over the running
+    // inode fails with ETXTBSY on Linux and risks a partial executable if the
+    // process is interrupted.
+    let current_exe = std::env::current_exe()?;
+    let install_dir = current_exe
+        .parent()
+        .context("the current devbox executable has no parent directory")?;
+    let temp = tempfile::Builder::new()
+        .prefix(".devbox-update-")
+        .tempfile_in(install_dir)
+        .with_context(|| {
+            format!(
+                "cannot create an update beside {}; check directory permissions",
+                current_exe.display()
+            )
+        })?;
 
     let status = tokio::process::Command::new("curl")
-        .args(["-sL", "-o", archive_path.to_str().unwrap(), &url])
+        .args(["-fsSL", "-o"])
+        .arg(temp.path())
+        .arg(&url)
         .status()
         .await?;
 
     if !status.success() {
-        bail!("Failed to download release {version} for {target}");
+        bail!("Failed to download release {version} asset {asset}");
     }
 
-    // Extract
-    let status = tokio::process::Command::new("tar")
-        .args([
-            "xzf",
-            archive_path.to_str().unwrap(),
-            "-C",
-            temp_dir.to_str().unwrap(),
-        ])
-        .status()
-        .await?;
-
-    if !status.success() {
-        bail!("Failed to extract archive");
+    if temp.as_file().metadata()?.len() == 0 {
+        bail!("Downloaded release {version} asset {asset} is empty");
     }
-
-    // Find current binary location and replace
-    let current_exe = std::env::current_exe()?;
-    let new_binary = temp_dir.join(BINARY_NAME);
-
-    if !new_binary.exists() {
-        bail!(
-            "Binary not found in archive. Expected: {}",
-            new_binary.display()
-        );
-    }
-
-    // Replace in place
-    std::fs::copy(&new_binary, &current_exe)?;
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    temp.as_file().sync_all()?;
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))?;
+    temp.persist(&current_exe).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to atomically replace {}: {}",
+            current_exe.display(),
+            error.error
+        )
+    })?;
 
     println!("Updated to version {version}");
     Ok(())
@@ -158,10 +154,8 @@ fn detect_target() -> Result<String> {
     let os = std::env::consts::OS;
 
     let target = match (os, arch) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("macos", "aarch64") => "devbox-darwin-arm64",
+        ("linux", "x86_64") => "devbox-linux-amd64",
         _ => bail!("Unsupported platform: {os}/{arch}"),
     };
 
@@ -175,11 +169,25 @@ mod tests {
     #[test]
     fn detect_target_works() {
         let target = detect_target().unwrap();
-        assert!(!target.is_empty());
-        // Should match current platform
-        assert!(
-            target.contains(std::env::consts::OS.replace("macos", "apple").as_str())
-                || target.contains("linux")
-        );
+        assert!(matches!(
+            target.as_str(),
+            "devbox-darwin-arm64" | "devbox-linux-amd64"
+        ));
+    }
+
+    #[test]
+    fn updater_and_release_workflow_name_the_same_assets() {
+        let release = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/release.yml"
+        ));
+        for asset in ["devbox-darwin-arm64", "devbox-linux-amd64"] {
+            assert!(
+                release.contains(asset),
+                "release workflow does not publish {asset}"
+            );
+            assert!(!asset.ends_with(".tar.gz"));
+        }
+        assert_eq!(REPO, "ethannortharc/devbox");
     }
 }

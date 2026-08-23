@@ -58,7 +58,7 @@ func (f *Fixture) replayOnce(ctx context.Context, out chan<- *event.Event) error
 	if err != nil {
 		return fmt.Errorf("open fixture %s: %w", f.Path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	// Event lines can carry a long argv; the default 64 KiB token limit is

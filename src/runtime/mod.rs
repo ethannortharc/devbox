@@ -5,16 +5,28 @@ pub mod incus;
 pub mod lima;
 pub mod multipass;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// Current time in the stable, human-readable format persisted in box state.
+pub(crate) fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// Sandbox status as reported by the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
     Running,
+    /// The runtime process is up, but its guest control channel is not.
+    ///
+    /// Treating this as `Running` makes shell, policy, and file operations
+    /// hang or fail after the UI has already promised that the box is ready.
+    /// It is distinct from `Unknown`: we know the box must be stopped (and
+    /// possibly force-stopped) before it can be started cleanly again.
+    Unreachable(String),
     Stopped,
     NotFound,
     Unknown(String),
@@ -62,6 +74,23 @@ pub struct Mount {
     pub host_path: PathBuf,
     pub container_path: String,
     pub read_only: bool,
+}
+
+/// Runtime-owned rollback data for a mount update that has not yet been
+/// committed to sandbox state.
+///
+/// Keeping the runtime's exact original mount description in the caller makes
+/// `devbox use` a two-phase operation: state persistence either succeeds, or
+/// the runtime mounts are restored.
+#[derive(Debug)]
+pub enum MountUpdate {
+    Lima {
+        yaml_path: PathBuf,
+        original: Vec<u8>,
+    },
+    Incus {
+        original: Vec<(String, BTreeMap<String, String>)>,
+    },
 }
 
 /// Result of executing a command inside a sandbox.
@@ -135,6 +164,18 @@ pub trait Runtime: Send + Sync {
     async fn upgrade(&self, name: &str, tools: &[String]) -> Result<()>;
 
     /// Update mount points for an existing sandbox.
-    /// Stops the VM, updates mounts in the config, and restarts.
-    async fn update_mounts(&self, name: &str, mounts: &[Mount]) -> Result<()>;
+    ///
+    /// An implementation returning `Err` must have either made no runtime
+    /// change or restored the original mounts and running state itself. This
+    /// lets callers distinguish an operation failure from a committed update
+    /// without powering off a box that was never touched.
+    fn supports_mount_updates(&self) -> bool {
+        false
+    }
+
+    async fn update_mounts(&self, name: &str, mounts: &[Mount]) -> Result<MountUpdate>;
+
+    /// Roll back an update whose corresponding sandbox state could not be
+    /// persisted. Implementations must leave the next start on the old mounts.
+    async fn rollback_mounts(&self, name: &str, update: &MountUpdate) -> Result<()>;
 }

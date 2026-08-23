@@ -6,29 +6,19 @@
 //!
 //! Both paths use the same package definitions from nix/sets/*.nix.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
-use crate::runtime::Runtime;
+use crate::runtime::{ExecResult, Runtime};
+
+/// Browser provisioning reports long-running command output into the box's
+/// SSE build panel. CLI provisioning passes no reporter and keeps inheriting
+/// the caller's terminal, preserving the familiar progress display there.
+pub type ProvisionReporter<'a> = &'a (dyn Fn(&str) + Sync);
 
 // ── Embedded Nix files (for NixOS provisioning) ─────────────
 
 const NIX_DEVBOX_MODULE: &str = include_str!("../../nix/devbox-module.nix");
-const NIX_SETS_DEFAULT: &str = include_str!("../../nix/sets/default.nix");
-const NIX_SETS_SYSTEM: &str = include_str!("../../nix/sets/system.nix");
-const NIX_SETS_SHELL: &str = include_str!("../../nix/sets/shell.nix");
-const NIX_SETS_TOOLS: &str = include_str!("../../nix/sets/tools.nix");
-const NIX_SETS_EDITOR: &str = include_str!("../../nix/sets/editor.nix");
-const NIX_SETS_GIT: &str = include_str!("../../nix/sets/git.nix");
-const NIX_SETS_CONTAINER: &str = include_str!("../../nix/sets/container.nix");
-const NIX_SETS_NETWORK: &str = include_str!("../../nix/sets/network.nix");
-const NIX_SETS_AI_CODE: &str = include_str!("../../nix/sets/ai-code.nix");
-const NIX_SETS_AI_INFRA: &str = include_str!("../../nix/sets/ai-infra.nix");
-const NIX_SETS_LANG_GO: &str = include_str!("../../nix/sets/lang-go.nix");
-const NIX_SETS_LANG_RUST: &str = include_str!("../../nix/sets/lang-rust.nix");
-const NIX_SETS_LANG_PYTHON: &str = include_str!("../../nix/sets/lang-python.nix");
-const NIX_SETS_LANG_NODE: &str = include_str!("../../nix/sets/lang-node.nix");
-const NIX_SETS_LANG_JAVA: &str = include_str!("../../nix/sets/lang-java.nix");
-const NIX_SETS_LANG_RUBY: &str = include_str!("../../nix/sets/lang-ruby.nix");
+const NIX_OBSD_MODULE: &str = include_str!("../../nix/obsd-module.nix");
 
 // ── Embedded config files (yazi, etc.) ───────────────────
 const YAZI_CONFIG: &str = include_str!("../../configs/yazi/yazi.toml");
@@ -40,26 +30,6 @@ const AICHAT_ROLES: &str = include_str!("../../configs/aichat/roles.yaml");
 const AICHAT_ROLE_ARCHITECT: &str = include_str!("../../configs/aichat/roles/architect.md");
 const AICHAT_ROLE_REVIEWER: &str = include_str!("../../configs/aichat/roles/reviewer.md");
 const MANAGEMENT_SCRIPT: &str = include_str!("../../configs/management.sh");
-
-/// All set nix files: (filename, content)
-const NIX_SET_FILES: &[(&str, &str)] = &[
-    ("default.nix", NIX_SETS_DEFAULT),
-    ("system.nix", NIX_SETS_SYSTEM),
-    ("shell.nix", NIX_SETS_SHELL),
-    ("tools.nix", NIX_SETS_TOOLS),
-    ("editor.nix", NIX_SETS_EDITOR),
-    ("git.nix", NIX_SETS_GIT),
-    ("container.nix", NIX_SETS_CONTAINER),
-    ("network.nix", NIX_SETS_NETWORK),
-    ("ai-code.nix", NIX_SETS_AI_CODE),
-    ("ai-infra.nix", NIX_SETS_AI_INFRA),
-    ("lang-go.nix", NIX_SETS_LANG_GO),
-    ("lang-rust.nix", NIX_SETS_LANG_RUST),
-    ("lang-python.nix", NIX_SETS_LANG_PYTHON),
-    ("lang-node.nix", NIX_SETS_LANG_NODE),
-    ("lang-java.nix", NIX_SETS_LANG_JAVA),
-    ("lang-ruby.nix", NIX_SETS_LANG_RUBY),
-];
 
 // ── Package name mapping (for Ubuntu/Nix profile install) ───
 // These map set names to nixpkgs attribute paths for `nix profile install`.
@@ -382,6 +352,10 @@ pub(crate) fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
         ],
         "network" => vec![
             "frr",
+            "dnsmasq",
+            "chrony",
+            "busybox",
+            "iproute2",
             "conntrack-tools",
             "tailscale",
             "mosh",
@@ -479,8 +453,30 @@ pub async fn provision_vm_full(
     mount_mode: &str,
     packages: &[(String, String)],
 ) -> Result<()> {
+    provision_vm_full_reported(
+        runtime, name, sets, languages, image, mount_mode, packages, None,
+    )
+    .await
+}
+
+/// Provision with an optional progress sink owned by the caller.
+///
+/// Supplying a reporter is the web-console mode: long-running guest commands
+/// run with piped stdio and publish each line rather than inheriting (and
+/// potentially taking over) the terminal that launched `devbox web`.
+#[allow(clippy::too_many_arguments)]
+pub async fn provision_vm_full_reported(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    image: &str,
+    mount_mode: &str,
+    packages: &[(String, String)],
+    reporter: Option<ProvisionReporter<'_>>,
+) -> Result<()> {
     match image {
-        "ubuntu" => provision_ubuntu(runtime, name, sets, languages, packages).await,
+        "ubuntu" => provision_ubuntu(runtime, name, sets, languages, packages, reporter).await,
         // NixOS writes `[custom_packages]` keys, which the module resolves as
         // attribute paths under `pkgs` — so it wants the name, not the
         // installable reference. Ubuntu runs `nix profile install` and wants
@@ -503,9 +499,46 @@ pub async fn provision_vm_full(
                 .iter()
                 .map(|(n, s)| nixos_attr_path(n, s).to_string())
                 .collect();
-            provision_nixos(runtime, name, sets, languages, mount_mode, &names).await
+            provision_nixos(runtime, name, sets, languages, mount_mode, &names, reporter).await
         }
     }
+}
+
+/// Run a long install step according to the caller's output policy.
+async fn run_install_step(
+    runtime: &dyn Runtime,
+    name: &str,
+    cmd: &[&str],
+    reporter: Option<ProvisionReporter<'_>>,
+) -> Result<ExecResult> {
+    if let Some(report) = reporter {
+        let argv = runtime.argv(name, cmd, false);
+        let exit_code = crate::web::build::stream_command(&argv, |line| report(line)).await?;
+        Ok(ExecResult {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    } else {
+        runtime.exec_cmd(name, cmd, true).await
+    }
+}
+
+fn require_install_success(result: &ExecResult, step: &str, retry: &str) -> Result<()> {
+    if result.exit_code == 0 {
+        return Ok(());
+    }
+    let detail = result.stderr.trim();
+    if detail.is_empty() {
+        bail!(
+            "{step} failed with exit code {}. Retry with: {retry}",
+            result.exit_code
+        );
+    }
+    bail!(
+        "{step} failed with exit code {}: {detail}. Retry with: {retry}",
+        result.exit_code
+    )
 }
 
 // ── NixOS Provisioning ─────────────────────────────────────
@@ -519,6 +552,7 @@ async fn provision_nixos(
     languages: &[String],
     mount_mode: &str,
     packages: &[String],
+    reporter: Option<ProvisionReporter<'_>>,
 ) -> Result<()> {
     let username = whoami();
 
@@ -538,10 +572,27 @@ async fn provision_nixos(
         )
         .await?;
 
+    // The agent and its module are part of the same host binary, so a box can
+    // never accidentally retain a sidecar from another devbox release.
+    let obsd_installed = match install_obsd_binary(runtime, name).await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("Warning: observability agent was not installed: {error}");
+            false
+        }
+    };
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/devbox/obsd-module.nix",
+        NIX_OBSD_MODULE,
+    )
+    .await?;
+
     // 2. Generate base NixOS config if it doesn't exist
     //    NixOS Lima images ship with an empty /etc/nixos/ — we need to
     //    run nixos-generate-config to create the hardware and base configs.
-    ensure_nixos_config(runtime, name).await?;
+    ensure_nixos_config(runtime, name, obsd_installed).await?;
 
     // 3. Push devbox-state.toml (includes mount_mode for overlay setup)
     let state_toml = generate_state_toml(sets, languages, &username, mount_mode, packages);
@@ -557,7 +608,7 @@ async fn provision_nixos(
     .await?;
 
     // 5. Push all set .nix files
-    for (filename, content) in NIX_SET_FILES {
+    for (filename, content) in crate::nix::sets::NIX_SET_FILES {
         let path = format!("/etc/devbox/sets/{filename}");
         write_file_to_vm(runtime, name, &path, content).await?;
     }
@@ -571,16 +622,16 @@ async fn provision_nixos(
         "export NIXPKGS_ALLOW_UNFREE=1 && ",
         "nixos-rebuild switch"
     );
-    let result = runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", rebuild_cmd], true)
-        .await?;
-
-    if result.exit_code != 0 {
-        eprintln!("Warning: nixos-rebuild failed (exit {})", result.exit_code);
-        eprintln!("You can retry with `devbox exec --name {name} -- sudo nixos-rebuild switch`");
-    } else {
-        println!("NixOS rebuild complete.");
-    }
+    let result = run_install_step(
+        runtime,
+        name,
+        &["sudo", "bash", "-c", rebuild_cmd],
+        reporter,
+    )
+    .await?;
+    let retry = format!("devbox exec --name {name} -- sudo nixos-rebuild switch");
+    require_install_success(&result, "nixos-rebuild switch", &retry)?;
+    println!("NixOS rebuild complete.");
 
     // 8. Set up user shell (zshrc with PATH, aliases, etc.)
     setup_nixos_shell(runtime, name).await?;
@@ -614,6 +665,7 @@ async fn provision_ubuntu(
     sets: &[String],
     languages: &[String],
     extra: &[(String, String)],
+    reporter: Option<ProvisionReporter<'_>>,
 ) -> Result<()> {
     // 1. Install the Nix package manager
     println!("Installing Nix package manager on Ubuntu...");
@@ -697,18 +749,11 @@ fi"#;
         let install_cmd = format!(
             ". /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && nix profile install {pkg_list}"
         );
-        let result = runtime
-            .exec_cmd(name, &["bash", "-c", &install_cmd], true)
-            .await?;
-
-        if result.exit_code != 0 {
-            eprintln!("Warning: some packages failed to install.");
-            eprintln!(
-                "You can retry with: devbox exec --name {name} -- nix profile install <packages>"
-            );
-        } else {
-            println!("Nix package installation complete.");
-        }
+        let result =
+            run_install_step(runtime, name, &["bash", "-c", &install_cmd], reporter).await?;
+        let retry = format!("devbox exec --name {name} -- nix profile install <packages>");
+        require_install_success(&result, "nix profile install", &retry)?;
+        println!("Nix package installation complete.");
     }
 
     // 4. Install services that need apt (Docker, Tailscale)
@@ -732,6 +777,18 @@ fi"#;
     setup_yazi_config(runtime, name).await?;
     setup_aichat_config(runtime, name).await?;
     setup_ai_tool_configs(runtime, name).await?;
+
+    // Observability is useful but not a prerequisite for a usable box. Keep it
+    // after package and shell setup, and leave a loud warning if its runtime-
+    // specific transport cannot be installed.
+    match install_obsd_binary(runtime, name).await {
+        Ok(()) => {
+            if let Err(error) = install_ubuntu_obsd_service(runtime, name).await {
+                eprintln!("Warning: observability service was not enabled: {error}");
+            }
+        }
+        Err(error) => eprintln!("Warning: observability agent was not installed: {error}"),
+    }
 
     Ok(())
 }
@@ -1248,7 +1305,246 @@ async fn write_file_to_vm(
     let cmd = format!("echo '{encoded}' | base64 -d | sudo tee {path} > /dev/null");
     let result = runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
     if result.exit_code != 0 {
-        eprintln!("Warning: failed to write {path}: {}", result.stderr.trim());
+        bail!("failed to write {path}: {}", result.stderr.trim());
+    }
+    Ok(())
+}
+
+/// Materialize the embedded Go agent through the runtime's native copy path.
+/// Binary payloads are not passed through argv: even base64 exceeds the OS
+/// argument limit long before a statically linked agent does.
+async fn install_obsd_binary(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    install_embedded_binary(runtime, name, "devbox-obsd", crate::embedded::OBSD).await
+}
+
+/// Materialize a release-pinned guest binary through the runtime's native
+/// copy path, then freeze and verify it before the privileged install.
+pub(crate) async fn install_embedded_binary(
+    runtime: &dyn Runtime,
+    name: &str,
+    binary_name: &str,
+    payload: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let staging = tempfile::Builder::new()
+        .prefix(&format!("{binary_name}-"))
+        .tempdir()
+        .with_context(|| format!("create private {binary_name} staging directory"))?;
+    let temp = staging.path().join(binary_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .with_context(|| format!("create staged agent {}", temp.display()))?;
+    file.write_all(payload)
+        .with_context(|| format!("write staged {binary_name} {}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flush staged agent {}", temp.display()))?;
+    drop(file);
+
+    let nonce = hex_bytes(&rand::random::<[u8; 16]>());
+    let guest_stage = format!("/tmp/{binary_name}-{nonce}");
+    let root_dir = format!("/run/devbox-install-{nonce}");
+    let root_copy = format!("{root_dir}/{binary_name}");
+    let expected_digest = sha256_hex(payload);
+
+    // The runtime copy for Lima and Multipass runs as the guest login user.
+    // Treat that file as hostile until root has frozen it in a directory the
+    // guest cannot enter and the host has verified the embedded-byte digest.
+    // A workload may win the race before the root copy, but then verification
+    // fails; after the copy it cannot change the bytes that will be installed.
+    let mut root_created = false;
+    let install_result: Result<()> = async {
+        copy_file_to_box(runtime, name, &temp, &guest_stage).await?;
+
+        let made = runtime
+            .exec_cmd(
+                name,
+                &["sudo", "mkdir", "-m", "0700", "--", &root_dir],
+                false,
+            )
+            .await?;
+        if made.exit_code != 0 {
+            bail!(
+                "create private agent install directory: {}",
+                made.stderr.trim()
+            );
+        }
+        root_created = true;
+
+        let frozen = runtime
+            .exec_cmd(
+                name,
+                &["sudo", "cp", "--", &guest_stage, &root_copy],
+                false,
+            )
+            .await?;
+        if frozen.exit_code != 0 {
+            bail!("freeze staged {binary_name}: {}", frozen.stderr.trim());
+        }
+
+        let digest = runtime
+            .exec_cmd(name, &["sudo", "sha256sum", "--", &root_copy], false)
+            .await?;
+        if digest.exit_code != 0 {
+            bail!("verify staged {binary_name}: {}", digest.stderr.trim());
+        }
+        let actual_digest = digest.stdout.split_whitespace().next().unwrap_or_default();
+        if actual_digest != expected_digest {
+            bail!(
+                "staged {binary_name} changed before privileged install (expected {expected_digest}, got {actual_digest})"
+            );
+        }
+
+        let installed = runtime
+            .exec_cmd(
+                name,
+                &[
+                    "sudo",
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0755",
+                    "-D",
+                    &root_copy,
+                    &format!("/usr/local/bin/{binary_name}"),
+                ],
+                false,
+            )
+            .await?;
+        if installed.exit_code != 0 {
+            bail!("install {binary_name} in box: {}", installed.stderr.trim());
+        }
+        Ok(())
+    }
+    .await;
+
+    // Best-effort on both success and failure. The root path is an exact,
+    // random child of /run created above; no guest-controlled component is
+    // accepted here.
+    if root_created {
+        let _ = runtime
+            .exec_cmd(name, &["sudo", "rm", "-rf", "--", &root_dir], false)
+            .await;
+    }
+    let _ = runtime
+        .exec_cmd(name, &["rm", "-f", "--", &guest_stage], false)
+        .await;
+    install_result
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_bytes(&Sha256::digest(payload))
+}
+
+fn hex_bytes(payload: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(payload.len() * 2);
+    for byte in payload {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+async fn copy_file_to_box(
+    runtime: &dyn Runtime,
+    name: &str,
+    source: &std::path::Path,
+    destination: &str,
+) -> Result<()> {
+    let source = source
+        .to_str()
+        .context("temporary agent path is not UTF-8")?;
+    let instance = format!("devbox-{name}");
+    let (program, args): (&str, Vec<String>) = match runtime.name() {
+        "lima" => (
+            "limactl",
+            vec![
+                "copy".into(),
+                source.into(),
+                format!("{instance}:{destination}"),
+            ],
+        ),
+        "multipass" => (
+            "multipass",
+            vec![
+                "transfer".into(),
+                source.into(),
+                format!("{instance}:{destination}"),
+            ],
+        ),
+        "incus" => (
+            "incus",
+            vec![
+                "file".into(),
+                "push".into(),
+                source.into(),
+                format!("{instance}{destination}"),
+            ],
+        ),
+        "docker" => (
+            "docker",
+            vec![
+                "cp".into(),
+                source.into(),
+                format!("{instance}:{destination}"),
+            ],
+        ),
+        other => bail!("runtime '{other}' has no host-to-box copy implementation"),
+    };
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::runtime::cmd::run_ok(program, &refs)
+        .await
+        .with_context(|| format!("copy embedded agent into box '{name}'"))?;
+    Ok(())
+}
+
+async fn install_ubuntu_obsd_service(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let no_ebpf = if crate::obs::uses_ebpf(runtime.name()) {
+        ""
+    } else {
+        " -no-ebpf"
+    };
+    let transport = if crate::obs::uses_host_socket(runtime.name()) {
+        " -socket /run/devbox-host/obsd.sock"
+    } else {
+        " -no-transport"
+    };
+    let unit = format!(
+        "[Unit]\nDescription=devbox observability agent\nAfter=network.target\n\n\
+         [Service]\nType=simple\nExecStart=/usr/local/bin/devbox-obsd -box-id {name}{transport} \
+         -packet=true -status-file /run/devbox/obsd-status.json \
+         -policy /etc/devbox/policy.json{no_ebpf}\n\
+         Restart=always\nRestartSec=2s\nRuntimeDirectory=devbox\n\
+         CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYSLOG CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE\n\
+         AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYSLOG CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE\n\
+         NoNewPrivileges=true\nProtectSystem=strict\nPrivateTmp=true\nMemoryMax=256M\nCPUQuota=25%\n\n\
+         [Install]\nWantedBy=multi-user.target\n"
+    );
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/systemd/system/devbox-obsd.service",
+        &unit,
+    )
+    .await?;
+    let result = runtime
+        .exec_cmd(
+            name,
+            &["sudo", "systemctl", "enable", "--now", "devbox-obsd"],
+            false,
+        )
+        .await?;
+    if result.exit_code != 0 {
+        bail!("enable devbox-obsd: {}", result.stderr.trim());
     }
     Ok(())
 }
@@ -1259,7 +1555,11 @@ async fn write_file_to_vm(
 /// We run `nixos-generate-config` to create hardware-configuration.nix,
 /// then write our own minimal configuration.nix with correct bootloader
 /// settings and the devbox module import already included.
-async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+async fn ensure_nixos_config(
+    runtime: &dyn Runtime,
+    name: &str,
+    enable_obsd_service: bool,
+) -> Result<()> {
     // Generate hardware-configuration.nix (always safe to regenerate)
     let hw_check = runtime
         .exec_cmd(
@@ -1311,7 +1611,16 @@ async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
   imports = [
     ./hardware-configuration.nix
     /etc/devbox/devbox-module.nix
+    /etc/devbox/obsd-module.nix
   ];
+
+  services.devbox-obsd = {{
+    enable = {enable_obsd_service};
+    boxId = {box_id:?};
+    socket = "/run/devbox-host/obsd.sock";
+    noTransport = {no_transport};
+    enableEbpf = {enable_ebpf};
+  }};
 
 {bootloader_config}
 
@@ -1324,7 +1633,11 @@ async fn ensure_nixos_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
   # NixOS state version — matches the pre-built image
   system.stateVersion = lib.mkDefault "25.11";
 }}
-"#
+"#,
+        box_id = name,
+        enable_obsd_service = enable_obsd_service,
+        no_transport = !crate::obs::uses_host_socket(runtime.name()),
+        enable_ebpf = crate::obs::uses_ebpf(runtime.name()),
     );
 
     write_file_to_vm(runtime, name, "/etc/nixos/configuration.nix", &config_nix).await?;
@@ -1557,6 +1870,42 @@ fn whoami() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nonzero_guest_install_is_a_provisioning_error() {
+        let result = ExecResult {
+            exit_code: 17,
+            stdout: String::new(),
+            stderr: "the selected package did not build".into(),
+        };
+        let error = require_install_success(
+            &result,
+            "nixos-rebuild switch",
+            "devbox exec --name demo -- sudo nixos-rebuild switch",
+        )
+        .expect_err("a launched guest command with a non-zero exit is not success");
+        let message = error.to_string();
+        assert!(message.contains("exit code 17"));
+        assert!(message.contains("selected package did not build"));
+        assert!(message.contains("Retry with"));
+    }
+
+    #[test]
+    fn embedded_agent_digest_is_stable_sha256() {
+        let digest = sha256_hex(b"abc");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(digest.len(), 64);
+    }
+
+    #[test]
+    fn install_nonce_is_path_safe_hex() {
+        let encoded = hex_bytes(&[0x00, 0xab, 0xff]);
+        assert_eq!(encoded, "00abff");
+        assert!(encoded.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn generate_state_toml_basic() {

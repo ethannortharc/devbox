@@ -122,7 +122,6 @@ func ReadJSON(r io.Reader, v any) error {
 	return nil
 }
 
-// Handshake performs the agent side: send Hello, read HelloAck.
 // ErrRejected is the collector explicitly refusing this agent — a wrong box id,
 // a name it does not know. Permanent: retrying cannot change the answer.
 var ErrRejected = errors.New("collector rejected the agent")
@@ -131,6 +130,8 @@ var ErrRejected = errors.New("collector rejected the agent")
 // reason: neither side will change version by being asked again.
 var ErrProtocol = errors.New("protocol mismatch")
 
+// Handshake performs the agent side: send Hello, read HelloAck.
+//
 // Sentinels rather than message text, because the caller has to act on the
 // difference: a refusal must stop the agent, and a connection that died
 // mid-handshake must not. Matching on strings would make that distinction a

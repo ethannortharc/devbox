@@ -23,9 +23,10 @@ import (
 
 // Source produces events until its context is cancelled.
 //
-// Run must return promptly once ctx is done, and must close nothing the caller
-// owns. Events are delivered on out; a blocked send is backpressure, which is
-// the correct behaviour — the alternative is an unbounded buffer.
+// Run must return promptly once ctx is done, must close nothing the caller
+// owns, and must not return while any goroutine can still send on out. Events
+// are delivered on out; a blocked send is backpressure, which is the correct
+// behaviour — the alternative is an unbounded buffer.
 type Source interface {
 	// Name identifies the source in the handshake and in the UI, so nobody
 	// mistakes proc-polling coverage for kernel coverage.
@@ -37,6 +38,20 @@ type Source interface {
 
 	// Run streams events until ctx is cancelled or the source fails.
 	Run(ctx context.Context, out chan<- *event.Event) error
+}
+
+// Close releases resources acquired while a source is selected.
+//
+// High-fidelity sources deliberately acquire their privileged kernel handles
+// in their constructors. That makes source selection a real preflight: the
+// agent can advertise only the capture that is actually usable and degrade
+// before it restores policy. Callers use this helper because ordinary sources
+// own no such handles.
+func Close(source Source) error {
+	if closer, ok := source.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // Send delivers one event, honouring cancellation.
@@ -106,6 +121,15 @@ func (m *Multi) Domains() []event.Type {
 		}
 	}
 	return all
+}
+
+// Close releases every prepared child source.
+func (m *Multi) Close() error {
+	var errs []error
+	for i := len(m.sources) - 1; i >= 0; i-- {
+		errs = append(errs, Close(m.sources[i]))
+	}
+	return errors.Join(errs...)
 }
 
 // Run streams every source until all finish or ctx is cancelled.

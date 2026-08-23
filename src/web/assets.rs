@@ -4,6 +4,7 @@
 //! `src/web/assets/` and embedded with [`rust_embed`]. Nothing is fetched from
 //! a CDN at runtime — the console works with no network at all, which is what
 //! keeps the "single binary" promise honest.
+//! A product rebuild snapshots the lifecycle/SSE client code into that binary.
 
 use axum::body::Body;
 use axum::extract::Path;
@@ -153,6 +154,22 @@ mod tests {
                 "embedded asset is empty: {path}"
             );
         }
+    }
+
+    #[test]
+    fn dashboard_sse_merges_around_lifecycle_requests() {
+        let file = Assets::get("js/htmx-config.js").unwrap();
+        let source = std::str::from_utf8(&file.data).unwrap();
+
+        assert!(source.contains("mergeBoxesSnapshot(e.detail.data"));
+        assert!(source.contains("type === 'boxes' && document.getElementById('box-grid')"));
+        assert!(source.contains("current.matches('.htmx-request')"));
+        assert!(source.contains("current.querySelector('.htmx-request')"));
+        assert!(source.contains("current.replaceWith(replacement)"));
+        assert!(source.contains("mergeDetailSnapshotPreservingError"));
+        assert!(source.contains("preserveLifecycleErrorForSameStatus(current, replacement)"));
+        assert!(source.contains("current.dataset.boxStatus !== incoming.dataset.boxStatus"));
+        assert!(source.contains("error.cloneNode(true)"));
     }
 
     #[tokio::test]

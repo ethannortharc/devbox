@@ -69,6 +69,10 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Internal entry point for the per-user collector process.
+    #[command(name = "__collector", hide = true)]
+    Collector,
+
     /// Create a new sandbox
     Create(create::CreateArgs),
 
@@ -160,8 +164,37 @@ pub enum Command {
 }
 
 impl Command {
+    /// Whether this command can create, start, or actively observe a box.
+    ///
+    /// Read-only metadata commands deliberately do not start a background
+    /// process. Lifecycle and observation commands do, so capture survives
+    /// after the foreground command or web console exits.
+    pub fn needs_collector(&self) -> bool {
+        matches!(
+            self,
+            Self::Create(_)
+                | Self::Shell(_)
+                | Self::Exec(_)
+                | Self::Reprovision(_)
+                | Self::Code(_)
+                | Self::Use(_)
+                | Self::Sets(_)
+                | Self::Watch(_)
+                | Self::Behavior(_)
+                | Self::Policy(_)
+                | Self::Lab(_)
+                | Self::Web(_)
+        )
+    }
+
     pub async fn run(self, manager: &SandboxManager) -> Result<()> {
         match self {
+            Command::Collector => {
+                let manager = std::sync::Arc::new(SandboxManager {
+                    state_dir: manager.state_dir.clone(),
+                });
+                crate::obs::daemon::run(manager).await
+            }
             Command::Create(args) => create::run(args, manager).await,
             Command::Shell(args) => shell::run(args, manager).await,
             Command::Exec(args) => exec::run(args, manager).await,

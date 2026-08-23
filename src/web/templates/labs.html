@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block title %}devbox — labs{% endblock %}
+
+{% block content %}
+<section class="hero labs-hero">
+  <div class="hero-copy">
+    <span class="eyebrow">Network experimentation</span>
+    <h1>Break the network.<br />Keep the host clean.</h1>
+    <p>Run repeatable topologies with real Linux namespaces, veth links, routing daemons, and controlled failure.</p>
+  </div>
+  <div class="lab-principles" aria-label="Lab capabilities">
+    <span><strong>01</strong> Real packets</span>
+    <span><strong>02</strong> Reproducible wiring</span>
+    <span><strong>03</strong> Reversible faults</span>
+  </div>
+</section>
+
+<div class="section-head">
+  <div><span class="eyebrow">Built-in scenarios</span><h2>Choose a topology</h2></div>
+  <span class="section-note">{{ scenarios.len() }} ready-to-run plans</span>
+</div>
+
+<div class="scenario-list">
+  {% for scenario in scenarios %}
+  <article class="scenario-row">
+    <span class="scenario-index">0{{ loop.index }}</span>
+    <div class="scenario-copy">
+      <h2><a href="/labs/{{ scenario.name }}">{{ scenario.name }}</a></h2>
+      <p>{{ scenario.summary }}</p>
+      <span>{{ scenario.demonstrates }}</span>
+    </div>
+    <div class="scenario-meta">
+      <span><strong>{{ scenario.nodes }}</strong> nodes</span>
+      <span><strong>{{ scenario.links }}</strong> links</span>
+    </div>
+    <a class="scenario-open" href="/labs/{{ scenario.name }}" aria-label="Open {{ scenario.name }} lab">↗</a>
+  </article>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -167,7 +167,7 @@ func (s *Server) OperatorHandler() http.Handler {
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
 	return mux
 }
@@ -194,7 +194,7 @@ func (s *Server) provisioningMux() *http.ServeMux {
 	// network enumerate the fabric even after /metrics moved off, which is
 	// the same exposure with a different path.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
 	return mux
 }
@@ -237,7 +237,7 @@ func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
 	// A shell script, because that is what a blank node can run: no
 	// interpreter to install, no package to fetch first.
 	w.Header().Set("Content-Type", "text/x-shellscript")
-	fmt.Fprintf(w, `#!/bin/sh
+	_, _ = fmt.Fprintf(w, `#!/bin/sh
 # devbox ZTP bootstrap — fetched via DHCP option 67.
 set -eu
 
@@ -248,8 +248,11 @@ ZTP="%s"
 # on ARM and anything else without a DMI serial file, the script exited here
 # before the fallback could run. The trailing "|| true" keeps the assignment
 # succeeding with an empty value, and the emptiness check does the real work.
-SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || true)"
-[ -n "$SERIAL" ] || SERIAL="$(cat /etc/machine-id 2>/dev/null || true)"
+SERIAL="${DEVBOX_ZTP_SERIAL:-}"
+if [ -z "$SERIAL" ]; then
+  SERIAL="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || true)"
+  [ -n "$SERIAL" ] || SERIAL="$(cat /etc/machine-id 2>/dev/null || true)"
+fi
 # Stripped to what a serial can legitimately contain. It is interpolated into
 # the JSON bodies below, so a quote or a backslash from DMI — which is not a
 # trusted source; it is whatever the board vendor wrote — would produce a
@@ -288,7 +291,9 @@ report rendering
 # Fetch. Compare against what is already installed before touching anything:
 # re-pushing identical config would restart routing for no reason, which is
 # exactly what makes a reconciliation loop unsafe.
-mkdir -p /etc/frr
+FRR_DIR="${DEVBOX_ZTP_FRR_DIR:-/etc/frr}"
+FRR_CONF="$FRR_DIR/frr.conf"
+mkdir -p "$FRR_DIR"
 wget -q -O /tmp/frr.conf.new "$ZTP/config/$NAME" || {
   report failed "config fetch failed"; exit 1; }
 
@@ -296,7 +301,9 @@ wget -q -O /tmp/frr.conf.new "$ZTP/config/$NAME" || {
 # and has to be set on every run — not only when the config changed. A node
 # that rebooted and found its config unchanged used to come back healthy with
 # the OS default hostname, which is what an operator reads in every log.
-hostname "$NAME"
+if [ "${DEVBOX_ZTP_SKIP_HOSTNAME:-0}" != "1" ]; then
+  hostname "$NAME"
+fi
 
 # Compare against the config that was last successfully *activated*, not the
 # one sitting on disk.
@@ -324,9 +331,56 @@ hostname "$NAME"
 # vtysh gets an answer. A daemon that cannot answer cannot be verified either,
 # so the two agree by construction rather than by two people remembering to
 # keep them in step.
-ACTIVATED=/etc/frr/.devbox-activated
+ACTIVATED="$FRR_DIR/.devbox-activated"
 frr_answers() {
-  [ -n "$(vtysh -c 'show bgp summary' 2>/dev/null || true)" ]
+  if [ -n "${DEVBOX_ZTP_NETNS:-}" ]; then
+    [ -n "$(vtysh -N "$DEVBOX_ZTP_NETNS" -c 'show bgp summary' 2>/dev/null || true)" ]
+  else
+    [ -n "$(vtysh -c 'show bgp summary' 2>/dev/null || true)" ]
+  fi
+}
+restart_frr() {
+  if [ -z "${DEVBOX_ZTP_NETNS:-}" ]; then
+    /etc/init.d/frr restart >/dev/null 2>&1 || service frr restart >/dev/null 2>&1
+    return
+  fi
+
+  _run="${DEVBOX_ZTP_RUN_DIR:-/run/devbox-ztp}"
+  mkdir -p "$_run" "/run/frr/$DEVBOX_ZTP_NETNS" "/etc/frr/$DEVBOX_ZTP_NETNS"
+  touch "/etc/frr/$DEVBOX_ZTP_NETNS/vtysh.conf"
+  for _daemon in bgpd zebra mgmtd; do
+    _pidfile="$_run/$_daemon.pid"
+    if [ -s "$_pidfile" ]; then
+      kill "$(cat "$_pidfile")" 2>/dev/null || true
+    fi
+  done
+  # mgmtd first, and it takes no -f.
+  #
+  # FRR 10 moved interface configuration into mgmtd's northbound datastore.
+  # Without it running, "interface lo" is not a command zebra knows: it logs
+  # "No such command", carries on, and the node comes up with its BGP
+  # configuration and none of its addresses. A node provisioned this way has
+  # nothing else to configure it -- that is the whole point -- so its loopback
+  # never appeared, the prefix it advertised was never valid, and no peer could
+  # reach it. Every per-node check still passed, and only the fabric-wide
+  # reachability matrix failed.
+  # Only if this FRR has it: mgmtd arrived in 9 and owns interface config from
+  # 10. A node running FRR 8 -- Debian bookworm ships 8.4 -- has no such binary
+  # and does not need one, because there zebra still owns it.
+  if command -v mgmtd >/dev/null 2>&1; then
+    mgmtd -u root -g root -d -i "$_run/mgmtd.pid" \
+      -z "$_run/zserv.api" -N "$DEVBOX_ZTP_NETNS" || return 1
+  fi
+  zebra -u root -g root -d -f "$FRR_CONF" -i "$_run/zebra.pid" \
+    -z "$_run/zserv.api" -N "$DEVBOX_ZTP_NETNS" || return 1
+  bgpd -u root -g root -d -f "$FRR_CONF" -i "$_run/bgpd.pid" \
+    -z "$_run/zserv.api" -N "$DEVBOX_ZTP_NETNS" || return 1
+
+  # Then distribute the file, because no single daemon reading it applies all
+  # of it: each one's -f keeps the commands it owns and silently drops the
+  # rest. vtysh holds a session to all of them and hands each line to whichever
+  # owns it, which is what an integrated frr.conf is for.
+  vtysh -N "$DEVBOX_ZTP_NETNS" -f "$FRR_CONF" >/dev/null 2>&1
 }
 #
 # The marker also has to still describe what is *installed*. It records what a
@@ -341,22 +395,21 @@ frr_answers() {
 # node is running exactly what was activated", which is what the caller reads
 # it as.
 if [ -f "$ACTIVATED" ] && cmp -s /tmp/frr.conf.new "$ACTIVATED" \
-  && cmp -s /etc/frr/frr.conf "$ACTIVATED" && frr_answers; then
+  && cmp -s "$FRR_CONF" "$ACTIVATED" && frr_answers; then
   rm -f /tmp/frr.conf.new
   report verifying
 else
   report pushing
-  mv /tmp/frr.conf.new /etc/frr/frr.conf
+  mv /tmp/frr.conf.new "$FRR_CONF"
   # Not "|| true". A restart that fails leaves the *old* bgpd running with the
   # old configuration, and the verification below then finds established
   # sessions and reports healthy — for a node that never loaded the config it
   # was just given.
-  if ! /etc/init.d/frr restart >/dev/null 2>&1 && \
-     ! service frr restart >/dev/null 2>&1; then
+  if ! restart_frr; then
     report failed "frr restart failed; the new config was not loaded"
     exit 1
   fi
-  cp /etc/frr/frr.conf "$ACTIVATED"
+  cp "$FRR_CONF" "$ACTIVATED"
   report verifying
 fi
 
@@ -393,7 +446,11 @@ CFG_HASH="$(sha256sum "$ACTIVATED" 2>/dev/null | cut -c1-16)"
 _ok=0
 _try=0
 while [ "$_try" -lt 30 ]; do
-  _summary="$(vtysh -c 'show bgp summary' 2>/dev/null || true)"
+  if [ -n "${DEVBOX_ZTP_NETNS:-}" ]; then
+    _summary="$(vtysh -N "$DEVBOX_ZTP_NETNS" -c 'show bgp summary' 2>/dev/null || true)"
+  else
+    _summary="$(vtysh -c 'show bgp summary' 2>/dev/null || true)"
+  fi
   if [ -n "$_summary" ]; then
     # "show bgp summary" prints one row per neighbour; Established rows carry
     # an uptime in the Up/Down column instead of a state word.
@@ -411,6 +468,47 @@ while [ "$_try" -lt 30 ]; do
   _try=$((_try + 1))
   sleep 2
 done
+
+# A resolver that sends a query, not the C library.
+#
+# "getent hosts" was the obvious way to write this and cannot work on the image
+# devbox builds. A NixOS substrate runs nsncd, and glibc hands every name
+# lookup to it over a unix socket; nsncd lives in the root network namespace
+# and answers from the *host's* resolv.conf. A node in a lab namespace
+# therefore asks a resolver that cannot see its fabric, gets nothing, and
+# reports the fabric's DNS broken. tcpdump inside the node during that check
+# shows no DNS packet at all, which is the tell: the query never reached the
+# network.
+#
+# -type=A because the lab addresses IPv4 only, and because a bare lookup asks
+# for A and AAAA together and fails if either leg does.
+#
+# Three ways down, because a substrate is whatever the user brought. nslookup
+# on PATH is busybox's applet on the Nix image and bind's elsewhere; both take
+# -type. busybox reaches the same applet where only the multi-call binary is
+# installed -- a Debian slim image with no dnsutils, which is what the e2e
+# fixture is. getent is the last resort and is correct wherever nsncd is not in
+# the way; the two conditions do not overlap in practice, because the image
+# that runs nsncd is the one that carries busybox.
+dns_answers() {
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup -type=A "$1" >/dev/null 2>&1
+  elif command -v busybox >/dev/null 2>&1; then
+    busybox nslookup -type=A "$1" >/dev/null 2>&1
+  else
+    getent hosts "$1" >/dev/null 2>&1
+  fi
+}
+
+if [ "$_ok" -eq 1 ] && [ -n "${DEVBOX_ZTP_DNS_NAME:-}" ]; then
+  dns_answers "$DEVBOX_ZTP_DNS_NAME" || {
+    report failed "DNS self-check failed"; exit 1; }
+fi
+
+if [ "$_ok" -eq 1 ] && [ -n "${DEVBOX_ZTP_NTP:-}" ]; then
+  chronyd -Q -t 10 "server $DEVBOX_ZTP_NTP iburst" >/dev/null 2>&1 || {
+    report failed "NTP self-check failed"; exit 1; }
+fi
 
 if [ "$_ok" -eq 1 ]; then
   report healthy
@@ -486,7 +584,7 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	// idempotent.
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Devbox-Config-Hash", Hash(config))
-	fmt.Fprint(w, config)
+	_, _ = fmt.Fprint(w, config)
 }
 
 func (s *Server) report(w http.ResponseWriter, r *http.Request) {
@@ -629,7 +727,9 @@ func (s *Server) missingSerials() []string {
 	for _, node := range s.registry.List() {
 		seen[node.Serial] = struct{}{}
 	}
-	var missing []string
+	// An empty JSON array, not null. Callers consume this as a collection, and
+	// `null` makes strongly typed clients reject an otherwise healthy status.
+	missing := make([]string, 0)
 	for _, serial := range s.catalogSerials() {
 		if _, ok := seen[serial]; !ok {
 			missing = append(missing, serial)
@@ -697,7 +797,7 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprint(w, b.String())
+	_, _ = fmt.Fprint(w, b.String())
 }
 
 // promLabel renders a label value the Prometheus text format accepts.

@@ -102,7 +102,7 @@ pub fn escape_label(value: &str) -> String {
 /// Must be the strings `web::service::status_label` produces; a test pins the
 /// two together, because a zero series under a name nothing emits is a
 /// dashboard that reads healthy forever.
-const ZEROED_STATUSES: &[&str] = &["running", "stopped", "missing", "unknown"];
+const ZEROED_STATUSES: &[&str] = &["running", "unreachable", "stopped", "missing", "unknown"];
 
 pub fn render(snapshot: &Snapshot) -> String {
     let mut out = String::with_capacity(1024);
@@ -211,6 +211,7 @@ mod tests {
         use crate::runtime::SandboxStatus;
         for status in [
             SandboxStatus::Running,
+            SandboxStatus::Unreachable("guest probe failed".into()),
             SandboxStatus::Stopped,
             SandboxStatus::NotFound,
         ] {

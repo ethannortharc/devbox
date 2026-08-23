@@ -78,7 +78,6 @@ impl ImageChoice {
 pub enum RuntimeChoice {
     Incus,
     Lima,
-    Multipass,
     Docker,
 }
 
@@ -87,7 +86,6 @@ impl RuntimeChoice {
         match self {
             Self::Incus => "incus",
             Self::Lima => "lima",
-            Self::Multipass => "multipass",
             Self::Docker => "docker",
         }
     }

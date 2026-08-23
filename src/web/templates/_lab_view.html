@@ -1,0 +1,55 @@
+<section class="lab-topology panel">
+  <div class="topology-head">
+    <div><span class="eyebrow">Live topology</span><h2>Traffic map</h2></div>
+    <div class="lab-stats">
+      <span><strong>{{ view.nodes.len() }}</strong> nodes</span>
+      <span><strong>{{ view.links.len() }}</strong> links</span>
+      <span><strong>{{ view.total_events }}</strong> events</span>
+      <span><strong>{{ view.total_bytes }}</strong> bytes</span>
+    </div>
+  </div>
+  <svg class="topology" viewBox="0 0 800 380" role="img" aria-label="{{ view.name }} topology">
+    {% for link in view.links %}
+    <g class="topo-link {% if link.events > 0 %}active{% endif %}">
+      <line x1="{{ link.x1 }}" y1="{{ link.y1 }}" x2="{{ link.x2 }}" y2="{{ link.y2 }}" />
+      <text x="{{ link.label_x }}" y="{{ link.label_y }}" text-anchor="middle">{{ link.events }} ev · {{ link.bytes }} B</text>
+    </g>
+    {% endfor %}
+    {% for node in view.nodes %}
+    {#- The class is what turns "zero touch" into something you can watch: a
+        blank node's box changes as its state machine advances, so three grey
+        outlines going green *is* the demonstration. -#}
+    <g class="topo-node {% if !node.phase.is_empty() %}node-{{ node.phase }}{% endif %}"
+       transform="translate({{ node.x }} {{ node.y }})">
+      <rect x="-66" y="-28" width="132" height="56" rx="7" />
+      <text class="node-name" y="-3" text-anchor="middle">{{ node.name }}</text>
+      <text class="node-role" y="15" text-anchor="middle">{{ node.role }}{% if let Some(asn) = node.asn %} · AS{{ asn }}{% endif %}</text>
+    </g>
+    {% endfor %}
+  </svg>
+</section>
+
+<div class="lab-tables">
+  <section class="panel tabpanel">
+    <h3 class="acthead">Nodes</h3>
+    <table class="data">
+      <thead><tr><th>node</th><th>role</th><th>ASN</th><th>loopback</th></tr></thead>
+      <tbody>
+      {% for node in view.nodes %}
+      <tr><td>{{ node.name }}</td><td>{{ node.role }}</td><td>{% if let Some(asn) = node.asn %}{{ asn }}{% else %}—{% endif %}</td><td>{% if let Some(loopback) = node.loopback %}{{ loopback }}{% else %}—{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  <section class="panel tabpanel">
+    <h3 class="acthead">Links</h3>
+    <table class="data">
+      <thead><tr><th>end A</th><th>end B</th><th>subnet</th><th>events</th><th>bytes</th></tr></thead>
+      <tbody>
+      {% for link in view.links %}
+      <tr><td>{{ link.a }}</td><td>{{ link.b }}</td><td>{{ link.subnet }}</td><td>{{ link.events }}</td><td>{{ link.bytes }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>

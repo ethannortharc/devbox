@@ -1,0 +1,18 @@
+<div class="capture capture-{{ capture.level }}" role="status">
+  <div class="capture-head">
+    <span class="capture-dot" aria-hidden="true"></span>
+    <strong>{{ capture.headline }}</strong>
+    <span class="spacer"></span>
+    {% for fact in capture.facts %}
+    <span class="capture-fact"><span>{{ fact.label }}</span><b>{{ fact.value }}</b></span>
+    {% endfor %}
+  </div>
+  {% if !capture.detail.is_empty() %}
+  <p class="capture-detail">{{ capture.detail }}</p>
+  {% endif %}
+  {% if let Some(remedy) = capture.remedy %}
+  <p class="capture-remedy">
+    {% if !remedy.command.is_empty() %}<code>{{ remedy.command }}</code> — {% endif %}{{ remedy.hint }}
+  </p>
+  {% endif %}
+</div>

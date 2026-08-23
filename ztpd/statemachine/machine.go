@@ -215,7 +215,7 @@ func (r *Registry) Save(path string) error {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return nil

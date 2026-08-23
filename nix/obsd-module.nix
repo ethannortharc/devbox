@@ -4,19 +4,11 @@
 # the collector refuses a mismatched agent rather than decoding events with the
 # wrong layout.
 #
-# **Not yet wired into provisioning.** Nothing pushes the `devbox-obsd` binary
-# into a box, imports this module, or sets `services.devbox-obsd.enable`, so no
-# box built by `devbox create` runs the agent today. Two things depend on that
-# and do not work until it lands:
-#
-#   * activity capture — the console's timeline stays empty on a real box;
-#   * domain allowlists — `allowlist` and `mirror-only` are enforced by
-#     nftables whose allow set only the agent can populate from DNS, so an
-#     allowlisted domain is *blocked*, not permitted.
-#
-# `devbox policy set` refuses domain-based postures for exactly that reason
-# (see `policy::enforce`). CIDR-only allowlists, `isolated`, and `open` are
-# fully enforced without the agent.
+# Provisioning writes this module and the version-matched embedded agent before
+# `nixos-rebuild`, then mounts the host collector directory at
+# `/run/devbox-host` on native Linux Docker; VM-backed runtimes use exec stdio.
+# Domain allowlists are admitted only after the agent's atomic status file
+# confirms that packet capture actually acquired its kernel resources.
 { config, lib, pkgs, ... }:
 
 let
@@ -27,7 +19,7 @@ in
     enable = lib.mkEnableOption "the devbox observability agent";
 
     package = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.str;
       default = "/usr/local/bin/devbox-obsd";
       description = ''
         Path to the agent binary. Defaults to where `devbox` pushes it on
@@ -46,33 +38,33 @@ in
       default = "/run/devbox/obsd.sock";
       description = ''
         Unix socket the collector listens on. `devbox` bind-mounts the host
-        side here; on VM runtimes this becomes a vsock address instead.
+        side here only when native Linux Docker shares the host kernel.
+      '';
+    };
+
+    noTransport = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Capture and enforce without exporting events. VM services use this
+        between console sessions; the console launches a second agent over
+        authenticated runtime-exec stdio because host Unix sockets do not
+        cross VM filesystem mounts.
       '';
     };
 
     enableEbpf = lib.mkOption {
       type = lib.types.bool;
-      # The shipped agent has no eBPF source linked in — `chooseSource` errors
-      # out when neither a fixture nor `-no-ebpf` is given, so defaulting this
-      # on would restart-loop the service. Flip it when the privileged build
-      # lands; until then the degraded path is the one that runs.
+      # Local developer builds embed the portable proc+packet agent. Release
+      # builds override this from the generated CO-RE artifact.
       default = false;
       description = ''
         Attach eBPF programs. Turning this off selects the degraded
-        proc-polling path (§13), which sees processes and sockets but not
-        DNS, TLS, or file access — the console marks which source is in play.
+        proc-polling path (§13). The independent packet tap still captures
+        DNS and TLS; file-open fidelity is what is lost.
       '';
     };
 
-    capture = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ "exec" "connect" "dns" "tls" "file" ];
-      description = ''
-        Event domains to capture. `api` is opt-in and off by default: it means
-        an SSL uprobe or a MITM proxy, which is a different trust decision from
-        watching syscalls (§7.1, N3).
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -101,8 +93,11 @@ in
             cfg.package
             "-box-id" (lib.escapeShellArg cfg.boxId)
             "-socket" (lib.escapeShellArg cfg.socket)
+            "-packet=true"
+            "-status-file" "/run/devbox/obsd-status.json"
           ]
           ++ lib.optional (!cfg.enableEbpf) "-no-ebpf"
+          ++ lib.optional cfg.noTransport "-no-transport"
           # The egress policy, when the control plane has written one. The
           # agent is what keeps the firewall's allow sets in step with DNS, so
           # an allowlist is only enforceable if this is passed.
@@ -118,12 +113,14 @@ in
 
         # Loading eBPF programs and reading every process needs real
         # privileges; everything else is dropped.
-        AmbientCapabilities = lib.mkIf cfg.enableEbpf [
+        AmbientCapabilities = [
+          "CAP_NET_RAW"
+          "CAP_NET_ADMIN"
+          "CAP_SYSLOG"
+        ] ++ lib.optionals cfg.enableEbpf [
           "CAP_BPF"
           "CAP_PERFMON"
           "CAP_SYS_RESOURCE"
-          "CAP_NET_ADMIN"
-          "CAP_SYSLOG"
         ];
         # The bounding set is *unconditional*; only the eBPF entries are not.
         #
@@ -157,6 +154,9 @@ in
           # the split. Trading "too many capabilities" for "not enough to do
           # the job" is not a fix.
           "CAP_NET_ADMIN"
+          # AF_PACKET is the payload source for DNS answers and TLS SNI in both
+          # eBPF and proc modes.
+          "CAP_NET_RAW"
         ] ++ lib.optionals cfg.enableEbpf [
           "CAP_BPF"
           "CAP_PERFMON"
@@ -170,7 +170,10 @@ in
         PrivateTmp = true;
         NoNewPrivileges = true;
         RuntimeDirectory = "devbox";
-        RuntimeDirectoryMode = "0750";
+        # The status contains only the pid and effective capture names. The
+        # host control plane runs as the ordinary guest user, so it must be
+        # able to read this file without acquiring root.
+        RuntimeDirectoryMode = "0755";
 
         # The collector is the source of truth; a crashed agent should come
         # back rather than leaving a silent gap in the timeline.

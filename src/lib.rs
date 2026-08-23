@@ -19,6 +19,7 @@
 //! - [`tools`] — language/tool detection and the tool registry.
 
 pub mod cli;
+pub mod embedded;
 pub mod lab;
 pub mod metrics;
 pub mod nix;

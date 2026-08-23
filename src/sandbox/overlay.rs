@@ -67,6 +67,30 @@ pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<Overl
     Ok(changes)
 }
 
+/// Changes that carry user data rather than merely containing another entry.
+///
+/// `find` reports every upper-layer parent directory. Existing/ancestor
+/// directories are structural noise, but a leaf directory newly added to the
+/// overlay is itself meaningful: commit intentionally recreates it even when
+/// it is empty. Destroy therefore must protect it just like a changed file.
+pub fn meaningful_changes(changes: &[OverlayChange]) -> Vec<&OverlayChange> {
+    changes
+        .iter()
+        .filter(|change| {
+            if !change.is_dir {
+                return true;
+            }
+            if change.status != ChangeStatus::Added {
+                return false;
+            }
+            let prefix = format!("{}/", change.path.trim_end_matches('/'));
+            !changes
+                .iter()
+                .any(|other| other.path != change.path && other.path.starts_with(prefix.as_str()))
+        })
+        .collect()
+}
+
 /// Show overlay status summary (like `git status`).
 /// Returns the list of changes for further processing.
 pub async fn status(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<OverlayChange>> {
@@ -540,5 +564,34 @@ impl ChangeStatus {
             Self::Modified => "\x1b[33m~\x1b[0m",
             Self::Deleted => "\x1b[31m-\x1b[0m",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(path: &str, status: ChangeStatus, is_dir: bool) -> OverlayChange {
+        OverlayChange {
+            status,
+            path: path.into(),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn meaningful_changes_keep_empty_new_directories_but_not_structural_parents() {
+        let changes = vec![
+            change("src", ChangeStatus::Modified, true),
+            change("src/new", ChangeStatus::Added, true),
+            change("src/new/file.txt", ChangeStatus::Added, false),
+            change("empty", ChangeStatus::Added, true),
+        ];
+
+        let paths: Vec<&str> = meaningful_changes(&changes)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["src/new/file.txt", "empty"]);
     }
 }

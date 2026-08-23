@@ -66,7 +66,7 @@ impl GlobalConfig {
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "default.runtime" => {
-                let valid = ["auto", "incus", "lima", "multipass", "docker"];
+                let valid = ["auto", "incus", "lima", "docker"];
                 if !valid.contains(&value) {
                     anyhow::bail!("Invalid runtime '{}'. Options: {}", value, valid.join(", "));
                 }

@@ -1,32 +1,23 @@
 /* devbox console — the console key, and the only place it is touched.
  *
  * The key is what every request carrying data is judged by. It lives in
- * `sessionStorage`, which is scoped to an origin — scheme, host *and port* — so
- * a service on another 127.0.0.1 port cannot read it. That is why it is not a
- * cookie: cookies are scoped by host alone, so the console's used to be handed
- * to every other loopback service the browser spoke to.
+ * `localStorage` on a fresh random `devbox-….localhost` hostname created for
+ * each console launch. Storage is scoped to an origin — scheme, host *and
+ * port* — so all tabs on the current launch can read it, while another
+ * loopback service, the stable 127.0.0.1 console address, and every previous
+ * launch cannot. That is why it is not a cookie: cookies are scoped by host
+ * alone, so the console's used to be handed to every other loopback service
+ * the browser spoke to.
  *
- * ## Why session and not local
+ * ## Why local storage is safe here
  *
- * Same origin is not the same program. The console binds a predictable port,
- * and a page served earlier from that port by something else — a project's own
- * dev server, since stopped — shares this origin exactly. `localStorage` is
- * shared by every tab on an origin *and* announces writes to them through the
- * `storage` event, so such a page, still open, would be handed the key the
- * moment the console installed it, and could replay it same-origin against the
- * terminal and lifecycle routes.
- *
- * `sessionStorage` is per tab. Another tab cannot read this one's, and no
- * cross-tab event fires. It is copied into tabs opened from the console, and
- * restored by session restore, so it costs less than it sounds: the key is
- * per-launch anyway, which already meant no bookmark outlived a restart. What
- * it does cost is a freshly typed URL or bookmark during a live launch, which
- * gets a notice telling the user to re-open the printed URL.
- *
- * One residual, recorded rather than hidden: within a *single* tab, history or
- * bfcache could restore that earlier page into a tab whose sessionStorage now
- * holds the key. Nothing available to a page on a fixed loopback origin closes
- * that; see ADR-0048.
+ * Same origin is not the same program, so this was unsafe while the browser
+ * origin was the predictable `127.0.0.1:7878`. The server now separates its
+ * stable listening address from its browser origin: each launch prints a new
+ * random `.localhost` hostname and redirects bare loopback navigations there.
+ * An old page does not know that unguessable origin and cannot observe its
+ * storage. Sharing within it is precisely what makes independently opened tabs
+ * reentrant.
  *
  * Nothing attaches this automatically. Each caller below sends it on purpose,
  * which is also why the console has no CSRF surface: forgery rides ambient
@@ -42,13 +33,11 @@ window.devboxKey = (function () {
 
   var NAME = "devbox.key";
 
-  // Sweep up the key this used to write. Keys are per-launch, so anything left
-  // in `localStorage` by an older build is already dead — but it is
-  // credential-shaped and it sits in precisely the storage that other tabs on
-  // this origin can read, which is why it stopped living there. Leaving it is
-  // leaving litter in the place the finding was about.
+  // Sweep up the key the preceding per-tab build wrote. On the random
+  // per-launch origin it can only be stale or a duplicate; keeping one source
+  // of truth makes upgrade behaviour deterministic.
   try {
-    window.localStorage.removeItem(NAME);
+    window.sessionStorage.removeItem(NAME);
   } catch (e) {
     /* nothing to sweep if storage is unavailable */
   }
@@ -60,14 +49,14 @@ window.devboxKey = (function () {
   return {
     get: function () {
       try {
-        return window.sessionStorage.getItem(NAME);
+        return window.localStorage.getItem(NAME);
       } catch (e) {
         return null;
       }
     },
     set: function (value) {
       try {
-        window.sessionStorage.setItem(NAME, value);
+        window.localStorage.setItem(NAME, value);
         return true;
       } catch (e) {
         return false;
@@ -75,7 +64,7 @@ window.devboxKey = (function () {
     },
     clear: function () {
       try {
-        window.sessionStorage.removeItem(NAME);
+        window.localStorage.removeItem(NAME);
       } catch (e) {
         /* nothing to clear if storage is unavailable */
       }

@@ -10,6 +10,8 @@ By contributing to this project, you agree that your contributions will be licen
 
 - Rust toolchain 1.89+ (edition 2024; let-chains need 1.88, std file locks 1.89)
 - Cargo
+- Go 1.26+ (the Rust build embeds the in-guest `devbox-obsd` agent; packaging
+  can provide one with `DEVBOX_OBSD_BINARY=/path/to/devbox-obsd`)
 - A VM runtime for end-to-end testing (Lima on macOS, Incus on Linux)
 
 ## Building

@@ -1,0 +1,32 @@
+# A small routed fabric. Addresses and private ASNs are assigned deterministically.
+[lab]
+name = "example-mini-clos"
+substrate = "auto"
+base = "10.30.0.0/16"
+asn_base = 65100
+
+[[nodes]]
+name = "leaf1"
+role = "frr-router"
+sets = ["network"]
+
+[[nodes]]
+name = "leaf2"
+role = "frr-router"
+sets = ["network"]
+
+[[nodes]]
+name = "spine1"
+role = "frr-router"
+sets = ["network"]
+
+[[links]]
+endpoints = ["leaf1:eth1", "spine1:eth1"]
+
+[[links]]
+endpoints = ["leaf2:eth1", "spine1:eth2"]
+
+[services]
+dns = true
+dhcp = false
+ntp = true

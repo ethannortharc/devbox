@@ -45,7 +45,7 @@ func dnsEvent(name string, answers ...string) *event.Event {
 	return &event.Event{
 		TSWall: "2026-08-06T22:00:00.000Z", BoxID: "myapp", PID: 812,
 		Type: event.TypeDNS,
-		Net:  &event.Net{QName: name, QType: "A", Answers: answers},
+		Net:  &event.Net{QName: name, QType: "A", Answers: answers, Response: true},
 	}
 }
 
@@ -133,6 +133,22 @@ func TestOnDNSIgnoresLookupsOutsideThePolicy(t *testing.T) {
 	}
 	if len(added) != 0 || len(applier.elements) != 0 {
 		t.Errorf("a disallowed name must not open the firewall: %v", applier.elements)
+	}
+}
+
+func TestOnDNSNeverTrustsAQueryShapedPacket(t *testing.T) {
+	t.Parallel()
+
+	applier := &fakeApplier{}
+	enforcer := New(applier, []string{"github.com"}, false)
+	event := dnsEvent("github.com", "203.0.113.7")
+	event.Net.Response = false
+	added, err := enforcer.OnDNS(context.Background(), event)
+	if err != nil {
+		t.Fatalf("OnDNS: %v", err)
+	}
+	if len(added) != 0 || len(applier.elements) != 0 {
+		t.Fatalf("query-shaped packet populated allow set: %v / %v", added, applier.elements)
 	}
 }
 

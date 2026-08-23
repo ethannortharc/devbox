@@ -102,6 +102,101 @@ async fn body_string(res: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+#[test]
+fn the_light_theme_keeps_the_green_product_identity_readable() {
+    let css = include_str!("../src/web/assets/css/app.css");
+    let start = css
+        .find("@media (prefers-color-scheme: light)")
+        .expect("light theme exists");
+    let rest = &css[start..];
+    let end = rest
+        .find("\n}\n\n*")
+        .expect("light theme closes before the universal selector");
+    let light = &rest[..end];
+
+    assert!(
+        light.contains("--bg: #f5f8f3;") && light.contains("--bg-soft: #dfeadd;"),
+        "the light theme must use its warm green surfaces"
+    );
+    assert!(
+        light.contains("--accent: #2f7f4d;")
+            && light.contains("--accent-hover: #286d43;")
+            && light.contains("--accent-ink: #ffffff;"),
+        "the light theme needs a readable green primary-control palette"
+    );
+}
+
+#[test]
+fn terminal_and_favicon_use_the_same_green_identity() {
+    let terminal = include_str!("../src/web/assets/js/term.js");
+    let favicon = include_str!("../src/web/assets/favicon.svg");
+
+    assert!(terminal.contains(r##"cursor: "#a7ed69""##));
+    assert!(terminal.contains(r##"cursor: "#2f7f4d""##));
+    assert!(favicon.contains(r##"stroke="#a7ed69""##));
+    for old_blue in ["#0969da", "#4493f8"] {
+        assert!(!terminal.contains(old_blue), "terminal retained {old_blue}");
+        assert!(!favicon.contains(old_blue), "favicon retained {old_blue}");
+    }
+}
+
+#[test]
+fn current_launch_origin_is_shared_across_independent_tabs() {
+    let key_store = include_str!("../src/web/assets/js/key.js");
+
+    assert!(
+        key_store.contains("window.localStorage.getItem(NAME)")
+            && key_store.contains("window.localStorage.setItem(NAME, value)")
+            && key_store.contains("window.localStorage.removeItem(NAME)"),
+        "independently opened tabs on the random launch origin must share the key"
+    );
+    assert!(
+        !key_store.contains("window.sessionStorage.setItem")
+            && !key_store.contains("document.cookie"),
+        "the shared key must not fall back to a cookie or per-tab storage"
+    );
+}
+
+#[test]
+fn an_unconnected_browser_profile_gets_actionable_guidance() {
+    let shell = include_str!("../src/web/assets/js/shell.js");
+    assert!(shell.contains("This browser profile is not authorized"));
+    assert!(shell.contains("Each browser profile must open the launch URL once"));
+    assert!(shell.contains("after that, every tab in it can use the bound loopback address"));
+}
+
+#[tokio::test]
+async fn every_authenticated_page_offers_the_multi_tab_launcher() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    for uri in ["/", "/help", "/boxes/alpha"] {
+        let page = body_string(app.clone().oneshot(get_authed(uri)).await.unwrap()).await;
+        assert!(
+            page.contains(r#"id="open-console-tab""#),
+            "{uri} is missing the New tab control"
+        );
+        assert!(
+            page.contains(r#"id="open-console-tab" href="" target="_blank""#)
+                && page.contains(r#"rel="noopener""#),
+            "{uri} does not expose a native, opener-free new-tab link"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_controls_render_as_one_named_control_rail() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let page = body_string(app.oneshot(get_authed("/boxes/alpha")).await.unwrap()).await;
+
+    assert!(page.contains(r#"class="actions box-actions" role="group""#));
+    assert!(page.contains(r#"aria-label="Actions for alpha""#));
+
+    let css = include_str!("../src/web/assets/css/app.css");
+    assert!(css.contains("grid-template-columns: repeat(4, minmax(0, 1fr));"));
+    assert!(css.contains(".box-actions .btn-danger"));
+    assert!(css.contains("grid-template-columns: repeat(2, minmax(0, 1fr));"));
+}
+
 // ── auth ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -159,6 +254,106 @@ async fn launch_token_is_exchanged_for_the_console_key() {
         !body.contains(TOKEN),
         "the bootstrap page must not echo the token: {body}"
     );
+}
+
+fn console_on_random_browser_origin() -> (tempfile::TempDir, Router) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let manager = Arc::new(SandboxManager {
+        state_dir: dir.path().to_path_buf(),
+    });
+    let app = routes::router(AppState::new_with_browser_origin(
+        manager,
+        TOKEN,
+        KEY,
+        "devbox-0123456789abcdef0123456789abcdef.localhost",
+        7878,
+    ));
+    (dir, app)
+}
+
+#[tokio::test]
+async fn independently_opened_loopback_tabs_enter_the_current_launch_origin() {
+    let (_dir, app) = console_on_random_browser_origin();
+
+    let res = app
+        .clone()
+        .oneshot(get("/boxes/alpha?tab=terminal"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "http://devbox-0123456789abcdef0123456789abcdef.localhost:7878/boxes/alpha?tab=terminal"
+    );
+    assert_eq!(
+        res.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+
+    // Even an explicitly typed token URL first moves off the predictable
+    // origin; the key must never be installed on 127.0.0.1:7878.
+    let res = app
+        .clone()
+        .oneshot(get(&format!("/?t={TOKEN}")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("http://devbox-0123456789abcdef0123456789abcdef.localhost:7878/?t={TOKEN}")
+    );
+
+    let launch = Request::builder()
+        .uri(format!("/?t={TOKEN}"))
+        .header(
+            header::HOST,
+            "devbox-0123456789abcdef0123456789abcdef.localhost:7878",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(launch).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        body_string(res)
+            .await
+            .contains(&format!(r#"content="{KEY}""#))
+    );
+}
+
+#[tokio::test]
+async fn another_random_localhost_name_cannot_rebind_the_console() {
+    let (_dir, app) = console_on_random_browser_origin();
+    let req = Request::builder()
+        .uri("/")
+        .header(
+            header::HOST,
+            "devbox-ffffffffffffffffffffffffffffffff.localhost:7878",
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn foreign_navigation_is_not_redirected_toward_an_authorized_launch_origin() {
+    let (_dir, app) = console_on_random_browser_origin();
+    let req = Request::builder()
+        .uri("/boxes/alpha?tab=terminal")
+        .header(header::HOST, "127.0.0.1:7878")
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(res.headers().get(header::LOCATION).is_none());
 }
 
 #[tokio::test]
@@ -411,6 +606,92 @@ async fn api_requires_a_token_too() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn create_lab_and_pcap_routes_validate_real_http_requests() {
+    let (dir, app) = console_with_boxes(&["alpha"]);
+
+    let create_page = app.clone().oneshot(get_authed("/boxes/new")).await.unwrap();
+    assert_eq!(create_page.status(), StatusCode::OK);
+    let create_body = body_string(create_page).await;
+    assert!(create_body.contains("/api/boxes"));
+    assert!(create_body.contains("Docker — bare Ubuntu / writable only"));
+    assert!(create_body.contains("id=\"docker-contract\""));
+    assert!(create_body.contains("image.value = \"ubuntu\""));
+    assert!(create_body.contains("mount.value = \"writable\""));
+    assert!(create_body.contains("bare.checked = true"));
+    assert!(
+        !create_body.contains("value=\"multipass\""),
+        "the create UI must not offer a runtime that cannot satisfy its contract"
+    );
+
+    let missing_project = app
+        .clone()
+        .oneshot(post_form("/api/boxes", "name=beta&runtime=docker"))
+        .await
+        .unwrap();
+    assert_eq!(missing_project.status(), StatusCode::BAD_REQUEST);
+
+    let duplicate_form = form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "project_dir",
+            &dir.path().join("projects/alpha").display().to_string(),
+        )
+        .append_pair("name", "alpha")
+        .append_pair("runtime", "docker")
+        .append_pair("image", "ubuntu")
+        .append_pair("mount_mode", "writable")
+        .append_pair("bare", "on")
+        .finish();
+    let duplicate = app
+        .clone()
+        .oneshot(post_form("/api/boxes", &duplicate_form))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    for uri in ["/labs", "/labs/ztp-fabric", "/api/labs/ztp-fabric/view"] {
+        let response = app.clone().oneshot(get_authed(uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        if uri == "/labs/ztp-fabric" {
+            assert!(
+                body_string(response)
+                    .await
+                    .contains("data-build-status=\"lab-ztp-fabric\""),
+                "lab operation status must be protected from a stale replay GET"
+            );
+        }
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(post_form("/api/labs/no-such-lab/up", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(post_form("/api/labs/ztp-fabric/fault", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let invalid_capture = app
+        .oneshot(post_authed(
+            "/api/boxes/alpha/flows/pcap?proto=tcp&daddr=203.0.113.1&dport=443&duration=0",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_capture.status(), StatusCode::CONFLICT);
+    assert!(
+        body_string(invalid_capture)
+            .await
+            .contains("capture duration")
+    );
+}
+
 // ── box detail ───────────────────────────────────────────
 
 #[tokio::test]
@@ -476,7 +757,12 @@ async fn lifecycle_actions_report_a_conflict_when_the_runtime_is_missing() {
             StatusCode::CONFLICT,
             "{action} should report a conflict"
         );
-        assert!(body_string(res).await.contains("alpha"));
+        let body = body_string(res).await;
+        assert!(body.contains("alpha"));
+        assert!(body.contains("/api/boxes/alpha/start"));
+        assert!(body.contains("/api/boxes/alpha/destroy?force=true"));
+        assert!(body.contains("uncommitted and stashed overlay changes"));
+        assert!(body.contains("role=\"alert\""));
     }
 }
 
@@ -491,6 +777,20 @@ async fn lifecycle_actions_require_a_token() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn terminal_start_returns_an_actionable_card_the_page_can_reconcile() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let res = app
+        .oneshot(post_authed("/api/boxes/alpha/start?terminal=true"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body = body_string(res).await;
+    assert!(body.contains("Could not start"));
+    assert!(body.contains("role=\"alert\""));
+    assert!(body.contains("/api/boxes/alpha/destroy?force=true"));
 }
 
 // ── sets ─────────────────────────────────────────────────
@@ -510,6 +810,10 @@ async fn sets_tab_renders_the_checklist() {
     assert!(html.contains("value=\"git\""));
     assert!(html.contains("value=\"lang-rust\""));
     assert!(html.contains("Apply &amp; rebuild"));
+    assert!(
+        html.contains("id=\"build-panel\" role=\"status\" aria-live=\"polite\""),
+        "rebuild completion and safety warnings must be announced"
+    );
 }
 
 #[tokio::test]
@@ -527,6 +831,7 @@ async fn applying_a_selection_is_accepted_and_returns_a_live_log_panel() {
     assert_eq!(res.status(), StatusCode::ACCEPTED);
     let html = body_string(res).await;
     assert!(html.contains("sse-swap=\"build-alpha\""));
+    assert!(html.contains("/api/operations/alpha/status"));
     assert!(html.contains("2 set(s), 1 extra package(s)"), "got: {html}");
 }
 
@@ -677,7 +982,7 @@ async fn policy_editing_requires_a_token() {
 // ── activity, behaviour, metrics ─────────────────────────
 
 #[tokio::test]
-async fn activity_tab_renders_before_any_capture() {
+async fn activity_tab_says_why_it_is_empty_rather_than_only_that_it_is() {
     let (_dir, app) = console_with_boxes(&["alpha"]);
     let res = app
         .oneshot(get_authed("/boxes/alpha?tab=activity"))
@@ -685,9 +990,129 @@ async fn activity_tab_renders_before_any_capture() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
+    // No collector daemon owns this temporary state directory's lock, and that
+    // outranks every other reading: nothing is being recorded for any box, so
+    // "no data" is a fact about the host and not about this box.
     let html = body_string(res).await;
-    assert!(html.contains("No observability data yet"));
-    assert!(html.contains("devbox-obsd"));
+    assert!(html.contains("capture-down"), "{html}");
+    assert!(html.contains("Collector is not running"));
+    assert!(html.contains("devbox doctor"));
+}
+
+#[tokio::test]
+async fn the_ztp_fragment_refuses_a_lab_name_that_is_a_file_path() {
+    // `scenarios::resolve` falls back to *reading a file* for a name it does
+    // not recognise, which the CLI wants (`devbox lab up ./my-topology.toml`)
+    // and a request must never get: a name pointing at a character device is a
+    // read that never returns.
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+
+    // Percent-encoded, because an unencoded slash is a different route and
+    // never reaches this handler at all — testing that would prove nothing.
+    for name in ["%2Fdev%2Fzero", "..%2F..%2Fetc%2Fpasswd", "not-a-scenario"] {
+        let res = app
+            .clone()
+            .oneshot(get_authed(&format!("/api/labs/{name}/ztp")))
+            .await
+            .unwrap();
+        // Nothing to render, and nothing read: the panel is simply absent.
+        assert_eq!(res.status(), StatusCode::OK, "{name}");
+        assert!(body_string(res).await.trim().is_empty(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn the_ztp_fragment_renders_for_a_built_in_scenario_with_no_substrate() {
+    let (_dir, app) = console_with_boxes(&["alpha"]);
+    let html = body_string(
+        app.oneshot(get_authed("/api/labs/ztp-fabric/ztp"))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    // One registered box, so "auto" resolves to it — and with no lab running
+    // on it the panel invites rather than reporting a failure.
+    assert!(html.contains("Zero-touch provisioning"), "{html}");
+    assert!(html.contains("Not running"));
+}
+
+#[tokio::test]
+async fn the_activity_fragments_refuse_a_box_that_is_not_registered() {
+    // Observability files live outside `sandboxes/<name>` on purpose, so a
+    // crash between removing a sandbox and removing its store leaves an
+    // orphan. These routes read a store by name and never look a box up, so
+    // without a registry check they would serve it while the box page 404s.
+    let (dir, app) = console_with_boxes(&["alpha"]);
+    let ghost = dir.path().join("boxes").join("ghost");
+    std::fs::create_dir_all(&ghost).expect("orphan directory");
+    devbox::obs::Store::open(&ghost.join("events.db")).expect("orphan store");
+
+    for path in [
+        "/api/boxes/ghost/activity",
+        "/api/boxes/ghost/activity/live",
+        "/api/boxes/ghost/activity/tail",
+        // The export is the one that would hand over the whole record.
+        "/api/boxes/ghost/behavior",
+        "/api/boxes/ghost/behavior?format=jsonl",
+    ] {
+        let res = app.clone().oneshot(get_authed(path)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_box_whose_agent_never_started_names_the_fix_on_the_page() {
+    use devbox::obs::health::{self, CaptureHealth, CaptureState};
+
+    let (dir, app) = console_with_boxes(&["alpha"]);
+    // What the supervisor writes for a box provisioned before v4: the agent
+    // binary is not in the guest, so the exec closes before the handshake.
+    health::publish(
+        dir.path(),
+        &CaptureHealth::new("alpha", CaptureState::Failed)
+            .with_transport("exec")
+            .with_detail(
+                "agent closed the connection before saying hello — the agent said: \
+                 sh: /usr/local/bin/devbox-obsd: not found",
+            )
+            .with_attempts(9),
+    )
+    .expect("publish capture health");
+
+    // A held lock plus a published identity is exactly what a running collector
+    // daemon looks like from the outside, and the daemon check outranks the
+    // record — without this the page would (correctly) report the host problem
+    // instead of this box's.
+    let locks = dir.path().join("locks");
+    std::fs::create_dir_all(&locks).expect("locks dir");
+    std::fs::write(
+        locks.join("collector-daemon.owner"),
+        format!("pid={} version=0.1.3\n", std::process::id()),
+    )
+    .expect("owner record");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(locks.join("collector-daemon.lock"))
+        .expect("daemon lock");
+    held.lock().expect("hold the daemon lock");
+
+    let html = body_string(
+        app.oneshot(get_authed("/boxes/alpha?tab=activity"))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert!(html.contains("The agent could not start"), "{html}");
+    // The guest's own words, which used to live only in collector.log…
+    assert!(html.contains("devbox-obsd: not found"));
+    // …and what they imply.
+    assert!(html.contains("devbox reprovision"));
+    assert!(html.contains("capture-down"));
+
+    std::fs::File::unlock(&held).expect("release the daemon lock");
 }
 
 #[tokio::test]
@@ -765,6 +1190,17 @@ async fn help_topic_404s_for_an_unknown_sheet() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn an_unknown_help_topic_is_escaped_before_the_shell_writes_it() {
+    let (_dir, app) = console_with_boxes(&[]);
+    let res = app
+        .oneshot(get_authed(&format!("/help/{}", urlencode(HOSTILE))))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_not_executable("the unknown help topic", &body_string(res).await);
+}
+
 // ── sse ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -779,16 +1215,24 @@ async fn stream_emits_a_heartbeat_tick() {
     );
 
     let mut body = res.into_body().into_data_stream();
-    let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), {
+    let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         use futures::StreamExt;
-        body.next()
+        let mut received = String::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.expect("chunk is readable");
+            received.push_str(&String::from_utf8_lossy(&chunk));
+            if received.contains("event: tick") {
+                return received;
+            }
+        }
+        panic!("stream ended before a heartbeat: {received}");
     })
     .await
-    .expect("a tick within 5s")
-    .expect("stream is not empty")
-    .expect("chunk is readable");
+    .expect("a tick within 5s");
 
-    let text = String::from_utf8_lossy(&chunk);
+    // A reconnect snapshot is deliberately sent before or alongside the
+    // heartbeat. The assertion must inspect the stream, not assume the first
+    // transport chunk contains a tick.
     assert!(text.contains("event: tick"), "got: {text}");
     assert!(text.contains("data: live · "), "got: {text}");
 }
@@ -1024,8 +1468,8 @@ async fn another_consoles_key_does_not_open_this_one() {
     // the leak — the browser still *sent* the cookie to every other loopback
     // service, which is the finding that removed cookies altogether.
     //
-    // `sessionStorage` is scoped to an origin, port included, so neither
-    // console can see the other's key and there is nothing left to evict. What remains
+    // Each live console uses its own random browser origin, so neither can see
+    // the other's stored key and there is nothing left to evict. What remains
     // worth asserting is the server half: this console answers to its own key
     // and to no other.
     let (_dir, app) = console_with_boxes(&["alpha"]);

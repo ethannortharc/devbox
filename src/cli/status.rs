@@ -22,10 +22,13 @@ pub async fn run(args: StatusArgs, manager: &SandboxManager) -> Result<()> {
     let status = runtime.status(&name).await?;
 
     let status_str = match &status {
-        SandboxStatus::Running => "\x1b[32mRunning\x1b[0m",
-        SandboxStatus::Stopped => "\x1b[33mStopped\x1b[0m",
-        SandboxStatus::NotFound => "\x1b[31mNot Found\x1b[0m",
-        SandboxStatus::Unknown(s) => s.as_str(),
+        SandboxStatus::Running => "\x1b[32mRunning\x1b[0m".to_string(),
+        SandboxStatus::Unreachable(reason) => {
+            format!("\x1b[31mUnreachable\x1b[0m ({reason})")
+        }
+        SandboxStatus::Stopped => "\x1b[33mStopped\x1b[0m".to_string(),
+        SandboxStatus::NotFound => "\x1b[31mNot Found\x1b[0m".to_string(),
+        SandboxStatus::Unknown(s) => s.clone(),
     };
 
     println!("Sandbox:     {}", name);

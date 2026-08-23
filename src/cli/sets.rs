@@ -243,10 +243,9 @@ async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
     // selection, which the user can see and re-apply. The other order leaves
     // devbox reporting the new selection while the project file describes the
     // old one, and a later recreate silently reverts the box.
-    config
-        .save(&state.project_dir.join("devbox.toml"))
-        .context("rebuilt the box, but could not record the selection in devbox.toml")?;
-    state.save(&manager.state_dir)?;
+    manager
+        .save_config_and_state(&config, &state)
+        .context("rebuilt the box, but could not atomically record the new selection")?;
 
     // Same as the console path: the rebuild can take the firewall with it.
 

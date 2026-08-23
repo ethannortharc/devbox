@@ -1,7 +1,89 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+static NEXT_ATOMIC_WRITE: AtomicU64 = AtomicU64::new(0);
+
+/// Replace a small state/config file without exposing a truncated destination.
+///
+/// Lifecycle claims serialize writes to any one sandbox or project. The
+/// process-local counter only makes temporary names distinct when tests or
+/// independent projects write concurrently in the same process.
+///
+/// The name also carries randomness, because `create_new` fails on a name that
+/// already exists and a pid plus a counter that both restart at zero is not
+/// unique across a crash: a leftover `.state.json.<pid>.0.pending` from a
+/// process whose pid was later reused made the next first write to that file
+/// fail, permanently, with nothing to say why.
+pub(crate) fn write_atomically(path: &Path, content: &[u8], description: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{description} has no parent directory: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let nonce = NEXT_ATOMIC_WRITE.fetch_add(1, Ordering::Relaxed);
+    let pending = parent.join(format!(
+        ".{file_name}.{}.{}.{:016x}.pending",
+        std::process::id(),
+        nonce,
+        rand::random::<u64>()
+    ));
+
+    // Preserve the target's exact mode. A devbox.toml may contain `[env]`
+    // secrets, and replacing a 0600 file with an umask-created 0644 pending
+    // file silently discloses them. New state/config files start private.
+    let mode = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o7777,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o600,
+        Err(error) => {
+            return Err(error).with_context(|| format!("read permissions for {}", path.display()));
+        }
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        // Secure even before the explicit mode restore below; umask can only
+        // remove bits from this value, never make the pending file public.
+        .mode(0o600)
+        .open(&pending)
+        .with_context(|| format!("create pending {description}: {}", pending.display()))?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(content)?;
+        file.sync_all()?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = std::fs::remove_file(&pending);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to write pending {description}: {}",
+                pending.display()
+            )
+        });
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&pending, path) {
+        let _ = std::fs::remove_file(&pending);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to atomically replace {description}: {}",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
 
 /// Persistent state for a sandbox instance, stored in ~/.devbox/sandboxes/<name>/state.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +157,16 @@ fn default_image() -> String {
 impl SandboxState {
     /// Load state from a sandbox directory.
     pub fn load(state_dir: &Path, name: &str) -> Result<Self> {
+        // The same rule `save` and `remove` apply, applied on the way out.
+        //
+        // Guarding only the writers left the reader joining whatever it was
+        // handed: `save` refuses a name that is a path component, but `load`
+        // would happily follow one — and web routes take a box name straight
+        // from a URL, which axum has already percent-decoded. A name that
+        // could never have been written is not a name worth reading.
+        if !is_safe_name(name) {
+            bail!("refusing to read sandbox state for {name:?}: not a box name");
+        }
         let path = state_dir.join("sandboxes").join(name).join("state.json");
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read sandbox state: {}", path.display()))?;
@@ -112,8 +204,7 @@ impl SandboxState {
         stamped.schema = SCHEMA;
         let content =
             serde_json::to_string_pretty(&stamped).context("Failed to serialize sandbox state")?;
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write sandbox state: {}", path.display()))?;
+        write_atomically(&path, content.as_bytes(), "sandbox state")?;
         Ok(())
     }
 
@@ -238,6 +329,27 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writes_preserve_existing_permissions_and_make_new_files_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.toml");
+        std::fs::write(&existing, b"secret").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomically(&existing, b"replacement", "test config").unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        let new_file = dir.path().join("new-state.json");
+        write_atomically(&new_file, b"{}", "test state").unwrap();
+        assert_eq!(
+            std::fs::metadata(new_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
     fn list_all_states() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -312,15 +424,26 @@ mod writer_audit {
                 // rather than hidden because the failure mode of this guard is
                 // silence, and silence here reads as "every writer is fine".
                 if !(line.contains(".save(&manager.state_dir")
-                    || line.contains(".save(&self.state_dir"))
+                    || line.contains(".save(&self.state_dir")
+                    || line.contains(".save_config_and_state("))
                 {
                     continue;
                 }
                 if line.trim_start().starts_with("config.save(") {
                     continue;
                 }
+                // The transaction helper is the implementation behind the
+                // audited `save_config_and_state` call sites below. Audit its
+                // callers (where the selection fields are prepared), not its
+                // unavoidable internal call on an already-prepared state.
+                let function_window = lines[n.saturating_sub(30)..=n].join("\n");
+                if line.contains("state.save(&self.state_dir")
+                    && function_window.contains("fn save_config_and_state")
+                {
+                    continue;
+                }
                 // Look back over the enclosing work for a write to `packages`.
-                let from = n.saturating_sub(60);
+                let from = n.saturating_sub(120);
                 let window = lines[from..=n].join("\n");
                 if !window.contains(".packages = ") && !window.contains("packages:") {
                     offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));

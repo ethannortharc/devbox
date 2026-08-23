@@ -63,7 +63,7 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "devbox-ztpd: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "devbox-ztpd: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -94,12 +94,12 @@ func run(args []string, out io.Writer) error {
 	// happened. A 2s ticker lost whatever landed in the last tick — which is
 	// exactly the window the chaos test aims at.
 	registry.Persisting(statePath, func(err error) {
-		fmt.Fprintf(os.Stderr, "devbox-ztpd: could not persist state: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "devbox-ztpd: could not persist state: %v\n", err)
 	})
 	server := api.New(registry, catalog, cfg.bootURL())
-	fmt.Fprintf(out, "%s listening on %s (%d device(s) known)\n",
+	_, _ = fmt.Fprintf(out, "%s listening on %s (%d device(s) known)\n",
 		buildinfo.String(buildinfo.Ztpd), cfg.listen, len(catalog.Serials))
-	fmt.Fprintf(out, "  DHCP option 67 should point at %s/bootstrap.sh\n", cfg.bootURL())
+	_, _ = fmt.Fprintf(out, "  DHCP option 67 should point at %s/bootstrap.sh\n", cfg.bootURL())
 
 	// Metrics get their own listener, as the flag advertises. A node fetching
 	// its config should not be able to reach the metrics surface by accident,
@@ -135,10 +135,10 @@ func run(args []string, out io.Writer) error {
 	}
 	go func() {
 		if err := metricsSrv.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "devbox-ztpd: metrics listener: %v\n", err)
+			_, _ = fmt.Fprintf(os.Stderr, "devbox-ztpd: metrics listener: %v\n", err)
 		}
 	}()
-	fmt.Fprintf(out, "  metrics on %s\n", cfg.metrics)
+	_, _ = fmt.Fprintf(out, "  metrics on %s\n", cfg.metrics)
 
 	// The node-facing listener serves provisioning only. `Handler()` includes
 	// GET /metrics, so registering it here also published node names and

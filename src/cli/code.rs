@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use clap::Args;
 
-use crate::runtime::SandboxStatus;
 use crate::runtime::cmd::run_cmd;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay;
@@ -22,25 +21,7 @@ pub struct CodeArgs {
 
 pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.name.as_deref())?;
-    let state = manager.get_sandbox(&name)?;
-    let runtime = manager.runtime_for_sandbox(&state)?;
-
-    // Ensure sandbox is running
-    let status = runtime.status(&name).await?;
-    match status {
-        SandboxStatus::Running => {}
-        SandboxStatus::Stopped => {
-            println!("Starting sandbox '{name}'...");
-            runtime.start(&name).await?;
-        }
-        SandboxStatus::NotFound => bail!("Sandbox '{name}' not found."),
-        SandboxStatus::Unknown(s) => bail!("Sandbox '{name}' is in unknown state: {s}"),
-    }
-
-    // Whether or not this call started it. A box already running may have been
-    // started outside devbox — after a host reboot, Lima and Incus bring their
-    // instances back on their own — and it then has no firewall at all.
-    crate::policy::enforce::apply_saved_or_step_aside(manager, &name).await?;
+    let (state, runtime, claim) = manager.prepare_running_for_use(&name).await?;
 
     // Refresh overlay before opening editor to avoid stale file handles
     if state.mount_mode != "writable" {
@@ -49,6 +30,10 @@ pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
             eprintln!("Warning: overlay refresh failed: {e}");
         }
     }
+
+    // Mounts and posture are now coherent. Do not make the editor process own
+    // the lifecycle claim after it launches.
+    drop(claim);
 
     let vm_name = format!("devbox-{name}");
     let ssh_host = format!("devbox-{name}");

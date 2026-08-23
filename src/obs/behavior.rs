@@ -122,8 +122,12 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
                     summary.domains.insert(peer);
                 }
                 if let Some(net) = &event.net {
-                    summary.bytes_tx += net.bytes_tx;
-                    summary.bytes_rx += net.bytes_rx;
+                    // Saturating: an agent supplies these and nothing
+                    // validates them, so two events claiming most of a `u64`
+                    // between them would panic a checked build and wrap a
+                    // release one — on every render of the Activity tab.
+                    summary.bytes_tx = summary.bytes_tx.saturating_add(net.bytes_tx);
+                    summary.bytes_rx = summary.bytes_rx.saturating_add(net.bytes_rx);
                 }
             }
             EventType::File => {
@@ -152,7 +156,7 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
                 {
                     let entry = api.entry(call.host.clone()).or_insert((0, 0));
                     entry.0 += 1;
-                    entry.1 += call.tokens;
+                    entry.1 = entry.1.saturating_add(call.tokens);
                 }
             }
             EventType::Exit | EventType::Syscall => {}
@@ -221,6 +225,15 @@ impl Diff {
 }
 
 /// Compare two summaries.
+/// `after - before` as a signed number, clamped rather than wrapped.
+fn signed_delta(before: u64, after: u64) -> i64 {
+    if after >= before {
+        i64::try_from(after - before).unwrap_or(i64::MAX)
+    } else {
+        i64::try_from(before - after).map_or(i64::MIN, |d| -d)
+    }
+}
+
 pub fn diff(before: &Summary, after: &Summary) -> Diff {
     Diff {
         new_domains: difference(&after.domains, &before.domains),
@@ -228,8 +241,12 @@ pub fn diff(before: &Summary, after: &Summary) -> Diff {
         new_processes: difference(&after.processes, &before.processes),
         gone_processes: difference(&before.processes, &after.processes),
         new_files: difference(&after.files_written, &before.files_written),
-        bytes_tx_delta: after.bytes_tx as i64 - before.bytes_tx as i64,
-        bytes_rx_delta: after.bytes_rx as i64 - before.bytes_rx as i64,
+        // Signed subtraction on values an agent supplied, so neither the
+        // cast nor the difference may be taken on trust: `u64::MAX as i64` is
+        // -1, which reported a vast transfer as a byte less than nothing, and
+        // two large totals overflowed the subtraction outright.
+        bytes_tx_delta: signed_delta(before.bytes_tx, after.bytes_tx),
+        bytes_rx_delta: signed_delta(before.bytes_rx, after.bytes_rx),
         // Compared by identity, not by count. One violation against A
         // followed by one against B is the same length, and subtracting gave
         // zero — so a run that started hitting a different blocked target
@@ -313,10 +330,17 @@ pub fn render_markdown(summary: &Summary) -> String {
         crate::cli::watch::human_bytes(summary.bytes_rx)
     );
 
+    // Not "open". The posture is only known from a policy event, and a window
+    // holding none says nothing about it — an isolated box that simply refused
+    // nothing in the last hour was being written into an audit summary as
+    // wide open, which is the opposite of the truth.
     let _ = writeln!(
         out,
         "- **Egress policy:** {} — {} violation(s)",
-        summary.egress_mode.as_deref().unwrap_or("open"),
+        summary
+            .egress_mode
+            .as_deref()
+            .unwrap_or("not recorded in this window"),
         summary.violations.len()
     );
 
@@ -415,6 +439,17 @@ pub fn render_jsonl(events: &[Event]) -> Result<String, serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_window_with_no_policy_event_does_not_claim_a_posture() {
+        // An audit summary that reports a posture it never observed is worse
+        // than one that admits it did not see it — and `open` is the most
+        // reassuring of the four, which is exactly the wrong default.
+        let summary = Summary::default();
+        let rendered = render_markdown(&summary);
+        assert!(!rendered.contains("Egress policy:** open"), "{rendered}");
+        assert!(rendered.contains("not recorded"));
+    }
+
     use super::*;
     use crate::obs::event::{Api, Exec, File, Net, Policy};
 
@@ -534,6 +569,7 @@ mod tests {
 
         let s = summarize("myapp", &events);
         assert_eq!(s.egress_mode.as_deref(), Some("allowlist"));
+        assert!(render_markdown(&s).contains("allowlist"));
         assert_eq!(
             s.violations.len(),
             1,

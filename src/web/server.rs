@@ -70,19 +70,16 @@ pub async fn bind_loopback(start: u16, scan: u16) -> Result<(TcpListener, Socket
 /// The URL to hand the user, carrying the one-time token.
 ///
 /// `landing` is a path such as `/` or `/boxes/myapp`; the token rides as a
-/// query parameter and is exchanged for a cookie on the first request.
-pub fn console_url(addr: &SocketAddr, token: &str, landing: &str) -> String {
+/// query parameter and is exchanged for an origin-scoped browser key on the
+/// first request.
+pub fn console_url(host: &str, port: u16, token: &str, landing: &str) -> String {
     let path = if landing.starts_with('/') {
         landing
     } else {
         "/"
     };
     let sep = if path.contains('?') { '&' } else { '?' };
-    format!(
-        "http://{}:{}{path}{sep}t={token}",
-        Ipv4Addr::LOCALHOST,
-        addr.port()
-    )
+    format!("http://{host}:{port}{path}{sep}t={token}",)
 }
 
 /// Ask the desktop to open a URL. Best-effort: a headless host simply prints
@@ -104,19 +101,31 @@ pub fn open_browser(url: &str) -> Result<()> {
 
 /// Start the console and serve until interrupted.
 pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()> {
+    crate::obs::daemon::ensure_running(&manager);
     let token = super::auth::generate_token();
     // Two independent secrets, not one derived from the other: recovering the
     // token must not recover the key, or the separation is decoration. See the
     // module docs on `auth`.
     let key = super::auth::generate_token();
-    let state = AppState::new(manager, token.clone(), key);
+    let browser_host = super::auth::generate_browser_host();
+    let (listener, addr) = bind_loopback(opts.port, PORT_SCAN).await?;
+    let state = AppState::new_with_browser_origin(
+        manager,
+        token.clone(),
+        key,
+        browser_host.clone(),
+        addr.port(),
+    );
     let app = routes::router(state.clone());
 
     // Keeps open dashboards current; idles while no console is connected.
     tokio::spawn(super::watch::run(state.clone()));
+    // Separate loop, separate cadence: box status comes from runtime CLIs
+    // every few seconds, activity comes from a local database twice a second,
+    // and sharing one interval would make each of them wrong for the other.
+    tokio::spawn(super::tail::run(state.clone()));
 
-    let (listener, addr) = bind_loopback(opts.port, PORT_SCAN).await?;
-    let url = console_url(&addr, &token, &opts.landing);
+    let url = console_url(&browser_host, addr.port(), &token, &opts.landing);
 
     println!("devbox console  →  {url}");
     println!("  bound to loopback only; press Ctrl-C to stop");
@@ -135,7 +144,7 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
     // handler could spawn after the idle check had passed. Axum then drains
     // the request and not the task it started. The signal resolves at once
     // now, and the waiting happens below, where nothing can create more.
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown({
             let state = state.clone();
             async move {
@@ -144,8 +153,13 @@ pub async fn serve(manager: Arc<SandboxManager>, opts: WebOptions) -> Result<()>
                 state.begin_shutdown();
             }
         })
-        .await
-        .context("console server failed")?;
+        .await;
+
+    // Also covers a listener failure rather than only Ctrl-C. Live browser
+    // streams end here; the per-user collector deliberately does not — guest
+    // capture must survive closing the console.
+    state.begin_shutdown();
+    served.context("console server failed")?;
 
     drain_rebuilds(&state).await;
 
@@ -219,33 +233,35 @@ mod tests {
 
     #[test]
     fn console_url_includes_loopback_port_and_token() {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
         assert_eq!(
-            console_url(&addr, "tok", "/"),
-            "http://127.0.0.1:7878/?t=tok"
+            console_url("devbox-abc.localhost", 7878, "tok", "/"),
+            "http://devbox-abc.localhost:7878/?t=tok"
         );
     }
 
     #[test]
     fn console_url_lands_on_a_specific_box() {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
         assert_eq!(
-            console_url(&addr, "tok", "/boxes/myapp"),
-            "http://127.0.0.1:7878/boxes/myapp?t=tok"
+            console_url("devbox-abc.localhost", 7878, "tok", "/boxes/myapp"),
+            "http://devbox-abc.localhost:7878/boxes/myapp?t=tok"
         );
         assert_eq!(
-            console_url(&addr, "tok", "/boxes/myapp?tab=terminal"),
-            "http://127.0.0.1:7878/boxes/myapp?tab=terminal&t=tok"
+            console_url(
+                "devbox-abc.localhost",
+                7878,
+                "tok",
+                "/boxes/myapp?tab=terminal"
+            ),
+            "http://devbox-abc.localhost:7878/boxes/myapp?tab=terminal&t=tok"
         );
     }
 
     #[test]
     fn a_landing_path_that_is_not_a_path_falls_back_to_the_dashboard() {
         // Guards against a box name ever being spliced in as a full URL.
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7878));
         assert_eq!(
-            console_url(&addr, "tok", "https://evil.example/"),
-            "http://127.0.0.1:7878/?t=tok"
+            console_url("devbox-abc.localhost", 7878, "tok", "https://evil.example/"),
+            "http://devbox-abc.localhost:7878/?t=tok"
         );
     }
 

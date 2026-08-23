@@ -1,0 +1,9 @@
+<p class="muted">Creating {{ summary }}…</p>
+<div class="buildlog"
+     sse-swap="build-{{ name }}"
+     hx-swap="beforeend scroll:bottom"></div>
+<p class="muted create-status"
+   data-build-status="{{ name }}"
+   hx-get="/api/operations/{{ name|urlencode_strict }}/status"
+   hx-trigger="load"
+   sse-swap="build-status-{{ name }}">{{ retained|safe }}</p>
