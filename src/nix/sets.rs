@@ -446,16 +446,17 @@ mod tests {
             .map(str::to_string)
     }
 
-    /// The `${…}` interpolations in a Nix expression, by token.
+    /// The `${…}` interpolations in a Nix expression, raw.
+    ///
+    /// Raw, so the caller sees every one. An earlier version filtered to
+    /// well-shaped tokens here, which silently dropped anything else — and
+    /// `${builtins.getAttr "htop" pkgs}` is exactly the kind of "anything
+    /// else" that installs an uncatalogued package. Classification is the
+    /// caller's job; this only finds them.
     fn interpolations(text: &str) -> impl Iterator<Item = String> + '_ {
-        text.split("${").skip(1).filter_map(|rest| {
-            let token = rest.split('}').next()?.trim();
-            let shaped = !token.is_empty()
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
-            shaped.then(|| token.to_string())
-        })
+        text.split("${")
+            .skip(1)
+            .filter_map(|rest| Some(rest.split('}').next()?.trim().to_string()))
     }
 
     /// Explicit `pkgs.<attr.path>` references (dynamic `pkgs.${…}` excluded).
@@ -641,8 +642,21 @@ mod tests {
                     ));
                     continue;
                 }
-                for dep in interpolations(group) {
-                    let dep = dep.strip_prefix("pkgs.").unwrap_or(&dep);
+                for raw in interpolations(group) {
+                    let shaped = !raw.is_empty()
+                        && raw
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+                    if !shaped {
+                        drift.push(format!(
+                            "{}.nix's helper interpolates `${{{raw}}}`, which this \
+                             test cannot map to a package: an expression there can \
+                             install anything, invisibly",
+                            set.name
+                        ));
+                        continue;
+                    }
+                    let dep = raw.strip_prefix("pkgs.").unwrap_or(&raw);
                     if !catalogued.contains(dep) {
                         drift.push(format!(
                             "{}.nix's helper interpolates '{dep}', which the \
@@ -722,8 +736,19 @@ mod tests {
         let mut imported = std::collections::BTreeMap::new();
         for line in default.lines() {
             let line = line.trim();
-            let Some((key, rest)) = line.split_once('=') else {
+            // Structure, exhaustively. Skipping "lines without `=`" let an
+            // `inherit (pkgs) htop;` through: the parsed map still equalled
+            // the catalog while the evaluated index carried an extra
+            // attribute.
+            if line.is_empty() || line == "{" || line == "}" || line == "{ pkgs }:" {
                 continue;
+            }
+            let Some((key, rest)) = line.split_once('=') else {
+                panic!(
+                    "nix/sets/default.nix contains `{line}`, which is neither \
+                     structure nor a canonical import binding — whatever it \
+                     evaluates to, this test cannot vouch for it"
+                );
             };
             let key = key.trim();
             let rest = rest.trim();

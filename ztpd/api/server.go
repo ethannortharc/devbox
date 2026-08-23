@@ -348,41 +348,54 @@ restart_frr() {
   _run="${DEVBOX_ZTP_RUN_DIR:-/run/devbox-ztp}"
   mkdir -p "$_run" "/run/frr/$DEVBOX_ZTP_NETNS" "/etc/frr/$DEVBOX_ZTP_NETNS"
   touch "/etc/frr/$DEVBOX_ZTP_NETNS/vtysh.conf"
-  # Snapshot the pids before touching anything. The wait below must poll the
-  # processes that were signalled, not re-read pidfiles a daemon may unlink on
-  # its way out while still holding the zserv socket -- that re-read declared
-  # the old zebra gone and recreated FRR mid-race, which is the exact failure
-  # the wait exists to prevent. Non-numeric pidfile content is skipped rather
-  # than signalled: kill takes the file's word for a process identity, and a
-  # stale file's number may belong to anything by now.
-  _pids=""
+  # Snapshot pid *and identity* before touching anything.
+  #
+  # A pidfile's number is only meaningful while the process it names is still
+  # the daemon that wrote it. Three ways the bare number lies, each fatal in
+  # its own direction: "0" passes a numeric check and "kill 0" signals this
+  # bootstrap's whole process group; a stale positive number can belong to an
+  # unrelated process, which root then terminates; and a pid reused *during*
+  # the wait turns a cleanly departed daemon into a "survivor" that gets
+  # SIGKILLed. So a pid is signalled only if it is > 1 and /proc says its comm
+  # is the daemon the file claims -- and the same check is what "still alive"
+  # means below, so a reused pid reads as gone, not as surviving.
+  #
+  # The wait polls this snapshot rather than re-reading pidfiles, because a
+  # daemon can unlink its pidfile on the way out while still holding
+  # zserv.api -- the re-read declared it gone and recreated FRR mid-race.
+  _same_daemon() {
+    [ "$(cat "/proc/${1%%:*}/comm" 2>/dev/null)" = "${1#*:}" ]
+  }
+  _victims=""
   for _daemon in bgpd zebra mgmtd; do
     _pidfile="$_run/$_daemon.pid"
-    if [ -s "$_pidfile" ]; then
-      _pid=$(cat "$_pidfile" 2>/dev/null)
-      case "$_pid" in
-        ''|*[!0-9]*) ;;
-        *) _pids="$_pids $_pid"; kill "$_pid" 2>/dev/null || true ;;
-      esac
-    fi
+    [ -s "$_pidfile" ] || continue
+    _pid=$(cat "$_pidfile" 2>/dev/null)
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$_pid" -gt 1 ] 2>/dev/null || continue
+    _same_daemon "$_pid:$_daemon" || continue
+    _victims="$_victims $_pid:$_daemon"
+    kill "$_pid" 2>/dev/null || true
   done
   _wait_gone() {
     _tries=$1
     while [ "$_tries" -gt 0 ]; do
       _left=""
-      for _pid in $_pids; do
-        if kill -0 "$_pid" 2>/dev/null; then _left="$_left $_pid"; fi
+      for _v in $_victims; do
+        if _same_daemon "$_v"; then _left="$_left $_v"; fi
       done
-      _pids="$_left"
-      [ -z "$_pids" ] && return 0
+      _victims="$_left"
+      [ -z "$_victims" ] && return 0
       _tries=$((_tries - 1))
       sleep 0.2 2>/dev/null || sleep 1
     done
     return 1
   }
   if ! _wait_gone 25; then
-    for _pid in $_pids; do
-      kill -9 "$_pid" 2>/dev/null || true
+    for _v in $_victims; do
+      if _same_daemon "$_v"; then
+        kill -9 "${_v%%:*}" 2>/dev/null || true
+      fi
     done
     # A daemon that survives SIGKILL is unkillable kernel state; starting a
     # replacement against its sockets can only produce the race this whole
