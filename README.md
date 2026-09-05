@@ -3,164 +3,38 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-**The sandbox that AI coding agents deserve.** Isolated developer VMs where Claude, Codex, and Aider can write, build, and test code freely — without ever touching your host machine, and without doing anything you cannot see.
+**The sandbox that shows you what your coding agent did.**
 
-```bash
-cd my-project
-devbox
+Devbox runs Claude, Codex, or any other agent inside an isolated Linux VM where
+your project is mounted read-only, and records the run: every file it wrote,
+every host it reached, every process it spawned, every credential it used.
+
+Then it hands you the receipt.
+
+```console
+$ devbox run --label "update the version file" -- sh -c 'curl -sS -o /dev/null https://api.github.com/repos/rust-lang/rust; curl -sS -o /dev/null https://pypi.org/simple/requests/; printf "0.2.0\n" > /workspace/VERSION; sleep 1'
+run 01M1S6K0XSDYN51E45Y3JS6NK7 · 1.9s · exit 0 · finished
+  files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
+  network  2 peers · 2 DNS · ↑3.7KB ↓98.3KB
+  process  24 in the tree
+  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1S6K0XSDYN51E45Y3JS6NK7/report.html
 ```
 
-That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and opens a local web console where you can watch and govern everything the box does.
+That is a real run on a real box, verbatim except for `$HOME`. The command is a
+stand-in for an agent because the box it ran in has no agent installed; with
+`claude` in the box, you would write `devbox run -- claude -p "…"` and read the
+same five lines.
 
-v4 keeps the proven sandbox core and replaces the terminal UI with a local web
-console, continuous eBPF/proc observability, live egress policy, and real
-packet capture. Start at [the v4 quickstart](docs/quickstart-v4.md).
-
----
-
-## How It Works
-
-```bash
-cd my-project
-devbox                          # 1. Create sandbox (auto-detects Go, Rust, Python, etc.)
-
-# ... AI agent writes code, installs packages, does whatever it wants ...
-
-devbox diff                     # 2. See exactly what changed
-devbox commit                   # 3. Accept the good changes
-devbox discard                  # 3. Or throw everything away
-```
-
-Your project directory is mounted **read-only** inside the VM. Every file write goes to an isolated overlay layer. Nothing reaches your real files until you explicitly run `devbox commit`. It's like a code review for your entire filesystem.
-
-v4 extends that to *behaviour*. Every process, connection, DNS lookup, and TLS
-handshake is captured and correlated, so `devbox behavior diff` answers "what
-did this run do that the last one didn't?" the same way `devbox diff` answers
-"what files changed?" — and `devbox policy` turns the answer into enforcement.
-
-> **Claude just `rm -rf`'d your src directory?**
-> With devbox: `devbox discard`. Done. Your files were never touched.
+The last line of that summary is the point of the whole product. `coverage`
+says how much of the run devbox actually saw — which capture backends attached,
+how many events were attributed to this run, and how many were dropped. A tool
+that reports on a sandbox and cannot report on its own blind spots is worse
+than no tool at all.
 
 ---
 
-## Why Devbox?
-
-| Without Devbox | With Devbox |
-|----------------|-------------|
-| AI agent deletes your files | `devbox discard` — instant recovery |
-| Agent installs conflicting deps | Each sandbox is isolated with its own packages |
-| Dev tools pollute your host OS | Everything lives in disposable VMs — zero residue |
-| "It works on my machine" | Reproducible NixOS VMs with declarative config |
-| Reviewing AI changes is painful | `devbox diff` shows every change, `devbox commit --path src/` accepts selectively |
-| Security and compliance concerns | Full VM boundary with audit trail |
-
----
-
-## Local web console
-
-![devbox v4 console](docs/screenshot-console.png)
-
-The console manages box creation and lifecycle, streamed Nix rebuilds, Activity
-and flow pcaps, egress policy, overlay files, and a browser terminal. It binds
-loopback only and gives every launch a random
-`devbox-….localhost` browser origin. A one-time URL token installs a key in that
-origin's storage and requests send it explicitly as `x-devbox-key`; it is never
-a cookie or a navigable URL credential. Open as many tabs as you need: typing
-the bound loopback address shown by `devbox web` (`http://127.0.0.1:7878` by
-default) redirects each tab to the current private origin. `Host`, origin, and
-framing guards protect the console. Browser profiles do not share credentials:
-open the launch URL printed by `devbox web` once in each profile (for example,
-once in Chrome and once in an embedded browser) before using its bare address.
-
----
-
-## Workspace Layouts (removed in v4)
-
-v3 shipped a Zellij layout subsystem — `devbox layout list`, `--layout`, custom
-KDL files. v4 replaces the terminal UI with the web console, and the layout
-commands and the `--layout` flag are gone with it. `devbox create --layout tdd`
-is now an error rather than a silent no-op, which is the honest answer for a
-flag nothing reads.
-
-The box still has a shell; `devbox shell` attaches to it.
-
----
-
-## Remote Access via SSH
-
-Devbox VMs run a full SSH server, making them accessible from any machine on your network. This is useful for headless servers, remote development, or managing sandboxes from a different workstation.
-
-```bash
-# SSH into a sandbox directly (Lima)
-ssh -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
-
-# Or use Lima's built-in shortcut
-limactl shell devbox-myapp
-
-# Incus VMs
-incus exec devbox-myapp -- bash
-```
-
-**SSH agent forwarding** is enabled by default on Lima, so your host SSH keys (for GitHub, GitLab, etc.) work seamlessly inside the sandbox — no need to copy keys.
-
-**Port forwarding** for web development:
-
-```bash
-# Forward port 3000 from the sandbox to your host
-ssh -L 3000:localhost:3000 -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
-
-# Or use Lima's port forwarding (auto-forwards common ports)
-# Access your dev server at localhost:3000 from the host browser
-```
-
-**Remote team workflow:**
-
-```bash
-# On the server: create a sandbox
-devbox create --name shared-api --tools go,docker
-
-# From your laptop: SSH in and attach
-ssh yourserver -t "devbox shell shared-api"
-```
-
----
-
-## IDE Integration
-
-Use your local VS Code, Cursor, or Windsurf to edit code inside the sandbox — full IntelliSense, extensions, and debugging, all running in the isolated VM.
-
-```bash
-devbox code                       # Open VS Code into the sandbox
-devbox code --editor cursor       # Use Cursor instead
-devbox code --editor windsurf     # Use Windsurf
-devbox code myapp                 # Open a specific sandbox
-devbox code --path /workspace/src # Open a specific directory
-```
-
-Devbox automatically:
-1. Configures `~/.ssh/config` for the sandbox VM
-2. Refreshes the overlay layer (clears stale file handles)
-3. Launches the editor with Remote SSH pointed at `/workspace`
-
-Works with any editor that supports [Remote SSH](https://code.visualstudio.com/docs/remote/ssh) — VS Code, Cursor, Windsurf, and others.
-
-> **NixOS compatibility:** Devbox enables `nix-ld` in the VM so VS Code Server and other dynamically linked binaries run without issues.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- A supported VM runtime for the default protected-overlay workspace:
-  - [Lima](https://lima-vm.io/) (macOS, recommended)
-  - [Incus](https://linuxcontainers.org/incus/) (Linux, recommended)
-
-Docker is available only as an explicit, weaker-isolation base box:
-`devbox create --runtime docker --image ubuntu --writable --bare`. It is not
-an automatic fallback because it cannot provide the protected OverlayFS
-contract. New Multipass boxes are disabled until image and read-only mount
-semantics can be guaranteed; existing registered boxes remain manageable.
+## Quick start
 
 ### Install
 
@@ -177,90 +51,81 @@ cd devbox
 cargo install --path .
 ```
 
-Release/packaging builds may supply a matching binary with
-`DEVBOX_OBSD_BINARY=/path/to/devbox-obsd` instead of invoking Go.
+You also need a VM runtime: [Lima](https://lima-vm.io/) on macOS,
+[Incus](https://linuxcontainers.org/incus/) on Linux. Run `devbox doctor` to
+check.
 
-### Verify your system
-
-```bash
-devbox doctor
-```
-
-### Create your first sandbox
+### Make a box for this project
 
 ```bash
-# Auto-detect project and create sandbox
 cd my-project
 devbox
-
-# Or be explicit
-devbox create --name myapp --tools go,docker
-
-# Ubuntu base image instead of NixOS
-devbox create --image ubuntu --tools python
 ```
 
-### Common workflows
+Devbox detects the project type, provisions a NixOS VM with
+[120+ tools](docs/PACKAGES.md), and opens the local web console on that box.
+Your project directory is mounted **read-only**; everything the box writes goes
+to an overlay layer that never touches your files until you say so.
+
+### Give the agent a credential without giving it the key
 
 ```bash
-# Attach to an existing sandbox
-devbox shell myapp
-
-# Run a one-off command inside the sandbox
-devbox exec myapp -- make test
-
-# See what files changed in the overlay
-devbox diff
-
-# Sync overlay changes back to host
-devbox commit
-
-# Discard all changes (safe reset)
-devbox discard
-
-# Stop or destroy
-devbox stop myapp
-devbox destroy myapp
+devbox secret set anthropic --from-env ANTHROPIC_API_KEY
 ```
 
-### Managing tools
+The value goes into the host keychain. It is never written into the box, into
+its environment, or into any file the box can read. A host-side broker holds it
+and injects it per request; the box gets a per-box token instead, and every use
+is recorded as a `credential` event — `devbox watch --type credential`.
+
+### Run the agent
 
 ```bash
-devbox upgrade --tools rust       # Add Rust toolchain to running sandbox
-devbox sets list                  # Inspect declarative sets
-devbox sets apply --set system --set git --set lang-rust
-devbox nix add <package>          # Add any nixpkgs package
-devbox guide lazygit              # Show cheat sheet for a tool
+devbox run -- claude
 ```
+
+`devbox run` takes a checkpoint, wires the broker environment into the
+command's own argv, runs it — attached to your terminal when you have one — and
+closes the run with a second checkpoint. The five-line summary appears when it
+finishes.
+
+### Read the report
+
+```bash
+devbox runs                        # every recorded run on this box
+devbox report <RUN_ID>             # the Markdown rendering
+devbox report <RUN_ID> --open      # the HTML one, in a browser
+```
+
+The console shows the same report at `/boxes/<box>/runs/<run>` — one model,
+three renderings, so the terminal, the file on disk and the page cannot
+disagree.
 
 ---
 
-## Security Model
+## What you get
 
-Devbox prioritizes protecting your host filesystem and providing safe, reversible workflows.
+![The run report page in the devbox console: run identity and coverage, the files the run changed, and the peers it reached with byte counts](docs/screenshot-console.png)
 
-| Layer | Protection |
-|-------|-----------|
-| **OverlayFS isolation** | Host project directory mounted read-only. All writes go to an overlay layer inside the VM. |
-| **Explicit commit** | Changes sync to host only when you run `devbox commit`. Review first with `devbox diff`. |
-| **Snapshot & rollback** | Auto-snapshots on shell attach. NixOS generations allow full system rollback. |
-| **VM boundary** | Full VM isolation (not containers). Your host OS is never modified. |
-| **Credentials stay on the host** | No API key, OAuth token, or git credential is written into a box or its environment. `devbox secret set` keeps them in the host keychain; a host-side broker injects them per request, inside a declared scope, and records every use as a `credential` event. |
-| **Writable opt-in** | Direct host mount requires explicit `--writable` flag. Default is always safe overlay mode. |
-| **Behaviour audit** | A background collector persists process, network, DNS, TLS and workspace-file events per box. |
-| **Egress policy** | `allowlist`, `mirror-only`, and `isolated` postures compile to live nftables enforcement. |
+Every run produces one report with these sections.
 
-```bash
-devbox diff                      # Review overlay changes
-devbox commit                    # Sync to host
-devbox commit --path src/        # Sync only specific paths
-devbox discard                   # Throw away all changes
-devbox snapshot restore <id>     # Roll back to a snapshot
-```
+| Section | What it answers |
+|---|---|
+| **Files** | What this run wrote, from the diff of the checkpoint taken before it against the checkpoint taken after — not the box's lifetime of changes. The report says which scope it used. |
+| **Network** | One row per peer: connections, ports, whether TLS was seen, bytes each way, and how long the connection lasted. Bytes are settled at `close`, so an open connection reads 0 rather than a guess. TLS server names and DNS answers are listed under it. |
+| **Processes** | The process tree the run spawned, by pid, including devbox's own wrapper. Nothing is filtered out for looking untidy. |
+| **Credential use** | Which brokered credential the run used, how often, and first use. **Not yet populated:** the broker writes `credential` events (read them with `devbox watch --type credential`), but the report does not aggregate them yet, and the section says so rather than printing "none used". |
+| **Coverage** | Which capture backends were live, the agent version, how many events were attributed to this run and by which rule, how many were dropped, and how many events in the same window belonged to something else. |
 
-### Overlay Layer Lifecycle
+Read them together and `devbox behavior diff` answers "what did this run do
+that the last one didn't?" the same way `devbox diff` answers "what files
+changed?"
 
-The overlay layer is the bridge between your sandbox and the host. Here's the complete workflow:
+---
+
+## How it works
+
+### Files: an overlay, and checkpoints inside it
 
 ```
 Host filesystem ──(read-only)──> /mnt/host (lower layer)
@@ -269,24 +134,240 @@ Host filesystem ──(read-only)──> /mnt/host (lower layer)
                                 OverlayFS merge ──> /workspace (what you see)
                                       ▲
                                       │
-                        /var/devbox/overlay/upper (your changes)
+                        /var/devbox/overlay/upper (the box's changes)
 ```
 
-| Command | Direction | What it does |
-|---------|-----------|--------------|
-| `devbox layer refresh` | Host → VM (read) | Re-read host changes; your edits preserved. Clears stale file handles. |
-| `devbox layer conflicts` | — | Show files modified on both host and sandbox sides. |
-| `devbox diff` | — | Show what's in the upper layer vs the lower layer. |
-| `devbox commit` | VM → Host (write) | Copy upper layer changes to host. The **only** operation that writes to host. |
-| `devbox discard` | — | Wipe the upper layer. Back to clean state. |
-| `devbox layer stash` | — | Save upper layer aside for later. |
+Nothing reaches your real files until you run `devbox commit`. `devbox discard`
+throws the upper layer away.
 
-### What Happens in Each Scenario
+A **checkpoint** is a copy of that upper layer, not a new overlay level — the
+kernel supports a fixed number of layers and stacking one per run would run
+out. `devbox run` takes one before and one after, and the report's Files
+section is the diff between them. `devbox layer restore <ID>` puts the upper
+layer back to a checkpoint and remounts the overlay, because replacing the
+upper without a remount leaves processes reading stale content.
+
+```bash
+devbox layer checkpoint --label before-refactor
+devbox layer checkpoints
+devbox layer diff --from 01m1s3zz          # against the box now
+devbox layer restore 01m1s3zz
+```
+
+### Behaviour: an eBPF agent, and an honest coverage line
+
+An agent (`devbox-obsd`) runs inside the box and streams events to a per-user
+collector on the host, which writes a SQLite store per box.
+
+Where the kernel has BTF, the agent attaches eBPF probes and sees execs,
+connects, accepts, closes, and file opens at the syscall boundary. Where it
+does not, it polls `/proc` and keeps an independent packet tap for DNS and TLS
+— which loses process attribution and file events, and says so.
+
+Two things worth knowing before you trust a timeline:
+
+- **The CO-RE objects are committed per architecture** (`agent/bpf/devbox_<arch>_bpfel.{go,o}`).
+  A source build embeds the eBPF agent when the object for the guest
+  architecture is present, and prints a `cargo:warning` naming the fallback
+  when it is not. Release builds always embed it.
+- **`devbox doctor` tells you which one you got**, per running box:
+
+  ```
+  devtest (lima):
+    kernel: 6.19.0
+    btf: ready
+    agent: devbox-obsd 0.2.0 (<commit>)
+    agent binary: matches host embed
+    capture: ebpf+packet+netfilter
+    file scope: /workspace, /home
+  ```
+
+  `agent binary:` compares the content hash of the agent in the box against the
+  one this devbox ships — versions are equal far too often to be a useful test.
+  `file scope:` is the set of path prefixes the agent exports file events for;
+  it rides in the handshake, so the report can say what it was watching.
+
+### Credentials: a broker, not a copy
+
+`devbox secret set` puts the value in the host keychain (macOS Keychain; on
+Linux `~/.devbox/secrets/<provider>`, mode 0600). A host process,
+`devbox __broker`, is a **per-service reverse proxy**: the box speaks plain
+HTTP to it, and the broker opens TLS to the real upstream and injects the
+credential. There is no CA in the box and no TLS interception.
+
+| Provider | Upstream | The box sees | Injected |
+|---|---|---|---|
+| `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_BASE_URL=http://<broker>/anthropic`, `ANTHROPIC_AUTH_TOKEN=<box token>` | `Authorization: Bearer` or `x-api-key`, per the stored secret |
+| `openai` | `https://api.openai.com` | `OPENAI_BASE_URL=http://<broker>/openai/v1`, `OPENAI_API_KEY=<box token>` | `Authorization: Bearer` |
+| `github` | `https://api.github.com`, `https://github.com` | git only: `url."http://<broker>/github/".insteadOf "https://github.com/"` in the guest gitconfig | `Authorization: Bearer` |
+| `http:<name>` | whatever `--url` says | `DEVBOX_SECRET_<NAME>_URL` | the header `--header` names |
+
+The box token is per box, rotated at box start, and passed only in the
+environment of sessions devbox itself starts. Holding it grants brokered,
+scoped, logged access and nothing else.
+
+```bash
+devbox secret ls                                   # names and backends, never values
+devbox secret scope github --repo owner/name       # what this credential may reach
+devbox broker reach mybox                          # how this box gets to the broker
+```
+
+**`gh` is not brokered.** It forces HTTPS and `GH_HOST` does not accept a
+scheme, so pointing it at a plaintext broker fails at the TLS handshake.
+Supporting it would mean a TLS listener and a trust anchor inside the box,
+which is the thing this design refuses. `git` over smart HTTP works.
+
+### Egress: a posture, for the box or for one run
+
+```bash
+devbox policy set mirror-only          # for the box
+devbox run --posture isolated -- ./build.sh   # for this run only, then back
+```
+
+| Posture | Behaviour |
+|---|---|
+| `open` | Nothing blocked. With an allowlist set, out-of-policy connections are flagged. |
+| `allowlist` | Default-deny. Only listed domains and CIDRs. A bare `github.com` covers its subdomains; `evilgithub.com` is not one. |
+| `mirror-only` | Package mirrors and git hosts only. `pip`, `npm`, `cargo`, `nix` work; nothing phones home. |
+| `isolated` | No egress. Loopback only. The broker is blocked too — an isolated run has no credentials, which is the point. |
+
+Postures compile to live nftables rules inside the box, with the allow set kept
+in sync from the DNS the agent is already capturing.
+
+### MCP servers: inside a box, as a run
+
+An MCP server is code someone else wrote, launched by your agent, on your
+machine, with your rights. `devbox mcp` moves it into a box.
+
+```bash
+devbox mcp add fetch --box mcp-tools -- uvx mcp-server-fetch
+devbox mcp ls
+claude mcp add fetch -- devbox mcp run fetch
+```
+
+`devbox mcp run` is a byte-exact stdio shim: it hands the agent's JSON-RPC
+through to the server in the box and back, with no parsing and no line
+buffering. The server's stderr goes to `~/.devbox/mcp/<name>.log` so it cannot
+corrupt the protocol stream. `--posture` holds an egress posture for the
+duration and restores the box's own afterwards. Registration edits
+`devbox.toml` as text, so your comments survive; `--global` writes
+`~/.devbox/mcp.toml` instead, for servers you want from any directory.
+
+### Export: the same events, in someone else's schema
+
+```bash
+devbox export --run 01M1S6K0XSDYN51E45Y3JS6NK7 --format ocsf
+devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
+devbox export --format jsonl
+```
+
+`ocsf` emits OCSF 1.3 (Process Activity, File System Activity, Network
+Activity, DNS Activity, HTTP Activity, Detection Finding, API Activity), one
+JSON object per line, every class validated against the OCSF schema server.
+`otlp-json` emits one OTLP/JSON `ExportLogsServiceRequest`, accepted by a
+stock OpenTelemetry Collector. `jsonl` is devbox's own event, unchanged.
+
+An event kind with no honest mapping is counted as unmapped and skipped rather
+than filed under a nearby class, and a run that does not balance
+(`matched == written + unmapped`) fails instead of printing a partial export.
+
+---
+
+## Commands
+
+Every command that acts on an existing box takes the box name as an **optional
+first positional**: `devbox status devtest`, or plain `devbox status` for the
+box registered to the current directory. Where a command has a positional of
+its own, the box name comes second — `devbox snapshot save nightly devtest`,
+`devbox layer restore 01kfx9 devtest`.
+
+| Command | What it does |
+|---|---|
+| `devbox` | Ensure a box for this project, then open its console page |
+| `devbox create` | Create a new sandbox |
+| `devbox shell` | Attach a terminal |
+| `devbox exec -- <cmd>` | Run a one-off command in the box |
+| `devbox run -- <cmd>` | Run a command and record what it did |
+| `devbox runs` | List a box's recorded runs |
+| `devbox report <RUN_ID>` | Print a run's report (`--format md\|json\|html`, `--open`) |
+| `devbox stop` / `destroy` / `prune` | Stop one box, remove one, or remove all stopped ones |
+| `devbox list` / `status` | Every sandbox, or one in detail |
+| `devbox diff` / `commit` / `discard` | Review, accept, or throw away the overlay's changes |
+| `devbox layer status` | Overlay layer summary |
+| `devbox layer refresh` | Pick up host-side file changes |
+| `devbox layer conflicts` | Files modified on both sides |
+| `devbox layer stash` / `stash-pop` | Set the overlay aside and bring it back |
+| `devbox layer checkpoint` | Save the upper layer as a checkpoint (`--label`) |
+| `devbox layer checkpoints` | List checkpoints |
+| `devbox layer diff --from <ID>` | Diff a checkpoint against the box now, or `--to` another |
+| `devbox layer restore <ID>` | Put the overlay back to a checkpoint |
+| `devbox layer checkpoint-rm <ID>` | Delete a checkpoint (`--force` for one a run's report cites) |
+| `devbox snapshot save` / `restore` / `list` | Whole-VM snapshots |
+| `devbox watch` | Query captured activity (`--type`, `--peer`, `--path`, `--tree`, `--json`) |
+| `devbox behavior summary` / `diff` / `pcap` | Summarize, compare, or capture a real flow pcap |
+| `devbox policy show` / `set` / `allow` / `test` / `rules` | Read and enforce egress posture |
+| `devbox secret set` / `ls` / `rm` / `scope` | The credentials the broker holds |
+| `devbox broker status` / `start` / `stop` / `reach` | The host-side broker |
+| `devbox mcp add` / `run` / `ls` / `rm` | MCP servers that run inside a box |
+| `devbox export --format <fmt>` | Export events as OCSF, OTLP/JSON, or JSON Lines |
+| `devbox web` | Start the local web console without touching a box |
+| `devbox code` | Open VS Code / Cursor into a box via Remote SSH |
+| `devbox use <name>` | Point an existing box at the current directory |
+| `devbox upgrade --tools <set>` | Add tools to a running box |
+| `devbox sets list` / `apply` | Inspect or rebuild the declarative set selection |
+| `devbox nix add` / `remove` | Add or remove a nixpkgs package |
+| `devbox init` | Generate `devbox.toml` |
+| `devbox config set` / `get` / `show` | Global defaults |
+| `devbox guide [tool]` | Built-in cheat sheets |
+| `devbox doctor` | Diagnose the host, the runtimes, and each running box |
+| `devbox reprovision` | Re-push configs and rebuild |
+| `devbox self-update` | Update the devbox binary |
+
+The pre-v5 `--name <NAME>` spelling still works everywhere it used to, but no
+longer appears in `--help`. `devbox policy allow` and `devbox report` keep a
+visible `--name`: the first because its list of entries leaves no room for
+another positional, the second because omitting it means "search every box for
+this run".
+
+---
+
+## Security model
+
+| Layer | v4 | v5 |
+|---|---|---|
+| **Files** | overlay, explicit commit | + per-run checkpoints; restore to any checkpoint |
+| **Behaviour** | box-wide audit | + per-run attribution, coverage stated in every report |
+| **Egress** | posture per box | + posture per run; the broker is the only credentialled path |
+| **Credentials** | copied into the guest | **never in the guest**; scoped, logged broker |
+| **Tool servers** | run on the host with full rights | run in a box, as a run |
+| **Integrity of the record** | — | reports carry event counts, dropped counts, and attribution counts |
+
+Underneath, unchanged from v4: a full VM boundary rather than a container, a
+host project directory mounted read-only, `--writable` as an explicit opt-in,
+and NixOS generations for whole-system rollback.
+
+```bash
+devbox diff                      # review the overlay
+devbox commit --path src/        # accept selectively
+devbox discard                   # throw it all away
+devbox snapshot restore <id>     # roll the whole VM back
+```
+
+### Overlay layer lifecycle
+
+| Command | Direction | What it does |
+|---|---|---|
+| `devbox layer refresh` | Host → VM (read) | Re-read host changes; your edits preserved. Clears stale file handles. |
+| `devbox layer conflicts` | — | Files modified on both host and box sides. |
+| `devbox diff` | — | What is in the upper layer vs the lower layer. |
+| `devbox commit` | VM → Host (write) | Copy upper-layer changes to the host. The **only** operation that writes to the host. |
+| `devbox discard` | — | Wipe the upper layer, then remount so the next read is the truth. |
+| `devbox layer stash` | — | Save the upper layer aside for later. |
 
 **On `devbox layer refresh`** (re-read host files):
 
-| Your sandbox (upper) | Host (lower) | After refresh |
-|----------------------|--------------|---------------|
+| Your box (upper) | Host (lower) | After refresh |
+|---|---|---|
 | Didn't touch the file | Host updated it | You see the new host version |
 | You edited the file | Host didn't change | Your edit is preserved |
 | You edited the file | Host also changed | **Your edit wins** (upper always overrides lower) |
@@ -296,74 +377,128 @@ Host filesystem ──(read-only)──> /mnt/host (lower layer)
 | You created a new file | — | Your new file is preserved |
 | — | Host added a new file | You see the new file |
 
-**On `devbox commit`** (sync your changes to host):
+**On `devbox commit`** (sync your changes to the host):
 
-| Your sandbox (upper) | Host (lower) | After commit |
-|----------------------|--------------|--------------|
+| Your box (upper) | Host (lower) | After commit |
+|---|---|---|
 | You edited a file | Host didn't change | Host gets your version |
 | You edited a file | Host also changed | **Host is overwritten** with your version |
 | You created a new file | File doesn't exist on host | File is created on host |
 | You deleted a file | File exists on host | File is deleted on host |
-| Didn't touch the file | — | No change (not in upper layer) |
+| Didn't touch the file | — | No change (not in the upper layer) |
 
-> **Key rule:** `refresh` never loses your work (upper always wins in the merge). `commit` always overwrites the host with your version. Use `devbox layer conflicts` before either operation to see what overlaps.
-
-When you run `devbox shell`, devbox automatically detects if host files changed and prompts you to refresh. Conflicts (files modified on both sides) are flagged — your sandbox version always takes precedence, but you can review and merge manually.
-
-All layer operations are also available in the **DevBox Management Panel** inside the sandbox (press `r` for refresh, `f` for conflicts).
+> **Key rule:** `refresh` never loses your work (upper always wins in the
+> merge). `commit` always overwrites the host with your version. Run
+> `devbox layer conflicts` before either to see what overlaps.
 
 ---
 
-## Commands
+## Local web console
 
-| Command | Description |
-|---------|-------------|
-| `devbox` | Ensure a box for this project and open its console page |
-| `devbox create` | Create a new sandbox |
-| `devbox web` | Open the local web console without touching a box |
-| `devbox shell` | Attach to a sandbox |
-| `devbox exec <cmd>` | Run a command inside the sandbox |
-| `devbox stop` | Stop a sandbox |
-| `devbox destroy` | Remove a sandbox |
-| `devbox list` | List all sandboxes |
-| `devbox status` | Show detailed sandbox status |
-| `devbox code` | Open VS Code / Cursor into sandbox via Remote SSH |
-| `devbox use <name>` | Switch sandbox to current directory |
-| `devbox upgrade --tools <set>` | Add tools to a running sandbox |
-| `devbox sets list/apply` | Inspect or rebuild the declarative set selection |
-| `devbox watch` | Query or stream captured activity |
-| `devbox behavior summary/diff/pcap` | Compare runs or capture a real flow pcap |
-| `devbox policy show/set/allow/test/rules` | Inspect and enforce egress posture |
-| `devbox diff` | Show overlay changes vs host |
-| `devbox commit` | Sync overlay changes to host |
-| `devbox discard` | Throw away overlay changes |
-| `devbox layer status` | Overlay layer summary |
-| `devbox layer refresh` | Pick up host-side file changes |
-| `devbox layer conflicts` | Show files modified on both sides |
-| `devbox layer stash` | Stash current overlay changes |
-| `devbox layer stash-pop` | Restore stashed changes |
-| `devbox snapshot save` | Create a snapshot |
-| `devbox snapshot restore` | Restore a snapshot |
-| `devbox guide [tool]` | Built-in cheat sheets |
-| `devbox doctor` | Diagnose system issues |
-| `devbox reprovision` | Re-push configs and rebuild |
-| `devbox self-update` | Update devbox binary |
-| `devbox init` | Generate devbox.toml |
-| `devbox config show` | Show current configuration |
-| `devbox nix add <pkg>` | Add a Nix package |
-| `devbox nix remove <pkg>` | Remove a Nix package |
-| `devbox prune` | Remove all stopped sandboxes |
+The console binds loopback only and gives every launch a random
+`devbox-….localhost` browser origin. A one-time URL token installs a key in
+that origin's storage and requests send it explicitly as `x-devbox-key`; it is
+never a cookie or a navigable URL credential. `Host`, origin, and framing
+guards protect it.
 
-Network labs and the ZTP fabric were removed in v5; they will return as a
-separate, container-based tool.
+| View | What it does |
+|---|---|
+| **Boxes** | Every box, live status, start/stop/destroy inline, plus **New box**. |
+| **Overview** | Runtime, image, mount mode, sets, project directory. |
+| **Activity** | Live event stream, peers rollup, flow table, DNS log, process tree, file writes, policy refusals. |
+| **Runs** | Every recorded run, with its coverage badge; each row opens its report. |
+| **Sets** | A checklist of Nix sets. Only what is checked gets built. |
+| **Policy** | Egress posture and allowlist, editable live. |
+| **Files** | Overlay changes — what the box wrote, before you commit it. |
+| **Terminal** | A real shell, over a real pty, with the same broker variables `devbox shell` gets. |
+| **Guides** | The cheat sheets, rendered in the browser. |
+
+Open as many tabs as you need: typing the bound loopback address shown by
+`devbox web` (`http://127.0.0.1:7878` by default) redirects each tab to the
+current private origin. Browser profiles do not share credentials, so open the
+launch URL once in each profile before using its bare address.
 
 ---
 
-## Tool Catalog
+## Configuration
 
-Devbox ships with [**120+ tools**](docs/PACKAGES.md) organized into toggleable sets. All packages come from [nixpkgs](https://search.nixos.org/packages), the largest and most up-to-date package repository. See the [full package reference](docs/PACKAGES.md) for detailed descriptions of every tool.
+### Project-level (`devbox.toml`)
 
-### Core Sets (always installed)
+Generated with `devbox init`, auto-detects your project settings.
+
+```toml
+[sandbox]
+runtime = "auto"            # auto | lima | incus | docker (explicit limited mode)
+image = "nixos"             # nixos | ubuntu
+mount_mode = "overlay"      # overlay (safe) | writable (direct)
+
+[sets]
+editor = true               # neovim, helix, nano
+git = true                  # git, lazygit, gh
+container = false           # docker, compose, lazydocker
+network = false             # network diagnostics
+ai_code = true              # claude-code (npm), codex, aider, aichat, ...
+ai_infra = false            # ollama, open-webui
+
+[languages]
+go = true                   # auto-detected from go.mod
+rust = false
+python = false
+node = false
+
+[resources]
+cpu = 4
+memory = "8GiB"
+
+[policy]
+egress = "mirror-only"      # open | allowlist | mirror-only | isolated
+allow = ["github.com"]
+alert_on_violation = true
+
+[mcp.fetch]                 # written by `devbox mcp add`
+command = ["uvx", "mcp-server-fetch"]
+box = "mcp-tools"
+posture = "mirror-only"
+```
+
+### Global defaults
+
+```bash
+devbox config set runtime lima
+devbox config show
+```
+
+---
+
+## Base images and runtimes
+
+Both images install the same [120+ tools](docs/PACKAGES.md) from
+[nixpkgs](https://search.nixos.org/packages).
+
+| Image | Method | Rollback | Best for |
+|---|---|---|---|
+| **nixos** (default) | `nixos-rebuild switch` | Full system generations | Reproducible, declarative environments |
+| **ubuntu** | Nix package manager | `nix profile rollback` | A familiar base OS |
+
+Devbox auto-detects only runtimes that implement the default NixOS protected
+overlay contract. Restricted runtimes must be selected explicitly.
+
+| Runtime | Platform | New-box support |
+|---|---|---|
+| Incus | Linux | Auto-detected; NixOS overlay or Ubuntu writable |
+| Lima | macOS | Auto-detected; NixOS overlay or Ubuntu writable |
+| Docker | Any | Explicit only: `--runtime docker --image ubuntu --writable --bare`. No protected OverlayFS, and no eBPF — it shares your kernel. |
+| Multipass | macOS/Linux | Existing boxes only; new creation disabled |
+
+---
+
+## Tool catalog
+
+Devbox ships with [**120+ tools**](docs/PACKAGES.md) organized into toggleable
+sets, all from [nixpkgs](https://search.nixos.org/packages). See the
+[full package reference](docs/PACKAGES.md) for every tool.
+
+### Core sets (always installed)
 
 <details>
 <summary><b>system</b> -- 24 packages</summary>
@@ -427,7 +562,7 @@ Three terminal editors covering different preferences. Neovim for power users, H
 
 </details>
 
-### Default Sets (on by default)
+### Default sets (on by default)
 
 <details>
 <summary><b>git</b> -- 6 packages</summary>
@@ -444,7 +579,7 @@ installed via npm during provisioning
 
 </details>
 
-### Optional Sets (off by default)
+### Optional sets (off by default)
 
 <details>
 <summary><b>container</b> -- 6 packages</summary>
@@ -468,10 +603,10 @@ ollama, open-webui, litellm, mcp-hub, huggingface-hub
 
 </details>
 
-### Language Sets (auto-detected or `--tools` flag)
+### Language sets (auto-detected or `--tools`)
 
 | Language | Detection | Packages |
-|----------|-----------|----------|
+|---|---|---|
 | **Go** | `go.mod` | go, gopls, golangci-lint, delve, gotools, gore |
 | **Rust** | `Cargo.toml` | rustup, rust-analyzer, cargo-watch, cargo-edit, cargo-expand, sccache |
 | **Python** | `pyproject.toml`, `requirements.txt` | python 3.12, uv, ruff, pyright, ipython, pytest |
@@ -481,73 +616,66 @@ ollama, open-webui, litellm, mcp-hub, huggingface-hub
 
 ---
 
-## Configuration
+## IDE integration
 
-### Project-level (`devbox.toml`)
-
-Generated with `devbox init`, auto-detects your project settings.
-
-```toml
-[sandbox]
-runtime = "auto"            # auto | lima | incus | docker (explicit limited mode)
-image = "nixos"             # nixos | ubuntu
-mount_mode = "overlay"      # overlay (safe) | writable (direct)
-
-[sets]
-editor = true               # neovim, helix, nano
-git = true                  # git, lazygit, gh
-container = false           # docker, compose, lazydocker
-network = false             # network diagnostics, FRR and role services
-ai_code = true              # claude-code (npm), codex, aider, aichat, ...
-ai_infra = false            # ollama, open-webui
-
-[languages]
-go = true                   # auto-detected from go.mod
-rust = false
-python = false
-node = false
-
-[resources]
-cpu = 4
-memory = "8GiB"
-
-[policy]
-egress = "mirror-only"      # open | allowlist | mirror-only | isolated
-allow = ["github.com"]
-alert_on_violation = true
-```
-
-### Global defaults
+Use your local VS Code, Cursor, or Windsurf to edit code inside the box — full
+IntelliSense, extensions, and debugging, all running in the isolated VM.
 
 ```bash
-devbox config set runtime lima
-devbox config show
+devbox code                       # Open VS Code into the box
+devbox code --editor cursor       # Use Cursor instead
+devbox code myapp                 # Open a specific box
+devbox code --path /workspace/src # Open a specific directory
 ```
 
+Devbox configures `~/.ssh/config` for the box, refreshes the overlay layer, and
+launches the editor with Remote SSH pointed at `/workspace`. Works with any
+editor that supports [Remote SSH](https://code.visualstudio.com/docs/remote/ssh).
+
+> **NixOS compatibility:** devbox enables `nix-ld` in the VM so VS Code Server
+> and other dynamically linked binaries run without issues.
+>
+> **Known gap:** `devbox code` does not inject the broker environment. The
+> editor's remote server is started by VS Code, not by devbox, so there is no
+> guest command line to wrap. Use `devbox shell` or `devbox run` for anything
+> that needs a brokered credential.
+
 ---
 
-## Base Images
+## Remote access via SSH
 
-Both images install the same [120+ tools](docs/PACKAGES.md) from [nixpkgs](https://search.nixos.org/packages).
+Devbox VMs run a full SSH server, so they are reachable from any machine on
+your network — useful for headless servers and remote development.
 
-| Image | Method | Rollback | Best For |
-|-------|--------|----------|----------|
-| **nixos** (default) | `nixos-rebuild switch` | Full system generations | Reproducible, declarative environments |
-| **ubuntu** | Nix package manager | `nix profile rollback` | Familiar base OS |
+```bash
+# SSH into a box directly (Lima)
+ssh -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
 
----
+# Or use Lima's built-in shortcut
+limactl shell devbox-myapp
 
-## Runtime Support
+# Incus VMs
+incus exec devbox-myapp -- bash
+```
 
-Devbox auto-detects only runtimes that implement the default NixOS protected
-overlay contract. Restricted runtimes must be selected explicitly.
+**SSH agent forwarding** is enabled by default on Lima, so your host SSH keys
+work inside the box without copying them.
 
-| Runtime | Platform | New-box support |
-|---------|----------|-----------------|
-| Incus | Linux | Auto-detected; NixOS overlay or Ubuntu writable |
-| Lima | macOS | Auto-detected; NixOS overlay or Ubuntu writable |
-| Docker | Any | Explicit only: Ubuntu + writable + bare |
-| Multipass | macOS/Linux | Existing boxes only; new creation disabled |
+**Port forwarding** for web development:
+
+```bash
+ssh -L 3000:localhost:3000 -p $(limactl show-ssh --format=port devbox-myapp) $(whoami)@localhost
+```
+
+**Remote team workflow:**
+
+```bash
+# On the server
+devbox create --name shared-api --tools go,docker
+
+# From your laptop
+ssh yourserver -t "devbox shell shared-api"
+```
 
 ---
 
@@ -557,64 +685,64 @@ overlay contract. Restricted runtimes must be selected explicitly.
 devbox (single binary)
   |
   |-- CLI + local web control plane
-  |     one lifecycle, policy, observability and terminal API
+  |     one lifecycle, policy, observability, run and terminal API
   |
   |-- Sandbox Manager
   |     Lifecycle: create -> start -> attach -> stop -> destroy
-  |     State persistence at ~/.devbox/sandboxes/
-  |     OverlayFS diff/commit/discard
+  |     State at ~/.devbox/sandboxes/, overlay diff/commit/discard, checkpoints
   |
   |-- Runtime Abstraction
   |     Trait-based backends (Lima, Incus, Multipass, Docker)
-  |     Auto-detection with priority scoring
-  |     Uniform exec/start/stop/status interface
+  |     Auto-detection with priority scoring; uniform exec/start/stop/status
   |
   |-- NixOS Provisioning
-  |     All .nix files embedded in binary (include_str!)
-  |     Base64-encoded push via shell commands
+  |     All .nix files embedded in the binary (include_str!)
   |     Declarative package management via nixos-rebuild
   |
   |-- Observability + control
-        embedded devbox-obsd, background collector, per-box SQLite
-        eBPF/proc capture, behavior diff, pcap, nftables policy
+  |     embedded devbox-obsd, background collector, per-box SQLite
+  |     eBPF/proc capture, run attribution, behavior diff, pcap, nftables policy
+  |
+  |-- Credential broker
+        host keychain, per-service reverse proxy, per-box tokens, scopes, audit
 ```
 
 ### Provisioning flow
 
-1. VM runtime creates and boots a NixOS (or Ubuntu) image
+1. The VM runtime creates and boots a NixOS (or Ubuntu) image
 2. Devbox pushes `.nix` config files into the VM at `/etc/devbox/`
-3. NixOS module is imported into the VM's system configuration
-4. `nixos-rebuild switch` installs all declared packages from binary cache
-5. Matching observability/configuration agents and policy are installed
-6. Sandbox state is saved to `~/.devbox/sandboxes/<name>/` and the background
+3. The NixOS module is imported into the VM's system configuration
+4. `nixos-rebuild switch` installs all declared packages from the binary cache
+5. The matching observability agent and the saved egress policy are installed
+6. Box state is saved to `~/.devbox/sandboxes/<name>/` and the background
    collector begins supervising it
+
+---
+
+## Documentation
+
+- [Quickstart](docs/quickstart-v5.md) — the v5 tour, one page
+- [Observability](docs/observability.md) — what is captured, how to read it
+- [Package reference](docs/PACKAGES.md) — every tool in every set
+- [E2E test guide](docs/E2E_TEST_GUIDE.md) — manual lifecycle verification
+- [Decisions](DECISIONS.md) — the architecture decision log
 
 ---
 
 ## Development
 
 ```bash
-# Build
-cargo build --release
-
-# Test all Rust units and integrations
-cargo test
-
-# Go agent
-go test ./...
-
-# Lint
-cargo clippy -- -D warnings
-
-# Format
+cargo build --release          # build
+cargo test                     # all Rust units and integrations
+go test ./...                  # the Go agent
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-For end-to-end testing with real VMs, see the [E2E Test Guide](docs/E2E_TEST_GUIDE.md).
-
 ## Contributing
 
-Contributions are welcome. Please open an issue to discuss significant changes before submitting a pull request.
+Contributions are welcome. Please open an issue to discuss significant changes
+before submitting a pull request.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
@@ -624,4 +752,7 @@ Contributions are welcome. Please open an issue to discuss significant changes b
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for
+details.
+
+© 2026 Ethan H.B. Zhou
