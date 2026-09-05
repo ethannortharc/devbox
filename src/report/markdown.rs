@@ -191,7 +191,7 @@ fn outside(out: &mut String, report: &RunReport) {
         return;
     }
     out.push_str("### Writes outside the workspace overlay\n\n");
-    out.push_str("| directory | writes | files |\n|---|---|---|\n");
+    out.push_str("| directory | opens | files |\n|---|---|---|\n");
     for row in &report.files.outside {
         out.push_str(&format!(
             "| `{}` | {} | {} |\n",
