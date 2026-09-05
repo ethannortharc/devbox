@@ -124,6 +124,8 @@ func (s *Scope) KernelNoise() uint64 { return s.kernelNoise.Load() }
 // running, and this one is the difference between a report that can be handed
 // to someone and a report that cannot.
 
+// ArgvRedacted is how many exec argv words were replaced with `***` before
+// the event left the agent.
 func (s *Scope) ArgvRedacted() uint64 { return s.argvRedacted.Load() }
 
 // Name implements Source, naming the source underneath rather than the filter.

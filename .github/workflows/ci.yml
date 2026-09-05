@@ -97,9 +97,10 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
-          # The prebuilt binaries lag the Go release the module targets; build
-          # the linter with the job's own toolchain instead.
+          # `latest` resolves to the v1 line in goinstall mode, and v1 rejects
+          # a version-2 config; pin the v2 release and build it with the job's
+          # own Go, since prebuilt binaries lag the Go release the module targets.
+          version: v2.13.2
           install-mode: goinstall
 
   ebpf:
@@ -144,8 +145,8 @@ jobs:
         run: |
           # Keep the committed bindings: `go generate` overwrites them, and the
           # next step's whole job is to compare the two.
-          if [ -f agent/bpf/devbox_amd64_bpfel.go ]; then
-            cp agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed
+          if [ -f agent/bpf/devbox_x86_bpfel.go ]; then
+            cp agent/bpf/devbox_x86_bpfel.go agent/bpf/devbox_x86_bpfel.go.committed
           fi
           go generate -tags bpf2go ./agent/bpf
 
@@ -166,18 +167,18 @@ jobs:
       # bindings, and no CI check can see it.
       - name: check the committed amd64 bindings are current
         run: |
-          if [ ! -f agent/bpf/devbox_amd64_bpfel.go.committed ]; then
+          if [ ! -f agent/bpf/devbox_x86_bpfel.go.committed ]; then
             echo "::notice::no committed amd64 pair yet; download devbox-bpf-amd64 from this run and commit both files"
             exit 0
           fi
-          if ! cmp -s agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed; then
-            echo "::error file=agent/bpf/devbox_amd64_bpfel.go::the committed amd64 bindings are not what this source generates."
+          if ! cmp -s agent/bpf/devbox_x86_bpfel.go agent/bpf/devbox_x86_bpfel.go.committed; then
+            echo "::error file=agent/bpf/devbox_x86_bpfel.go::the committed amd64 bindings are not what this source generates."
             echo "Download the devbox-bpf-amd64 artifact from this run and commit both files."
-            diff -u agent/bpf/devbox_amd64_bpfel.go.committed \
-                    agent/bpf/devbox_amd64_bpfel.go || true
+            diff -u agent/bpf/devbox_x86_bpfel.go.committed \
+                    agent/bpf/devbox_x86_bpfel.go || true
             exit 1
           fi
-          rm -f agent/bpf/devbox_amd64_bpfel.go.committed
+          rm -f agent/bpf/devbox_x86_bpfel.go.committed
 
       # Uploaded on failure too: a failing bindings check is exactly when the
       # generated pair is the thing you came for.
@@ -186,8 +187,8 @@ jobs:
         with:
           name: devbox-bpf-amd64
           path: |
-            agent/bpf/devbox_amd64_bpfel.go
-            agent/bpf/devbox_amd64_bpfel.o
+            agent/bpf/devbox_x86_bpfel.go
+            agent/bpf/devbox_x86_bpfel.o
           retention-days: 14
 
       - name: load probes and capture a scripted workload

@@ -130,13 +130,15 @@ the wrong offsets. That is the failure mode this section exists to prevent.
 
 ### What CI does and does not check
 
+bpf2go names files after the clang architecture, so the amd64 pair is
+`devbox_x86_bpfel.{go,o}` while the arm64 pair is `devbox_arm64_bpfel.{go,o}`.
 The `ebpf` job regenerates the amd64 pair on every run, and gates the two
 halves differently:
 
 | file | gate |
 |---|---|
-| `devbox_amd64_bpfel.go` | byte-compared against what is committed; **differs → job fails** |
-| `devbox_amd64_bpfel.o` | not compared; uploaded as the `devbox-bpf-amd64` artifact |
+| `devbox_x86_bpfel.go` | byte-compared against what is committed; **differs → job fails** |
+| `devbox_x86_bpfel.o` | not compared; uploaded as the `devbox-bpf-amd64` artifact |
 
 The bindings are comparable because they encode only the loader's API surface —
 program, map, and type names — which moves when and only when `devbox.bpf.c`

@@ -60,9 +60,16 @@ fn main() {
 /// Returns whether the agent that was built contains the generated loader.
 fn build_agent(out: &Path) -> bool {
     let arch = guest_arch();
+    // bpf2go names its output after the *clang* architecture, not GOARCH:
+    // `-target amd64` writes `devbox_x86_bpfel.o`, `-target arm64` writes
+    // `devbox_arm64_bpfel.o` (cilium/ebpf cmd/bpf2go/gen/target.go).
+    let stem_arch = match arch {
+        "amd64" => "x86",
+        other => other,
+    };
     let object = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("agent/bpf")
-        .join(format!("devbox_{arch}_bpfel.o"));
+        .join(format!("devbox_{stem_arch}_bpfel.o"));
     let tags: &[&str] = if object.exists() {
         &["ebpf"]
     } else {
