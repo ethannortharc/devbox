@@ -1,3 +1,4 @@
+pub mod agent_sync;
 pub mod checkpoint;
 pub mod config;
 pub mod global_config;
@@ -744,6 +745,53 @@ impl SandboxManager {
                 ),
             }
         }
+
+        // The box may have been provisioned by an older devbox, or by a build
+        // of *this* version that embedded a different agent. Both hand back a
+        // box whose handshake passes and whose capture is quietly degraded,
+        // because the collector compares version strings and these agents
+        // share one. This is the point where the host holds the lifecycle
+        // claim, so it is the point that may also regenerate the service.
+        //
+        // Never fatal. A box that cannot have its agent refreshed is still a
+        // box the user asked to enter.
+        match crate::sandbox::agent_sync::ensure_current(
+            self,
+            runtime.as_ref(),
+            name,
+            &state.image,
+            crate::sandbox::agent_sync::Scope::Full,
+            &claim,
+        )
+        .await
+        {
+            Ok(refresh) => {
+                if refresh.changed() {
+                    println!(
+                        "Observability agent in box '{name}' is now the one this devbox ships."
+                    );
+                }
+            }
+            // One failure here is not like the others. Regenerating the unit
+            // rebuilds the box, and a rebuild removes its firewall; if the
+            // saved posture did not come back, the box is running open while
+            // every surface still says otherwise. Same fail-closed condition
+            // as the apply above, and the same answer.
+            Err(error) if crate::sandbox::agent_sync::lost_the_posture(&error) => {
+                match runtime.stop(name).await {
+                    Ok(()) => bail!(
+                        "sandbox '{name}' cannot be used: {error:#}. It was stopped for safety"
+                    ),
+                    Err(stop_error) => bail!(
+                        "sandbox '{name}' cannot be used: {error:#}. It could not be stopped and may still be running without that policy: {stop_error:#}. Run `devbox stop {name}` immediately"
+                    ),
+                }
+            }
+            Err(error) => eprintln!(
+                "Warning: could not bring box '{name}'s observability agent up to date: {error:#}"
+            ),
+        }
+
         Ok((state, runtime, claim))
     }
 

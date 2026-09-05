@@ -34,6 +34,12 @@ fn main() {
         build_agent(&out)
     };
 
+    // The Rust side needs the same label the agent carries, so the collector
+    // daemon's ownership record can say which build is serving a box. It is a
+    // label, not an identity: this script reruns only when the agent's inputs
+    // change, so a Rust-only commit leaves it — like the agent's own stamp —
+    // naming the commit it was actually built from.
+    println!("cargo:rustc-env=DEVBOX_BUILD_COMMIT={}", build_commit());
     println!("cargo:rustc-env=DEVBOX_EMBEDDED_OBSD={}", out.display());
     println!(
         "cargo:rustc-env=DEVBOX_EMBEDDED_OBSD_EBPF={}",

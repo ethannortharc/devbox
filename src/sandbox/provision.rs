@@ -751,13 +751,7 @@ async fn provision_nixos(
             false
         }
     };
-    write_file_to_vm(
-        runtime,
-        name,
-        "/etc/devbox/obsd-module.nix",
-        NIX_OBSD_MODULE,
-    )
-    .await?;
+    write_obsd_module(runtime, name).await?;
 
     // 2. Ensure NixOS channel is available (images:nixos/* may not have it)
     //    nixos-rebuild needs `<nixpkgs/nixos>` in NIX_PATH, which comes from
@@ -1544,6 +1538,22 @@ async fn write_file_to_vm(
     Ok(())
 }
 
+/// Push the NixOS module that supervises the agent.
+///
+/// Named rather than inlined because the agent refresh path rewrites it too:
+/// the module is where `enableEbpf` turns into both the `-no-ebpf` flag and
+/// the capability set that flag needs, so a box whose agent is replaced has to
+/// receive the module this host build ships, not the one it was born with.
+pub(crate) async fn write_obsd_module(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/devbox/obsd-module.nix",
+        NIX_OBSD_MODULE,
+    )
+    .await
+}
+
 /// Materialize the embedded Go agent through the runtime's native copy path.
 /// Binary payloads are not passed through argv: even base64 exceeds the OS
 /// argument limit long before a statically linked agent does.
@@ -1678,7 +1688,7 @@ pub async fn install_embedded_binary(
     install_result
 }
 
-fn sha256_hex(payload: &[u8]) -> String {
+pub(crate) fn sha256_hex(payload: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex_bytes(&Sha256::digest(payload))
 }
@@ -1746,7 +1756,7 @@ async fn copy_file_to_box(
     Ok(())
 }
 
-async fn install_ubuntu_obsd_service(runtime: &dyn Runtime, name: &str) -> Result<()> {
+pub(crate) async fn install_ubuntu_obsd_service(runtime: &dyn Runtime, name: &str) -> Result<()> {
     let no_ebpf = if crate::obs::uses_ebpf(runtime.name()) {
         ""
     } else {
@@ -1910,7 +1920,7 @@ async fn ensure_nixos_channel(runtime: &dyn Runtime, name: &str) -> Result<()> {
 /// We run `nixos-generate-config` to create hardware-configuration.nix,
 /// then write our own minimal configuration.nix with correct bootloader
 /// settings and the devbox module import already included.
-async fn ensure_nixos_config(
+pub(crate) async fn ensure_nixos_config(
     runtime: &dyn Runtime,
     name: &str,
     enable_obsd_service: bool,
