@@ -26,6 +26,32 @@ ordered work list, §17 the quality bar).
 | 8 | ZTP fabric + SoT + config-gen | **DONE** |
 | 9 | Polish, docs, examples | **DONE** — external PR creation awaits explicit authorization |
 
+## v5 wave status
+
+v5 is built in waves of parallel task branches, each merged into `v5-main` after
+the full gate. The v5 build log starts at "devbox v5 — build log" below.
+
+| Wave | Task | Branch | Status |
+|---|---|---|---|
+| W0 | W0-1 merge `origin/main` (70 commits) | `v5/merge-main` | **DONE** |
+| W0 | W0-2a remove labs, ZTP and labkit | `v5/lab-removal` | **DONE** |
+| W0 | W0-2b archive the lab code with its history | separate repo | **DONE** |
+| W0 | W0-3 commit CO-RE objects; embed the eBPF agent in a source build | `v5/ebpf-local` | **DONE** |
+| W0 | W0-4 positional box name across the CLI | `v5/cli-names` | **DONE** |
+| W0-5 | W0-5a SNI read across TCP segments | `v5/tls-sni` | **DONE** |
+| W0-5 | W0-5b byte counts settled at `tcp_close` | `v5/bytes` | **DONE** |
+| W0-5 | W0-5c replace a box's agent by content hash | `v5/agent-update` | **DONE** |
+| W1 | W1-A run evidence: runs, attribution, reports | `v5/run` | **DONE** |
+| W1 | W1-B credential broker: keychain, proxy, scopes, audit | `v5/broker` | **DONE** |
+| W1 | W1-D MCP servers inside a box | `v5/mcp` | **DONE** |
+| W1 | W1-E overlay checkpoints | `v5/checkpoint` | **DONE** |
+| W1 | W1-G export as OCSF 1.3 and OTLP/JSON | `v5/export` | **DONE** |
+| W2 | W2-0 file events get a scope | `v5/file-scope` | **DONE** |
+| W2 | W2-1 wire A to E, B, G; newest-first summary; `export --run` | `v5/run` | **DONE** |
+| W2 | W2-2 `mcp run` as a run, `mcp report`, `mcp self` | `v5/mcp` | in flight |
+| W2 | W2-3 sweep: discard remount, `checkpoint-rm`, guest home, NixOS file scope | `v5/sweep` | **DONE** |
+| W2 | W2-4 README, docs, screenshot, ADR-0059…0067, version 0.2.0 | `v5/docs` | **DONE** |
+
 ## Environment notes
 
 Recorded once so later sessions do not re-discover them:
