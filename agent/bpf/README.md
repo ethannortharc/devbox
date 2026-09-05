@@ -14,7 +14,15 @@ CO-RE programs that feed the observability plane (§7.1).
 DNS and TLS SNI are **not** eBPF programs: they are parsed from the flow by
 `agent/decode` (see `wire.go`). A ClientHello is plaintext by design and a DNS
 message is a UDP payload, so neither needs a kernel probe — and keeping them in
-userspace keeps the verifier's job small.
+userspace keeps the verifier's job small. The two differ in one way that
+matters: a DNS message arrives whole in one datagram, while a ClientHello no
+longer does. TLS 1.3 now offers a post-quantum key share by default and that
+pushes the record past a 1448-byte MSS, so `decode.SNI` parses whatever a
+segment actually carries and answers `ErrNeedMore` when `server_name` is not in
+it yet, and `agent/capture` joins the flow's next segment — along the sequence
+number, capped at 4 segments and 8 KiB — and retries. Doing that in a kernel
+probe would mean a TCP reassembler inside the verifier's reach, which is exactly
+the trade this split avoids.
 
 ## Filtering
 

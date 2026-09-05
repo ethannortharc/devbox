@@ -3,6 +3,8 @@ package decode
 import (
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -441,10 +443,219 @@ func TestSNITruncatedExtensionsAreRejected(t *testing.T) {
 		t.Log("a corrupted trailing byte may still parse; the length guards are what matter")
 	}
 
-	// A record whose declared length exceeds what is present must be refused.
-	short := clientHello("example.com", "")
-	short[3], short[4] = 0xFF, 0xFF
-	if _, err := SNI(short); err == nil {
-		t.Error("a record claiming more bytes than it has must be rejected")
+	// A record that over-declares its own length is no longer refused on that
+	// alone: that is exactly the shape a segment boundary produces, and the
+	// ClientHello inside this one is entirely present. What must not happen is
+	// a name assembled out of bytes that are not here.
+	over := clientHello("example.com", "")
+	over[3], over[4] = 0xFF, 0xFF
+	hello, err := SNI(over)
+	if err != nil {
+		t.Fatalf("a complete ClientHello inside an over-declared record: %v", err)
 	}
+	if hello.SNI != "example.com" {
+		t.Errorf("SNI = %q, want example.com", hello.SNI)
+	}
+
+	// Cut that same record inside its extension block. Now bytes really are
+	// missing, and the answer must be "ask again", not a guess and not
+	// ErrMalformed — the caller decides between them.
+	cut := serverNameOffset(t, over)
+	if _, err := SNI(over[:cut+2]); !errors.Is(err, ErrNeedMore) {
+		t.Errorf("a ClientHello cut before its server_name = %v, want ErrNeedMore", err)
+	}
+}
+
+// serverNameOffset reports where the server_name extension header starts inside
+// a record, so a test can cut a ClientHello at a point it cares about rather
+// than at a magic number.
+func serverNameOffset(t *testing.T, record []byte) int {
+	t.Helper()
+	hs := record[9:]
+	off := 34
+	off += 1 + int(hs[off])
+	off += 2 + int(binary.BigEndian.Uint16(hs[off:off+2]))
+	off += 1 + int(hs[off])
+	ext := hs[off+2:]
+	pos := 0
+	for pos+4 <= len(ext) {
+		extLen := int(binary.BigEndian.Uint16(ext[pos+2 : pos+4]))
+		if binary.BigEndian.Uint16(ext[pos:pos+2]) == 0x0000 {
+			return 9 + off + 2 + pos
+		}
+		pos += 4 + extLen
+	}
+	t.Fatal("fixture has no server_name extension")
+	return 0
+}
+
+// ── TLS across a segment boundary ────────────────────────
+//
+// See testdata/README.md: both fixtures are whole 1521-byte records, and it is
+// these tests that cut them at the 1448-byte MSS the agent actually meets.
+
+const (
+	// mss is the segment size observed on devtest, where the ClientHello for
+	// `curl https://example.com` was split 1448 + 112.
+	mss = 1448
+	// pqClientHelloSize is the size of both fixtures. Asserted, not assumed:
+	// a fixture that shrank under the MSS would make these tests pass while
+	// testing nothing.
+	pqClientHelloSize = 1521
+)
+
+func loadClientHello(t *testing.T, name string) []byte {
+	t.Helper()
+	record, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if len(record) != pqClientHelloSize {
+		t.Fatalf("fixture %s is %d bytes, want %d — see testdata/README.md",
+			name, len(record), pqClientHelloSize)
+	}
+	if len(record) <= mss {
+		t.Fatalf("fixture %s fits one segment and so tests nothing", name)
+	}
+	return record
+}
+
+// TestSNIFromTheFirstSegmentOfAPostQuantumClientHello is the case that made
+// `watch --type tls` empty on every box: the record is 1521 bytes, the segment
+// is 1448, and the old parser refused everything that was not a whole record —
+// even though server_name sat at byte 108, well inside the first segment.
+func TestSNIFromTheFirstSegmentOfAPostQuantumClientHello(t *testing.T) {
+	t.Parallel()
+
+	record := loadClientHello(t, "clienthello_pq.bin")
+	whole, err := SNI(record)
+	if err != nil || whole.SNI != "example.com" || whole.ALPN != "h2" {
+		t.Fatalf("the whole record decoded to %+v, %v", whole, err)
+	}
+
+	first := record[:mss]
+	if int(binary.BigEndian.Uint16(first[3:5])) <= len(first)-5 {
+		t.Fatal("the first segment is not actually short of the declared record")
+	}
+	hello, err := SNI(first)
+	if err != nil {
+		t.Fatalf("first segment alone: %v", err)
+	}
+	if hello.SNI != "example.com" {
+		t.Errorf("SNI = %q, want example.com", hello.SNI)
+	}
+	if hello.ALPN != "h2" {
+		t.Errorf("ALPN = %q — this fixture carries ALPN before the key share, "+
+			"so a segment that reaches server_name reaches it too", hello.ALPN)
+	}
+}
+
+// TestSNIWaitsForTheSegmentCarryingServerName covers the other half: nothing is
+// wrong with the bytes, there are simply not enough of them yet, and saying so
+// distinguishably is what lets the caller join the next segment instead of
+// abandoning the flow.
+func TestSNIWaitsForTheSegmentCarryingServerName(t *testing.T) {
+	t.Parallel()
+
+	record := loadClientHello(t, "clienthello_pq_sni_last.bin")
+
+	hello, err := SNI(record[:mss])
+	if !errors.Is(err, ErrNeedMore) {
+		t.Fatalf("first segment = (%+v, %v), want ErrNeedMore", hello, err)
+	}
+	if errors.Is(err, ErrMalformed) {
+		t.Error("ErrNeedMore must not also be ErrMalformed: the caller tells them apart")
+	}
+	if hello != nil {
+		t.Errorf("an incomplete parse returned %+v; it must return no name at all", hello)
+	}
+
+	joined, err := SNI(append(append([]byte(nil), record[:mss]...), record[mss:]...))
+	if err != nil {
+		t.Fatalf("joined segments: %v", err)
+	}
+	if joined.SNI != "example.com" {
+		t.Errorf("SNI = %q, want example.com", joined.SNI)
+	}
+}
+
+// TestSNIRefusesToInventBytesItDoesNotHave feeds every prefix of a real
+// ClientHello. Two invariants, and they are the whole security argument for
+// parsing an incomplete record at all: it never panics, and it never reports a
+// name it has not seen in full.
+func TestSNIRefusesToInventBytesItDoesNotHave(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"clienthello_pq.bin", "clienthello_pq_sni_last.bin"} {
+		record := loadClientHello(t, name)
+		for size := 0; size <= len(record); size++ {
+			hello, err := SNI(record[:size])
+			switch {
+			case err == nil && hello.SNI != "" && hello.SNI != "example.com":
+				t.Fatalf("%s[:%d] produced the name %q", name, size, hello.SNI)
+			case err != nil && !errors.Is(err, ErrNeedMore) && !errors.Is(err, ErrMalformed):
+				t.Fatalf("%s[:%d] returned an unclassified error: %v", name, size, err)
+			}
+		}
+	}
+}
+
+// TestSNIOverDeclaredRecordStaysIncomplete is the hostile shape: a record header
+// claiming 65535 bytes with 100 supplied. It must not be read past, must not
+// yield a name, and must stay ErrNeedMore so the caller's own caps — not this
+// parser — are what eventually discard it.
+func TestSNIOverDeclaredRecordStaysIncomplete(t *testing.T) {
+	t.Parallel()
+
+	hostile := append([]byte(nil), loadClientHello(t, "clienthello_pq.bin")[:100]...)
+	hostile[3], hostile[4] = 0xFF, 0xFF
+
+	hello, err := SNI(hostile)
+	if !errors.Is(err, ErrNeedMore) {
+		t.Fatalf("(%+v, %v), want ErrNeedMore", hello, err)
+	}
+	if hello != nil {
+		t.Errorf("returned %+v from 100 bytes claiming 65535", hello)
+	}
+
+	// The same lie told about the handshake message rather than the record.
+	// This one is decidable: the record is whole and the message inside it is
+	// not, so no further segment can help and it is malformed, not incomplete.
+	spanning := append([]byte(nil), loadClientHello(t, "clienthello_pq.bin")...)
+	spanning[6], spanning[7], spanning[8] = 0xFF, 0xFF, 0xFF
+	if _, err := SNI(spanning); !errors.Is(err, ErrMalformed) {
+		t.Errorf("a handshake message overrunning a whole record = %v, want ErrMalformed", err)
+	}
+}
+
+// FuzzSNI guards the one property that makes parsing an incomplete record safe
+// to do at all: whatever bytes arrive, the walk stays inside them. A parser
+// that is handed arbitrary prefixes of attacker-influenced traffic is exactly
+// where an off-by-one becomes a read past the end of the capture buffer.
+func FuzzSNI(f *testing.F) {
+	for _, name := range []string{"clienthello_pq.bin", "clienthello_pq_sni_last.bin"} {
+		record, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("read fixture: %v", err)
+		}
+		f.Add(record)
+		f.Add(record[:mss])
+		f.Add(record[:100])
+	}
+	f.Add(clientHello("example.com", "h2"))
+	f.Add([]byte{0x16, 0x03, 0x01, 0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0xFF})
+
+	f.Fuzz(func(t *testing.T, record []byte) {
+		hello, err := SNI(record)
+		switch {
+		case err == nil && hello == nil:
+			t.Fatal("SNI returned neither a ClientHello nor an error")
+		case err != nil && hello != nil:
+			t.Fatalf("SNI returned both %+v and %v", hello, err)
+		case err != nil && !errors.Is(err, ErrNeedMore) && !errors.Is(err, ErrMalformed):
+			t.Fatalf("unclassified error: %v", err)
+		case errors.Is(err, ErrNeedMore) && errors.Is(err, ErrMalformed):
+			t.Fatal("an error must not be both incomplete and malformed")
+		}
+	})
 }
