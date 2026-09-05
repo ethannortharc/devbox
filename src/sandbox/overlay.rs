@@ -411,12 +411,23 @@ pub async fn commit(
 
 /// Discard overlay changes (clear the upper layer).
 /// If `paths` is Some, only discard those paths. Otherwise discard everything.
+///
+/// The overlay is remounted afterwards, for the reason
+/// [`crate::sandbox::checkpoint::restore`] remounts: the kernel does not
+/// expect the upper to move under a live mount, so `readdir` notices the
+/// removal immediately while a cached `read` keeps serving the discarded
+/// contents. Without this, `devbox layer discard` followed by `cat` returned
+/// the very edit that had just been thrown away.
+///
+/// A remount needs `/workspace` idle, so a failure is a warning rather than an
+/// error: the discard itself has already happened, and `devbox diff` — which
+/// reads the upper directly — agrees with it either way.
 pub async fn discard(
     runtime: &dyn Runtime,
     sandbox_name: &str,
     paths: Option<&[String]>,
 ) -> Result<usize> {
-    if let Some(filter_paths) = paths {
+    let discarded = if let Some(filter_paths) = paths {
         let mut discarded = 0;
         for path in filter_paths {
             let upper_path = format!("{UPPER}/{}", path.trim_start_matches('/'));
@@ -430,7 +441,7 @@ pub async fn discard(
         if discarded > 0 {
             println!("\nDiscarded {} path(s).", discarded);
         }
-        Ok(discarded)
+        discarded
     } else {
         // Clear entire upper layer
         let cmd = format!("rm -rf {UPPER}/* {UPPER}/.[!.]* 2>/dev/null; true");
@@ -441,8 +452,25 @@ pub async fn discard(
         }
 
         println!("All overlay changes discarded.");
-        Ok(1)
+        1
+    };
+
+    // Nothing was removed, so nothing can be stale.
+    if discarded == 0 {
+        return Ok(discarded);
     }
+
+    if let Err(error) = refresh(runtime, sandbox_name).await {
+        eprintln!(
+            "Warning: the changes are discarded but /workspace could not be remounted: {error:#}"
+        );
+        eprintln!(
+            "         Processes with files open under /workspace may still read the old contents."
+        );
+        eprintln!("         Close them and run `devbox layer refresh {sandbox_name}`.");
+    }
+
+    Ok(discarded)
 }
 
 /// Stash the current overlay upper layer (save and clear).
@@ -692,6 +720,176 @@ impl ChangeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
+
+    use crate::runtime::{ExecResult, SandboxStatus};
+
+    /// A guest that records every privileged command and can be told to refuse
+    /// the remount.
+    ///
+    /// `discard` is otherwise untestable without a hypervisor, and the thing
+    /// that keeps being wrong is the *ordering* — whether the remount happens
+    /// at all, and whether it happens after the upper is cleared.
+    struct RecordingGuest {
+        commands: Mutex<Vec<String>>,
+        /// Both the `mount -o remount` and the umount/mount fallback fail, the
+        /// way a busy `/workspace` fails.
+        remount_fails: bool,
+    }
+
+    impl RecordingGuest {
+        fn new(remount_fails: bool) -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                remount_fails,
+            }
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for RecordingGuest {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn priority(&self) -> u32 {
+            0
+        }
+        // `run_as_root` funnels into this, so recording here catches the
+        // command the way the guest would receive it.
+        async fn exec_cmd(&self, _: &str, cmd: &[&str], _: bool) -> Result<ExecResult> {
+            let joined = cmd.join(" ");
+            self.commands.lock().unwrap().push(joined.clone());
+            let failed = self.remount_fails && joined.contains("mount");
+            Ok(ExecResult {
+                exit_code: i32::from(failed),
+                stdout: String::new(),
+                stderr: if failed {
+                    "target is busy".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+        async fn create(
+            &self,
+            _: &crate::runtime::CreateOpts,
+        ) -> Result<crate::runtime::SandboxInfo> {
+            unimplemented!()
+        }
+        async fn start(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stop(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn status(&self, _: &str) -> Result<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
+            unimplemented!()
+        }
+        async fn list(&self) -> Result<Vec<crate::runtime::SandboxInfo>> {
+            unimplemented!()
+        }
+        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_list(&self, _: &str) -> Result<Vec<crate::runtime::SnapshotInfo>> {
+            unimplemented!()
+        }
+        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn update_mounts(
+            &self,
+            _: &str,
+            _: &[crate::runtime::Mount],
+        ) -> Result<crate::runtime::MountUpdate> {
+            unimplemented!()
+        }
+        async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// The stale-read fix: clearing the upper is only half of a discard,
+    /// because a cached `read` under `/workspace` keeps serving the contents
+    /// that were just thrown away until the mount is rebuilt.
+    #[tokio::test]
+    async fn discarding_everything_remounts_the_overlay_afterwards() {
+        let guest = RecordingGuest::new(false);
+        let count = discard(&guest, "devtest", None).await.expect("discard");
+        assert_eq!(count, 1);
+
+        let commands = guest.commands();
+        let cleared = commands
+            .iter()
+            .position(|c| c.contains("rm -rf") && c.contains(UPPER))
+            .expect("the upper is cleared");
+        let remounted = commands
+            .iter()
+            .position(|c| c.contains("mount -o remount") && c.contains(WORKSPACE))
+            .expect("the overlay is remounted");
+        assert!(
+            cleared < remounted,
+            "the remount has to come after the clear: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discarding_named_paths_remounts_too() {
+        let guest = RecordingGuest::new(false);
+        let paths = vec!["src/main.rs".to_string()];
+        let count = discard(&guest, "devtest", Some(&paths))
+            .await
+            .expect("discard");
+        assert_eq!(count, 1);
+        assert!(
+            guest
+                .commands()
+                .iter()
+                .any(|c| c.contains("mount -o remount")),
+            "a path-scoped discard leaves the same stale reads behind"
+        );
+    }
+
+    /// A busy `/workspace` is the ordinary case (an editor, a shell sitting in
+    /// it). The discard has already happened by then, so it must not be
+    /// reported as a failure.
+    #[tokio::test]
+    async fn a_refused_remount_is_a_warning_not_a_failure() {
+        let guest = RecordingGuest::new(true);
+        let count = discard(&guest, "devtest", None)
+            .await
+            .expect("a busy workspace does not fail the discard");
+        assert_eq!(count, 1);
+    }
+
+    /// Nothing was removed, so nothing can be stale — and an unnecessary
+    /// remount would drop file handles for no reason.
+    #[tokio::test]
+    async fn a_discard_that_removed_nothing_leaves_the_mount_alone() {
+        let guest = RecordingGuest::new(false);
+        let count = discard(&guest, "devtest", Some(&[]))
+            .await
+            .expect("discard");
+        assert_eq!(count, 0);
+        assert!(guest.commands().is_empty(), "{:?}", guest.commands());
+    }
 
     fn change(path: &str, status: ChangeStatus, is_dir: bool) -> OverlayChange {
         OverlayChange {

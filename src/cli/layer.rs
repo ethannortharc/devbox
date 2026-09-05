@@ -108,6 +108,22 @@ pub enum LayerAction {
         #[command(flatten)]
         boxarg: BoxArg,
     },
+    /// Delete a checkpoint
+    ///
+    /// The id comes first for the same reason it does on `restore`.
+    #[command(name = "checkpoint-rm")]
+    CheckpointRm {
+        /// The checkpoint to delete; a unique prefix is enough
+        #[arg(value_name = "ID")]
+        id: String,
+
+        #[command(flatten)]
+        boxarg: BoxArg,
+
+        /// Delete it even though a run's report is built on it
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl LayerAction {
@@ -125,7 +141,8 @@ impl LayerAction {
             | Self::StashPop { boxarg }
             | Self::Checkpoint { boxarg, .. }
             | Self::Checkpoints { boxarg }
-            | Self::Restore { boxarg, .. } => boxarg,
+            | Self::Restore { boxarg, .. }
+            | Self::CheckpointRm { boxarg, .. } => boxarg,
         }
     }
 }
@@ -289,6 +306,32 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
                 &name,
             ))?;
             checkpoint::restore(runtime.as_ref(), &store, &name, &id).await?;
+        }
+        LayerAction::CheckpointRm { id, force, .. } => {
+            let typed = CheckpointId::parse(&id)?;
+            // Listed once here rather than left to `delete`: the guard needs
+            // the manifest, not just the id, and resolving a prefix twice
+            // could in principle land on two different checkpoints.
+            let known = checkpoint::list(runtime.as_ref(), &name).await?;
+            let resolved = checkpoint::resolve_id(&known, &typed)?;
+            let record = known
+                .iter()
+                .find(|c| c.id == resolved)
+                .expect("resolve_id returns an id from the list it was given");
+
+            if !force {
+                checkpoint::refuse_pinned_delete(&name, record)?;
+            }
+
+            checkpoint::delete(runtime.as_ref(), &name, &resolved).await?;
+            println!(
+                "Deleted checkpoint {resolved}{}.",
+                record
+                    .label
+                    .as_deref()
+                    .map(|l| format!(" ({l})"))
+                    .unwrap_or_default(),
+            );
         }
     }
 

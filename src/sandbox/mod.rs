@@ -930,7 +930,7 @@ impl SandboxManager {
         let shell = crate::web::service::detect_shell(runtime.as_ref(), name).await;
         let mut env = self.broker_env(runtime.as_ref(), name).await;
         env.extend_from_slice(extra);
-        let cmd = crate::broker::with_env(&env, &[shell.to_string(), "-l".to_string()]);
+        let cmd = crate::web::service::login_shell_command(shell, &env);
         let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
         runtime.exec_as_user(name, &cmd_refs).await?;
         Ok(())

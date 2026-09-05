@@ -331,13 +331,33 @@ pub async fn detect_shell(runtime: &dyn crate::runtime::Runtime, name: &str) -> 
     "sh"
 }
 
+/// The guest command that opens a login shell in a box.
+///
+/// Shared by `devbox shell` and the console's terminal so the two cannot drift
+/// on what a session gets. They already had: `attach_with_env` put the
+/// broker's variables in front of the shell, and the browser terminal ran the
+/// bare `[shell, "-l"]` — so the console was the one way into a box where
+/// `ANTHROPIC_BASE_URL` and friends were simply absent, and a tool that works
+/// from `devbox shell` reached upstream directly, or failed for want of a key,
+/// when the same person ran it in the browser instead.
+///
+/// `env` is best-effort by construction: no secrets, no running broker, or no
+/// verified route from the box to the host all yield an empty list, and
+/// [`crate::broker::with_env`] then returns the command untouched.
+pub fn login_shell_command(shell: &str, env: &[(String, String)]) -> Vec<String> {
+    crate::broker::with_env(env, &[shell.to_string(), "-l".to_string()])
+}
+
 /// Host-side argv that opens an interactive shell inside a box.
 pub async fn terminal_argv(manager: &Arc<SandboxManager>, name: &str) -> Result<Vec<String>> {
     let state = manager.get_sandbox(name)?;
     let runtime = manager.runtime_for_sandbox(&state)?;
 
     let shell = detect_shell(runtime.as_ref(), name).await;
-    Ok(runtime.argv(name, &[shell, "-l"], true))
+    let env = manager.broker_env(runtime.as_ref(), name).await;
+    let cmd = login_shell_command(shell, &env);
+    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    Ok(runtime.argv(name, &cmd_refs, true))
 }
 
 // ── sets (the Sets tab) ──────────────────────────────────
@@ -1122,6 +1142,38 @@ mod tests {
         assert_eq!(fc.status, "modified");
         assert_eq!(fc.path, "src/main.rs");
         assert!(!fc.is_dir);
+    }
+
+    /// The console terminal used to run the bare `[shell, "-l"]` while
+    /// `devbox shell` wrapped it — so a brokered box behaved differently
+    /// depending on which door you came in by. One builder, one shape.
+    #[test]
+    fn a_login_shell_carries_the_brokers_variables() {
+        let env = vec![
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://host.lima.internal:8931/anthropic".to_string(),
+            ),
+            ("DEVBOX_BROKER_TOKEN".to_string(), "tok".to_string()),
+        ];
+        assert_eq!(
+            login_shell_command("zsh", &env),
+            vec![
+                "env",
+                "--",
+                "ANTHROPIC_BASE_URL=http://host.lima.internal:8931/anthropic",
+                "DEVBOX_BROKER_TOKEN=tok",
+                "zsh",
+                "-l",
+            ],
+        );
+    }
+
+    /// A host with no secrets configured is the ordinary case, and it must not
+    /// put a bare `env` in front of the shell.
+    #[test]
+    fn nothing_to_broker_leaves_the_shell_alone() {
+        assert_eq!(login_shell_command("bash", &[]), vec!["bash", "-l"]);
     }
 
     #[test]

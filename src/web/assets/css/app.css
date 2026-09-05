@@ -1519,8 +1519,6 @@ footer {
   gap: 22px;
 }
 .btn-large { padding: 10px 16px; }
-.text-link { color: var(--fg); font-size: 13px; }
-.text-link:hover { color: var(--accent); }
 
 .hero-status {
   position: relative;

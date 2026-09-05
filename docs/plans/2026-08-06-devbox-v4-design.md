@@ -449,6 +449,8 @@ The observability plane is the oracle: assertions read the same event store the 
 
 Each `type` populates its own sub-object; the common envelope enables uniform storage, filtering, and correlation.
 
+> v5 added two types to that list: `close`, which carries what crossed a connection and how long it lasted (W0-5b), and `credential`, produced on the host by the broker rather than by the guest agent (W1-B). See `docs/plans/2026-09-05-devbox-v5-design.md`.
+
 ### 11.2 Control-plane API (Rust, consumed by CLI + web)
 
 ```

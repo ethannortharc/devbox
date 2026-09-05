@@ -53,6 +53,26 @@ in
       '';
     };
 
+    fileScope = lib.mkOption {
+      type = lib.types.str;
+      default = "/workspace,/home";
+      description = ''
+        Comma-separated path prefixes a file event has to be under to be
+        exported. The agent's own default is `/workspace` alone; devbox widens
+        it to include the box user's home, because an agent session that never
+        leaves `~/.config` or `~/.cache` would otherwise look like a box doing
+        nothing at all.
+
+        `/home` rather than one user's directory is the safe default: on Lima
+        the guest user has the *host's* uid and a `/home/<user>.guest` home its
+        passwd entry does not name, so both spellings have to be covered.
+        Provisioning overrides this with the same probed value it writes into
+        the non-NixOS unit — two agents watching one box must not disagree
+        about which paths produce file events, or the feed changes shape
+        depending on who attached.
+      '';
+    };
+
     enableEbpf = lib.mkOption {
       type = lib.types.bool;
       # Local developer builds embed the portable proc+packet agent. Release
@@ -95,6 +115,7 @@ in
             "-socket" (lib.escapeShellArg cfg.socket)
             "-packet=true"
             "-status-file" "/run/devbox/obsd-status.json"
+            "-file-scope" (lib.escapeShellArg cfg.fileScope)
           ]
           ++ lib.optional (!cfg.enableEbpf) "-no-ebpf"
           ++ lib.optional cfg.noTransport "-no-transport"
