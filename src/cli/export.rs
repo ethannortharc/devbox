@@ -74,8 +74,16 @@ pub async fn run(args: ExportArgs, manager: &SandboxManager) -> Result<()> {
     }
 
     let store = Store::open(&path)?;
-    let ctx = export::Context::new(&name);
     let run_id = args.run.as_deref();
+    // The run is what makes an export evidence rather than a log dump, and it
+    // has to reach the records themselves — `metadata.correlation_uid`,
+    // `actor.session.uid`, and the `devbox.run.id` resource attribute all read
+    // it from here. Selecting the run's rows without stamping them left every
+    // record saying "correlated with nothing".
+    let ctx = export::Context {
+        run_id: run_id.map(str::to_string),
+        ..export::Context::new(&name)
+    };
 
     // Say so rather than exporting nothing. An empty OCSF document for a run
     // id that does not exist on this box is indistinguishable from a run that

@@ -289,20 +289,26 @@ devbox export --format jsonl
 
 | Format | What comes out |
 |---|---|
-| `ocsf` | OCSF 1.3, one JSON object per line. Process Activity 1007, File System Activity 1001, Network Activity 4001, DNS Activity 4003, HTTP Activity 4002, Detection Finding 2004. |
+| `ocsf` | OCSF 1.3, one JSON object per line. Process Activity 1007, File System Activity 1001, Network Activity 4001, DNS Activity 4003, HTTP Activity 4002, Detection Finding 2004, API Activity 6003. |
 | `otlp-json` | One OTLP/JSON `ExportLogsServiceRequest`: 64-bit fields as decimal strings, enums as integers, semconv attribute names where one exists and `devbox.*` where none does. |
 | `jsonl` | The canonical devbox event, unchanged. |
 
 `--run` resolves the run to a row-id range before scanning, so exporting one run
 out of a large store costs the run, not the store.
 
+A brokered credential use is API Activity 6003: `api.operation` and
+`api.service.name` name the call and the provider, `http_request.url` the
+upstream host and path (the broker strips the query string before it records
+anything), `status_id` folds the verdict onto Success/Failure with the reason in
+`status_detail`, and `actor.session.uid` carries the run — as does
+`metadata.correlation_uid`. 6003 is the one class in the mapping with no
+`device` attribute, so the common envelope omits it there. The credential itself
+never appears: the broker holds it and the guest never sees it.
+
 An event kind with no honest OCSF class is counted as **unmapped** and skipped,
 not filed under a neighbouring class, and the summary names the kinds it
-dropped. Two kinds are in that position today: `syscall`, which OCSF has no
-class for, and `credential` — API Activity 6003 is where a brokered request
-belongs and the encoder already makes room for it (6003 has no `device`
-attribute, so the common envelope skips one there), but no event is mapped onto
-it yet. `--format jsonl` always carries everything.
+dropped. One kind is in that position today: `syscall`, which OCSF has no class
+for. `--format jsonl` always carries everything.
 
 The invariant `matched == written + unmapped` is checked, and an export that
 does not balance fails rather than printing a plausible-looking partial

@@ -110,8 +110,8 @@ fn every_mapped_event_type_renders_its_golden_ocsf() {
         }
     }
     assert_eq!(
-        rendered, 10,
-        "ten of the eleven fixture types map to a class"
+        rendered, 11,
+        "eleven of the twelve fixture types map to a class"
     );
 }
 
@@ -153,7 +153,7 @@ fn type_uid_is_class_uid_times_a_hundred_plus_activity_id() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 10);
+    assert_eq!(checked, 11);
 }
 
 /// The §8 table, asserted as a table.
@@ -215,6 +215,11 @@ fn the_mapping_table_is_the_one_in_the_design() {
         (2004, 1),
         "Detection Finding / Create"
     );
+    assert_eq!(
+        by_kind[&EventType::Credential],
+        (6003, 1),
+        "API Activity / Create, from method=POST"
+    );
     assert!(
         !by_kind.contains_key(&EventType::Syscall),
         "syscall has no class"
@@ -250,12 +255,16 @@ fn ocsf_drops_only_the_types_it_has_no_class_for_and_says_which() {
     let store = store_with(&events);
     let (text, stats) = export_to_string(&store, &Window::default(), Format::Ocsf);
 
-    assert_eq!(stats.written, 10);
+    assert_eq!(stats.written, 11);
     assert_eq!(stats.unmapped, 1);
-    assert_eq!(stats.unmapped_summary(), "syscall=1");
+    assert_eq!(
+        stats.unmapped_summary(),
+        "syscall=1",
+        "credential maps to API Activity now; syscall is the only kind left"
+    );
     assert_eq!(
         text.lines().count(),
-        10,
+        11,
         "one line per written record, and no blank tail"
     );
     for line in text.lines() {
@@ -588,6 +597,227 @@ fn an_orphan_close_is_unknown_direction_and_says_so() {
     let by_key = attributes(&record);
     assert_eq!(by_key["devbox.net.orphan"]["boolValue"], true);
     assert!(!by_key.contains_key("devbox.net.direction"));
+}
+
+/// The brokered request, mapped onto the one class §8 reserves for it.
+///
+/// Every assertion here is about something the class does *not* share with
+/// HTTP Activity, which is why the mapping needed its own renderer.
+#[test]
+fn a_credential_use_maps_onto_api_activity() {
+    let ctx = ctx();
+    let cred_event = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Credential)
+        .expect("the fixture has a credential");
+    let cred = cred_event.credential.clone().unwrap();
+
+    let v = devbox::export::ocsf::render(&cred_event, &ctx).expect("credential maps");
+    assert_eq!(v["class_uid"], 6003);
+    assert_eq!(v["category_uid"], 6);
+    // POST is Create on 6003's CRUD enum — *not* 6, which is what POST means
+    // on HTTP Activity's verb enum.
+    assert_eq!(v["activity_id"], 1, "Create");
+    assert_eq!(v["type_uid"], 600301);
+
+    assert_eq!(v["api"]["operation"], "POST");
+    assert_eq!(v["api"]["service"]["name"], cred.provider);
+    assert_eq!(v["api"]["response"]["code"], cred.status);
+    assert!(
+        v["api"]["request"]["uid"]
+            .as_str()
+            .unwrap()
+            .starts_with("devbox:myapp:credential:"),
+        "request.uid is required by the object"
+    );
+    assert_eq!(v["http_request"]["url"]["hostname"], cred.host);
+    assert_eq!(v["http_request"]["url"]["path"], cred.path);
+    assert_eq!(v["status_id"], 1, "allowed is Success");
+    assert_eq!(
+        v["status_code"],
+        cred.status.to_string(),
+        "a string in OCSF"
+    );
+    assert_eq!(v["src_endpoint"]["hostname"], cred_event.box_id);
+    assert_eq!(v["unmapped"]["verdict"], cred.verdict);
+
+    // The class has no `device` attribute at all, and no profile to declare.
+    assert!(v.get("device").is_none(), "api_activity has no device");
+    assert!(
+        v["metadata"].get("profiles").is_none(),
+        "actor, api and src_endpoint are all core on 6003"
+    );
+
+    // Whatever else it says, it does not say the secret.
+    let text = serde_json::to_string(&v).unwrap();
+    assert!(
+        !text.contains("sk-"),
+        "no credential material in the record"
+    );
+}
+
+/// A refused request: no response, a Failure status, the reason, and a
+/// severity that a pipeline alerting on egress blocks will also catch.
+#[test]
+fn a_denied_credential_is_a_failure_with_no_response() {
+    let ctx = ctx();
+    let mut e = events()
+        .into_iter()
+        .find(|x| x.kind == EventType::Credential)
+        .unwrap();
+    {
+        let c = e.credential.as_mut().unwrap();
+        c.verdict = "denied".into();
+        c.status = 0;
+        c.reason = "host not in the provider's scope".into();
+    }
+
+    let v = devbox::export::ocsf::render(&e, &ctx).unwrap();
+    assert_eq!(v["status_id"], 2, "Failure");
+    assert_eq!(v["status_detail"], "host not in the provider's scope");
+    assert!(
+        v["api"].get("response").is_none(),
+        "a denied request never reached upstream, so it has no response"
+    );
+    assert!(v.get("status_code").is_none(), "no upstream code to report");
+    assert_eq!(v["severity_id"], 4, "High, as for an egress block");
+
+    let record = devbox::export::otlp::log_record(&e, &ctx);
+    assert_eq!(record["severityText"], "ERROR");
+    assert_eq!(record["severityNumber"], 17);
+    let by_key = attributes(&record);
+    assert_eq!(by_key["devbox.credential.verdict"]["stringValue"], "denied");
+    assert!(!by_key.contains_key("http.response.status_code"));
+}
+
+/// The run is the whole point of a brokered-credential record: *which run*
+/// asked for the token. It has to reach the record, not just select it.
+#[test]
+fn a_run_scoped_export_stamps_the_run_on_the_record() {
+    let with_run = export::Context {
+        run_id: Some("01M1SD2Z4F842DVZSBZXA2B688".into()),
+        ..ctx()
+    };
+    let cred_event = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Credential)
+        .unwrap();
+
+    let v = devbox::export::ocsf::render(&cred_event, &with_run).unwrap();
+    assert_eq!(
+        v["metadata"]["correlation_uid"],
+        "01M1SD2Z4F842DVZSBZXA2B688"
+    );
+    assert_eq!(
+        v["actor"]["session"]["uid"], "01M1SD2Z4F842DVZSBZXA2B688",
+        "§8: actor.session.uid = run_id"
+    );
+
+    // And absent, not blank, when the export was not scoped to a run.
+    let without = devbox::export::ocsf::render(&cred_event, &ctx()).unwrap();
+    assert!(without["metadata"].get("correlation_uid").is_none());
+    assert!(without["actor"].get("session").is_none());
+}
+
+/// The §8 semconv list for a brokered request.
+#[test]
+fn a_credential_use_carries_its_semconv_attributes() {
+    let ctx = ctx();
+    let cred_event = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Credential)
+        .unwrap();
+    let cred = cred_event.credential.clone().unwrap();
+
+    let record = devbox::export::otlp::log_record(&cred_event, &ctx);
+    assert_eq!(record["eventName"], "devbox.credential");
+    let by_key = attributes(&record);
+    assert_eq!(by_key["event.name"]["stringValue"], "devbox.credential");
+    assert_eq!(
+        by_key["devbox.credential.provider"]["stringValue"],
+        cred.provider
+    );
+    assert_eq!(by_key["http.request.method"]["stringValue"], "POST");
+    assert_eq!(by_key["server.address"]["stringValue"], cred.host);
+    assert_eq!(by_key["url.path"]["stringValue"], cred.path);
+    assert_eq!(
+        by_key["http.response.status_code"]["intValue"],
+        cred.status.to_string()
+    );
+    assert_eq!(
+        by_key["devbox.credential.verdict"]["stringValue"],
+        cred.verdict
+    );
+}
+
+/// `api.request.uid` has to be stable across exports and distinct between
+/// events. The broker's `ts_mono_ns` is neither — it restarts near zero for
+/// every broker process, and a real devtest run recorded `0` — so the id is
+/// derived from the event itself.
+#[test]
+fn a_request_uid_is_stable_across_exports_and_distinct_between_events() {
+    let ctx = ctx();
+    let base = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Credential)
+        .unwrap();
+
+    let uid = |e: &Event| {
+        devbox::export::ocsf::render(e, &ctx).unwrap()["api"]["request"]["uid"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    assert_eq!(uid(&base), uid(&base), "the same event exports one id");
+
+    // Two brokered calls that a per-process monotonic clock would have handed
+    // the same `ts_mono_ns`.
+    let mut a = base.clone();
+    let mut b = base.clone();
+    a.ts_mono_ns = 0;
+    b.ts_mono_ns = 0;
+    b.credential.as_mut().unwrap().path = "/v1/other".into();
+    assert_ne!(uid(&a), uid(&b), "distinct requests, distinct ids");
+}
+
+/// A recorded host is an HTTP authority, so it may carry a port. `hostname`
+/// must not.
+#[test]
+fn an_authority_with_a_port_splits_into_hostname_and_port() {
+    let ctx = ctx();
+    let mut e = events()
+        .into_iter()
+        .find(|x| x.kind == EventType::Credential)
+        .unwrap();
+    e.credential.as_mut().unwrap().host = "127.0.0.1:18098".into();
+
+    let v = devbox::export::ocsf::render(&e, &ctx).unwrap();
+    assert_eq!(v["dst_endpoint"]["hostname"], "127.0.0.1");
+    assert_eq!(v["dst_endpoint"]["port"], 18098);
+    assert_eq!(v["http_request"]["url"]["hostname"], "127.0.0.1");
+    assert_eq!(v["http_request"]["url"]["port"], 18098);
+    // The full URL keeps the authority it was fetched with.
+    assert_eq!(
+        v["http_request"]["url"]["url_string"],
+        "https://127.0.0.1:18098/v1/messages"
+    );
+
+    let record = devbox::export::otlp::log_record(&e, &ctx);
+    let by_key = attributes(&record);
+    assert_eq!(by_key["server.address"]["stringValue"], "127.0.0.1");
+    assert_eq!(by_key["server.port"]["intValue"], "18098");
+
+    // A bare IPv6 literal has colons and no port; a bracketed one has both.
+    e.credential.as_mut().unwrap().host = "::1".into();
+    let v = devbox::export::ocsf::render(&e, &ctx).unwrap();
+    assert_eq!(v["dst_endpoint"]["hostname"], "::1");
+    assert!(v["dst_endpoint"].get("port").is_none());
+
+    e.credential.as_mut().unwrap().host = "[::1]:8080".into();
+    let v = devbox::export::ocsf::render(&e, &ctx).unwrap();
+    assert_eq!(v["dst_endpoint"]["hostname"], "::1");
+    assert_eq!(v["dst_endpoint"]["port"], 8080);
 }
 
 // --------------------------------------------------------------- contract

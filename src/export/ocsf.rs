@@ -45,6 +45,7 @@ pub const CLASS_API_ACTIVITY: i64 = 6003;
 
 /// `severity_id` — OCSF's scale, of which this mapping uses the bottom four.
 const SEV_INFORMATIONAL: i64 = 1;
+const SEV_LOW: i64 = 2;
 const SEV_MEDIUM: i64 = 3;
 const SEV_HIGH: i64 = 4;
 
@@ -71,15 +72,11 @@ const DIRECTION_OUTBOUND: i64 = 2;
 /// The catch-all arm is load-bearing, not defensive: `EventType` is a shared
 /// contract that other tracks extend, and an export that panicked on a type it
 /// had not been taught would take down the one command an operator runs when
-/// something has already gone wrong. `Close` arrived that way and cost one
-/// line. The type still to come:
+/// something has already gone wrong. `Close` and `Credential` both arrived
+/// that way; each cost one arm here plus its own renderer.
 ///
-/// * `Credential` (broker use) → `(CLASS_API_ACTIVITY, from the method)` —
-///   API Activity, with `actor.session.uid = run_id`. Note that
-///   `api_activity` has no `device` attribute, so [`base`] must drop it for
-///   that class.
-///
-/// Add the arm above the `_`; nothing else in this file needs to change.
+/// A new type goes above the `_`. Until it does, it exports as jsonl and is
+/// counted here, which is the behaviour the counter exists to give.
 pub fn classify(event: &Event) -> Option<(i64, i64)> {
     let activity = match event.kind {
         EventType::Exec => (CLASS_PROCESS_ACTIVITY, 1), // Launch
@@ -96,6 +93,7 @@ pub fn classify(event: &Event) -> Option<(i64, i64)> {
         ),
         EventType::Api => (CLASS_HTTP_ACTIVITY, http_activity_id(event)),
         EventType::Policy => (CLASS_DETECTION_FINDING, 1), // Create
+        EventType::Credential => (CLASS_API_ACTIVITY, credential_activity_id(event)),
         // `syscall` has no class in §8's table, and neither does any type this
         // build has not been taught. Counted, not guessed at.
         _ => return None,
@@ -117,6 +115,29 @@ fn file_activity_id(event: &Event) -> i64 {
         "rename" | "move" => 5,
         "open" => 14,
         _ => 99,
+    }
+}
+
+/// API Activity `activity_id` from the request method.
+///
+/// **Not** [`http_activity_id`]. Class 4002 enumerates the HTTP verbs
+/// themselves (`GET` is 3); class 6003 enumerates CRUD (`Create`, `Read`,
+/// `Update`, `Delete`), so the verbs have to be folded onto that. Reusing the
+/// other function here would put `type_uid` 600303 — "API Activity: Update" —
+/// on every `GET`.
+fn credential_activity_id(event: &Event) -> i64 {
+    let method = event
+        .credential
+        .as_ref()
+        .map(|c| c.method.as_str())
+        .unwrap_or("");
+    match method.to_ascii_uppercase().as_str() {
+        "POST" => 1,          // Create
+        "GET" | "HEAD" => 2,  // Read
+        "PUT" | "PATCH" => 3, // Update
+        "DELETE" => 4,        // Delete
+        _ => 99,              // Other, including a request denied before a
+                               // method was ever parsed
     }
 }
 
@@ -148,6 +169,7 @@ pub fn render(event: &Event, ctx: &Context) -> Option<Value> {
         CLASS_DNS_ACTIVITY => dns_activity(event, &mut out),
         CLASS_HTTP_ACTIVITY => http_activity(event, &mut out),
         CLASS_DETECTION_FINDING => detection_finding(event, &mut out),
+        CLASS_API_ACTIVITY => api_activity(event, ctx, &mut out),
         _ => {}
     }
     Some(Value::Object(out))
@@ -209,8 +231,9 @@ fn base(event: &Event, ctx: &Context, class_uid: i64, activity_id: i64) -> Map<S
 /// `device`.
 ///
 /// `process_activity` and `file_activity` define both in their own core, so
-/// they declare nothing. `api_activity` has `actor` in core and no `device` at
-/// all. Everything else inherits them from `host`.
+/// they declare nothing. `api_activity` has `actor`, `api` and `src_endpoint`
+/// in core and no `device` attribute at all, so it declares nothing either.
+/// Everything else inherits `actor` and `device` from `host`.
 fn profiles_for(class_uid: i64) -> Option<&'static [&'static str]> {
     match class_uid {
         CLASS_NETWORK_ACTIVITY
@@ -228,11 +251,26 @@ pub fn type_uid(class_uid: i64, activity_id: i64) -> i64 {
 
 /// Informational for everything a box does, unless a policy said otherwise.
 fn severity_id(event: &Event) -> i64 {
-    match event.policy.as_ref().map(|p| p.verdict.as_str()) {
-        Some("block") => SEV_HIGH,
-        Some("flag") => SEV_MEDIUM,
-        _ => SEV_INFORMATIONAL,
+    if let Some(policy) = &event.policy {
+        return match policy.verdict.as_str() {
+            "block" => SEV_HIGH,
+            "flag" => SEV_MEDIUM,
+            _ => SEV_INFORMATIONAL,
+        };
     }
+    if let Some(credential) = &event.credential {
+        return match credential.verdict.as_str() {
+            // A guard said no. The same weight as an egress block, because it
+            // is the same kind of event: something inside the box asked for
+            // more than it was scoped to have.
+            "denied" => SEV_HIGH,
+            // The broker could not complete the request. Worth surfacing,
+            // but it is an operational fault, not an attempt at anything.
+            "error" => SEV_LOW,
+            _ => SEV_INFORMATIONAL,
+        };
+    }
+    SEV_INFORMATIONAL
 }
 
 /// The process the event is attributed to.
@@ -585,6 +623,166 @@ fn detection_finding(event: &Event, out: &mut Map<String, Value>) {
     u.insert("mode".into(), json!(policy.mode));
     if !policy.target.is_empty() {
         u.insert("target".into(), json!(policy.target));
+    }
+}
+
+/// A brokered credential use — API Activity (§6.5, §8).
+///
+/// The record has to carry two things a normal HTTP mapping does not. The
+/// credential itself is never in it, by construction: the broker holds it, the
+/// guest never sees it, and `Credential.reason` is documented as never being a
+/// header value. And the *run* is what makes the event evidence — which run
+/// asked for this token is the question the report is for — so `run_id` lands
+/// on `actor.session.uid` as well as in `metadata.correlation_uid`.
+fn api_activity(event: &Event, ctx: &Context, out: &mut Map<String, Value>) {
+    let Some(cred) = &event.credential else {
+        return;
+    };
+    let method = cred.method.to_ascii_uppercase();
+
+    // The run is the session a brokered request belongs to. Omitted rather
+    // than blanked when the export was not scoped to one run.
+    if let Some(run_id) = &ctx.run_id
+        && let Some(actor) = out.get_mut("actor").and_then(|a| a.as_object_mut())
+    {
+        actor.insert("session".into(), json!({ "uid": run_id }));
+    }
+
+    let mut api = Map::new();
+    // Required. Empty only when the broker refused before parsing a request,
+    // and "UNKNOWN" is the honest word for that.
+    api.insert(
+        "operation".into(),
+        json!(match method.is_empty() {
+            true => "UNKNOWN".to_string(),
+            false => method.clone(),
+        }),
+    );
+    api.insert("service".into(), json!({ "name": cred.provider }));
+    // `request.uid` is required by the object.
+    api.insert("request".into(), json!({ "uid": request_uid(event) }));
+    // A denied request never reached upstream, so it has no response — an
+    // absent one says that, where `code: 0` would look like a status.
+    if cred.status != 0 {
+        api.insert("response".into(), json!({ "code": cred.status }));
+    }
+    out.insert("api".into(), Value::Object(api));
+
+    // Required by the class. The request came from the box, and on the host
+    // side of the broker there is no guest pid to name — the envelope carries
+    // `u32::MAX` for exactly that reason.
+    out.insert(
+        "src_endpoint".into(),
+        json!({ "hostname": event.box_id, "svc_name": "devbox-broker" }),
+    );
+    if !cred.host.is_empty() {
+        // `Credential.host` is an HTTP authority, so it may carry a port —
+        // `127.0.0.1:18098` is what a brokered call to a local upstream
+        // records. OCSF has a `port` for that; putting the whole authority in
+        // `hostname` would make the field not a hostname.
+        let (host, port) = split_host_port(&cred.host);
+        let mut dst = Map::new();
+        dst.insert("hostname".into(), json!(host));
+        dst.insert("domain".into(), json!(host));
+        if let Some(port) = port {
+            dst.insert("port".into(), json!(port));
+        }
+        out.insert("dst_endpoint".into(), Value::Object(dst));
+
+        let mut url = Map::new();
+        url.insert("hostname".into(), json!(host));
+        if let Some(port) = port {
+            url.insert("port".into(), json!(port));
+        }
+        url.insert("scheme".into(), json!("https"));
+        if !cred.path.is_empty() {
+            url.insert("path".into(), json!(cred.path));
+        }
+        // The broker strips the query string before it records anything, so
+        // this URL is complete as it stands rather than truncated.
+        url.insert(
+            "url_string".into(),
+            json!(format!("https://{}{}", cred.host, cred.path)),
+        );
+        let mut request = Map::new();
+        if !method.is_empty() {
+            request.insert("http_method".into(), json!(method));
+        }
+        request.insert("url".into(), Value::Object(url));
+        out.insert("http_request".into(), Value::Object(request));
+    }
+
+    // `api_activity` has no `disposition_id` — that attribute belongs to the
+    // `security_control` profile, which this class does not offer. The verdict
+    // is therefore carried by the status trio, which every consumer reads.
+    out.insert(
+        "status_id".into(),
+        json!(match cred.verdict.as_str() {
+            "allowed" => 1,          // Success
+            "denied" | "error" => 2, // Failure
+            _ => 0,                  // Unknown
+        }),
+    );
+    if cred.status != 0 {
+        // `status_code` is a string in OCSF: the source's own code, verbatim.
+        out.insert("status_code".into(), json!(cred.status.to_string()));
+    }
+    if !cred.reason.is_empty() {
+        out.insert("status_detail".into(), json!(cred.reason));
+    }
+
+    let u = unmapped(out);
+    // The exact vocabulary, kept alongside the OCSF status it was folded into.
+    u.insert("verdict".into(), json!(cred.verdict));
+    u.insert("provider".into(), json!(cred.provider));
+    // API Activity has no `traffic` object, so the byte counts have no
+    // schema home; they are still the size of what left the box.
+    if cred.req_bytes != 0 {
+        u.insert("req_bytes".into(), json!(cred.req_bytes));
+    }
+    if cred.resp_bytes != 0 {
+        u.insert("resp_bytes".into(), json!(cred.resp_bytes));
+    }
+}
+
+/// A stable, collision-resistant id for one brokered request.
+///
+/// Not `ts_mono_ns`. The broker measures that from the start of *its own*
+/// process, so it restarts near zero for every broker run and two credential
+/// uses from two brokers routinely share a value — the first draft of this
+/// mapping emitted `devbox:devtest:credential:0` for a real request. (The
+/// guest agent's `ts_mono_ns` is a genuine box-wide total order, which is why
+/// the policy finding can still key on it.) Hashing the event gives an id that
+/// is identical on every export of the same observation and different for
+/// every distinct one.
+fn request_uid(event: &Event) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::to_string(event)
+        .unwrap_or_else(|_| format!("{}:{}", event.ts_wall, event.ts_mono_ns));
+    let digest = Sha256::digest(canonical.as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("devbox:{}:credential:{hex}", event.box_id)
+}
+
+/// Split an HTTP authority into host and port, tolerating a bracketed IPv6
+/// literal and a bare one.
+pub(crate) fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `[::1]:8080`, or `[::1]` with no port.
+        return match rest.split_once(']') {
+            Some((addr, tail)) => (addr, tail.strip_prefix(':').and_then(|p| p.parse().ok())),
+            None => (authority, None),
+        };
+    }
+    match authority.rsplit_once(':') {
+        // A bare IPv6 literal has several colons and no port at all, so the
+        // text after the last one is a hextet, not a port.
+        Some((addr, port)) if !addr.contains(':') => match port.parse::<u16>() {
+            Ok(port) => (addr, Some(port)),
+            Err(_) => (authority, None),
+        },
+        _ => (authority, None),
     }
 }
 

@@ -290,10 +290,14 @@ devbox export --format jsonl
 ```
 
 `ocsf` emits OCSF 1.3 — Process Activity, File System Activity, Network
-Activity, DNS Activity, HTTP Activity and Detection Finding — one JSON object
-per line, every class validated against the OCSF schema server. `otlp-json`
-emits one OTLP/JSON `ExportLogsServiceRequest`, accepted by a stock
-OpenTelemetry Collector. `jsonl` is devbox's own event, unchanged.
+Activity, DNS Activity, HTTP Activity, Detection Finding and API Activity — one
+JSON object per line, every class validated against the OCSF schema server.
+A brokered credential use is API Activity 6003, carrying the provider, the
+upstream host and path, the verdict, and the run it belongs to on
+`actor.session.uid`; the credential itself is never in the record, because the
+broker is the only thing that ever held it. `otlp-json` emits one OTLP/JSON
+`ExportLogsServiceRequest`, accepted by a stock OpenTelemetry Collector.
+`jsonl` is devbox's own event, unchanged.
 
 An event kind with no honest mapping is counted as unmapped and skipped rather
 than filed under a nearby class, and the export says which kinds it dropped:
@@ -301,14 +305,14 @@ than filed under a nearby class, and the export says which kinds it dropped:
 ```
 Exported 60 of 61 event(s) as ocsf to run.ocsf.jsonl (scanned 61).
 warning: 1 event(s) have no ocsf class in this build and were not written:
-credential=1. Use --format jsonl for the complete record.
+syscall=1. Use --format jsonl for the complete record.
 ```
 
-`credential` and `syscall` are the two kinds in that position today — API
-Activity 6003 is where a brokered request belongs, and the plumbing for it is
-in place, but nothing is mapped onto it yet. `jsonl` carries everything. An
-export whose counts do not balance (`matched == written + unmapped`) fails
-rather than printing a plausible-looking partial record.
+`syscall` is the one kind in that position today: OCSF has no class for it, and
+filing it under a neighbouring one would put a claim into an audit record that
+nothing observed. `jsonl` carries everything. An export whose counts do not
+balance (`matched == written + unmapped`) fails rather than printing a
+plausible-looking partial record.
 
 ---
 

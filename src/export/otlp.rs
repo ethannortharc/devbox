@@ -78,14 +78,27 @@ pub fn log_record(event: &Event, ctx: &Context) -> Value {
     })
 }
 
-/// `severityText` is decided by a policy verdict and is `INFO` for everything
-/// else — a box doing its job is not a warning.
+/// `severityText` is decided by a verdict — a policy's or the broker's — and
+/// is `INFO` for everything else: a box doing its job is not a warning.
 fn severity(event: &Event) -> (i64, &'static str) {
-    match event.policy.as_ref().map(|p| p.verdict.as_str()) {
-        Some("block") => (17, "ERROR"),
-        Some("flag") => (13, "WARN"),
-        _ => (9, "INFO"),
+    if let Some(policy) = &event.policy {
+        return match policy.verdict.as_str() {
+            "block" => (17, "ERROR"),
+            "flag" => (13, "WARN"),
+            _ => (9, "INFO"),
+        };
     }
+    if let Some(credential) = &event.credential {
+        return match credential.verdict.as_str() {
+            // A refused credential is the same shape of event as a blocked
+            // connection, and a log pipeline that alerts on one should see
+            // the other.
+            "denied" => (17, "ERROR"),
+            "error" => (13, "WARN"),
+            _ => (9, "INFO"),
+        };
+    }
+    (9, "INFO")
 }
 
 /// The record attributes, in a fixed order so an export is reproducible.
@@ -211,6 +224,50 @@ fn record_attributes(event: &Event, _ctx: &Context, event_name: &str) -> Vec<Val
         }
         if !api.endpoint.is_empty() {
             attrs.push(string_attr("devbox.api.endpoint", &api.endpoint));
+        }
+    }
+
+    if let Some(cred) = &event.credential {
+        attrs.push(string_attr("devbox.credential.provider", &cred.provider));
+        attrs.push(string_attr("devbox.credential.verdict", &cred.verdict));
+        if !cred.method.is_empty() {
+            attrs.push(string_attr(
+                "http.request.method",
+                &cred.method.to_ascii_uppercase(),
+            ));
+        }
+        if !cred.host.is_empty() {
+            // The recorded host is an authority and may carry a port;
+            // semconv splits those into two attributes.
+            let (host, port) = crate::export::ocsf::split_host_port(&cred.host);
+            attrs.push(string_attr("server.address", host));
+            if let Some(port) = port {
+                attrs.push(int_attr("server.port", i64::from(port)));
+            }
+            // The broker strips the query string before recording, so the full
+            // URL is exactly authority plus path.
+            attrs.push(string_attr(
+                "url.full",
+                &format!("https://{}{}", cred.host, cred.path),
+            ));
+        }
+        if !cred.path.is_empty() {
+            attrs.push(string_attr("url.path", &cred.path));
+        }
+        if cred.status != 0 {
+            attrs.push(int_attr(
+                "http.response.status_code",
+                i64::from(cred.status),
+            ));
+        }
+        if !cred.reason.is_empty() {
+            attrs.push(string_attr("devbox.credential.reason", &cred.reason));
+        }
+        if cred.req_bytes != 0 {
+            attrs.push(uint_attr("devbox.credential.req_bytes", cred.req_bytes));
+        }
+        if cred.resp_bytes != 0 {
+            attrs.push(uint_attr("devbox.credential.resp_bytes", cred.resp_bytes));
         }
     }
 

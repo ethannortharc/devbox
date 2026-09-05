@@ -222,8 +222,9 @@ one JSON object per line; `otlp-json` is a single OTLP/JSON
 `ExportLogsServiceRequest`; `jsonl` is devbox's own event, unchanged.
 
 `ocsf` skips what it cannot map honestly, and names it on the way out —
-`credential` and `syscall` have no class in this build, so a run that used a
-credential exports one event fewer and says so. Use `jsonl` when you need the
+`syscall` is the one kind with no class, so a run that made syscall events
+exports that many fewer and says so. A run that used a credential exports it as
+API Activity 6003, stamped with the run id. Use `jsonl` when you need the
 complete record.
 
 ## The CLI, by task
