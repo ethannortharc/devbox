@@ -121,7 +121,12 @@ jobs:
       - name: install clang/llvm and headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y bpftool clang llvm libbpf-dev
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
+          # On Ubuntu 24.04 `bpftool` is a virtual package: the binary ships in
+          # the kernel-specific linux-tools package, so ask for the running
+          # kernel's and fall back to the generic one.
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
+          bpftool version
 
       - name: generate vmlinux types
         run: sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
