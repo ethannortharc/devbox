@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 
+use crate::cli::box_arg::SnapshotBoxArg;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::state::is_safe_name;
@@ -26,36 +27,41 @@ pub struct SnapshotArgs {
     pub action: SnapshotAction,
 }
 
+/// The snapshot's own name comes first and the box second, because the box is
+/// the optional one: `devbox snapshot save nightly` has to keep meaning "this
+/// directory's box", which it cannot if the leading positional is the box.
 #[derive(Subcommand, Debug)]
 pub enum SnapshotAction {
     /// Create a named snapshot
     Save {
         /// Snapshot name
-        name: String,
-        /// Sandbox name
-        #[arg(long)]
-        sandbox: Option<String>,
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+        #[command(flatten)]
+        boxarg: SnapshotBoxArg,
     },
     /// Restore a snapshot
     Restore {
         /// Snapshot name
-        name: String,
-        /// Sandbox name
-        #[arg(long)]
-        sandbox: Option<String>,
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+        #[command(flatten)]
+        boxarg: SnapshotBoxArg,
     },
     /// List all snapshots
     List {
-        /// Sandbox name
-        #[arg(long)]
-        sandbox: Option<String>,
+        #[command(flatten)]
+        boxarg: SnapshotBoxArg,
     },
 }
 
 pub async fn run(args: SnapshotArgs, manager: &SandboxManager) -> Result<()> {
     match args.action {
-        SnapshotAction::Save { name, sandbox } => {
-            let sandbox_name = manager.resolve_name(sandbox.as_deref())?;
+        SnapshotAction::Save {
+            snapshot: name,
+            boxarg,
+        } => {
+            let sandbox_name = manager.resolve_name(boxarg.name())?;
             if !is_safe_name(&name) {
                 bail!(
                     "Snapshot name must be 1-64 characters, not a path component, and free of control characters."
@@ -78,8 +84,11 @@ pub async fn run(args: SnapshotArgs, manager: &SandboxManager) -> Result<()> {
             println!("Snapshot '{name}' created.");
             Ok(())
         }
-        SnapshotAction::Restore { name, sandbox } => {
-            let sandbox_name = manager.resolve_name(sandbox.as_deref())?;
+        SnapshotAction::Restore {
+            snapshot: name,
+            boxarg,
+        } => {
+            let sandbox_name = manager.resolve_name(boxarg.name())?;
             let (claim, state) = manager.claim_and_read(&sandbox_name).context(
                 "cannot restore a snapshot while another lifecycle operation is running",
             )?;
@@ -191,8 +200,8 @@ pub async fn run(args: SnapshotArgs, manager: &SandboxManager) -> Result<()> {
             println!("Snapshot '{name}' restored.");
             Ok(())
         }
-        SnapshotAction::List { sandbox } => {
-            let sandbox_name = manager.resolve_name(sandbox.as_deref())?;
+        SnapshotAction::List { boxarg } => {
+            let sandbox_name = manager.resolve_name(boxarg.name())?;
             let (_claim, state) = manager
                 .claim_and_read(&sandbox_name)
                 .context("cannot list snapshots while another lifecycle operation is running")?;

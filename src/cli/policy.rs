@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
+use crate::cli::box_arg::BoxArg;
 use crate::policy::{Policy, Posture, Target, mirrors};
 use crate::sandbox::SandboxManager;
 use crate::sandbox::config::DevboxConfig;
@@ -33,8 +34,8 @@ pub enum PolicyCommand {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 }
 
 #[derive(Args, Debug)]
@@ -42,18 +43,23 @@ pub struct SetArgs {
     /// One of: open, allowlist, mirror-only, isolated
     pub posture: String,
 
-    /// Sandbox name (default: current directory's sandbox)
-    #[arg(long)]
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 }
 
+/// The one command that keeps a visible `--name`.
+///
+/// Everywhere else the box is a positional. Here `entries` is variadic and
+/// required, so it swallows every positional: a leading `[NAME]` would capture
+/// the first domain, and a trailing one is unreachable. Rather than invent a
+/// third shape, `allow` keeps the flag and says so in `--help`.
 #[derive(Args, Debug)]
 pub struct AllowArgs {
     /// Domains or CIDRs to permit
     #[arg(required = true)]
     pub entries: Vec<String>,
 
-    /// Sandbox name (default: current directory's sandbox)
+    /// Box name; defaults to the box registered for the current directory
     #[arg(long)]
     pub name: Option<String>,
 }
@@ -63,6 +69,9 @@ pub struct TestArgs {
     /// Domain to test, e.g. `pypi.org`
     pub domain: String,
 
+    #[command(flatten)]
+    pub boxarg: BoxArg,
+
     /// Address it resolves to
     #[arg(long, default_value = "203.0.113.1")]
     pub addr: String,
@@ -70,10 +79,6 @@ pub struct TestArgs {
     /// Destination port
     #[arg(long, default_value_t = 443)]
     pub port: u16,
-
-    /// Sandbox name (default: current directory's sandbox)
-    #[arg(long)]
-    pub name: Option<String>,
 }
 
 pub async fn run(args: PolicyArgs, manager: &SandboxManager) -> Result<()> {
@@ -149,7 +154,7 @@ fn save(config: &DevboxConfig, path: &std::path::Path) -> Result<()> {
 }
 
 fn show(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
-    let (name, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
+    let (name, config, _, _box_claim, _edit) = load(manager, args.boxarg.name())?;
     let policy = &config.policy;
 
     println!("Egress policy for '{name}':\n");
@@ -191,7 +196,7 @@ async fn set(args: SetArgs, manager: &SandboxManager) -> Result<()> {
     // overlapping edits finish their *applies* in the opposite order from
     // their file writes — devbox.toml ending at `isolated` while a delayed
     // earlier `open` cleared the live table.
-    let (name, mut config, path, _box_claim, _edit) = load(manager, args.name.as_deref())?;
+    let (name, mut config, path, _box_claim, _edit) = load(manager, args.boxarg.name())?;
 
     let previous = config.policy.egress;
     config.policy.egress = posture;
@@ -304,7 +309,7 @@ async fn reapply(
 }
 
 fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
-    let (name, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
+    let (name, config, _, _box_claim, _edit) = load(manager, args.boxarg.name())?;
 
     let target = Target {
         domain: args.domain.clone(),
@@ -332,7 +337,7 @@ fn test(args: TestArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 fn rules(args: ShowArgs, manager: &SandboxManager) -> Result<()> {
-    let (_, config, _, _box_claim, _edit) = load(manager, args.name.as_deref())?;
+    let (_, config, _, _box_claim, _edit) = load(manager, args.boxarg.name())?;
     print!("{}", crate::policy::nftables::ruleset(&config.policy));
     Ok(())
 }

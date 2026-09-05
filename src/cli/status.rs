@@ -1,17 +1,18 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 }
 
 pub async fn run(args: StatusArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);

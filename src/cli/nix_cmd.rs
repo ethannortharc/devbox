@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
+use crate::cli::box_arg::BoxArg;
 use crate::nix;
 use crate::sandbox::SandboxManager;
 
@@ -16,24 +17,22 @@ pub enum NixAction {
     Add {
         /// Package reference
         package: String,
-        /// Sandbox name
-        #[arg(long)]
-        name: Option<String>,
+        #[command(flatten)]
+        boxarg: BoxArg,
     },
     /// Remove a previously added Nix package
     Remove {
         /// Package name
         package: String,
-        /// Sandbox name
-        #[arg(long)]
-        name: Option<String>,
+        #[command(flatten)]
+        boxarg: BoxArg,
     },
 }
 
 pub async fn run(args: NixArgs, manager: &SandboxManager) -> Result<()> {
     match args.action {
-        NixAction::Add { package, name } => {
-            let sandbox_name = manager.resolve_name(name.as_deref())?;
+        NixAction::Add { package, boxarg } => {
+            let sandbox_name = manager.resolve_name(boxarg.name())?;
             if !manager.sandbox_exists(&sandbox_name) {
                 anyhow::bail!("Sandbox '{}' not found.", sandbox_name);
             }
@@ -41,8 +40,8 @@ pub async fn run(args: NixArgs, manager: &SandboxManager) -> Result<()> {
             let runtime = manager.runtime_for_sandbox(&state)?;
             nix::add_package(runtime.as_ref(), &sandbox_name, &package).await
         }
-        NixAction::Remove { package, name } => {
-            let sandbox_name = manager.resolve_name(name.as_deref())?;
+        NixAction::Remove { package, boxarg } => {
+            let sandbox_name = manager.resolve_name(boxarg.name())?;
             if !manager.sandbox_exists(&sandbox_name) {
                 anyhow::bail!("Sandbox '{}' not found.", sandbox_name);
             }

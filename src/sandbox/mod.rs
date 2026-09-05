@@ -968,10 +968,7 @@ impl SandboxManager {
                         "Warning: {} uncommitted overlay change(s) in sandbox '{}'.",
                         change_count, name
                     );
-                    eprintln!(
-                        "  Run `devbox layer commit --name {}` to save them first,",
-                        name
-                    );
+                    eprintln!("  Run `devbox layer commit {}` to save them first,", name);
                     eprintln!("  or use `devbox destroy {} --force` to discard.", name);
                     bail!("Aborting destroy due to uncommitted changes.");
                 }
@@ -985,7 +982,7 @@ impl SandboxManager {
                     })?;
                 if has_stash {
                     eprintln!("Warning: sandbox '{name}' has saved overlay changes in its stash.");
-                    eprintln!("  Run `devbox layer stash-pop --name {name}` to restore them,");
+                    eprintln!("  Run `devbox layer stash-pop {name}` to restore them,");
                     eprintln!(
                         "  then commit them, or use `devbox destroy {name} --force` to discard."
                     );

@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::obs::correlate;
 use crate::obs::event::EventType;
 use crate::obs::store::{Query, Store};
@@ -13,8 +14,8 @@ use crate::sandbox::SandboxManager;
 
 #[derive(Args, Debug)]
 pub struct WatchArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Only these event types; repeat or comma-separate
     #[arg(long = "type", value_delimiter = ',')]
@@ -58,7 +59,7 @@ pub struct WatchArgs {
 const WIDENED_SCAN_MAX_BYTES: usize = 64 * 1024;
 
 pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     // `store_path` only joins. An explicit `--name` reaches here untouched, so
     // `devbox watch /some/dir` pointed `Store::open` at an unrelated database
     // and wrote this schema's tables and pragmas into it.

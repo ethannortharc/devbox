@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::cli::box_arg::BoxArg;
 use crate::obs::behavior;
 use crate::obs::store::{Query, Store};
 use crate::sandbox::SandboxManager;
@@ -34,8 +35,8 @@ pub enum BehaviorCommand {
 
 #[derive(Args, Debug)]
 pub struct SummaryArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Only events at or after this RFC 3339 timestamp
     #[arg(long)]
@@ -52,8 +53,8 @@ pub struct SummaryArgs {
 
 #[derive(Args, Debug)]
 pub struct DiffArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Start of the earlier window (RFC 3339)
     #[arg(long)]
@@ -70,8 +71,8 @@ pub struct DiffArgs {
 
 #[derive(Args, Debug)]
 pub struct PcapArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Transport protocol
     #[arg(long, value_parser = ["tcp", "udp"])]
@@ -115,7 +116,7 @@ pub async fn run(args: BehaviorArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 async fn pcap(args: PcapArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let filter = crate::obs::pcap::FlowFilter {
         proto: args.proto,
         saddr: args.saddr,
@@ -171,7 +172,7 @@ fn open(manager: &SandboxManager, name: &str) -> Result<Option<Store>> {
 }
 
 fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let Some(store) = open(manager, &name)? else {
         return Ok(());
     };
@@ -209,7 +210,7 @@ fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 fn diff(args: DiffArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let Some(store) = open(manager, &name)? else {
         return Ok(());
     };

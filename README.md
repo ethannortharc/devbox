@@ -207,7 +207,7 @@ devbox create --image ubuntu --tools python
 devbox shell myapp
 
 # Run a one-off command inside the sandbox
-devbox exec --name myapp -- make test
+devbox exec myapp -- make test
 
 # See what files changed in the overlay
 devbox diff

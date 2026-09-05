@@ -1,14 +1,15 @@
 use anyhow::{Result, bail};
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::runtime::cmd::run_cmd;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay;
 
 #[derive(Args, Debug)]
 pub struct CodeArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Editor command to use (code, cursor, windsurf, etc.)
     #[arg(long, default_value = "code")]
@@ -20,7 +21,7 @@ pub struct CodeArgs {
 }
 
 pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let (state, runtime, claim) = manager.prepare_running_for_use(&name).await?;
 
     // Refresh overlay before opening editor to avoid stale file handles.

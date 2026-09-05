@@ -1,19 +1,19 @@
 use anyhow::{Context, Result};
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::runtime::SandboxStatus;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::provision;
 
 #[derive(Args, Debug)]
 pub struct ReprovisionArgs {
-    /// Sandbox name
-    #[arg(long)]
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 }
 
 pub async fn run(args: ReprovisionArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);

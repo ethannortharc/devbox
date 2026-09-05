@@ -94,7 +94,7 @@ async fn ensure_overlay_departure_is_clean(runtime: &dyn Runtime, name: &str) ->
     let change_count = overlay::meaningful_changes(&changes).len();
     if change_count > 0 {
         bail!(
-            "box '{name}' has {change_count} uncommitted overlay change(s). Run `devbox layer commit --name {name}` to save them or `devbox discard --name {name}` to discard them before switching projects or mount mode; its project mounts were not changed"
+            "box '{name}' has {change_count} uncommitted overlay change(s). Run `devbox layer commit {name}` to save them or `devbox discard {name}` to discard them before switching projects or mount mode; its project mounts were not changed"
         );
     }
 
@@ -105,7 +105,7 @@ async fn ensure_overlay_departure_is_clean(runtime: &dyn Runtime, name: &str) ->
     })?;
     if has_stash {
         bail!(
-            "box '{name}' has stashed overlay changes. Run `devbox layer stash-pop --name {name}`, then commit or discard them before switching projects or mount mode; a stash is never carried to another project and its mounts were not changed"
+            "box '{name}' has stashed overlay changes. Run `devbox layer stash-pop {name}`, then commit or discard them before switching projects or mount mode; a stash is never carried to another project and its mounts were not changed"
         );
     }
 

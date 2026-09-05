@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
+use crate::cli::box_arg::BoxArg;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay;
 
@@ -8,20 +9,30 @@ use crate::sandbox::overlay;
 pub struct LayerArgs {
     #[command(subcommand)]
     pub action: LayerAction,
-
-    /// Sandbox name
-    #[arg(long, global = true)]
-    pub name: Option<String>,
 }
 
+/// The box is named once per action (`devbox layer status [NAME]`), not once
+/// for `layer` as a whole.
+///
+/// It used to be a `global = true` flag on `LayerArgs`, which is the only way
+/// clap can share a *flag* across subcommands — but a global cannot be a
+/// positional, and the positional is the shape every other command now has.
 #[derive(Subcommand, Debug)]
 pub enum LayerAction {
     /// Show overlay status (like git status)
-    Status,
+    Status {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
     /// Show file diffs in overlay
-    Diff,
+    Diff {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
     /// Sync overlay changes to host
     Commit {
+        #[command(flatten)]
+        boxarg: BoxArg,
         /// Only sync specific paths
         #[arg(long)]
         path: Option<Vec<String>>,
@@ -31,23 +42,54 @@ pub enum LayerAction {
     },
     /// Discard overlay changes
     Discard {
+        #[command(flatten)]
+        boxarg: BoxArg,
         /// Only discard specific paths
         #[arg(long)]
         path: Option<Vec<String>>,
     },
     /// Refresh overlay (pick up host-side changes)
-    Refresh,
+    Refresh {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
     /// Show files modified on both sides (potential conflicts)
-    Conflicts,
+    Conflicts {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
     /// Stash overlay changes
-    Stash,
+    Stash {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
     /// Restore stashed changes
     #[command(name = "stash-pop")]
-    StashPop,
+    StashPop {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
+}
+
+impl LayerAction {
+    /// The box this action names. Every variant carries one, so the shared
+    /// preamble below can resolve it before dispatching.
+    pub(crate) fn boxarg(&self) -> &BoxArg {
+        match self {
+            Self::Status { boxarg }
+            | Self::Diff { boxarg }
+            | Self::Commit { boxarg, .. }
+            | Self::Discard { boxarg, .. }
+            | Self::Refresh { boxarg }
+            | Self::Conflicts { boxarg }
+            | Self::Stash { boxarg }
+            | Self::StashPop { boxarg } => boxarg,
+        }
+    }
 }
 
 pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.action.boxarg().name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);
@@ -66,10 +108,10 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
     let runtime = manager.runtime_for_sandbox(&state)?;
 
     match args.action {
-        LayerAction::Status => {
+        LayerAction::Status { .. } => {
             overlay::status(runtime.as_ref(), &name).await?;
         }
-        LayerAction::Diff => {
+        LayerAction::Diff { .. } => {
             let changes = overlay::diff(runtime.as_ref(), &name).await?;
 
             if changes.is_empty() {
@@ -104,11 +146,11 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
                 deleted,
             );
         }
-        LayerAction::Commit { path, dry_run } => {
+        LayerAction::Commit { path, dry_run, .. } => {
             let paths = path.as_deref();
             overlay::commit(runtime.as_ref(), &name, paths, dry_run).await?;
         }
-        LayerAction::Discard { path } => {
+        LayerAction::Discard { path, .. } => {
             if path.is_none() {
                 println!("This will discard ALL overlay changes in sandbox '{name}'.");
                 print!("Continue? [y/N] ");
@@ -125,16 +167,16 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
             let paths = path.as_deref();
             overlay::discard(runtime.as_ref(), &name, paths).await?;
         }
-        LayerAction::Refresh => {
+        LayerAction::Refresh { .. } => {
             overlay::refresh(runtime.as_ref(), &name).await?;
         }
-        LayerAction::Conflicts => {
+        LayerAction::Conflicts { .. } => {
             overlay::conflicts(runtime.as_ref(), &name).await?;
         }
-        LayerAction::Stash => {
+        LayerAction::Stash { .. } => {
             overlay::stash(runtime.as_ref(), &name).await?;
         }
-        LayerAction::StashPop => {
+        LayerAction::StashPop { .. } => {
             overlay::stash_pop(runtime.as_ref(), &name).await?;
         }
     }

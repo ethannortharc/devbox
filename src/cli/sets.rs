@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
+use crate::cli::box_arg::BoxArg;
 use crate::nix::compose::{LOCKED_SETS, Selection, describe_change};
 use crate::nix::sets::NIX_SETS;
 use crate::sandbox::SandboxManager;
@@ -30,15 +31,14 @@ pub enum SetsCommand {
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 }
 
 #[derive(Args, Debug)]
 pub struct ApplyArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    #[arg(long)]
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Set to enable; repeat or comma-separate. Anything not listed is disabled.
     #[arg(long = "set", value_delimiter = ',')]
@@ -61,7 +61,7 @@ pub async fn run(args: SetsArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 fn list(args: ListArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let state = manager.get_sandbox(&name)?;
     let project = crate::sandbox::config::DevboxConfig::load_or_default(&state.project_dir);
     let current = Selection::from_state_and_project(&state, &project);
@@ -97,7 +97,7 @@ fn list(args: ListArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 async fn apply(args: ApplyArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
     let state = manager.get_sandbox(&name)?;
 
     // Falls back to the project file for a box predating the state fields;
