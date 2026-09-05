@@ -103,6 +103,24 @@ impl CollectorCleanup {
 impl Drop for CollectorCleanup {
     fn drop(&mut self) {
         for pid in self.pids.borrow().iter() {
+            // Ask what the pid *is* before signalling it. `forget` covers the
+            // pids this suite reaped itself, but a collector that exited on its
+            // own was never forgotten, and on a busy machine its number is
+            // somebody else's within seconds. On a CI runner that somebody is
+            // the runner's own worker, and a SIGTERM to it cancels the job with
+            // no failing test to point at.
+            let identity = Command::new("ps")
+                .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+                .output();
+            let is_ours = identity.is_ok_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .any(|arg| arg == "__collector")
+            });
+            if !is_ours {
+                continue;
+            }
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();

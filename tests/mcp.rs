@@ -14,7 +14,6 @@
 //! of the contract the shim actually depends on: `argv()` returns a host-side
 //! command line whose stdio is the guest process's stdio.
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -266,11 +265,6 @@ async fn registered_env_reaches_the_guest_process_verbatim() {
 /// `mcp run` sends back into the box — takes the process group with it.
 #[tokio::test]
 async fn a_deaf_server_and_the_children_it_spawned_are_both_stopped() {
-    if !PathBuf::from("/proc/self/stat").exists() {
-        // The wrapper records its process group from Linux `/proc`. Every
-        // devbox guest is Linux; a macOS host running this suite is not.
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let pgid = dir.path().join("run.pgid");
     let marker = dir.path().join("child-alive");
@@ -302,12 +296,44 @@ async fn a_deaf_server_and_the_children_it_spawned_are_both_stopped() {
         "a killed server was reported as a clean exit"
     );
 
+    // Before running the reaper *in this process*, check what it is about to
+    // be pointed at. `LocalRuntime` has no box to hide behind: the reaper runs
+    // in the harness's own process group, so a recorded id that is the
+    // harness's group is a `kill` aimed at `cargo test`. That is not a
+    // hypothetical — it is what this suite did on Linux CI, where the step
+    // died with 143 and this was the only case that never printed `ok`.
+    let recorded: i32 = std::fs::read_to_string(&pgid)
+        .expect("the wrapper recorded a group")
+        .trim()
+        .parse()
+        .expect("and recorded it as a number");
+    assert_ne!(
+        recorded,
+        shim::own_process_group(),
+        "the wrapper recorded the harness's own process group"
+    );
+    assert!(recorded > 1, "process group {recorded} names every process");
+
+    // Bounded, because it is the only wait in this test that had no bound.
+    // `exec_cmd` ends in `Command::output()`, which waits for EOF on the
+    // reaper's pipes as well as for the reaper — so a descendant that survives
+    // holding one of them is a wait with no end, and a test that hangs takes
+    // the whole binary's step down with it and names no failing case. A CI job
+    // cancelled at 73 seconds is what that looks like from the outside.
     let reaper = shim::reaper_script(pgid.to_str().unwrap());
     let refs: Vec<&str> = reaper.iter().map(String::as_str).collect();
-    LocalRuntime
-        .exec_cmd("devtest", &refs, false)
-        .await
-        .unwrap();
+    let reaped = tokio::time::timeout(
+        Duration::from_secs(30),
+        LocalRuntime.exec_cmd("devtest", &refs, false),
+    )
+    .await
+    .expect("the reaper must finish, or say which descendant is holding its pipes")
+    .unwrap();
+    assert_ne!(
+        reaped.exit_code, 2,
+        "the reaper refused the group it was given: {}",
+        reaped.stderr
+    );
     assert!(!pgid.exists(), "the reaper left its marker file behind");
 
     // The grandchild refreshes the marker five times a second; if it is still
