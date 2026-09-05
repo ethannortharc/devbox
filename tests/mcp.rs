@@ -658,10 +658,8 @@ fn an_unknown_server_is_an_error_that_names_the_file_it_looked_in() {
     }
 }
 
-/// `mcp report` belongs to the integration wave (§7.1) and must not be
-/// advertised before it exists.
 #[test]
-fn the_help_offers_exactly_the_four_subcommands_this_wave_ships() {
+fn the_help_offers_the_whole_component() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let output = devbox(project.path(), home.path())
@@ -669,11 +667,109 @@ fn the_help_offers_exactly_the_four_subcommands_this_wave_ships() {
         .output()
         .unwrap();
     let help = String::from_utf8_lossy(&output.stdout);
-    for verb in ["add", "run", "ls", "rm"] {
+    for verb in ["add", "run", "ls", "rm", "report", "self"] {
         assert!(help.contains(verb), "`mcp --help` omits {verb}:\n{help}");
     }
-    assert!(
-        !help.contains("report"),
-        "`mcp report` is not in this wave:\n{help}"
+}
+
+/// A server that has never run has no report, and the message has to say that
+/// rather than an id nobody can act on.
+#[test]
+fn reporting_on_a_server_that_has_never_run_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("devbox.toml"), PROJECT).unwrap();
+    devbox(project.path(), home.path())
+        .args([
+            "mcp",
+            "add",
+            "fetch",
+            "--box",
+            "mcp-tools",
+            "--",
+            "uvx",
+            "srv",
+        ])
+        .output()
+        .unwrap();
+
+    let output = devbox(project.path(), home.path())
+        .args(["mcp", "report", "fetch"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no recorded run"), "{stderr}");
+    assert!(stderr.contains("mcp-tools"), "{stderr}");
+}
+
+#[test]
+fn reporting_on_a_server_that_is_not_registered_says_that_instead() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("devbox.toml"), PROJECT).unwrap();
+    let output = devbox(project.path(), home.path())
+        .args(["mcp", "report", "absent"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no MCP server named 'absent'"), "{stderr}");
+}
+
+/// `devbox mcp self` speaks the protocol over real pipes — the thing an agent
+/// actually does, rather than the in-process dispatch the unit tests cover.
+#[test]
+fn mcp_self_answers_a_real_stdio_session() {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let mut child = devbox(project.path(), home.path())
+        .args(["mcp", "self"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let session = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+    stdin.write_all(session.as_bytes()).unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one response per request and none for the notification:\n{stdout}"
+    );
+
+    let init: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+
+    let tools: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(tools["id"], 2);
+    let names: Vec<String> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        ["list_runs", "run_report", "behavior_summary", "watch"]
     );
 }

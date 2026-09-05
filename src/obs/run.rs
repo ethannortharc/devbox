@@ -210,6 +210,9 @@ pub struct RunRecord {
     pub capture_sources: String,
     pub agent_version: String,
     pub dropped_events: u64,
+    /// Why the run stopped, when the host knows something the exit code does
+    /// not say. See [`EndedBy`].
+    pub ended_by: Option<String>,
 }
 
 impl RunRecord {
@@ -235,6 +238,43 @@ impl RunRecord {
         } else {
             self.argv.join(" ")
         }
+    }
+}
+
+/// Why a run stopped.
+///
+/// The exit code answers "what did it return", not "who decided it was over",
+/// and for a long-lived run the second question is the interesting one. A
+/// sandboxed MCP server that its agent closed down is a normal end; one the
+/// shim had to kill because it ignored both EOF and SIGTERM is a fact about
+/// that server which its exit code — 143, the same as a polite shutdown —
+/// cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndedBy {
+    /// The command exited on its own.
+    Exit,
+    /// A signal ended it and the host saw which.
+    Signal,
+    /// The client closed the run's stdin, which is the MCP shutdown handshake.
+    StdinEof,
+    /// The host had to take the transport down; the guest was still running.
+    Forced,
+}
+
+impl EndedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndedBy::Exit => "exit",
+            EndedBy::Signal => "signal",
+            EndedBy::StdinEof => "stdin-eof",
+            EndedBy::Forced => "forced",
+        }
+    }
+}
+
+impl fmt::Display for EndedBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

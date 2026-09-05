@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
-use super::run::{ActiveRun, Attribution, RunRecord, RunStatus, RunTag};
+use super::run::{ActiveRun, Attribution, EndedBy, RunRecord, RunStatus, RunTag};
 
 /// The schema this build writes, recorded in `meta` under `schema`.
 ///
@@ -195,7 +195,8 @@ impl Store {
                 checkpoint_end   TEXT,
                 capture_sources  TEXT    NOT NULL DEFAULT '',
                 agent_version    TEXT    NOT NULL DEFAULT '',
-                dropped_events   INTEGER NOT NULL DEFAULT 0
+                dropped_events   INTEGER NOT NULL DEFAULT 0,
+                ended_by         TEXT
             );
 
             CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
@@ -271,6 +272,29 @@ impl Store {
             }
             conn.execute(&format!("ALTER TABLE events ADD COLUMN {column} TEXT"), [])
                 .with_context(|| format!("failed to add events.{column}"))?;
+        }
+
+        // The same, for `runs`. `CREATE TABLE IF NOT EXISTS` leaves a store
+        // written by the first v5 build with the columns it had, so a column
+        // added later has to arrive here or every read of it fails.
+        let mut run_columns: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(runs)")
+                .context("failed to inspect the runs table")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("failed to read the runs columns")?;
+            for row in rows {
+                run_columns.push(row.context("failed to read a runs column")?);
+            }
+        }
+        for column in ["ended_by"] {
+            if run_columns.iter().any(|c| c == column) {
+                continue;
+            }
+            conn.execute(&format!("ALTER TABLE runs ADD COLUMN {column} TEXT"), [])
+                .with_context(|| format!("failed to add runs.{column}"))?;
         }
 
         // Not `IF NOT EXISTS` on the row: an upgrade has to overwrite the
@@ -377,8 +401,8 @@ impl Store {
                    (run_id, box_id, kind, argv, cwd, label, started_at, ended_at, exit_code,
                     status, posture_before, posture_during, cgroup_id, root_pid,
                     checkpoint_start, checkpoint_end, capture_sources, agent_version,
-                    dropped_events)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                    dropped_events, ended_by)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
                 params![
                     run.run_id,
                     run.box_id,
@@ -399,6 +423,7 @@ impl Store {
                     run.capture_sources,
                     run.agent_version,
                     run.dropped_events,
+                    run.ended_by,
                 ],
             )
             .context("failed to record a run")?;
@@ -465,12 +490,14 @@ impl Store {
         capture_sources: &str,
         agent_version: &str,
         dropped_events: u64,
+        ended_by: Option<EndedBy>,
     ) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE runs
                     SET ended_at = ?2, exit_code = ?3, status = ?4,
-                        capture_sources = ?5, agent_version = ?6, dropped_events = ?7
+                        capture_sources = ?5, agent_version = ?6, dropped_events = ?7,
+                        ended_by = ?8
                   WHERE run_id = ?1",
                 params![
                     run_id,
@@ -480,6 +507,7 @@ impl Store {
                     capture_sources,
                     agent_version,
                     dropped_events,
+                    ended_by.map(|e| e.as_str()),
                 ],
             )
             .context("failed to close a run")?;
@@ -1249,7 +1277,8 @@ fn event_params<'a>(
 /// The `runs` projection, in the order [`read_run`] expects.
 const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
-     checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events";
+     checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
+     ended_by";
 
 /// Counts rows a read could not decode, and says so exactly once.
 ///
@@ -1326,6 +1355,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         capture_sources: row.get(16)?,
         agent_version: row.get(17)?,
         dropped_events: row.get::<_, i64>(18)? as u64,
+        ended_by: row.get(19)?,
     })
 }
 

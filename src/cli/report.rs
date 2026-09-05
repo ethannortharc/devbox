@@ -78,7 +78,7 @@ pub async fn run(args: ReportArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 /// Find a run: the report on disk first, then the boxes' stores.
-fn locate(
+pub(crate) fn locate(
     manager: &SandboxManager,
     run_id: &str,
     named: Option<&str>,
