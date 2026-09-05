@@ -15,7 +15,7 @@ use crate::obs::behavior::{self, Summary, Violation};
 use crate::obs::correlate;
 use crate::obs::event::{Event, EventType};
 use crate::obs::run::{Attribution, RunRecord, UNATTRIBUTED_PID};
-use crate::sandbox::overlay::{ChangeStatus, OverlayChange};
+use crate::sandbox::overlay::{ChangeStatus, LOWER, OverlayChange, WORKSPACE};
 
 /// Where the file changes in a report came from.
 ///
@@ -67,6 +67,25 @@ pub struct FileChanges {
     /// Directories are counted but not listed: a hundred new `node_modules`
     /// subdirectories are one fact, not a hundred.
     pub directories: usize,
+    /// Writes the run made outside the workspace overlay.
+    ///
+    /// The overlay diff answers "what would `devbox commit` sync", which is
+    /// the question about the *host*. It is not the question about the run: a
+    /// command that downloaded twenty megabytes of wheels into `~/.cache/uv`
+    /// changed nothing in the upper layer and was reported as "No file
+    /// changes" — which is true of the workspace and false of the box.
+    pub outside: Vec<OutsideWrites>,
+}
+
+/// Writes under one top-level directory that the overlay does not carry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutsideWrites {
+    /// The directory, with `$HOME` folded back to `~` where it applies.
+    pub prefix: String,
+    pub writes: usize,
+    /// Distinct paths seen under it, which is the number that says whether
+    /// this was one file rewritten or a tree unpacked.
+    pub paths: usize,
 }
 
 impl FileChanges {
@@ -90,6 +109,11 @@ impl FileChanges {
 
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
+    }
+
+    /// Whether anything at all was written outside the overlay.
+    pub fn has_outside(&self) -> bool {
+        !self.outside.is_empty()
     }
 }
 
@@ -201,6 +225,12 @@ pub struct ProcessRow {
     pub started: String,
     pub peers: Vec<String>,
     pub files: usize,
+    /// Devbox's own plumbing rather than the user's command.
+    ///
+    /// Serialized, so a consumer of the JSON can make the same distinction the
+    /// rendered tree makes rather than re-deriving it from the argv.
+    #[serde(default)]
+    pub wrapper: bool,
 }
 
 impl ProcessRow {
@@ -225,10 +255,30 @@ impl ProcessRow {
 /// A credential the broker handed out during the run (component B).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CredentialUse {
-    pub name: String,
+    /// The broker provider: `anthropic`, `github`, `http:<name>`.
     pub provider: String,
+    /// The upstream the broker spoke to on the run's behalf.
+    pub host: String,
+    /// HTTP methods seen, sorted, comma-joined.
+    pub method: String,
     pub uses: usize,
-    pub first_use: String,
+    /// How many of those the broker refused. A row where this equals `uses` is
+    /// a policy working, not a credential being used.
+    pub denied: usize,
+    /// Wall clock of the most recent request, which is what someone reading a
+    /// report next to a log wants to line up.
+    pub last_use: String,
+}
+
+impl CredentialUse {
+    /// `3` normally, `3 (2 denied)` when any were refused.
+    pub fn uses_human(&self) -> String {
+        if self.denied == 0 {
+            self.uses.to_string()
+        } else {
+            format!("{} ({} denied)", self.uses, self.denied)
+        }
+    }
 }
 
 /// How much of the run the capture layer could actually see.
@@ -289,6 +339,11 @@ impl RunReport {
             tracing::warn!(error = %e, "run report has no file section");
             Vec::new()
         });
+        // `$HOME` inside the guest, so `~/.cache/uv` reads as itself rather
+        // than as `/home/ethan.guest/.cache`. Taken from the run's own exec
+        // events, which carry the cwd the wrapper set; empty is fine and
+        // simply means no path gets folded to `~`.
+        let home = guest_home(events);
 
         let coverage = Coverage {
             sources: run.capture_sources.clone(),
@@ -305,11 +360,11 @@ impl RunReport {
         Self {
             report_version: REPORT_VERSION,
             duration_ms: run.duration_ms(),
-            files: file_changes(scope, &changes),
+            files: file_changes(scope, &changes, outside_writes(events, &home)),
             network: network(events, &summary),
             processes: processes(events),
             violations: summary.violations.clone(),
-            credential_use: Vec::new(),
+            credential_use: credential_use(events),
             coverage,
             run,
         }
@@ -325,7 +380,205 @@ impl RunReport {
     }
 }
 
-fn file_changes(scope: &str, changes: &[OverlayChange]) -> FileChanges {
+/// The guest's `$HOME`, from the wrapper's own argv.
+///
+/// Only the wrapper knows it: the host cannot ask, because `$HOME` inside a
+/// box is the box's user's, and the exec events are the only place it is
+/// written down. Empty when there is no wrapper exec in the run, which folds
+/// no path to `~` and is only a cosmetic loss.
+fn guest_home(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter(|e| e.kind == EventType::Exec)
+        .filter_map(|e| e.exec.as_ref())
+        .find_map(|exec| crate::obs::run::home_from_wrapper(&exec.argv))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The broker requests this run made, one row per provider and upstream host.
+///
+/// Grouped rather than listed: an agent session makes hundreds of calls to one
+/// host, and a report that prints them all is a log, not a report. The counts
+/// and the last timestamp are what a reader lines up against the broker's own
+/// audit when they want the individual requests.
+///
+/// These events have no pid — the broker is a host process, not something in
+/// the box — so they reach a run through the window rule (§4.2).
+fn credential_use(events: &[Event]) -> Vec<CredentialUse> {
+    /// What one (provider, upstream) pair accumulates on the way through.
+    #[derive(Default)]
+    struct Tally {
+        uses: usize,
+        denied: usize,
+        methods: std::collections::BTreeSet<String>,
+        last_use: String,
+    }
+
+    let mut by_key: BTreeMap<(String, String), Tally> = BTreeMap::new();
+    for event in events {
+        if event.kind != EventType::Credential {
+            continue;
+        }
+        let Some(credential) = &event.credential else {
+            continue;
+        };
+        let key = (credential.provider.clone(), credential.host.clone());
+        let tally = by_key.entry(key).or_default();
+        tally.uses += 1;
+        // Anything that is not an outright allow. `denied` and `error` are
+        // different things to the broker and the same thing to a reader
+        // checking whether the credential was actually used.
+        if credential.verdict != "allowed" {
+            tally.denied += 1;
+        }
+        if !credential.method.is_empty() {
+            tally.methods.insert(credential.method.clone());
+        }
+        if event.ts_wall > tally.last_use {
+            tally.last_use = event.ts_wall.clone();
+        }
+    }
+
+    let mut rows: Vec<CredentialUse> = by_key
+        .into_iter()
+        .map(|((provider, host), tally)| CredentialUse {
+            provider,
+            host,
+            method: tally.methods.into_iter().collect::<Vec<_>>().join(", "),
+            uses: tally.uses,
+            denied: tally.denied,
+            last_use: tally.last_use,
+        })
+        .collect();
+    // Busiest first, and a refused provider ahead of a quiet one at the same
+    // count — a denial is the row someone is looking for.
+    rows.sort_by(|a, b| {
+        b.uses
+            .cmp(&a.uses)
+            .then_with(|| b.denied.cmp(&a.denied))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    rows
+}
+
+/// How many outside-write prefixes a report lists.
+///
+/// Five, and the tail is summarised rather than dropped. The point of the
+/// section is "this run wrote somewhere `devbox commit` will not see"; a
+/// reader needs the shape of that, not an inventory.
+const OUTSIDE_PREFIXES: usize = 5;
+
+/// Writes the run made outside the workspace overlay, by top-level directory.
+///
+/// `/workspace` and `/mnt/host` are excluded because the overlay diff above
+/// already accounts for them, and everything ephemeral to the guest's own
+/// machinery is excluded too — a report whose largest "finding" is that a
+/// command wrote to `/proc/self/fd` has buried the one that matters.
+fn outside_writes(events: &[Event], home: &str) -> Vec<OutsideWrites> {
+    use std::collections::BTreeSet;
+
+    // Pseudo-filesystems and the tmpfs devbox uses for its own bookkeeping.
+    // These are writes in the kernel's sense and noise in every other one.
+    const IGNORED: [&str; 6] = ["/proc/", "/sys/", "/dev/", "/run/", "/tmp/", "/var/log/"];
+
+    let mut by_prefix: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+    for event in events {
+        if event.kind != EventType::File {
+            continue;
+        }
+        let Some(file) = &event.file else { continue };
+        if !matches!(file.op.as_str(), "write" | "create") {
+            continue;
+        }
+        let path = file.path.as_str();
+        if !path.starts_with('/') {
+            continue;
+        }
+        if path.starts_with(&format!("{WORKSPACE}/"))
+            || path == WORKSPACE
+            || path.starts_with(&format!("{LOWER}/"))
+            || path == LOWER
+        {
+            continue;
+        }
+        if IGNORED.iter().any(|p| path.starts_with(p)) {
+            continue;
+        }
+        let entry = by_prefix
+            .entry(prefix_of(path, home))
+            .or_insert((0, BTreeSet::new()));
+        entry.0 += 1;
+        entry.1.insert(path.to_string());
+    }
+
+    let mut rows: Vec<OutsideWrites> = by_prefix
+        .into_iter()
+        .map(|(prefix, (writes, paths))| OutsideWrites {
+            prefix,
+            writes,
+            paths: paths.len(),
+        })
+        .collect();
+    // Busiest first: the reader wants the twenty-megabyte cache, not the
+    // alphabetically-first dotfile.
+    rows.sort_by(|a, b| {
+        b.writes
+            .cmp(&a.writes)
+            .then_with(|| a.prefix.cmp(&b.prefix))
+    });
+    if rows.len() > OUTSIDE_PREFIXES {
+        let tail: Vec<OutsideWrites> = rows.split_off(OUTSIDE_PREFIXES);
+        rows.push(OutsideWrites {
+            prefix: format!(
+                "… and {} more director{}",
+                tail.len(),
+                if tail.len() == 1 { "y" } else { "ies" }
+            ),
+            writes: tail.iter().map(|r| r.writes).sum(),
+            paths: tail.iter().map(|r| r.paths).sum(),
+        });
+    }
+    rows
+}
+
+/// The directory a path is filed under: two levels below `$HOME`, one level
+/// below `/`.
+///
+/// `~/.cache/uv` rather than `~` or the full path to every wheel — a home
+/// directory is where everything lives, so one level of it says nothing, and
+/// the whole path says too much.
+fn prefix_of(path: &str, home: &str) -> String {
+    let (base, rest) = if !home.is_empty() && home != "/" && path.starts_with(&format!("{home}/")) {
+        ("~".to_string(), &path[home.len() + 1..])
+    } else {
+        (String::new(), path.trim_start_matches('/'))
+    };
+    let depth = if base == "~" { 2 } else { 1 };
+    let head: Vec<&str> = rest
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .take(depth)
+        .collect();
+    if head.is_empty() {
+        return if base.is_empty() {
+            "/".to_string()
+        } else {
+            base
+        };
+    }
+    if base.is_empty() {
+        format!("/{}", head.join("/"))
+    } else {
+        format!("{base}/{}", head.join("/"))
+    }
+}
+
+fn file_changes(
+    scope: &str,
+    changes: &[OverlayChange],
+    outside: Vec<OutsideWrites>,
+) -> FileChanges {
     let directories = changes.iter().filter(|c| c.is_dir).count();
     let mut rows: Vec<FileChange> = changes
         .iter()
@@ -345,6 +598,7 @@ fn file_changes(scope: &str, changes: &[OverlayChange]) -> FileChanges {
         scope: scope.to_string(),
         changes: rows,
         directories,
+        outside,
     }
 }
 
@@ -427,6 +681,9 @@ fn network(events: &[Event], summary: &Summary) -> Network {
     }
 }
 
+/// What a folded run of devbox's own processes renders as.
+pub const WRAPPER_ROW: &str = "[devbox wrapper]";
+
 fn processes(events: &[Event]) -> Vec<ProcessRow> {
     // Packet-derived observations have no process; feeding the sentinel pid to
     // the chainer would invent one enormous phantom process that "ran" every
@@ -437,7 +694,7 @@ fn processes(events: &[Event]) -> Vec<ProcessRow> {
         .cloned()
         .collect();
     let chains = correlate::chains(&owned);
-    correlate::tree(&chains)
+    let rows: Vec<ProcessRow> = correlate::tree(&chains)
         .into_iter()
         .map(|(index, depth)| {
             let chain = &chains[index];
@@ -450,9 +707,87 @@ fn processes(events: &[Event]) -> Vec<ProcessRow> {
                 started: chain.started.clone(),
                 peers: chain.peers.clone(),
                 files: chain.files.len(),
+                wrapper: is_wrapper(chain),
             }
         })
-        .collect()
+        .collect();
+    fold_wrappers(rows)
+}
+
+/// Whether a chain is devbox's own plumbing.
+///
+/// Asked of the chain's `argv` when there is one, because that is the form the
+/// generators produce and the predicates match. A chain with no exec — a
+/// process the capture layer only ever saw doing something else — is the
+/// user's until proven otherwise.
+fn is_wrapper(chain: &correlate::Chain) -> bool {
+    chain
+        .events
+        .iter()
+        .filter(|e| e.kind == EventType::Exec)
+        .filter_map(|e| e.exec.as_ref())
+        .any(|exec| {
+            crate::obs::run::is_wrapper_command(&exec.argv)
+                || crate::mcp::shim::is_wrapper_command(&exec.argv)
+        })
+}
+
+/// Collapse each run of devbox's own processes into one line, and re-root what
+/// is left so the user's command is the tree.
+///
+/// Not "drop them": the wrapper is how the report knows what it knows, and a
+/// tree that silently omits three processes is a tree nobody can reconcile
+/// with `devbox watch --tree`, which shows the raw view on purpose. One line
+/// says they were there and gets out of the way.
+fn fold_wrappers(rows: Vec<ProcessRow>) -> Vec<ProcessRow> {
+    if !rows.iter().any(|r| r.wrapper) {
+        return rows;
+    }
+
+    let mut out: Vec<ProcessRow> = Vec::with_capacity(rows.len());
+    let mut folding: Option<ProcessRow> = None;
+    for row in rows {
+        if row.wrapper {
+            match &mut folding {
+                // Keep the first one's pid and start: it is the process that
+                // actually began the wrapping, and the timestamp is what lines
+                // the report up against `devbox watch`.
+                Some(open) => open.files += row.files,
+                None => {
+                    folding = Some(ProcessRow {
+                        depth: 0,
+                        comm: "devbox".to_string(),
+                        command: WRAPPER_ROW.to_string(),
+                        peers: Vec::new(),
+                        ..row
+                    })
+                }
+            }
+            continue;
+        }
+        if let Some(open) = folding.take() {
+            out.push(open);
+        }
+        out.push(row);
+    }
+    if let Some(open) = folding.take() {
+        out.push(open);
+    }
+
+    // Re-root. A user process whose parent was folded away kept the depth that
+    // parent gave it, so the tree opened one indent in from nothing.
+    let shallowest = out
+        .iter()
+        .filter(|r| r.command != WRAPPER_ROW)
+        .map(|r| r.depth)
+        .min()
+        .unwrap_or(0);
+    for row in &mut out {
+        if row.command != WRAPPER_ROW {
+            row.depth -= shallowest.min(row.depth);
+        }
+    }
+    out
 }
 
 /// Bytes as a human reads them. Shared by all three renderers so the markdown
@@ -487,4 +822,423 @@ pub fn human_duration(ms: Option<i64>) -> String {
     let minutes = (seconds / 60.0).floor() as i64;
     let rest = seconds - (minutes as f64) * 60.0;
     format!("{minutes}m{rest:.0}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obs::event::{Exec, File as FileDetail};
+    use crate::obs::run::{RUN_ID_ENV, SCOPED_FLAG, bootstrap, wrapper_script};
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn exec_event(pid: u32, ppid: u32, comm: &str, ts: &str, words: &[&str]) -> Event {
+        Event {
+            ts_wall: ts.to_string(),
+            ts_mono_ns: ts.len() as u64,
+            box_id: "b".into(),
+            cgroup_id: 1,
+            pid,
+            tid: pid,
+            ppid,
+            comm: comm.into(),
+            uid: 1000,
+            kind: EventType::Exec,
+            net: None,
+            exec: Some(Exec {
+                path: format!("/bin/{comm}"),
+                argv: argv(words),
+                cwd: "/workspace".into(),
+            }),
+            file: None,
+            api: None,
+            policy: None,
+            credential: None,
+        }
+    }
+
+    fn write_event(pid: u32, ts: &str, path: &str) -> Event {
+        Event {
+            file: Some(FileDetail {
+                path: path.into(),
+                op: "write".into(),
+                flags: 0,
+            }),
+            kind: EventType::File,
+            exec: None,
+            ..exec_event(pid, 1, "sh", ts, &["sh"])
+        }
+    }
+
+    // ----------------------------------------------------------- wrappers
+
+    #[test]
+    fn every_shape_of_devbox_plumbing_is_recognised() {
+        use crate::mcp::shim;
+        use crate::obs::run;
+
+        // 1. The bootstrap, exactly as `devbox run` generates it.
+        let boot = bootstrap("01ABCDEFGHJKMNPQRSTVWXYZ00", "/workspace");
+        assert!(run::is_wrapper_command(&boot), "bootstrap");
+        assert!(boot[2].contains(SCOPED_FLAG), "the script carries the flag");
+        assert!(wrapper_script().contains(SCOPED_FLAG));
+
+        // 2. The wrapper re-execing itself into its scope.
+        assert!(run::is_wrapper_command(&argv(&[
+            "/bin/sh",
+            "/tmp/.devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.sh",
+            SCOPED_FLAG,
+            "systemd-user",
+            "01ABCDEFGHJKMNPQRSTVWXYZ00",
+            "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json",
+            "/workspace",
+            "/home/dev",
+            "dev",
+            "sh",
+            "-c",
+            "true",
+        ])));
+
+        // 3. systemd-run, and the two helpers the wrapper spawns.
+        assert!(run::is_wrapper_command(&argv(&[
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--unit=devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00",
+            "--quiet",
+        ])));
+        assert!(run::is_wrapper_command(&argv(&[
+            "stat",
+            "-c",
+            "%i",
+            "/sys/fs/cgroup/user.slice/devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.scope",
+        ])));
+        assert!(run::is_wrapper_command(&argv(&[
+            "mv",
+            "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json.tmp",
+            "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json",
+        ])));
+
+        // 4. The environment shim.
+        assert!(run::is_wrapper_command(&argv(&[
+            "env",
+            "--",
+            "DEVBOX_BROKER_URL=http://h:9",
+            &format!("{RUN_ID_ENV}=01ABC"),
+            "sh",
+            "-c",
+            "true",
+        ])));
+
+        // 5. The MCP shim and its reaper.
+        let mcp = shim::wrap_guest_command(
+            "/tmp/devbox-mcp-fetch-0123456789abcdef.pgid",
+            std::iter::empty(),
+            &["uvx".to_string(), "mcp-server-fetch".to_string()],
+        );
+        assert!(shim::is_wrapper_command(&mcp), "mcp wrapper: {mcp:?}");
+        assert!(shim::is_wrapper_command(&shim::reaper_script(
+            "/tmp/devbox-mcp-fetch-0123456789abcdef.pgid"
+        )));
+    }
+
+    #[test]
+    fn a_users_command_that_merely_mentions_devbox_is_not_folded() {
+        use crate::obs::run;
+        // The trap a bare substring match falls into: the variable's *name*
+        // appears in a command the user wrote, and folding it would delete
+        // their command from their own report.
+        assert!(!run::is_wrapper_command(&argv(&[
+            "sh",
+            "-c",
+            "echo $DEVBOX_RUN_ID",
+        ])));
+        assert!(!run::is_wrapper_command(&argv(&["env"])));
+        assert!(!run::is_wrapper_command(&argv(&[
+            "curl",
+            "-s",
+            "https://x"
+        ])));
+        assert!(!run::is_wrapper_command(&[]));
+        assert!(!crate::mcp::shim::is_wrapper_command(&argv(&[
+            "uvx", "srv"
+        ])));
+    }
+
+    #[test]
+    fn the_wrapper_folds_to_one_line_and_the_command_becomes_the_root() {
+        // The shape a real run produces: bootstrap, the scoped re-exec, two
+        // helpers, then the user's command and its child.
+        let events = vec![
+            exec_event(
+                900,
+                1,
+                "sh",
+                "2026-09-05T10:00:00.000Z",
+                &[
+                    "/bin/sh",
+                    "/tmp/.devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.sh",
+                    SCOPED_FLAG,
+                    "systemd-user",
+                    "01ABCDEFGHJKMNPQRSTVWXYZ00",
+                    "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json",
+                    "/workspace",
+                    "/home/dev",
+                    "dev",
+                    "sh",
+                    "-c",
+                    "curl https://example.com",
+                ],
+            ),
+            exec_event(
+                901,
+                900,
+                "stat",
+                "2026-09-05T10:00:00.100Z",
+                &[
+                    "stat",
+                    "-c",
+                    "%i",
+                    "/sys/fs/cgroup/user.slice/devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.scope",
+                ],
+            ),
+            exec_event(
+                902,
+                900,
+                "mv",
+                "2026-09-05T10:00:00.110Z",
+                &[
+                    "mv",
+                    "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json.tmp",
+                    "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json",
+                ],
+            ),
+            exec_event(
+                900,
+                1,
+                "sh",
+                "2026-09-05T10:00:00.200Z",
+                &["sh", "-c", "curl https://example.com"],
+            ),
+            exec_event(
+                903,
+                900,
+                "curl",
+                "2026-09-05T10:00:00.300Z",
+                &["curl", "https://example.com"],
+            ),
+        ];
+
+        let rows = processes(&events);
+        let folded: Vec<&ProcessRow> = rows.iter().filter(|r| r.wrapper).collect();
+        assert_eq!(
+            folded.len(),
+            1,
+            "three wrapper processes, one line: {rows:#?}"
+        );
+        assert_eq!(folded[0].command, WRAPPER_ROW);
+        assert_eq!(folded[0].pid, 900, "the first wrapper's pid is kept");
+        assert_eq!(
+            folded[0].started, "2026-09-05T10:00:00.000Z",
+            "and its timestamp"
+        );
+
+        // The user's command is the root, and its child is under it.
+        let user: Vec<&ProcessRow> = rows.iter().filter(|r| !r.wrapper).collect();
+        assert_eq!(user.len(), 2, "{rows:#?}");
+        assert_eq!(user[0].command, "sh -c curl https://example.com");
+        assert_eq!(user[0].depth, 0, "the user's command is the tree root");
+        assert_eq!(user[1].comm, "curl");
+        assert!(user[1].depth > 0, "its child is under it");
+    }
+
+    #[test]
+    fn a_run_with_no_wrapper_is_left_exactly_as_it_was() {
+        // `exec` and `shell` runs have no wrapper. Folding must be a no-op
+        // there rather than re-rooting a tree that was already rooted.
+        let events = vec![
+            exec_event(
+                900,
+                1,
+                "sh",
+                "2026-09-05T10:00:00.000Z",
+                &["sh", "-c", "true"],
+            ),
+            exec_event(901, 900, "true", "2026-09-05T10:00:00.100Z", &["true"]),
+        ];
+        let rows = processes(&events);
+        assert!(rows.iter().all(|r| !r.wrapper));
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows.len(), 2);
+    }
+
+    // ---------------------------------------------------- outside writes
+
+    #[test]
+    fn writes_outside_the_overlay_are_grouped_by_directory() {
+        let mut events = vec![
+            // Inside the workspace: the overlay diff already has these.
+            write_event(900, "2026-09-05T10:00:00.000Z", "/workspace/w2-5.txt"),
+            write_event(900, "2026-09-05T10:00:00.001Z", "/mnt/host/src/main.rs"),
+            // Pseudo-filesystems and devbox's own tmpfs bookkeeping.
+            write_event(900, "2026-09-05T10:00:00.002Z", "/proc/self/uid_map"),
+            write_event(900, "2026-09-05T10:00:00.003Z", "/run/devbox/runs/x.json"),
+            write_event(900, "2026-09-05T10:00:00.004Z", "/dev/null"),
+        ];
+        // The thing the section exists for.
+        for i in 0..40 {
+            events.push(write_event(
+                901,
+                "2026-09-05T10:00:01.000Z",
+                &format!("/home/dev/.cache/uv/wheel-{i}.whl"),
+            ));
+        }
+        for i in 0..3 {
+            events.push(write_event(
+                901,
+                "2026-09-05T10:00:02.000Z",
+                &format!("/home/dev/.npm/_cacache/{i}"),
+            ));
+        }
+        events.push(write_event(
+            901,
+            "2026-09-05T10:00:03.000Z",
+            "/etc/hosts.new",
+        ));
+
+        let rows = outside_writes(&events, "/home/dev");
+        let prefixes: Vec<&str> = rows.iter().map(|r| r.prefix.as_str()).collect();
+        assert_eq!(prefixes, vec!["~/.cache/uv", "~/.npm/_cacache", "/etc"]);
+        assert_eq!(rows[0].writes, 40);
+        assert_eq!(rows[0].paths, 40);
+        assert_eq!(rows[1].writes, 3);
+
+        // With no `$HOME` known, nothing folds to `~` and the paths still
+        // group — a worse-looking report, not a wrong one.
+        let rows = outside_writes(&events, "");
+        assert_eq!(rows[0].prefix, "/home");
+
+        // Nothing outside means no section at all.
+        let inside = vec![write_event(900, "2026-09-05T10:00:00.000Z", "/workspace/a")];
+        assert!(outside_writes(&inside, "/home/dev").is_empty());
+    }
+
+    #[test]
+    fn only_five_directories_are_listed_and_the_rest_are_counted() {
+        let mut events = Vec::new();
+        // Seven directories, descending in size, so the order is decided.
+        for (dir, n) in [
+            ("a", 7),
+            ("b", 6),
+            ("c", 5),
+            ("d", 4),
+            ("e", 3),
+            ("f", 2),
+            ("g", 1),
+        ] {
+            for i in 0..n {
+                events.push(write_event(
+                    900,
+                    "2026-09-05T10:00:00.000Z",
+                    &format!("/opt/{dir}/{i}"),
+                ));
+            }
+        }
+        let rows = outside_writes(&events, "/home/dev");
+        // Everything under /opt collapses to one prefix — one level below `/`.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prefix, "/opt");
+        assert_eq!(rows[0].writes, 28);
+
+        // Now seven genuinely different top-level directories.
+        let events: Vec<Event> = "abcdefg"
+            .chars()
+            .enumerate()
+            .flat_map(|(i, c)| {
+                (0..(7 - i)).map(move |j| {
+                    write_event(900, "2026-09-05T10:00:00.000Z", &format!("/{c}/{j}"))
+                })
+            })
+            .collect();
+        let rows = outside_writes(&events, "");
+        assert_eq!(rows.len(), OUTSIDE_PREFIXES + 1, "five plus a tail");
+        assert_eq!(rows[0].prefix, "/a");
+        assert!(rows[5].prefix.starts_with("… and 2 more"), "{:?}", rows[5]);
+        assert_eq!(rows[5].writes, 2 + 1);
+    }
+
+    // ------------------------------------------------------- credentials
+
+    #[test]
+    fn credential_use_groups_by_provider_and_upstream() {
+        use crate::obs::event::Credential;
+
+        let credential =
+            |provider: &str, host: &str, method: &str, verdict: &str, ts: &str| Event {
+                ts_wall: ts.to_string(),
+                kind: EventType::Credential,
+                pid: crate::obs::run::UNATTRIBUTED_PID,
+                exec: None,
+                credential: Some(Credential {
+                    provider: provider.into(),
+                    method: method.into(),
+                    host: host.into(),
+                    path: "/v1/x".into(),
+                    status: 200,
+                    verdict: verdict.into(),
+                    ..Default::default()
+                }),
+                ..exec_event(1, 1, "broker", ts, &["x"])
+            };
+
+        let events = vec![
+            credential(
+                "anthropic",
+                "api.anthropic.com",
+                "POST",
+                "allowed",
+                "2026-09-05T10:00:00.000Z",
+            ),
+            credential(
+                "anthropic",
+                "api.anthropic.com",
+                "GET",
+                "allowed",
+                "2026-09-05T10:00:01.000Z",
+            ),
+            credential(
+                "anthropic",
+                "api.anthropic.com",
+                "POST",
+                "denied",
+                "2026-09-05T10:00:02.000Z",
+            ),
+            credential(
+                "github",
+                "github.com",
+                "GET",
+                "allowed",
+                "2026-09-05T10:00:03.000Z",
+            ),
+        ];
+
+        let rows = credential_use(&events);
+        assert_eq!(rows.len(), 2, "one row per provider and upstream");
+        assert_eq!(rows[0].provider, "anthropic");
+        assert_eq!(rows[0].host, "api.anthropic.com");
+        assert_eq!(rows[0].method, "GET, POST", "methods are merged, sorted");
+        assert_eq!(rows[0].uses, 3);
+        assert_eq!(rows[0].denied, 1);
+        assert_eq!(
+            rows[0].last_use, "2026-09-05T10:00:02.000Z",
+            "the most recent, not the first"
+        );
+        assert_eq!(rows[0].uses_human(), "3 (1 denied)");
+        assert_eq!(rows[1].provider, "github");
+        assert_eq!(rows[1].uses_human(), "1", "a clean row stays quiet");
+
+        assert!(credential_use(&[]).is_empty());
+    }
 }

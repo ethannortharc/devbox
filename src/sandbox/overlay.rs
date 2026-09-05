@@ -3,10 +3,14 @@ use anyhow::{Result, bail};
 use crate::runtime::Runtime;
 
 /// OverlayFS paths inside the VM.
-#[allow(dead_code)]
-const WORKSPACE: &str = "/workspace";
+///
+/// `WORKSPACE` and `LOWER` are the two trees a change under them can reach the
+/// host from — everything else a run writes stays inside the box. The run
+/// report needs to be able to tell those apart (`report::model`), so they are
+/// public rather than a second copy over there.
+pub const WORKSPACE: &str = "/workspace";
 pub(crate) const UPPER: &str = "/var/devbox/overlay/upper";
-const LOWER: &str = "/mnt/host";
+pub const LOWER: &str = "/mnt/host";
 #[allow(dead_code)]
 const WORK: &str = "/var/devbox/overlay/work";
 const STASH_DIR: &str = "/var/devbox/overlay/stash";

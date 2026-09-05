@@ -635,6 +635,31 @@ impl Attributor {
 /// cannot — a box with no passwordless sudo still gets attribution.
 pub const RUN_STATE_DIRS: [&str; 2] = ["/run/devbox/runs", "/tmp/.devbox-runs"];
 
+/// The sentinel that tells the wrapper it is already inside the scope.
+///
+/// Also what [`is_wrapper_command`] recognises. These constants exist because
+/// the report has to fold devbox's own plumbing out of the process tree, and a
+/// second copy of the string in the folding rule would silently stop matching
+/// the day the wrapper changed — leaving a report that renders three lines of
+/// shell where the user's command should be, with nothing failing.
+pub const SCOPED_FLAG: &str = "--devbox-scoped";
+
+/// The transient systemd unit, and the cgroup directory, one run gets.
+pub const UNIT_PREFIX: &str = "devbox-run-";
+
+/// Where the bootstrap writes the wrapper inside the guest.
+pub const WRAPPER_PATH_PREFIX: &str = "/tmp/.devbox-run-";
+
+/// The bootstrap's heredoc delimiter — the one word that identifies it even
+/// when the rest of the script has been rewritten.
+pub const HEREDOC_TAG: &str = "DEVBOX_WRAPPER_EOF";
+
+/// `$0` for the wrapper's shell, so `ps` says what it is.
+pub const BOOTSTRAP_ARGV0: &str = "devbox-run";
+
+/// The run's identity in the command's environment.
+pub const RUN_ID_ENV: &str = "DEVBOX_RUN_ID";
+
 /// The wrapper, stage 2 and stage 1 in one script (§4.2).
 ///
 /// Stage 1 picks the most exclusive scope the guest can give, then re-execs
@@ -645,8 +670,20 @@ pub const RUN_STATE_DIRS: [&str; 2] = ["/run/devbox/runs", "/tmp/.devbox-runs"];
 ///
 /// POSIX `sh`, no bashisms: the Docker boxes are Ubuntu with `dash` as `/bin/sh`.
 pub fn wrapper_script() -> &'static str {
-    r#"# devbox run wrapper — see src/obs/run.rs.
-if [ "${1-}" = "--devbox-scoped" ]; then
+    // Placeholders rather than `format!`: the script is full of `${…}` and the
+    // escaping would make it unreadable, which is the wrong trade for a shell
+    // program people have to be able to check by eye. Substituted once.
+    static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        RAW_WRAPPER
+            .replace("@SCOPED@", SCOPED_FLAG)
+            .replace("@UNIT@", UNIT_PREFIX)
+            .replace("@RUN_ID_ENV@", RUN_ID_ENV)
+    })
+}
+
+const RAW_WRAPPER: &str = r#"# devbox run wrapper — see src/obs/run.rs.
+if [ "${1-}" = "@SCOPED@" ]; then
     shift
     method=$1; rid=$2; state=$3; cwd=$4; home=$5; who=$6
     shift 6
@@ -663,7 +700,7 @@ if [ "${1-}" = "--devbox-scoped" ]; then
     printf '{"run_id":"%s","cgroup_id":%s,"cgroup_path":"%s","root_pid":%s,"scope":"%s"}\n' \
         "$rid" "${ino:-0}" "$cg" "$$" "$method" > "$state.tmp" 2>/dev/null &&
         mv "$state.tmp" "$state" 2>/dev/null
-    DEVBOX_RUN_ID=$rid; export DEVBOX_RUN_ID
+    @RUN_ID_ENV@=$rid; export @RUN_ID_ENV@
     if [ -n "$home" ] && [ "${HOME-}" != "$home" ]; then HOME=$home; export HOME; fi
     if [ -n "$who" ] && [ "${USER-}" != "$who" ]; then USER=$who; LOGNAME=$who; export USER LOGNAME; fi
     if [ -n "$cwd" ] && [ -d "$cwd" ]; then cd "$cwd" || true; fi
@@ -673,7 +710,7 @@ fi
 self=$0
 rid=$1; state=$2; cwd=$3
 shift 3
-unit=devbox-run-$rid
+unit=@UNIT@$rid
 home=${HOME-}; who=${USER-$(id -un 2>/dev/null || echo "")}
 method=
 if [ -d /run/systemd/system ]; then
@@ -691,19 +728,18 @@ fi
 case $method in
 systemd-user)
     exec systemd-run --user --scope --unit="$unit" --quiet --same-dir -- \
-        sh "$self" --devbox-scoped "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
+        sh "$self" @SCOPED@ "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
 systemd-system)
     exec sudo -n systemd-run --scope --unit="$unit" --quiet --same-dir \
         --uid="$(id -u)" --gid="$(id -g)" -- \
-        sh "$self" --devbox-scoped "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
+        sh "$self" @SCOPED@ "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
 cgroup)
     echo $$ > "/sys/fs/cgroup/devbox/$unit/cgroup.procs" 2>/dev/null || method=none
-    exec sh "$self" --devbox-scoped "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
+    exec sh "$self" @SCOPED@ "$method" "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
 *)
-    exec sh "$self" --devbox-scoped none "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
+    exec sh "$self" @SCOPED@ none "$rid" "$state" "$cwd" "$home" "$who" "$@" ;;
 esac
-"#
-}
+"#;
 
 /// The argv `devbox run` hands the runtime.
 ///
@@ -719,14 +755,16 @@ pub fn bootstrap(run_id: &str, cwd: &str) -> Vec<String> {
         r#"d={primary}
 {{ mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; }} || sudo -n sh -c 'mkdir -p {primary} && chmod 1777 {primary}' 2>/dev/null
 [ -w "$d" ] || {{ d={fallback}; mkdir -p "$d" 2>/dev/null; }}
-w=/tmp/.devbox-run-{run_id}.sh
-cat > "$w" <<'DEVBOX_WRAPPER_EOF'
+w={prefix}{run_id}.sh
+cat > "$w" <<'{tag}'
 {wrapper}
-DEVBOX_WRAPPER_EOF
+{tag}
 exec sh "$w" {run_id} "$d/{run_id}.json" '{cwd}' "$@"
 "#,
         primary = primary,
         fallback = fallback,
+        prefix = WRAPPER_PATH_PREFIX,
+        tag = HEREDOC_TAG,
         run_id = run_id,
         cwd = cwd.replace('\'', ""),
         wrapper = wrapper_script(),
@@ -735,7 +773,7 @@ exec sh "$w" {run_id} "$d/{run_id}.json" '{cwd}' "$@"
         "sh".to_string(),
         "-c".to_string(),
         script,
-        "devbox-run".to_string(),
+        BOOTSTRAP_ARGV0.to_string(),
     ]
 }
 
@@ -765,6 +803,78 @@ exit 1
     vec!["sh".to_string(), "-c".to_string(), script]
 }
 
+/// Where `$home` sits in the wrapper's stage-2 argv, counting from the flag.
+///
+/// `@SCOPED@ method rid state cwd home who` — see [`RAW_WRAPPER`]'s stage 2,
+/// which unpacks exactly these six in this order. Here so the report can fold
+/// a guest path back to `~` without a second copy of that ordering.
+const HOME_AFTER_FLAG: usize = 5;
+
+/// The guest's `$HOME`, as the wrapper recorded it, from a run's exec events.
+///
+/// `None` when no wrapper exec was captured — a short run whose first events
+/// arrived before the host knew the cgroup, or an `exec`/`shell` run, which
+/// has no wrapper at all. The caller's fallback is "fold nothing to `~`",
+/// which is a worse-looking report rather than a wrong one.
+pub fn home_from_wrapper(argv: &[String]) -> Option<&str> {
+    let flag = argv.iter().position(|a| a == SCOPED_FLAG)?;
+    argv.get(flag + HOME_AFTER_FLAG)
+        .map(String::as_str)
+        .filter(|home| home.starts_with('/') && home.len() > 1)
+}
+
+/// Whether this argv is devbox's own plumbing rather than the user's command.
+///
+/// A run report is read by someone asking "what did my command do". Three
+/// lines of heredoc, a `systemd-run --scope`, and a `stat` on a cgroup path
+/// answer a different question, and they arrive first — so the reader's eye
+/// lands on devbox's implementation before it reaches their own program.
+///
+/// Every marker here is the constant the generator uses, not a copy of it: the
+/// failure mode of a copy is a report that silently stops folding, which is
+/// invisible until someone reads one.
+///
+/// Positional where a bare substring would over-match. `sh -c 'echo
+/// $DEVBOX_RUN_ID'` is the user's command and mentions the variable; `env --
+/// DEVBOX_RUN_ID=… cmd` is devbox's shim and *assigns* it. Only the second is
+/// folded.
+pub fn is_wrapper_command(argv: &[String]) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    let word = |i: usize| argv.get(i).map(String::as_str).unwrap_or_default();
+
+    // `env -- K=V … cmd`, from `broker::with_env`.
+    if word(0) == "env"
+        && word(1) == "--"
+        && argv[2..]
+            .iter()
+            .any(|a| a.starts_with(&format!("{RUN_ID_ENV}=")))
+    {
+        return true;
+    }
+
+    // The wrapper re-execing itself into its scope, and `systemd-run` doing it.
+    if argv.iter().any(|a| a == SCOPED_FLAG) {
+        return true;
+    }
+    if word(0) == BOOTSTRAP_ARGV0 {
+        return true;
+    }
+
+    argv.iter().any(|a| {
+        // The bootstrap: `sh -c '…<<DEVBOX_WRAPPER_EOF…'`.
+        a.contains(HEREDOC_TAG)
+            // The wrapper file itself, and anything that touches it.
+            || a.starts_with(WRAPPER_PATH_PREFIX)
+            // `systemd-run --unit=devbox-run-<id>`, the `stat` on its cgroup
+            // directory, and the `rmdir` that cleans it up.
+            || a.contains(UNIT_PREFIX)
+            // The scope record the wrapper publishes and the host reads back.
+            || RUN_STATE_DIRS.iter().any(|dir| a.starts_with(dir))
+    })
+}
+
 /// Remove a finished run's wrapper and scope record from the guest.
 pub fn cleanup_argv(run_id: &str) -> Vec<String> {
     let primary = RUN_STATE_DIRS[0];
@@ -773,8 +883,10 @@ pub fn cleanup_argv(run_id: &str) -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "rm -f /tmp/.devbox-run-{run_id}.sh {primary}/{run_id}.json {fallback}/{run_id}.json 2>/dev/null; \
-             rmdir /sys/fs/cgroup/devbox/devbox-run-{run_id} 2>/dev/null; true"
+            "rm -f {prefix}{run_id}.sh {primary}/{run_id}.json {fallback}/{run_id}.json 2>/dev/null; \
+             rmdir /sys/fs/cgroup/devbox/{unit}{run_id} 2>/dev/null; true",
+            prefix = WRAPPER_PATH_PREFIX,
+            unit = UNIT_PREFIX
         ),
     ]
 }

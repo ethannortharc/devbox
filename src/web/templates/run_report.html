@@ -80,6 +80,14 @@
       }
       .tree .pid { color: var(--fg-faint); }
       .tree .cmd { color: var(--fg-muted); }
+      /* devbox's own plumbing, folded to one line: present, and out of the
+         way of the command the reader came for. */
+      .tree .wrapper { color: var(--fg-faint); font-style: italic; }
+      h3 {
+        font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+        color: var(--fg-faint); margin: 22px 0 10px; font-weight: 600;
+      }
+      td.denied { color: var(--err); }
       .empty { color: var(--fg-faint); font-style: italic; }
       .note {
         color: var(--fg-muted); font-size: 13px; margin: 0 0 12px;
@@ -120,7 +128,7 @@
       <h2>Files</h2>
       <p class="note">scope: {{ report.files.scope }}</p>
       {% if report.files.is_empty() %}
-      <p class="empty">No file changes.</p>
+      <p class="empty">No changes to the workspace overlay.</p>
       {% else %}
       <div class="scroll">
         <table>
@@ -143,6 +151,28 @@
         and {{ report.files.directories }} directories{% endif %}.
       </p>
       {% endif %}
+
+      {%- if report.files.has_outside() %}
+      <h3>Writes outside the workspace overlay</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>directory</th><th>writes</th><th>files</th></tr></thead>
+          <tbody>
+            {% for row in report.files.outside %}
+            <tr>
+              <td class="path">{{ row.prefix }}</td>
+              <td class="num">{{ row.writes }}</td>
+              <td class="num">{{ row.paths }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        These are inside the box's file scope but not part of what
+        <code>devbox commit</code> would sync.
+      </p>
+      {%- endif %}
 
       <h2>Network</h2>
       {% if report.network.domains.is_empty() && report.network.dns.is_empty() %}
@@ -183,22 +213,25 @@
       {% if report.processes.is_empty() %}
       <p class="empty">No processes captured.</p>
       {% else %}
-      <pre class="tree">{% for row in report.processes %}{{ row.indent() }}{{ row.comm }} <span class="pid">[{{ row.pid }}]</span> <span class="cmd">{{ row.display_command() }}</span>
+      <pre class="tree">{% for row in report.processes %}{{ row.indent() }}{% if row.wrapper %}<span class="wrapper">{{ row.comm }} [{{ row.pid }}] {{ row.display_command() }}</span>{% else %}{{ row.comm }} <span class="pid">[{{ row.pid }}]</span> <span class="cmd">{{ row.display_command() }}</span>{% endif %}
 {% endfor %}</pre>
       {% endif %}
 
       <h2>Credentials</h2>
       {% if report.credential_use.is_empty() %}
-      <p class="empty">Not recorded — the credential broker is not wired in this build.</p>
+      <p class="empty">No credential use recorded.</p>
       {% else %}
       <div class="scroll">
         <table>
-          <thead><tr><th>credential</th><th>provider</th><th>uses</th><th>first use</th></tr></thead>
+          <thead><tr><th>provider</th><th>upstream</th><th>method</th><th>uses</th><th>last use</th></tr></thead>
           <tbody>
             {% for cred in report.credential_use %}
             <tr>
-              <td class="mono">{{ cred.name }}</td><td>{{ cred.provider }}</td>
-              <td class="num">{{ cred.uses }}</td><td class="mono">{{ cred.first_use }}</td>
+              <td class="mono">{{ cred.provider }}</td>
+              <td class="peer">{{ cred.host }}</td>
+              <td>{{ cred.method }}</td>
+              <td class="num{% if cred.denied > 0 %} denied{% endif %}">{{ cred.uses_human() }}</td>
+              <td class="mono">{{ cred.last_use }}</td>
             </tr>
             {% endfor %}
           </tbody>

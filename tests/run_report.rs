@@ -364,8 +364,9 @@ fn the_markdown_report_states_every_fact_it_was_built_from() {
         "curl [901] curl -s https://example.com",
         // policy
         "| `10.1.2.3:22` | block | not in allowlist |",
-        // and the thing that must never read as "no credentials were used"
-        "Not recorded — the credential broker is not wired in this build.",
+        // The broker is wired now, so an empty section is a fact about the
+        // run rather than a fact about the build.
+        "No credential use recorded.",
     ] {
         assert!(
             report.contains(expected),
@@ -451,6 +452,137 @@ fn a_connection_the_window_did_not_see_start_is_still_reported() {
     assert_eq!(row.closes, 1);
     assert_eq!(row.bytes_rx, 4096);
     assert_eq!(row.conns_human(), "0 (+1 closed)", "and it says so");
+}
+
+#[test]
+fn the_renderers_show_what_the_overlay_and_the_broker_saw() {
+    use devbox::obs::event::{Credential, File as FileDetail};
+
+    let mut events = Vec::new();
+    // A run that installed something: nothing in the workspace, a lot in a
+    // cache the overlay does not carry. Before this section such a run read
+    // "No file changes", which is true of the workspace and false of the box.
+    for i in 0..12 {
+        let mut write = base(
+            EventType::File,
+            ROOT_PID,
+            1,
+            CGROUP,
+            "2026-09-05T10:00:00.400Z",
+        );
+        write.file = Some(FileDetail {
+            path: format!("/home/dev/.cache/uv/wheel-{i}.whl"),
+            op: "write".into(),
+            flags: 0,
+        });
+        events.push(write);
+    }
+    // The wrapper's own exec, which is where `$HOME` comes from and which the
+    // process tree must fold away.
+    let mut wrapper = base(
+        EventType::Exec,
+        ROOT_PID,
+        1,
+        CGROUP,
+        "2026-09-05T10:00:00.000Z",
+    );
+    wrapper.exec = Some(Exec {
+        path: "/bin/sh".into(),
+        argv: vec![
+            "/bin/sh".into(),
+            format!("/tmp/.devbox-run-{RUN}.sh"),
+            "--devbox-scoped".into(),
+            "systemd-user".into(),
+            RUN.into(),
+            format!("/run/devbox/runs/{RUN}.json"),
+            "/workspace".into(),
+            "/home/dev".into(),
+            "dev".into(),
+            "uv".into(),
+            "sync".into(),
+        ],
+        cwd: "/workspace".into(),
+    });
+    events.push(wrapper);
+
+    let mut user = base(
+        EventType::Exec,
+        950,
+        ROOT_PID,
+        CGROUP,
+        "2026-09-05T10:00:00.100Z",
+    );
+    user.comm = "uv".into();
+    user.exec = Some(Exec {
+        path: "/bin/uv".into(),
+        argv: vec!["uv".into(), "sync".into()],
+        cwd: "/workspace".into(),
+    });
+    events.push(user);
+
+    // Two broker requests, one refused. These have no pid at all.
+    for (verdict, ts) in [
+        ("allowed", "2026-09-05T10:00:00.600Z"),
+        ("denied", "2026-09-05T10:00:00.700Z"),
+    ] {
+        let mut credential = base(EventType::Credential, u32::MAX, 0, 0, ts);
+        credential.comm = "broker".into();
+        credential.credential = Some(Credential {
+            provider: "anthropic".into(),
+            method: "POST".into(),
+            host: "api.anthropic.com".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+            verdict: verdict.into(),
+            ..Default::default()
+        });
+        events.push(credential);
+    }
+
+    let report = RunReport::build(
+        record(),
+        &events,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let text = markdown::render(&report);
+
+    for expected in [
+        // The overlay saw nothing; the box saw twelve wheels.
+        "No changes to the workspace overlay.",
+        "### Writes outside the workspace overlay",
+        "| `~/.cache/uv` | 12 | 12 |",
+        "not part of what `devbox commit` would sync",
+        // The broker's two requests, grouped, with the refusal called out.
+        "| `anthropic` | `api.anthropic.com` | POST | 2 (1 denied) | 2026-09-05T10:00:00.700Z |",
+        // And the wrapper is one line, with the user's command as the root.
+        "devbox [900] [devbox wrapper]",
+        "uv [950] uv sync",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the report does not say {expected:?}\n---\n{text}"
+        );
+    }
+    // The wrapper's argv must not survive anywhere in the rendered tree.
+    let tree = text
+        .split("## Processes")
+        .nth(1)
+        .and_then(|s| s.split("## Credentials").next())
+        .expect("a process section");
+    assert!(
+        !tree.contains("--devbox-scoped"),
+        "the wrapper's argv is still in the tree:\n{tree}"
+    );
+
+    // The HTML says the same things.
+    let page = html::render(&report).unwrap();
+    assert!(page.contains("~/.cache/uv"));
+    assert!(page.contains("api.anthropic.com"));
+    assert!(page.contains("[devbox wrapper]"));
+    assert!(!page.contains("not wired in this build"));
 }
 
 #[test]
@@ -723,6 +855,115 @@ fn the_start_of_a_run_is_recovered_once_the_host_learns_its_cgroup() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn a_brokers_credential_event_reaches_the_run_it_was_made_for() {
+    // The broker is a host process: its events never travel through the agent
+    // socket, so the collector's flush path — where every other event is
+    // attributed — never sees them. They were landing with a NULL `run_id`,
+    // which left the report's Credentials section permanently empty while the
+    // events sat in the same table two columns away.
+    use devbox::obs::event::Credential;
+
+    let store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+
+    let mut event = base(
+        EventType::Credential,
+        u32::MAX,
+        0,
+        0,
+        "2026-09-05T10:00:00.500Z",
+    );
+    event.comm = "broker".into();
+    event.credential = Some(Credential {
+        provider: "w25test".into(),
+        method: "GET".into(),
+        host: "127.0.0.1:18099".into(),
+        path: "/x".into(),
+        status: 200,
+        verdict: "allowed".into(),
+        ..Default::default()
+    });
+    store.insert_attributed(&event).unwrap();
+
+    let mine = store
+        .query(&Query {
+            run_id: Some(RUN.to_string()),
+            limit: Some(Query::MAX_LIMIT),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(mine.len(), 1, "the broker's event never reached the run");
+    assert_eq!(
+        store.attribution_counts(RUN).unwrap(),
+        vec![(Attribution::Window, 1)],
+        "a pid-less event can only ever be a window decision"
+    );
+
+    // An event outside every live run's window still stores, unattributed —
+    // the broker's audit is not conditional on a run being open.
+    let mut outside = event.clone();
+    outside.ts_wall = "2026-09-04T00:00:00.000Z".into();
+    store.insert_attributed(&outside).unwrap();
+    assert_eq!(store.count().unwrap(), 2);
+    assert_eq!(
+        store
+            .query(&Query {
+                run_id: Some(RUN.to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn destroying_a_box_takes_its_reports_with_it() {
+    // `devbox destroy` removes the event store so a later box under the same
+    // name cannot inherit a predecessor's timeline. The rendered reports are
+    // the same evidence in a second tree, and they were staying behind — so
+    // `devbox report <id>`, which finds a run by id across every box, went on
+    // answering for a box that no longer existed.
+    //
+    // Written by the real renderer and removed by the real remover, so the two
+    // agree about the path by construction rather than by a comment.
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+
+    let report = RunReport::build(
+        record(),
+        &fixture(),
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let written = devbox::report::write(state_dir, &report).unwrap();
+    assert!(written.html.exists() && written.json.exists() && written.markdown.exists());
+    assert!(devbox::report::load(state_dir, BOX, RUN).unwrap().is_some());
+
+    // A second box's report, to prove the removal is scoped to the one box.
+    let mut other = report.clone();
+    other.run.box_id = "keeper".into();
+    let kept = devbox::report::write(state_dir, &other).unwrap();
+
+    devbox::obs::collector::remove_box_data(state_dir, BOX).unwrap();
+
+    assert!(
+        !written.html.exists(),
+        "the report outlived the box it describes"
+    );
+    assert!(
+        devbox::report::load(state_dir, BOX, RUN).unwrap().is_none(),
+        "`devbox report` can still find a destroyed box's run"
+    );
+    assert!(kept.html.exists(), "a neighbour's report was taken too");
 }
 
 #[test]

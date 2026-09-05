@@ -554,7 +554,11 @@ pub fn write_credential_event(state: &BrokerState, box_id: &str, credential: Cre
     let event = credential_event(box_id, credential);
     let write = (|| -> Result<()> {
         let store = crate::obs::store::Store::open(&path)?;
-        store.insert(&event)?;
+        // Attributed, not plain. This is the one event writer that is not the
+        // collector, so nothing else would give it a `run_id` — and a run
+        // report's Credentials section reads by run, which left it empty while
+        // the events it wanted were in the same table.
+        store.insert_attributed(&event)?;
         Ok(())
     })();
     if let Err(error) = write {

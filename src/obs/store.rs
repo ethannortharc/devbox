@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
-use super::run::{ActiveRun, Attribution, EndedBy, RunRecord, RunStatus, RunTag};
+use super::run::{ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag};
 
 /// The schema this build writes, recorded in `meta` under `schema`.
 ///
@@ -346,6 +346,39 @@ impl Store {
             )
             .context("failed to insert an event")?;
 
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Append one event, attributing it to a live run by time window.
+    ///
+    /// The collector attributes on its own flush path, but it is not the only
+    /// writer: the credential broker is a *host* process, so its events never
+    /// travel through the agent socket and were being stored with a NULL
+    /// `run_id` — which made a run report's Credentials section permanently
+    /// empty while the events sat in the store two columns away.
+    ///
+    /// The rule is [`Attributor`]'s, not a second copy of it: a fresh one per
+    /// call, seeded from the live runs. That costs one indexed read per
+    /// brokered request, which is the right price for the one writer that
+    /// produces an event only when a box actually asks for a credential.
+    pub fn insert_attributed(&self, event: &Event) -> Result<i64> {
+        event.validate()?;
+        let raw = serde_json::to_string(event).context("failed to serialize an event")?;
+
+        let mut attributor = Attributor::new();
+        attributor.set_active(self.active_runs()?);
+        let tag = attributor.attribute(event);
+
+        self.conn
+            .execute(
+                INSERT_EVENT,
+                params_from_iter(
+                    event_params(event, &raw, tag.as_ref())
+                        .iter()
+                        .map(|a| a.as_ref()),
+                ),
+            )
+            .context("failed to insert an event")?;
         Ok(self.conn.last_insert_rowid())
     }
 

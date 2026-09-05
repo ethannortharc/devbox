@@ -149,9 +149,41 @@ kill -TERM -$p 2>/dev/null; i=0; \
 while [ $i -lt 25 ] && kill -0 -$p 2>/dev/null; do sleep 0.2; i=$((i+1)); done; \
 kill -0 -$p 2>/dev/null && kill -KILL -$p 2>/dev/null; exit 0";
 
+/// `$0` for the wrapper's shell, and for the reaper's, so `ps` says what they
+/// are — and so [`is_wrapper_command`] can recognise them without matching on
+/// the script text, which changes.
+pub const WRAPPER_ARGV0: &str = "devbox-mcp";
+pub const REAPER_ARGV0: &str = "devbox-mcp-reap";
+
+/// Where the process-group file lives inside the guest.
+pub const PGID_PATH_PREFIX: &str = "/tmp/devbox-mcp-";
+
 /// A guest path for the process-group file, unique per shim invocation.
 pub fn pgid_file_path(name: &str) -> String {
-    format!("/tmp/devbox-mcp-{name}-{:016x}.pgid", rand::random::<u64>())
+    format!(
+        "{PGID_PATH_PREFIX}{name}-{:016x}.pgid",
+        rand::random::<u64>()
+    )
+}
+
+/// Whether this argv is the MCP shim's own plumbing rather than the server.
+///
+/// The same job [`crate::obs::run::is_wrapper_command`] does for `devbox run`,
+/// and for the same reason: an MCP session's report should open on the server
+/// the user registered, not on the `read -r _ _ _ _ g _ < /proc/self/stat`
+/// that put it in a killable process group.
+pub fn is_wrapper_command(argv: &[String]) -> bool {
+    let word = |i: usize| argv.get(i).map(String::as_str).unwrap_or_default();
+    if word(0) == WRAPPER_ARGV0 || word(0) == REAPER_ARGV0 {
+        return true;
+    }
+    // `sh -c <script> devbox-mcp …`: the shell that runs it has the argv0 at
+    // index 3, and the scripts themselves are the other half of the pair.
+    if word(3) == WRAPPER_ARGV0 || word(3) == REAPER_ARGV0 {
+        return true;
+    }
+    argv.iter()
+        .any(|a| a == GUEST_WRAPPER || a == GUEST_REAPER || a.starts_with(PGID_PATH_PREFIX))
 }
 
 /// The argv to hand [`crate::runtime::Runtime::argv`] for a registered server.
@@ -167,7 +199,7 @@ where
         "sh".to_string(),
         "-c".to_string(),
         GUEST_WRAPPER.to_string(),
-        "devbox-mcp".to_string(),
+        WRAPPER_ARGV0.to_string(),
         pgid_file.to_string(),
     ];
     let assignments: Vec<String> = env
@@ -188,7 +220,7 @@ pub fn reaper_script(pgid_file: &str) -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         GUEST_REAPER.to_string(),
-        "devbox-mcp-reap".to_string(),
+        REAPER_ARGV0.to_string(),
         pgid_file.to_string(),
     ]
 }

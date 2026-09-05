@@ -108,6 +108,7 @@ mod tests {
                 scope: SCOPE_BOX.into(),
                 changes: Vec::new(),
                 directories: 0,
+                outside: Vec::new(),
             },
             network: Network::default(),
             processes: Vec::new(),
