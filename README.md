@@ -12,13 +12,14 @@ every host it reached, every process it spawned, every credential it used.
 Then it hands you the receipt.
 
 ```console
-$ devbox run --label "fetch a page and call an API" -- sh -c 'curl -s -o /dev/null https://example.com; curl -s "$DEVBOX_BROKER_URL/shot/v1/thing" -H "x-devbox-broker-token: $DEVBOX_BROKER_TOKEN"; echo hi > /workspace/shot.txt'
-run 01M1SD2Z4F842DVZSBZXA2B688 · 682ms · exit 0 · finished
+$ devbox run --label "fetch a page and call an API" -- sh -c 'curl -s -o /dev/null https://example.com; curl -s -o /dev/null -w "broker: %{http_code}\n" "$DEVBOX_BROKER_URL/shot/v1/thing" -H "x-devbox-broker-token: $DEVBOX_BROKER_TOKEN"; echo hi > /workspace/shot.txt'
+broker: 200
+run 01M1SEWB66PS95BP62WTHJJF11 · 666ms · exit 0 · finished
   files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
   network  2 peers · 2 DNS · ↑2.1KB ↓6.4KB
-  process  16 in the tree
-  coverage full (ebpf+packet+netfilter) · 61 events · 0 dropped
-  report   ~/.devbox/runs/devtest/01M1SD2Z4F842DVZSBZXA2B688/report.html
+  process  9 in the tree
+  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1SEWB66PS95BP62WTHJJF11/report.html
 ```
 
 That is a real run on a real box, verbatim except for `$HOME`. The command is a
@@ -105,12 +106,11 @@ disagree.
 
 ## What you get
 
-![The run report page in the devbox console: run identity and coverage, the file the run changed under scope run, the two peers it reached with byte counts, and the brokered credential it used](docs/screenshot-console.png)
+![The full run report page in the devbox console: run identity and coverage, the file the run changed under scope run, the two peers it reached with byte counts, the process tree with the broker token shown as three asterisks, and the brokered credential it used](docs/screenshot-console.png)
 
-That is the report for the run at the top of this page. The rule across the
-middle is an elision: the Processes section sits between Network and
-Credentials and is left out here, because on a box with a broker configured it
-contains that box's broker token.
+That is the whole report for the run at the top of this page, unedited. The
+`***` in the command line and in the process tree is where that box's broker
+token was — see [Secrets in command lines](#secrets-in-command-lines).
 
 Every run produces one report with these sections.
 
@@ -284,7 +284,7 @@ server is broken" and stops asking.
 ### Export: the same events, in someone else's schema
 
 ```bash
-devbox export --run 01M1SD2Z4F842DVZSBZXA2B688 --format ocsf
+devbox export --run 01M1SEWB66PS95BP62WTHJJF11 --format ocsf
 devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
 devbox export --format jsonl
 ```
@@ -386,6 +386,45 @@ this run".
 | **Credentials** | copied into the guest | **never in the guest**; scoped, logged broker |
 | **Tool servers** | run on the host with full rights | run in a box, as a run |
 | **Integrity of the record** | — | reports carry event counts, dropped counts, and attribution counts |
+| **Secrets in command lines** | recorded in every `exec` event verbatim | redacted by variable name before the event is sent |
+
+### Secrets in command lines
+
+Every runtime's exec API takes an argv and no environment, so devbox passes the
+broker's variables on the **command line** (`env -- K=V … cmd`). That is the
+only form that works the same way on Lima, Incus and Docker — and it means a
+box's own credentials land in the `exec` events the agent captures, and from
+there in the run report's process tree, in `report.json`, in `devbox watch
+--tree`, and in every export.
+
+So they are removed, by variable name, at three points:
+
+1. **In the agent, before the event is sent** (`agent/capture/redact.go`), so
+   nothing is written down in the first place. The agent's status file counts
+   how often it fired (`argv_redacted`); non-zero is the normal state of a box
+   with a broker, and says the rule ran.
+2. **In the collector, on arrival** (`src/obs/redact.rs`), because an agent one
+   release behind is the ordinary state of a box between upgrades.
+3. **In the store, on the way out**, because rows written before any of this
+   existed cannot be reached by either of the first two. Every read path —
+   `watch`, the run report, the console, every export, and the run's own
+   recorded argv — decodes through that one function, so a consumer cannot be
+   added that forgets.
+
+The rule is the variable's *name*, not a pattern over the value: anything
+ending `_TOKEN`, `_SECRET`, `_KEY` or `_CREDENTIALS`; anything containing
+`PASSWORD`; the bare names `TOKEN`, `SECRET`, `PASSWD`, `CREDENTIALS`; and the
+headers `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` and
+anything ending `-token`, `-key`, `-secret` or `-password`. The value becomes
+`***`. A false positive costs you the value of `SORT_KEY`; a false negative
+costs you a live credential in a file you forwarded.
+
+Two things this is **not**. It is not a containment boundary — the box can read
+`/proc/*/cmdline` and see the same bytes, and the broker's token is per box and
+rotates at box start. And it does not rewrite history: an event recorded before
+this landed still holds the original bytes in its `raw` column, on your own
+disk, and is redacted when it is read. What is protected is everything devbox
+*renders*, which is what leaves the machine.
 
 Underneath, unchanged from v4: a full VM boundary rather than a container, a
 host project directory mounted read-only, `--writable` as an explicit opt-in,

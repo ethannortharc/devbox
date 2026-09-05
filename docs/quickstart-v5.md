@@ -32,12 +32,12 @@ devbox run -- claude
 Everything about that command is recorded and rendered:
 
 ```
-run 01M1SD2Z4F842DVZSBZXA2B688 · 682ms · exit 0 · finished
+run 01M1SEWB66PS95BP62WTHJJF11 · 666ms · exit 0 · finished
   files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
   network  2 peers · 2 DNS · ↑2.1KB ↓6.4KB
-  process  16 in the tree
-  coverage full (ebpf+packet+netfilter) · 61 events · 0 dropped
-  report   ~/.devbox/runs/devtest/01M1SD2Z4F842DVZSBZXA2B688/report.html
+  process  9 in the tree
+  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1SEWB66PS95BP62WTHJJF11/report.html
 ```
 
 Useful flags:
@@ -74,7 +74,7 @@ can attribute events to them — see [observability.md](observability.md#run-att
 | Files | The diff of the checkpoint taken before the run against the one taken after. `scope: run` means exactly that; `scope: box` would mean the whole box's overlay. |
 | Writes outside the workspace overlay | Directories the run wrote to that `devbox commit` would never sync — `~/.cache/uv`, `/etc` — by directory, with opens and file counts. The overlay only protects `/workspace`; this is the part of the run that escaped it. |
 | Network | One row per peer — connections, ports, TLS seen, bytes each way, duration. Plus TLS server names and DNS answers. |
-| Processes | The process tree, by pid. Devbox's own wrapper is folded into one `[devbox wrapper]` row, so the root of the tree is your command. |
+| Processes | The process tree, by pid. Devbox's own wrapper is folded into one `[devbox wrapper]` row, so the root of the tree is your command. Credentials that reached a command line read `***` — see below. |
 | Credentials | Each brokered credential the run reached for: provider, upstream, methods, uses, last use. `2 (1 denied)` means the scope refused one of them. |
 | Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. |
 
@@ -83,6 +83,18 @@ undoes `/workspace`; it does not undo a package the run installed into `$HOME`,
 and until v5 the report did not say that had happened. Its `opens` column counts
 capture events (the probe sees `open`/`create`, not each `write(2)`), so a 64 KB
 `dd` into one file counts as one.
+
+**A report can be handed to someone.** Devbox has to pass the broker's
+variables on the command line, because that is the only form every runtime's
+exec accepts — so the box's own token would otherwise be sitting in the process
+tree of every report. It is redacted by variable name (`*_TOKEN`, `*_SECRET`,
+`*_KEY`, `*_CREDENTIALS`, anything with `PASSWORD`, and the `Authorization` /
+`Cookie` family of headers) in the agent before the event is sent, again in the
+collector on arrival, and again in the store on the way out so that events
+recorded before any of it existed are covered too. The value becomes `***`.
+It is not a containment boundary — the box can read `/proc/*/cmdline` — it is
+what makes the receipt shareable. See
+[observability.md](observability.md#secrets-that-reach-an-argv).
 
 Two numbers surprise people the first time:
 
@@ -211,7 +223,7 @@ it comes back as `-32600`.
 ## Export
 
 ```bash
-devbox export --run 01M1SD2Z4F842DVZSBZXA2B688 --format ocsf
+devbox export --run 01M1SEWB66PS95BP62WTHJJF11 --format ocsf
 devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
 devbox export --format jsonl
 ```
