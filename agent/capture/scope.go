@@ -92,6 +92,7 @@ type Scope struct {
 
 	fileOutOfScope atomic.Uint64
 	kernelNoise    atomic.Uint64
+	argvRedacted   atomic.Uint64
 
 	mu       sync.Mutex
 	kthreads map[uint32]struct{}
@@ -116,6 +117,14 @@ func (s *Scope) FileOutOfScope() uint64 { return s.fileOutOfScope.Load() }
 
 // KernelNoise counts exec and exit events suppressed as kernel threads.
 func (s *Scope) KernelNoise() uint64 { return s.kernelNoise.Load() }
+
+// ArgvRedacted counts exec events that had a credential removed from their
+// argv. Published rather than merely applied, for the same reason the other
+// two are: a filter nobody can see is indistinguishable from one that stopped
+// running, and this one is the difference between a report that can be handed
+// to someone and a report that cannot.
+
+func (s *Scope) ArgvRedacted() uint64 { return s.argvRedacted.Load() }
 
 // Name implements Source, naming the source underneath rather than the filter.
 func (s *Scope) Name() string { return s.Inner.Name() }
@@ -153,6 +162,7 @@ func (s *Scope) Run(ctx context.Context, out chan<- *event.Event) error {
 		if !s.admit(e) {
 			continue
 		}
+		s.redact(e)
 		if err := Send(ctx, out, e); err != nil {
 			forwardErr = err
 			cancel()
@@ -169,6 +179,23 @@ func (s *Scope) Run(ctx context.Context, out chan<- *event.Event) error {
 		return forwardErr
 	}
 	return innerErr
+}
+
+// redact removes credentials from an exec event's argv.
+//
+// Here rather than in either source, because both of them produce execs and a
+// rule enforced in one place is a rule. Applied to what is *about to be sent*,
+// so nothing that skipped the filter can reach the transport by another route.
+//
+// Deliberately after admit: an event nobody will send needs nothing done to
+// it, and exec is the only type whose argv exists.
+func (s *Scope) redact(e *event.Event) {
+	if e.Type != event.TypeExec || e.Exec == nil {
+		return
+	}
+	if RedactArgv(e.Exec.Argv) {
+		s.argvRedacted.Add(1)
+	}
 }
 
 // admit decides one event, counting whatever it suppresses.
