@@ -1005,6 +1005,31 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_travels_inside_the_wrapper_not_in_front_of_it() {
+        // `env -- K=V … sh -c <wrapper>` would be lost on the
+        // `sudo -n systemd-run` path, because sudo resets the environment.
+        // Inside the wrapper's argv it is carried verbatim through every hop —
+        // the wrapper only ever passes `"$@"` along — so it survives sudo, the
+        // transient scope, and the re-exec into stage 2.
+        let env = vec![
+            ("DEVBOX_BROKER_URL".to_string(), "http://h:9".to_string()),
+            ("DEVBOX_RUN_ID".to_string(), "01ABC".to_string()),
+        ];
+        let mut argv = bootstrap("01ABCDEFGHJKMNPQRSTVWXYZ00", "/workspace");
+        argv.extend(crate::broker::with_env(&env, &["true".to_string()]));
+
+        assert_eq!(argv[0], "sh", "the wrapper still leads");
+        let env_at = argv.iter().position(|a| a == "env").expect("an env prefix");
+        let script_at = argv.iter().position(|a| a.contains("DEVBOX_WRAPPER_EOF"));
+        assert!(
+            script_at.unwrap() < env_at,
+            "the environment must be inside the wrapper's argv, not before it"
+        );
+        assert!(argv.iter().any(|a| a == "DEVBOX_BROKER_URL=http://h:9"));
+        assert_eq!(argv.last().unwrap(), "true", "the command comes last");
+    }
+
+    #[test]
     fn the_bootstrap_passes_the_command_as_separate_words() {
         let argv = bootstrap("01ABCDEFGHJKMNPQRSTVWXYZ00", "/workspace");
         assert_eq!(argv[0], "sh");
