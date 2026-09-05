@@ -858,6 +858,115 @@ fn the_start_of_a_run_is_recovered_once_the_host_learns_its_cgroup() {
 }
 
 #[test]
+fn a_brokers_credential_event_reaches_the_run_it_was_made_for() {
+    // The broker is a host process: its events never travel through the agent
+    // socket, so the collector's flush path — where every other event is
+    // attributed — never sees them. They were landing with a NULL `run_id`,
+    // which left the report's Credentials section permanently empty while the
+    // events sat in the same table two columns away.
+    use devbox::obs::event::Credential;
+
+    let store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+
+    let mut event = base(
+        EventType::Credential,
+        u32::MAX,
+        0,
+        0,
+        "2026-09-05T10:00:00.500Z",
+    );
+    event.comm = "broker".into();
+    event.credential = Some(Credential {
+        provider: "w25test".into(),
+        method: "GET".into(),
+        host: "127.0.0.1:18099".into(),
+        path: "/x".into(),
+        status: 200,
+        verdict: "allowed".into(),
+        ..Default::default()
+    });
+    store.insert_attributed(&event).unwrap();
+
+    let mine = store
+        .query(&Query {
+            run_id: Some(RUN.to_string()),
+            limit: Some(Query::MAX_LIMIT),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(mine.len(), 1, "the broker's event never reached the run");
+    assert_eq!(
+        store.attribution_counts(RUN).unwrap(),
+        vec![(Attribution::Window, 1)],
+        "a pid-less event can only ever be a window decision"
+    );
+
+    // An event outside every live run's window still stores, unattributed —
+    // the broker's audit is not conditional on a run being open.
+    let mut outside = event.clone();
+    outside.ts_wall = "2026-09-04T00:00:00.000Z".into();
+    store.insert_attributed(&outside).unwrap();
+    assert_eq!(store.count().unwrap(), 2);
+    assert_eq!(
+        store
+            .query(&Query {
+                run_id: Some(RUN.to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn destroying_a_box_takes_its_reports_with_it() {
+    // `devbox destroy` removes the event store so a later box under the same
+    // name cannot inherit a predecessor's timeline. The rendered reports are
+    // the same evidence in a second tree, and they were staying behind — so
+    // `devbox report <id>`, which finds a run by id across every box, went on
+    // answering for a box that no longer existed.
+    //
+    // Written by the real renderer and removed by the real remover, so the two
+    // agree about the path by construction rather than by a comment.
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+
+    let report = RunReport::build(
+        record(),
+        &fixture(),
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let written = devbox::report::write(state_dir, &report).unwrap();
+    assert!(written.html.exists() && written.json.exists() && written.markdown.exists());
+    assert!(devbox::report::load(state_dir, BOX, RUN).unwrap().is_some());
+
+    // A second box's report, to prove the removal is scoped to the one box.
+    let mut other = report.clone();
+    other.run.box_id = "keeper".into();
+    let kept = devbox::report::write(state_dir, &other).unwrap();
+
+    devbox::obs::collector::remove_box_data(state_dir, BOX).unwrap();
+
+    assert!(
+        !written.html.exists(),
+        "the report outlived the box it describes"
+    );
+    assert!(
+        devbox::report::load(state_dir, BOX, RUN).unwrap().is_none(),
+        "`devbox report` can still find a destroyed box's run"
+    );
+    assert!(kept.html.exists(), "a neighbour's report was taken too");
+}
+
+#[test]
 fn run_ids_sort_in_the_order_they_were_minted() {
     let ids: Vec<String> = (0..2000).map(|_| new_run_id()).collect();
     assert!(ids.iter().all(|id| is_run_id(id)));
