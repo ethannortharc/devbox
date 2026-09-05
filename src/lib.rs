@@ -10,6 +10,7 @@
 //! - [`cli`] — command surface (clap), one module per command.
 //! - [`web`] — the v4 web console: axum server, askama templates, SSE.
 //! - [`sandbox`] — box lifecycle, state, config, OverlayFS diff/commit.
+//! - [`mcp`] — the MCP registry and the stdio shim that boxes an MCP server.
 //! - [`nix`] — Nix set composition and rebuilds inside a box.
 //! - [`runtime`] — the Incus/Lima/Multipass/Docker abstraction.
 //! - [`obs`] — the observability plane: schema, store, collector, correlation.
@@ -19,6 +20,7 @@
 
 pub mod cli;
 pub mod embedded;
+pub mod mcp;
 pub mod metrics;
 pub mod nix;
 pub mod obs;

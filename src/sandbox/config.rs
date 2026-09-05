@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -31,6 +31,18 @@ pub struct DevboxConfig {
     /// Egress and activity control (§8, §12.1).
     #[serde(default)]
     pub policy: crate::policy::Policy,
+
+    /// MCP servers this project runs in a box (§7).
+    ///
+    /// Last, and it has to stay last: `toml` emits a struct's fields in
+    /// declaration order, and TOML requires a table's plain values before its
+    /// sub-tables. A map of tables placed above `[policy]` would make
+    /// [`Self::save`] produce a file it could not read back.
+    ///
+    /// Written by `devbox mcp add`, which does *not* go through [`Self::save`]
+    /// — see [`crate::mcp::registry`] for why.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: crate::mcp::registry::McpTable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +226,7 @@ impl Default for DevboxConfig {
             env: HashMap::new(),
             custom_packages: HashMap::new(),
             policy: crate::policy::Policy::default(),
+            mcp: crate::mcp::registry::McpTable::new(),
         }
     }
 }
