@@ -1963,6 +1963,15 @@ pub(crate) async fn ensure_nixos_config(
         .await?;
     let uses_grub = grub_check.exit_code == 0;
 
+    // The same scope `install_ubuntu_obsd_service` writes into its unit, from
+    // the same probe. The NixOS unit had been taking the agent's own default
+    // of `/workspace` alone, so a NixOS box and an Ubuntu box reported
+    // different file events for identical work — and the console's exec agent,
+    // which has always been given the probed scope, disagreed with the service
+    // running beside it. `scope_with_home` validates the value, so what lands
+    // in the Nix string is one absolute path list and nothing else.
+    let file_scope = crate::obs::supervisor::guest_file_scope(runtime, name).await;
+
     // Write our own configuration.nix with correct bootloader and devbox import.
     // We always overwrite to ensure a clean, known-good configuration.
     let bootloader_config = if uses_grub {
@@ -1995,6 +2004,7 @@ pub(crate) async fn ensure_nixos_config(
     socket = "/run/devbox-host/obsd.sock";
     noTransport = {no_transport};
     enableEbpf = {enable_ebpf};
+    fileScope = {file_scope:?};
   }};
 
 {bootloader_config}
@@ -2013,6 +2023,7 @@ pub(crate) async fn ensure_nixos_config(
         enable_obsd_service = enable_obsd_service,
         no_transport = !crate::obs::uses_host_socket(runtime.name()),
         enable_ebpf = crate::obs::uses_ebpf(runtime.name()),
+        file_scope = file_scope,
     );
 
     write_file_to_vm(runtime, name, "/etc/nixos/configuration.nix", &config_nix).await?;
