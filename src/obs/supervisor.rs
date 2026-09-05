@@ -540,6 +540,7 @@ impl Supervisor {
                         Some(hello) => CaptureHealth {
                             ebpf: hello.ebpf,
                             capture: hello.capture.clone(),
+                            source: hello.source.clone(),
                             agent_version: hello.version.clone(),
                             ..CaptureHealth::new(&health_box, CaptureState::Streaming)
                                 .with_transport(transport)

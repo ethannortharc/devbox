@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::obs::behavior::{self, Summary};
 use crate::obs::correlate::{self, Chain};
 use crate::obs::event::{Event, EventType};
-use crate::obs::health::{CaptureHealth, CaptureState};
+use crate::obs::health::{CaptureHealth, CaptureState, DEGRADED_LOSS, capture_composition};
 use crate::obs::store::{Query, Store};
 use crate::sandbox::SandboxManager;
 
@@ -395,18 +395,15 @@ pub fn capture_view(
                 value: health.transport.clone(),
             });
         }
-        if health.state == CaptureState::Streaming {
+        // The domains, labelled as domains. This fact used to be called
+        // "backends" and carried the same list, which reads as an answer to
+        // "what is capturing" — and it is the answer to "what is being
+        // captured". The backend composition is in the headline below, where a
+        // degraded one can say what it costs.
+        if health.state == CaptureState::Streaming && !health.capture.is_empty() {
             facts.push(Fact {
-                label: "backends",
-                value: if health.capture.is_empty() {
-                    if health.ebpf {
-                        "ebpf".into()
-                    } else {
-                        "proc".into()
-                    }
-                } else {
-                    health.capture.join(" + ")
-                },
+                label: "watching",
+                value: health.capture.join(" + "),
             });
         }
         if !health.agent_version.is_empty() {
@@ -480,20 +477,21 @@ pub fn capture_view(
     match health.state {
         CaptureState::Streaming => CaptureView {
             level: "ok",
-            headline: if health.ebpf {
-                "Capturing · eBPF".into()
-            } else {
-                "Capturing · proc + packet".into()
-            },
+            // The composition the agent actually kept, not a label for the
+            // two cases. "proc + packet" was printed for every degraded box
+            // whatever it was really running, and `devbox doctor` now prints
+            // the same string from the same record.
+            headline: format!("Capturing · {}", capture_composition(health)),
             detail: if health.ebpf {
                 "Kernel probes are attached: every exec, connection, lookup and \
                  handshake is seen at the syscall boundary."
                     .into()
             } else {
-                "No kernel probes on this runtime, so activity is reconstructed \
-                 from /proc and captured packets. Short-lived processes can be \
-                 missed."
-                    .into()
+                format!(
+                    "No kernel probes here, so capture is degraded: activity is \
+                     reconstructed from /proc and captured packets, which means \
+                     {DEGRADED_LOSS}, and short-lived processes can be missed."
+                )
             },
             remedy: None,
             facts,
@@ -1577,13 +1575,18 @@ mod tests {
     fn streaming_says_which_backends_actually_attached() {
         let mut record = health(CaptureState::Streaming);
         record.ebpf = true;
-        record.capture = vec!["ebpf".into(), "packet".into()];
+        record.source = "ebpf+packet+netfilter".into();
+        record.capture = vec!["exec".into(), "connect".into(), "dns".into()];
         let view = capture_view(true, "running", Some(&record));
         assert_eq!(view.level, "ok");
-        assert!(view.headline.contains("eBPF"));
+        assert_eq!(view.headline, "Capturing · ebpf+packet+netfilter");
         assert!(view.live);
+        // What is capturing and what is being captured are different facts,
+        // and the bar used to print the second under the first one's label.
         assert!(
-            view.facts.iter().any(|f| f.value == "ebpf + packet"),
+            view.facts
+                .iter()
+                .any(|f| f.label == "watching" && f.value == "exec + connect + dns"),
             "the reader cannot infer coverage from anywhere else"
         );
 
@@ -1591,9 +1594,39 @@ mod tests {
         // a short-lived process can be missed entirely.
         let mut degraded = health(CaptureState::Streaming);
         degraded.ebpf = false;
+        degraded.source = "proc+packet".into();
         let view = capture_view(true, "running", Some(&degraded));
-        assert!(view.headline.contains("proc"));
+        assert_eq!(view.headline, "Capturing · proc+packet");
         assert!(view.detail.contains("missed"));
+        assert!(
+            view.detail.contains("no process attribution"),
+            "a degraded bar has to name what it cannot see: {}",
+            view.detail
+        );
+    }
+
+    #[test]
+    fn the_console_and_doctor_name_the_same_composition() {
+        // Two readouts of one record. A reader who checks both should not have
+        // to work out whether "eBPF" and "ebpf+packet" are the same box.
+        // `doctor` puts composition and verdict on one line; the bar splits
+        // them across headline and detail, and between them says the same.
+        for (ebpf, source) in [(true, "ebpf+packet"), (false, "proc+packet")] {
+            let mut record = health(CaptureState::Streaming);
+            record.ebpf = ebpf;
+            record.source = source.into();
+            let view = capture_view(true, "running", Some(&record));
+            let doctor = crate::obs::health::capture_source(&record);
+
+            assert!(view.headline.ends_with(source), "{}", view.headline);
+            for word in doctor.split_whitespace() {
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+                assert!(
+                    view.headline.contains(word) || view.detail.contains(word),
+                    "the bar drops {word:?} from doctor's {doctor:?}"
+                );
+            }
+        }
     }
 
     #[test]

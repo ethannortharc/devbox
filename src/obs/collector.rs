@@ -80,6 +80,12 @@ pub struct Hello {
     pub box_id: String,
     #[serde(default)]
     pub capture: Vec<String>,
+    /// The composed capture backends that survived the agent's preflight —
+    /// `ebpf+packet+netfilter`, `proc+packet`. Empty from an agent built
+    /// before the field existed, which is why every reader falls back to
+    /// [`Hello::ebpf`] rather than treating empty as "no capture".
+    #[serde(default)]
+    pub source: String,
     #[serde(default)]
     pub ebpf: bool,
 }
@@ -878,6 +884,7 @@ mod tests {
             version: "0.0.9".into(),
             box_id: "myapp".into(),
             capture: vec!["exec".into()],
+            source: String::new(),
             ebpf: true,
         };
         let ack = evaluate_hello(&hello, None);
@@ -929,6 +936,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").into(),
             box_id: "myapp".into(),
             capture: vec!["exec".into()],
+            source: String::new(),
             ebpf: true,
         };
         assert!(evaluate_hello(&hello, None).accepted);
@@ -942,6 +950,7 @@ mod tests {
             version: "0.1.3".into(),
             box_id: "myapp".into(),
             capture: vec![],
+            source: String::new(),
             ebpf: true,
         };
         let ack = evaluate_hello(&hello, None);
@@ -956,6 +965,7 @@ mod tests {
             version: String::new(),
             box_id: String::new(),
             capture: vec![],
+            source: String::new(),
             ebpf: false,
         };
         assert!(!evaluate_hello(&nameless, None).accepted);
@@ -1038,6 +1048,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             box_id: "alpha".into(),
             capture: vec![],
+            source: String::new(),
             ebpf: false,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
@@ -1133,6 +1144,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             box_id: "alpha".into(),
             capture: vec!["ebpf".into(), "packet".into()],
+            source: String::new(),
             ebpf: true,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
@@ -1184,6 +1196,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             box_id: "alpha".into(),
             capture: vec![],
+            source: String::new(),
             ebpf: false,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
