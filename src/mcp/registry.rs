@@ -16,11 +16,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::Posture;
-use crate::sandbox::config::DevboxConfig;
 
 /// One registered MCP server.
 ///
@@ -211,9 +210,7 @@ fn without_lines(text: &str, start: usize, end: usize) -> String {
 /// entries `mcp add` wrote, and after whatever the user has arranged above.
 pub fn add_entry(text: &str, name: &str, entry: &McpEntry) -> Result<String> {
     validate_name(name)?;
-    let before: DevboxConfig = toml::from_str(text).map_err(|e| {
-        anyhow::anyhow!("devbox.toml does not parse, so it will not be edited: {e}")
-    })?;
+    parse(text)?;
 
     let stripped = match block_of(text, name) {
         Some((start, end)) => without_lines(text, start, end),
@@ -229,72 +226,123 @@ pub fn add_entry(text: &str, name: &str, entry: &McpEntry) -> Result<String> {
     }
     out.push_str(&render(name, entry));
 
-    let after: DevboxConfig = toml::from_str(&out).map_err(|e| {
-        anyhow::anyhow!("editing devbox.toml produced a file that does not parse: {e}")
-    })?;
-    verify_only_change(&before, &after, name, Some(entry))?;
+    verify_only_change(text, &out, name, Some(entry))?;
     Ok(out)
 }
 
 /// The file text without `[mcp.<name>]`, or `None` if there was no such entry.
 pub fn remove_entry(text: &str, name: &str) -> Result<Option<String>> {
     validate_name(name)?;
-    let before: DevboxConfig = toml::from_str(text).map_err(|e| {
-        anyhow::anyhow!("devbox.toml does not parse, so it will not be edited: {e}")
-    })?;
-    if !before.mcp.contains_key(name) {
+    if !table_of(&parse(text)?)?.contains_key(name) {
         return Ok(None);
     }
     let Some((start, end)) = block_of(text, name) else {
         bail!(
-            "'{name}' is registered in devbox.toml but not as a `[mcp.{name}]` table \
-             (an inline or dotted form), so it cannot be removed without rewriting the \
-             file and losing its comments; delete the entry by hand"
+            "'{name}' is registered but not as a `[mcp.{name}]` table (an inline or \
+             dotted form), so it cannot be removed without rewriting the file and \
+             losing its comments; delete the entry by hand"
         );
     };
     let out = without_lines(text, start, end);
-    let after: DevboxConfig = toml::from_str(&out).map_err(|e| {
-        anyhow::anyhow!("editing devbox.toml produced a file that does not parse: {e}")
-    })?;
-    verify_only_change(&before, &after, name, None)?;
+    verify_only_change(text, &out, name, None)?;
     Ok(Some(out))
+}
+
+/// Parse a registry-bearing file as a raw TOML document.
+///
+/// Raw, not [`DevboxConfig`]: the same `[mcp.<name>]` tables live in a
+/// project's `devbox.toml` *and* in `~/.devbox/mcp.toml`, which is not a
+/// project config at all. A raw document reads both, and — being lossless —
+/// makes [`verify_only_change`] able to see a key that no struct has a field
+/// for, which is exactly the kind of thing text surgery could silently drop.
+fn parse(text: &str) -> Result<toml::Table> {
+    text.parse::<toml::Table>()
+        .map_err(|e| anyhow::anyhow!("the file does not parse, so it will not be edited: {e}"))
+}
+
+/// The `[mcp]` section of a parsed document.
+fn table_of(document: &toml::Table) -> Result<McpTable> {
+    match document.get("mcp") {
+        None => Ok(McpTable::new()),
+        Some(value) => value
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("the `[mcp]` section is not a set of servers: {e}")),
+    }
 }
 
 /// Refuse an edit that changed anything but the one entry.
 ///
 /// Text surgery on a format with as many spellings as TOML is only safe if the
-/// result is checked. Comparing the *parsed* configs is the check: everything
-/// the file means, except `[mcp.<name>]`, has to be identical.
+/// result is checked. Re-parsing both texts is the check: everything the file
+/// means, except `[mcp.<name>]`, has to be identical.
 fn verify_only_change(
-    before: &DevboxConfig,
-    after: &DevboxConfig,
+    before_text: &str,
+    after_text: &str,
     name: &str,
     expected: Option<&McpEntry>,
 ) -> Result<()> {
-    if after.mcp.get(name) != expected {
-        bail!("editing devbox.toml did not produce the requested `[mcp.{name}]` entry");
-    }
-    let mut before_rest = before.mcp.clone();
-    let mut after_rest = after.mcp.clone();
-    before_rest.remove(name);
-    after_rest.remove(name);
-    if before_rest != after_rest {
-        bail!("editing `[mcp.{name}]` in devbox.toml would have changed another MCP entry");
+    let mut before = parse(before_text)?;
+    let mut after = parse(after_text)
+        .map_err(|e| anyhow::anyhow!("editing `[mcp.{name}]` produced a broken file: {e}"))?;
+    let before_mcp = before.remove("mcp");
+    let after_mcp = after.remove("mcp");
+
+    if before != after {
+        bail!("editing `[mcp.{name}]` would have changed the rest of the file");
     }
 
-    // Everything outside `[mcp]`, compared as TOML values so this keeps
-    // covering sections added to `DevboxConfig` after today.
-    let strip = |config: &DevboxConfig| -> Result<toml::Value> {
-        let mut value = toml::Value::try_from(config)?;
-        if let Some(table) = value.as_table_mut() {
-            table.remove("mcp");
+    let section = |value: Option<toml::Value>| -> Result<McpTable> {
+        match value {
+            None => Ok(McpTable::new()),
+            Some(value) => value
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("the `[mcp]` section is not a set of servers: {e}")),
         }
-        Ok(value)
     };
-    if strip(before)? != strip(after)? {
-        bail!("editing `[mcp.{name}]` in devbox.toml would have changed the rest of the file");
+    let mut before_mcp = section(before_mcp)?;
+    let mut after_mcp = section(after_mcp)?;
+
+    if after_mcp.get(name) != expected {
+        bail!("editing did not produce the requested `[mcp.{name}]` entry");
+    }
+    before_mcp.remove(name);
+    after_mcp.remove(name);
+    if before_mcp != after_mcp {
+        bail!("editing `[mcp.{name}]` would have changed another MCP entry");
     }
     Ok(())
+}
+
+/// Where a registration was found.
+///
+/// `mcp run` is launched by the agent, and the agent's working directory is
+/// its business, not ours — Claude Code does not promise to start an MCP
+/// server from the project root. A project-scoped registry alone therefore has
+/// a failure mode that looks like the registration never happened. So there
+/// are two, and the project one wins where both have the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A project's own `devbox.toml`.
+    Project(std::path::PathBuf),
+    /// `~/.devbox/mcp.toml`, which every directory can see.
+    Global(std::path::PathBuf),
+}
+
+impl Source {
+    /// The word `mcp ls` prints in its SOURCE column.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Source::Project(_) => "project",
+            Source::Global(_) => "global",
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Source::Project(path) | Source::Global(path) => path,
+        }
+    }
 }
 
 /// The `devbox.toml` a project-scoped `mcp` command reads and writes.
@@ -302,22 +350,76 @@ pub fn config_path(project_dir: &Path) -> std::path::PathBuf {
     project_dir.join("devbox.toml")
 }
 
-/// Read the registry, treating a missing file as an empty one.
+/// The registry every directory can see: `~/.devbox/mcp.toml`.
+pub fn global_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("mcp.toml")
+}
+
+/// Read one registry file, treating a missing file as an empty one.
 ///
 /// Fallible on a *malformed* file: `mcp run` resolving to "no such server"
-/// because `devbox.toml` has a typo in it would send the user looking for a
+/// because the file has a typo in it would send the user looking for a
 /// registration they can see with their own eyes.
-pub fn load(project_dir: &Path) -> Result<McpTable> {
-    let path = config_path(project_dir);
+pub fn load_file(path: &Path) -> Result<McpTable> {
     if !path.exists() {
         return Ok(McpTable::new());
     }
-    Ok(DevboxConfig::load(&path)?.mcp)
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    table_of(&parse(&text).with_context(|| format!("in {}", path.display()))?)
+        .with_context(|| format!("in {}", path.display()))
+}
+
+/// The project registry.
+pub fn load(project_dir: &Path) -> Result<McpTable> {
+    load_file(&config_path(project_dir))
+}
+
+/// The global registry.
+pub fn load_global(state_dir: &Path) -> Result<McpTable> {
+    load_file(&global_path(state_dir))
+}
+
+/// Every registration visible from `project_dir`, project first.
+///
+/// A name in both is returned twice, so `mcp ls` can show the user that one is
+/// shadowing the other rather than quietly listing whichever it happened to
+/// read last.
+pub fn visible(project_dir: &Path, state_dir: &Path) -> Result<Vec<(String, McpEntry, Source)>> {
+    let mut all = Vec::new();
+    let project = config_path(project_dir);
+    for (name, entry) in load_file(&project)? {
+        all.push((name, entry, Source::Project(project.clone())));
+    }
+    let global = global_path(state_dir);
+    for (name, entry) in load_file(&global)? {
+        all.push((name, entry, Source::Global(global.clone())));
+    }
+    all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.label().cmp(b.2.label())));
+    Ok(all)
+}
+
+/// The one registration `mcp run <name>` would launch, and where it came from.
+pub fn find(
+    project_dir: &Path,
+    state_dir: &Path,
+    name: &str,
+) -> Result<Option<(McpEntry, Source)>> {
+    let project = config_path(project_dir);
+    if let Some(entry) = load_file(&project)?.remove(name) {
+        return Ok(Some((entry, Source::Project(project))));
+    }
+    let global = global_path(state_dir);
+    if let Some(entry) = load_file(&global)?.remove(name) {
+        return Ok(Some((entry, Source::Global(global))));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::config::DevboxConfig;
 
     fn entry(command: &[&str]) -> McpEntry {
         McpEntry {
@@ -483,6 +585,89 @@ egress = \"open\"
         for good in ["fetch", "mcp-git", "srv_2"] {
             validate_name(good).unwrap();
         }
+    }
+
+    /// The project file wins, and the global one is the fallback — which is
+    /// the whole reason there are two.
+    #[test]
+    fn find_prefers_the_project_registry_and_falls_back_to_the_global_one() {
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+
+        assert!(find(project.path(), state.path(), "srv").unwrap().is_none());
+
+        std::fs::write(
+            global_path(state.path()),
+            "[mcp.srv]\ncommand = [\"global\"]\n[mcp.only-global]\ncommand = [\"g\"]\n",
+        )
+        .unwrap();
+        let (entry, source) = find(project.path(), state.path(), "srv").unwrap().unwrap();
+        assert_eq!(entry.command, ["global"]);
+        assert_eq!(source.label(), "global");
+
+        std::fs::write(
+            config_path(project.path()),
+            "[mcp.srv]\ncommand = [\"project\"]\n",
+        )
+        .unwrap();
+        let (entry, source) = find(project.path(), state.path(), "srv").unwrap().unwrap();
+        assert_eq!(
+            entry.command,
+            ["project"],
+            "the global entry shadowed the project one"
+        );
+        assert_eq!(source.label(), "project");
+
+        // The global-only name is still reachable.
+        let (_, source) = find(project.path(), state.path(), "only-global")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.label(), "global");
+    }
+
+    /// `ls` shows both, including the shadowed one — hiding it would make a
+    /// registration the user can see in a file simply not exist.
+    #[test]
+    fn visible_lists_a_shadowed_entry_as_well_as_the_one_that_wins() {
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(project.path()),
+            "[mcp.srv]\ncommand = [\"project\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            global_path(state.path()),
+            "[mcp.srv]\ncommand = [\"global\"]\n",
+        )
+        .unwrap();
+
+        let rows = visible(project.path(), state.path()).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let labels: Vec<&str> = rows.iter().map(|(_, _, s)| s.label()).collect();
+        assert_eq!(labels, ["global", "project"], "sorted by name then source");
+    }
+
+    /// A file that is nothing but `[mcp.*]` tables — which `~/.devbox/mcp.toml`
+    /// is — goes through the same editor as a full project config.
+    #[test]
+    fn the_global_shaped_file_is_edited_the_same_way() {
+        let original = "# a note\n\n[mcp.kept]\ncommand = [\"kept\"]\n";
+        let added = add_entry(original, "extra", &entry(&["extra"])).unwrap();
+        assert!(added.starts_with(original), "{added}");
+        let back = remove_entry(&added, "extra").unwrap().unwrap();
+        assert_eq!(back, original, "the round trip was not lossless");
+    }
+
+    /// The verifier reads the raw document, so a key no struct knows about is
+    /// still protected. `DevboxConfig` would have dropped this one silently.
+    #[test]
+    fn a_key_no_struct_has_a_field_for_is_still_protected() {
+        let text = "unknown_future_section = { a = 1 }\n\n[mcp.x]\ncommand = [\"x\"]\n";
+        let out = remove_entry(text, "x").unwrap().unwrap();
+        assert!(out.contains("unknown_future_section"), "{out}");
+        let added = add_entry(&out, "y", &entry(&["y"])).unwrap();
+        assert!(added.contains("unknown_future_section"), "{added}");
     }
 
     #[test]

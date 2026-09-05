@@ -59,6 +59,10 @@ pub struct AddArgs {
     #[arg(long)]
     pub posture: Option<String>,
 
+    /// Register in ~/.devbox/mcp.toml, visible from every directory
+    #[arg(long)]
+    pub global: bool,
+
     /// The server's command and arguments
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -99,18 +103,32 @@ pub async fn run(args: McpArgs, manager: &SandboxManager) -> Result<()> {
         McpCommand::Add(a) => add(a, manager).await,
         McpCommand::Run(a) => run_server(a, manager).await,
         McpCommand::Ls(a) => ls(a, manager),
-        McpCommand::Rm(a) => rm(a),
+        McpCommand::Rm(a) => rm(a, manager),
     }
 }
 
-/// The project whose `devbox.toml` holds the registry.
+/// The directory whose `devbox.toml` is the project registry.
 ///
-/// The current directory, which is also where the agent runs — `claude mcp add
-/// … -- devbox mcp run fetch` records a command that the agent later launches
-/// from its own project root.
+/// The current directory — but only *a* registry, not the registry. An agent
+/// launches `devbox mcp run <name>` from a working directory of its own
+/// choosing, and Claude Code does not promise that is the project root, so a
+/// project-scoped registration would resolve to "no such server" through no
+/// fault of the user's. `~/.devbox/mcp.toml` is the fallback every directory
+/// can see; see [`registry::Source`].
 fn project_dir() -> Result<PathBuf> {
     std::env::current_dir().context("cannot determine the current directory")
 }
+
+/// What a freshly created `~/.devbox/mcp.toml` starts as.
+///
+/// A comment, because the file is otherwise indistinguishable from a project
+/// config and someone will find it a year from now wondering what wrote it.
+const GLOBAL_HEADER: &str = "\
+# devbox — MCP servers registered for every directory.
+#
+# A project's own devbox.toml wins over this file for the same name.
+# Written by `devbox mcp add --global`; edit by hand if you prefer.
+";
 
 // ── add ─────────────────────────────────────────────────
 
@@ -124,17 +142,36 @@ async fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
         .transpose()?;
 
     let dir = project_dir()?;
-    let path = registry::config_path(&dir);
+    let path = if args.global {
+        registry::global_path(&manager.state_dir)
+    } else {
+        let path = registry::config_path(&dir);
+        if !path.exists() {
+            // Not written for them. A file containing only `[mcp.…]` parses,
+            // but every section it omits then reads as the *serde* default —
+            // and the serde default for `[mounts]` is empty, not the workspace
+            // mount `DevboxConfig::default()` carries. `devbox create` in that
+            // directory would go on to build a box with nothing mounted, from
+            // a config the user never asked for and would not think to check.
+            // Generating a whole project config is `devbox init`'s job, and it
+            // detects languages while it does it.
+            bail!(
+                "no devbox.toml in {}, and `mcp add` will not write a project config \
+                 for you — run `devbox init` first, or register it for every \
+                 directory with `devbox mcp add {} --global -- <command…>`",
+                dir.display(),
+                args.name
+            );
+        }
+        path
+    };
     let existed = path.exists();
     if !existed {
-        // A project with no `devbox.toml` still gets one, written the way
-        // `devbox init` writes it, rather than a stub. A file containing only
-        // `[mcp.…]` parses, but every section it omits then reads as the serde
-        // default — and the serde default for `[mounts]` is *empty*, not the
-        // workspace mount `DevboxConfig::default()` carries. `devbox create`
-        // in that directory would silently build a box with nothing mounted.
-        crate::sandbox::config::DevboxConfig::default()
-            .save(&path)
+        // The global registry is ours, and creating it costs the user nothing:
+        // unlike `devbox.toml` it means only what is in it.
+        std::fs::create_dir_all(&manager.state_dir)
+            .with_context(|| format!("failed to create {}", manager.state_dir.display()))?;
+        crate::sandbox::state::write_atomically(&path, GLOBAL_HEADER.as_bytes(), "MCP registry")
             .with_context(|| format!("failed to create {}", path.display()))?;
     }
 
@@ -146,13 +183,26 @@ async fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
         posture,
         env: Default::default(),
     };
-    let replaced = registry::load(&dir)?.contains_key(&args.name);
+    let replaced = registry::load_file(&path)?.contains_key(&args.name);
     let updated = registry::add_entry(&text, &args.name, &entry)?;
-    crate::sandbox::state::write_atomically(&path, updated.as_bytes(), "devbox config")
+    crate::sandbox::state::write_atomically(&path, updated.as_bytes(), "MCP registry")
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     if !existed {
         println!("{} {}", "Created".green().bold(), path.display());
+    }
+    // A global registration that a project entry already shadows would look
+    // like it did nothing the next time the user ran it from that project.
+    if args.global
+        && let Ok(project) = registry::load(&dir)
+        && project.contains_key(&args.name)
+    {
+        eprintln!(
+            "\n{} {} also registers '{}', and a project entry wins there.",
+            "Note:".yellow().bold(),
+            registry::config_path(&dir).display(),
+            args.name
+        );
     }
     println!(
         "{} MCP server '{}' → box '{}'",
@@ -166,6 +216,7 @@ async fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
             .unwrap_or_else(|| "(this project)".to_string()),
     );
     println!("  command: {}", args.command.join(" "));
+    println!("  in: {}", path.display());
     if let Some(posture) = posture {
         println!("  posture: {posture}");
         warn_about_posture_on_a_project_box(manager, &entry, posture);
@@ -323,17 +374,33 @@ fn warn_about_posture_on_a_project_box(
 
 fn ls(args: LsArgs, manager: &SandboxManager) -> Result<()> {
     let dir = project_dir()?;
-    let table = registry::load(&dir)?;
+    let rows = registry::visible(&dir, &manager.state_dir)?;
+    // A name in both files appears twice, and only the project one is what
+    // `mcp run` would launch.
+    let shadowed: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|(name, _, source)| {
+            matches!(source, registry::Source::Global(_))
+                && rows.iter().any(|(other, _, source)| {
+                    other == name && matches!(source, registry::Source::Project(_))
+                })
+        })
+        .map(|(name, _, _)| name.as_str())
+        .collect();
 
     if args.json {
-        let rows: Vec<serde_json::Value> = table
+        let rows: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, entry)| {
+            .map(|(name, entry, source)| {
                 serde_json::json!({
                     "name": name,
                     "box": entry.box_name,
                     "posture": entry.posture.map(|p| p.as_str()),
                     "command": entry.command,
+                    "source": source.label(),
+                    "file": source.path(),
+                    "shadowed": matches!(source, registry::Source::Global(_))
+                        && shadowed.contains(name.as_str()),
                     "log": log_path(manager, name),
                     "last_log": last_log_time(manager, name),
                 })
@@ -343,31 +410,47 @@ fn ls(args: LsArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     }
 
-    if table.is_empty() {
+    if rows.is_empty() {
         println!(
-            "No MCP servers registered in {}",
-            registry::config_path(&dir).display()
+            "No MCP servers registered in {} or {}",
+            registry::config_path(&dir).display(),
+            registry::global_path(&manager.state_dir).display(),
         );
         println!("  devbox mcp add <name> -- <command…>");
+        println!("  devbox mcp add <name> --global -- <command…>");
         return Ok(());
     }
 
     println!(
-        "{:<16} {:<14} {:<12} {:<20} {}",
+        "{:<16} {:<9} {:<14} {:<12} {:<20} {}",
         "NAME".bold(),
+        "SOURCE".bold(),
         "BOX".bold(),
         "POSTURE".bold(),
         "LAST LOG".bold(),
         "COMMAND".bold()
     );
-    for (name, entry) in &table {
+    for (name, entry, source) in &rows {
+        let label =
+            if matches!(source, registry::Source::Global(_)) && shadowed.contains(name.as_str()) {
+                "global*"
+            } else {
+                source.label()
+            };
         println!(
-            "{:<16} {:<14} {:<12} {:<20} {}",
+            "{:<16} {:<9} {:<14} {:<12} {:<20} {}",
             name,
+            label,
             entry.box_name.as_deref().unwrap_or("(project)"),
             entry.posture.map(|p| p.as_str()).unwrap_or("(box's own)"),
             last_log_time(manager, name).unwrap_or_else(|| "-".to_string()),
             one_line(&entry.command),
+        );
+    }
+    if !shadowed.is_empty() {
+        println!(
+            "\n* shadowed here by the project entry of the same name: {}",
+            shadowed.iter().copied().collect::<Vec<_>>().join(", ")
         );
     }
     Ok(())
@@ -388,27 +471,49 @@ fn one_line(command: &[String]) -> String {
         .replace('\t', "\\t")
 }
 
-fn rm(args: RmArgs) -> Result<()> {
+fn rm(args: RmArgs, manager: &SandboxManager) -> Result<()> {
     let dir = project_dir()?;
-    let path = registry::config_path(&dir);
-    if !path.exists() {
+    // The one `mcp run` would have launched, so removing it is removing the
+    // thing the user can see working.
+    let Some((_, source)) = registry::find(&dir, &manager.state_dir, &args.name)? else {
         bail!(
-            "no devbox.toml in {}; nothing is registered here",
-            dir.display()
+            "no MCP server named '{}' in {} or {}; `devbox mcp ls` shows what is registered",
+            args.name,
+            registry::config_path(&dir).display(),
+            registry::global_path(&manager.state_dir).display(),
         );
-    }
+    };
+    let path = source.path().to_path_buf();
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let Some(updated) = registry::remove_entry(&text, &args.name)? else {
         bail!(
-            "no MCP server named '{}' in {}; `devbox mcp ls` shows what is registered",
+            "'{}' was in {} a moment ago and is not now; nothing was changed",
             args.name,
             path.display()
         );
     };
-    crate::sandbox::state::write_atomically(&path, updated.as_bytes(), "devbox config")
+    crate::sandbox::state::write_atomically(&path, updated.as_bytes(), "MCP registry")
         .with_context(|| format!("failed to write {}", path.display()))?;
-    println!("{} MCP server '{}'", "Removed".green().bold(), args.name);
+    println!(
+        "{} MCP server '{}' from {}",
+        "Removed".green().bold(),
+        args.name,
+        path.display()
+    );
+
+    // Removing the project entry can *uncover* a global one, and a `mcp run`
+    // that goes on working after a `mcp rm` needs explaining.
+    if matches!(source, registry::Source::Project(_))
+        && let Ok(Some((_, uncovered))) = registry::find(&dir, &manager.state_dir, &args.name)
+    {
+        println!(
+            "  {} still registers '{}', so `devbox mcp run {}` keeps working.",
+            uncovered.path().display(),
+            args.name,
+            args.name
+        );
+    }
     // The log stays. It is the record of what that server did, and `mcp rm` is
     // a change to the registry, not a request to destroy evidence.
     println!("  its log is kept at {}", log_path_display(&args.name));
@@ -421,17 +526,23 @@ fn rm(args: RmArgs) -> Result<()> {
 /// JSON-RPC channel and one stray `println!` corrupts the session.
 async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     let dir = project_dir()?;
-    let table = registry::load(&dir)?;
-    let entry = table.get(&args.name).cloned().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no MCP server named '{}' in {}; register it with \
-             `devbox mcp add {} -- <command…>`",
-            args.name,
-            registry::config_path(&dir).display(),
-            args.name
-        )
-    })?;
+    // The project registry first, then the global one. The agent chose this
+    // working directory, not the user, so "not found" here must mean the name
+    // is in neither file rather than that the agent started somewhere else.
+    let (entry, source) =
+        registry::find(&dir, &manager.state_dir, &args.name)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no MCP server named '{}' in {} or {}; register it with \
+                 `devbox mcp add {} -- <command…>`, or with `--global` to make it \
+                 visible from every directory",
+                args.name,
+                registry::config_path(&dir).display(),
+                registry::global_path(&manager.state_dir).display(),
+                args.name
+            )
+        })?;
     shim::validate_command(&entry.command)?;
+    tracing::debug!(server = %args.name, source = %source.path().display(), "resolved MCP server");
 
     let box_name = match &entry.box_name {
         Some(name) => name.clone(),
@@ -448,8 +559,7 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // Lazy start under the box claim, exactly as the console's Terminal tab
     // does — and under the *same* claim as the posture override below, so a
     // concurrent `devbox use` or rebuild cannot land between them.
-    let claim = crate::web::build::claim_box(&manager.state_dir, &box_name)
-        .with_context(|| format!("cannot start box '{box_name}' while it is being rebuilt"))?;
+    let claim = wait_for_the_box_claim(manager, &box_name).await?;
     crate::web::service::ensure_running_holding_claim(manager, &box_name, &claim).await?;
 
     let state = manager.get_sandbox(&box_name)?;
@@ -539,6 +649,53 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
             eprintln!("devbox mcp: {error:#}");
             std::process::exit(1)
         }
+    }
+}
+
+/// How long `mcp run` waits for the box claim before giving up.
+///
+/// Long enough to sit behind a box that is starting (a cold Lima VM is tens of
+/// seconds), short enough that a genuinely stuck rebuild is reported rather
+/// than waited on forever.
+const CLAIM_WAIT: Duration = Duration::from_secs(120);
+
+/// Take the per-box claim, waiting for it rather than refusing on contention.
+///
+/// Everywhere else in devbox this claim refuses immediately, and that is right:
+/// a second `devbox sets apply` on one box is a mistake, not a queue. Here it
+/// is neither. An agent starts *all* of its configured MCP servers at once, and
+/// several of them on one box is the recommended layout (§7.2) — so contention
+/// is the normal case, the holder is another shim doing a lazy start that takes
+/// milliseconds, and refusing would fail every server but the first with a
+/// message about rebuilds that are not happening.
+///
+/// Waiting here cannot deadlock: this holds nothing while it waits, and the
+/// box-then-project order every other path takes is unchanged once it has the
+/// claim.
+async fn wait_for_the_box_claim(
+    manager: &SandboxManager,
+    box_name: &str,
+) -> Result<crate::web::build::BoxClaim> {
+    let deadline = std::time::Instant::now() + CLAIM_WAIT;
+    let mut announced = false;
+    loop {
+        // `?`, not a shrug: `Ok(None)` is contention, and an `Err` means the
+        // claim could not be evaluated at all — an unwritable state directory
+        // is not something to sit in a loop over.
+        if let Some(claim) = crate::web::build::try_claim_box(&manager.state_dir, box_name)? {
+            return Ok(claim);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "box '{box_name}' has been busy for {}s, so this MCP server was not started.                  Another devbox process is holding it — a rebuild, a `devbox use`, or a                  start that is not finishing.",
+                CLAIM_WAIT.as_secs()
+            );
+        }
+        if !announced {
+            eprintln!("devbox mcp: waiting for box '{box_name}' to be free…");
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -716,6 +873,46 @@ mod tests {
     }
 
     #[test]
+    fn global_is_a_flag_on_add_and_off_by_default() {
+        let cli = parse(&[
+            "devbox", "mcp", "add", "fetch", "--global", "--", "uvx", "srv",
+        ]);
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!()
+        };
+        let McpCommand::Add(add) = args.command else {
+            panic!()
+        };
+        assert!(add.global);
+
+        let cli = parse(&["devbox", "mcp", "add", "fetch", "--", "uvx", "srv"]);
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!()
+        };
+        let McpCommand::Add(add) = args.command else {
+            panic!()
+        };
+        assert!(
+            !add.global,
+            "a registration is project-scoped unless asked otherwise"
+        );
+    }
+
+    /// `--global` after `--` belongs to the server, like every other flag.
+    #[test]
+    fn the_servers_own_global_flag_is_not_devboxs() {
+        let cli = parse(&["devbox", "mcp", "add", "srv", "--", "server", "--global"]);
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!()
+        };
+        let McpCommand::Add(add) = args.command else {
+            panic!()
+        };
+        assert!(!add.global);
+        assert_eq!(add.command, ["server", "--global"]);
+    }
+
+    #[test]
     fn run_and_rm_require_a_name() {
         for verb in ["run", "rm"] {
             let error = Cli::try_parse_from(["devbox", "mcp", verb])
@@ -761,6 +958,38 @@ mod tests {
             Some("python")
         );
         assert_eq!(set_that_provides("mcp-server-fetch"), None);
+    }
+
+    /// An agent starts every configured MCP server at once, and several on
+    /// one box is the layout §7.2 recommends. A claim that refused on
+    /// contention would fail all but the first with a message about a rebuild
+    /// that is not happening.
+    #[tokio::test]
+    async fn a_second_shim_waits_for_the_box_claim_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SandboxManager {
+            state_dir: dir.path().to_path_buf(),
+        };
+        let held = crate::web::build::claim_box(&manager.state_dir, "shared").unwrap();
+
+        let state_dir = manager.state_dir.clone();
+        let waiter = tokio::spawn(async move {
+            let manager = SandboxManager { state_dir };
+            wait_for_the_box_claim(&manager, "shared").await.map(|_| ())
+        });
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the second shim gave up instead of waiting for the box"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the claim was released and the waiter never took it")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

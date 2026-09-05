@@ -430,11 +430,14 @@ fn a_recorded_posture_round_trips_and_the_project_box_warning_is_printed() {
     assert!(text.contains("posture = \"mirror-only\""), "{text}");
 }
 
-/// A project with no `devbox.toml` gets a complete one, not a stub: a file
-/// containing only `[mcp.…]` reads back with an *empty* `[mounts]`, and
-/// `devbox create` would then build a box with no workspace.
+/// A project with no `devbox.toml` is not one `mcp add` will invent.
+///
+/// A file containing only `[mcp.…]` parses, but every section it omits reads
+/// back as the *serde* default — and that default for `[mounts]` is empty, not
+/// the workspace mount `DevboxConfig::default()` carries. `devbox create`
+/// would then build a box with nothing mounted, from a config nobody wrote.
 #[test]
-fn adding_in_a_bare_directory_writes_a_config_that_still_mounts_the_workspace() {
+fn adding_in_a_bare_directory_is_refused_and_names_both_ways_forward() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -442,19 +445,195 @@ fn adding_in_a_bare_directory_writes_a_config_that_still_mounts_the_workspace() 
         .args(["mcp", "add", "srv", "--", "cat"])
         .output()
         .unwrap();
+    assert!(!output.status.success(), "a bare directory must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("devbox init"), "{stderr}");
+    assert!(stderr.contains("--global"), "{stderr}");
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        !project.path().join("devbox.toml").exists(),
+        "a refused `mcp add` still wrote a project config"
+    );
+}
+
+/// The reason the global registry exists: an agent's working directory is its
+/// own business, and a project-scoped registration disappears from anywhere
+/// else. `--global` is visible from a directory with no `devbox.toml` at all.
+#[test]
+fn a_global_registration_is_visible_from_a_directory_that_has_no_project() {
+    let home = tempfile::tempdir().unwrap();
+    let registered_from = tempfile::tempdir().unwrap();
+    let somewhere_else = tempfile::tempdir().unwrap();
+
+    let added = devbox(registered_from.path(), home.path())
+        .args([
+            "mcp",
+            "add",
+            "fetch",
+            "--global",
+            "--box",
+            "mcp-tools",
+            "--",
+            "uvx",
+            "srv",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&added.stdout),
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let global = home.path().join(".devbox").join("mcp.toml");
+    assert!(global.exists(), "--global did not write ~/.devbox/mcp.toml");
+    assert_eq!(
+        registry::load_file(&global).unwrap()["fetch"].command,
+        ["uvx", "srv"]
     );
 
-    let path = project.path().join("devbox.toml");
-    let config = devbox::sandbox::config::DevboxConfig::load(&path).unwrap();
+    // From an unrelated directory: listed, and resolvable.
+    let listed = devbox(somewhere_else.path(), home.path())
+        .args(["mcp", "ls"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(listed.contains("fetch"), "{listed}");
+    assert!(listed.contains("global"), "{listed}");
+
+    // `run` finds it too — it gets as far as the box, which does not exist.
+    let ran = devbox(somewhere_else.path(), home.path())
+        .args(["mcp", "run", "fetch"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&ran.stderr);
     assert!(
-        config.mounts.contains_key("workspace"),
-        "a config written by `mcp add` must still describe the workspace mount"
+        stderr.contains("mcp-tools"),
+        "`mcp run` did not resolve the global entry: {stderr}"
     );
-    assert_eq!(config.mcp["srv"].command, ["cat"]);
+
+    // And `rm` takes it out of the file it was actually in.
+    let removed = devbox(somewhere_else.path(), home.path())
+        .args(["mcp", "rm", "fetch"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    assert!(
+        String::from_utf8_lossy(&removed.stdout).contains("mcp.toml"),
+        "`mcp rm` did not say which file it edited"
+    );
+    assert!(registry::load_file(&global).unwrap().is_empty());
+}
+
+/// Both files can hold the same name. The project one is what runs, `ls` says
+/// so rather than listing one of them, and removing it uncovers the other.
+#[test]
+fn a_project_entry_shadows_the_global_one_and_ls_says_which() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("devbox.toml"), PROJECT).unwrap();
+
+    devbox(project.path(), home.path())
+        .args([
+            "mcp",
+            "add",
+            "srv",
+            "--global",
+            "--box",
+            "global-box",
+            "--",
+            "global-cmd",
+        ])
+        .output()
+        .unwrap();
+    let added = devbox(project.path(), home.path())
+        .args([
+            "mcp",
+            "add",
+            "srv",
+            "--box",
+            "project-box",
+            "--",
+            "project-cmd",
+        ])
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+
+    let listed = devbox(project.path(), home.path())
+        .args(["mcp", "ls"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(listed.contains("project-cmd"), "{listed}");
+    assert!(
+        listed.contains("global-cmd"),
+        "both entries must be listed:\n{listed}"
+    );
+    assert!(
+        listed.contains("global*"),
+        "the shadowed entry must be marked:\n{listed}"
+    );
+
+    // The project entry is the one that runs.
+    let ran = devbox(project.path(), home.path())
+        .args(["mcp", "run", "srv"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(
+        stderr.contains("project-box"),
+        "the global entry won: {stderr}"
+    );
+
+    // Removing it removes the project one and says the global one is now live.
+    let removed = devbox(project.path(), home.path())
+        .args(["mcp", "rm", "srv"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&removed.stdout).to_string();
+    assert!(stdout.contains("devbox.toml"), "{stdout}");
+    assert!(
+        stdout.contains("keeps working"),
+        "`mcp rm` did not say the global entry is now uncovered:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("devbox.toml")).unwrap(),
+        PROJECT
+    );
+    let global = home.path().join(".devbox").join("mcp.toml");
+    assert_eq!(
+        registry::load_file(&global).unwrap()["srv"].command,
+        ["global-cmd"]
+    );
+}
+
+/// The global file is edited with the same text surgery, so a comment someone
+/// put in it survives too.
+#[test]
+fn the_global_registry_keeps_its_comments() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global = home.path().join(".devbox").join("mcp.toml");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    let original = "# my own note about these servers\n\n[mcp.kept]\ncommand = [\"kept\"]\n";
+    std::fs::write(&global, original).unwrap();
+
+    devbox(project.path(), home.path())
+        .args(["mcp", "add", "added", "--global", "--", "added-cmd"])
+        .output()
+        .unwrap();
+    let after_add = std::fs::read_to_string(&global).unwrap();
+    assert!(after_add.starts_with(original), "{after_add}");
+
+    devbox(project.path(), home.path())
+        .args(["mcp", "rm", "added"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&global).unwrap(),
+        original,
+        "removing from the global registry did not restore it exactly"
+    );
 }
 
 #[test]
@@ -472,6 +651,10 @@ fn an_unknown_server_is_an_error_that_names_the_file_it_looked_in() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("absent"), "{stderr}");
         assert!(stderr.contains("devbox.toml"), "{stderr}");
+        assert!(
+            stderr.contains("mcp.toml"),
+            "the error must name the global registry too: {stderr}"
+        );
     }
 }
 
