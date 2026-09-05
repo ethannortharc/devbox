@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/boxes/new", get(create_box_page))
         .route("/boxes/{name}", get(box_detail))
+        .route("/boxes/{name}/runs/{run_id}", get(run_report))
         .route("/help", get(help_index))
         .route("/help/{topic}", get(help_topic))
         // json + fragments
@@ -353,6 +354,44 @@ struct BoxDetailTemplate {
     has_store: bool,
     /// A build status published before this page loaded.
     retained_build: String,
+    /// Only the Runs tab pays for reading the `runs` table.
+    runs: Vec<RunRow>,
+}
+
+/// One row of the Runs tab.
+///
+/// A view, not the record: every field is already the string the table prints,
+/// so the template does no formatting and the page cannot disagree with what
+/// `devbox runs` shows for the same run.
+pub struct RunRow {
+    pub run_id: String,
+    pub kind: String,
+    pub started: String,
+    pub duration: String,
+    pub exit: String,
+    pub status: String,
+    pub coverage: String,
+    pub violations: u64,
+    pub label: String,
+    pub command: String,
+}
+
+impl RunRow {
+    /// The leading characters of the id — enough to recognise and to click,
+    /// where twenty-six would push the command out of the table.
+    pub fn short_id(&self) -> String {
+        self.run_id.chars().take(10).collect()
+    }
+
+    /// A class for the exit column: green for zero, red for anything else,
+    /// nothing at all while the run has not finished.
+    pub fn status_class(&self) -> &'static str {
+        match (self.status.as_str(), self.exit.as_str()) {
+            ("running", _) => "running",
+            (_, "0") => "ok",
+            _ => "bad",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +406,7 @@ pub struct TabQuery {
 pub fn resolve_tab(requested: Option<&str>) -> &'static str {
     match requested {
         Some("activity") => "activity",
+        Some("runs") => "runs",
         Some("sets") => "sets",
         Some("policy") => "policy",
         Some("files") => "files",
@@ -431,10 +471,20 @@ async fn box_detail(
         (Activity::default(), CaptureView::default())
     };
 
+    let runs = if tab == "runs" {
+        load_runs(&state, &name).unwrap_or_else(|e| {
+            tracing::warn!(box_id = %name, error = %e, "could not load runs");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
     render(BoxDetailTemplate {
         version: state.version,
         nav: "dashboard",
         tab,
+        runs,
         box_event: super::watch::box_card_event(&name),
         groups: service::set_groups(&selection),
         extra_packages: selection
@@ -1369,6 +1419,94 @@ fn server_error(context: &str, err: &anyhow::Error) -> Response {
 /// The manager reports both "no such box" and "unreadable state" as an error;
 /// treating an unknown name as 404 is the useful distinction for a client, and
 /// the detail is logged either way.
+/// How many runs the tab lists.
+///
+/// A page, not a history: `devbox runs --limit` is the tool for going further
+/// back, and a box that has run ten thousand commands should not render ten
+/// thousand rows into a tab someone opened to see the last one.
+const RUNS_ON_TAB: usize = 50;
+
+fn load_runs(state: &AppState, name: &str) -> anyhow::Result<Vec<RunRow>> {
+    let path = crate::obs::collector::store_path(&state.manager.state_dir, name);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = crate::obs::Store::open(&path)?;
+    let refusals = store.refusals_by_run().unwrap_or_default();
+    Ok(store
+        .list_runs(RUNS_ON_TAB)?
+        .into_iter()
+        .map(|record| RunRow {
+            duration: crate::report::model::human_duration(record.duration_ms()),
+            started: record.started_at.clone(),
+            exit: record
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "—".into()),
+            coverage: coverage_badge(&record.capture_sources),
+            violations: refusals.get(&record.run_id).copied().unwrap_or(0),
+            command: record.command_line(),
+            kind: record.kind.clone(),
+            status: record.status.clone(),
+            label: record.label.clone(),
+            run_id: record.run_id,
+        })
+        .collect())
+}
+
+/// The same three words the report's own badge uses.
+fn coverage_badge(sources: &str) -> String {
+    if sources.is_empty() {
+        "unknown"
+    } else if sources.starts_with("ebpf") {
+        "full"
+    } else {
+        "partial"
+    }
+    .to_string()
+}
+
+/// `GET /boxes/{name}/runs/{id}` — one run's report.
+///
+/// The same self-contained document that is written to
+/// `~/.devbox/runs/<box>/<id>/report.html`, rendered from the stored model
+/// rather than served from the file: the file can be deleted, and a route that
+/// read a path built from a URL segment would be a traversal waiting to
+/// happen. `is_run_id` decides what may be a path component; nothing else.
+async fn run_report(
+    State(state): State<AppState>,
+    Path((name, run_id)): Path<(String, String)>,
+) -> Response {
+    if !crate::obs::run::is_run_id(&run_id) {
+        return (StatusCode::NOT_FOUND, error_notice("no such run")).into_response();
+    }
+    let report = match crate::report::load(&state.manager.state_dir, &name, &run_id) {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, error_notice("no such run")).into_response();
+        }
+        Err(e) => {
+            tracing::warn!(box_id = %name, %run_id, error = %e, "could not read a run report");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_notice("that run's report could not be read"),
+            )
+                .into_response();
+        }
+    };
+    match crate::report::html::render(&report) {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "run report render failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_notice("that run's report could not be rendered"),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn not_found(name: &str, err: &anyhow::Error) -> Response {
     tracing::debug!(box_id = %name, error = ?err, "box lookup failed");
     // htmx swaps 4xx, and this one echoes a path segment, so it goes through
@@ -1594,6 +1732,7 @@ mod tests {
         let selection = Selection::new(["system".to_string()], std::iter::empty());
         BoxDetailTemplate {
             retained_build: String::new(),
+            runs: Vec::new(),
             version: "0.1.3",
             nav: "dashboard",
             tab,

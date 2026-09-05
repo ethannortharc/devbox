@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::Args;
 
 use crate::cli::box_arg::BoxArg;
+use crate::cli::run::SimpleRun;
+use crate::obs::run::RunKind;
 use crate::sandbox::SandboxManager;
 
 /// `devbox exec [NAME] -- CMD…`.
@@ -23,8 +25,18 @@ pub struct ExecArgs {
 
 pub async fn run(args: ExecArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.boxarg.name())?;
-    let exit_code = manager.exec_in_sandbox(&name, &args.command, false).await?;
 
+    // Recorded, not reported (§4.6). The Runs tab is meant to be the whole
+    // story of a box; a box whose work is done through `exec` would otherwise
+    // show an empty one. See `SimpleRun` for what these runs can and cannot
+    // attribute — they get no wrapper, so no cgroup and no root pid.
+    let record = SimpleRun::start(manager, &name, RunKind::Exec, &args.command);
+    let outcome = manager.exec_in_sandbox(&name, &args.command, false).await;
+    if let Some(record) = record {
+        record.finish(manager, &name, outcome.as_ref().ok().copied());
+    }
+
+    let exit_code = outcome?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }

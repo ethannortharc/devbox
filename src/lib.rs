@@ -13,6 +13,7 @@
 //! - [`nix`] — Nix set composition and rebuilds inside a box.
 //! - [`runtime`] — the Incus/Lima/Multipass/Docker abstraction.
 //! - [`obs`] — the observability plane: schema, store, collector, correlation.
+//! - [`report`] — the run report: one model, three renderings (§4.4).
 //! - [`metrics`] — the Prometheus exporter.
 //! - [`policy`] — egress postures, the allowlist, and the nftables driver.
 //! - [`tools`] — language/tool detection and the tool registry.
@@ -23,6 +24,7 @@ pub mod metrics;
 pub mod nix;
 pub mod obs;
 pub mod policy;
+pub mod report;
 pub mod runtime;
 pub mod sandbox;
 pub mod tools;

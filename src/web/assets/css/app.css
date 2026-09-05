@@ -1777,3 +1777,32 @@ input.text:focus, select.text:focus, textarea.text:focus { outline: none; border
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Runs tab (§4.6) — five classes on top of `table.data`, because a run list is
+   a data table with three columns that mean something: a number, a verdict,
+   and a command that must be allowed to be long. */
+.run-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.run-exit-ok { color: var(--ok); }
+.run-exit-bad { color: var(--err); }
+.run-exit-running { color: var(--warn); }
+.run-coverage {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.run-coverage-full { color: var(--ok); }
+.run-coverage-partial { color: var(--warn); }
+.run-coverage-unknown { color: var(--fg-faint); }
+/* The one column allowed to wrap: a command line is the point of the row, and
+   truncating it to keep the table tidy is how a list stops being useful. */
+.run-cmd {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 22ch;
+}

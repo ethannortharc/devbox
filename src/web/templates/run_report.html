@@ -1,0 +1,239 @@
+{#- One self-contained run report (§4.4).
+
+    No `{% extends %}`, no `/assets/…`: this file is written to
+    `~/.devbox/runs/<box>/<id>/report.html` and is expected to open from a
+    file:// URL, be attached to a ticket, or be mailed to someone who has never
+    heard of devbox. Every byte it needs is in it — inline CSS, no JavaScript,
+    and the whole model embedded as JSON so the same file is also the machine
+    contract. The console serves this exact document, so a report someone
+    forwards and a report someone bookmarks are the same page.
+
+    The palette is `app.css`'s, copied rather than linked for the same reason.
+-#}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>devbox run {{ report.run.run_id }} · {{ report.run.box_id }}</title>
+    <style>
+      :root {
+        --bg: #0b100c; --bg-raised: #111a14; --bg-inset: #070c09;
+        --border: #25362b; --fg: #eef7f0; --fg-muted: #9caf9f; --fg-faint: #778a7c;
+        --accent: #a7ed69; --ok: #82dc71; --warn: #e9bd68; --err: #ff766f; --mag: #bd9bf4;
+        --radius: 8px;
+        --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+        --sans: "Avenir Next", "Segoe UI Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f5f8f3; --bg-raised: #fbfdf9; --bg-inset: #eaf1e7;
+          --border: #cbd8c8; --fg: #17221a; --fg-muted: #56675a; --fg-faint: #718076;
+          --accent: #2f7f4d; --ok: #2f7f4d; --warn: #8a650d; --err: #b93838; --mag: #8250df;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 32px 20px 72px; background: var(--bg); color: var(--fg);
+        font-family: var(--sans); font-size: 15px; line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+      }
+      main { max-width: 900px; margin: 0 auto; }
+      h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+      h2 {
+        font-size: 12px; text-transform: uppercase; letter-spacing: 0.09em;
+        color: var(--fg-faint); margin: 36px 0 12px; font-weight: 600;
+      }
+      code, .mono { font-family: var(--mono); font-size: 0.92em; }
+      .sub { color: var(--fg-muted); font-family: var(--mono); font-size: 13px; margin: 0 0 20px; }
+      .badge {
+        display: inline-block; padding: 2px 9px; border-radius: 999px;
+        font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
+        border: 1px solid currentColor;
+      }
+      .badge.full { color: var(--ok); }
+      .badge.partial { color: var(--warn); }
+      .badge.unknown { color: var(--fg-faint); }
+      .facts {
+        display: grid; grid-template-columns: max-content 1fr; gap: 4px 20px;
+        background: var(--bg-raised); border: 1px solid var(--border);
+        border-radius: var(--radius); padding: 16px 18px; margin: 0 0 8px;
+      }
+      .facts dt { color: var(--fg-faint); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+      .facts dd { margin: 0; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+      th, td {
+        text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--border);
+        white-space: nowrap;
+      }
+      th { color: var(--fg-faint); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+      tr:last-child td { border-bottom: 0; }
+      td.path, td.peer { font-family: var(--mono); white-space: normal; overflow-wrap: anywhere; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+      .add { color: var(--ok); } .mod { color: var(--warn); } .del { color: var(--err); }
+      .tree {
+        background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 14px 16px; margin: 0; overflow-x: auto;
+        font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+      }
+      .tree .pid { color: var(--fg-faint); }
+      .tree .cmd { color: var(--fg-muted); }
+      .empty { color: var(--fg-faint); font-style: italic; }
+      .note {
+        color: var(--fg-muted); font-size: 13px; margin: 0 0 12px;
+        border-left: 2px solid var(--border); padding-left: 12px;
+      }
+      footer { margin-top: 56px; color: var(--fg-faint); font-size: 12px; }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Run {{ report.run.run_id }}</h1>
+      <p class="sub">
+        {{ report.run.box_id }} · {{ report.run.kind }} ·
+        {{ report.run.started_at }} · {{ duration }} ·
+        exit {{ exit_code }} · {{ report.run.status }}
+        <span class="badge {{ report.coverage.badge() }}">coverage: {{ report.coverage.badge() }}</span>
+      </p>
+
+      <dl class="facts">
+        {% if !report.run.label.is_empty() %}
+        <dt>label</dt><dd>{{ report.run.label }}</dd>
+        {% endif %}
+        <dt>command</dt><dd>{{ report.run.command_line() }}</dd>
+        {% if !report.run.cwd.is_empty() %}
+        <dt>cwd</dt><dd>{{ report.run.cwd }}</dd>
+        {% endif %}
+        <dt>posture</dt><dd>{{ posture }}</dd>
+        <dt>capture</dt><dd>{{ sources }}{% if !report.coverage.agent_version.is_empty() %} · agent {{ report.coverage.agent_version }}{% endif %}</dd>
+        <dt>events</dt>
+        <dd>
+          {{ report.coverage.events }} attributed{% for kv in attribution %} · {{ kv.1 }} by {{ kv.0 }}{% endfor %}
+          · {{ report.coverage.dropped_events }} dropped
+          · {{ report.coverage.unattributed_in_window }} unattributed in the window
+        </dd>
+      </dl>
+
+      <h2>Files</h2>
+      <p class="note">scope: {{ report.files.scope }}</p>
+      {% if report.files.is_empty() %}
+      <p class="empty">No file changes.</p>
+      {% else %}
+      <div class="scroll">
+        <table>
+          <thead><tr><th></th><th>path</th></tr></thead>
+          <tbody>
+            {% for change in report.files.changes %}
+            <tr>
+              <td class="{% if change.status == "added" %}add{% else if change.status == "modified" %}mod{% else %}del{% endif %}">
+                {% if change.status == "added" %}+{% else if change.status == "modified" %}~{% else %}−{% endif %}
+              </td>
+              <td class="path">{{ change.path }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        {{ report.files.changes.len() }} file(s): {{ report.files.added() }} added,
+        {{ report.files.modified() }} modified, {{ report.files.deleted() }} deleted{% if report.files.directories > 0 %},
+        and {{ report.files.directories }} directories{% endif %}.
+      </p>
+      {% endif %}
+
+      <h2>Network</h2>
+      {% if report.network.domains.is_empty() && report.network.dns.is_empty() %}
+      <p class="empty">No network activity.</p>
+      {% else %}
+      {% if !report.network.domains.is_empty() %}
+      <div class="scroll">
+        <table>
+          <thead><tr><th>peer</th><th>conns</th><th>ports</th><th>tls</th><th>sent</th><th>received</th></tr></thead>
+          <tbody>
+            {% for row in report.network.domains %}
+            <tr>
+              <td class="peer">{{ row.peer }}</td>
+              <td class="num">{{ row.connections }}</td>
+              <td class="mono">{{ row.ports_human() }}</td>
+              <td>{% if row.tls %}yes{% endif %}</td>
+              <td class="num">{{ row.tx_human() }}</td>
+              <td class="num">{{ row.rx_human() }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+      {% if !report.network.tls.is_empty() %}
+      <p class="note">TLS server names: <span class="mono">{% for name in report.network.tls %}{% if !loop.first %}, {% endif %}{{ name }}{% endfor %}</span></p>
+      {% endif %}
+      {% if !report.network.dns.is_empty() %}
+      <p class="note">DNS: <span class="mono">{% for name in report.network.dns %}{% if !loop.first %}, {% endif %}{{ name }}{% endfor %}</span></p>
+      {% endif %}
+      <p class="note">
+        Total ↑ {{ report.network.tx_human() }} ↓ {{ report.network.rx_human() }}
+      </p>
+      {% endif %}
+
+      <h2>Processes</h2>
+      {% if report.processes.is_empty() %}
+      <p class="empty">No processes captured.</p>
+      {% else %}
+      <pre class="tree">{% for row in report.processes %}{{ row.indent() }}{{ row.comm }} <span class="pid">[{{ row.pid }}]</span> <span class="cmd">{{ row.display_command() }}</span>
+{% endfor %}</pre>
+      {% endif %}
+
+      <h2>Credentials</h2>
+      {% if report.credential_use.is_empty() %}
+      <p class="empty">Not recorded — the credential broker is not wired in this build.</p>
+      {% else %}
+      <div class="scroll">
+        <table>
+          <thead><tr><th>credential</th><th>provider</th><th>uses</th><th>first use</th></tr></thead>
+          <tbody>
+            {% for cred in report.credential_use %}
+            <tr>
+              <td class="mono">{{ cred.name }}</td><td>{{ cred.provider }}</td>
+              <td class="num">{{ cred.uses }}</td><td class="mono">{{ cred.first_use }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      <h2>Policy</h2>
+      {% if report.violations.is_empty() %}
+      <p class="empty">No refusals.</p>
+      {% else %}
+      <div class="scroll">
+        <table>
+          <thead><tr><th>target</th><th>verdict</th><th>reason</th><th>at</th></tr></thead>
+          <tbody>
+            {% for violation in report.violations %}
+            <tr>
+              <td class="peer">{{ violation.target }}</td>
+              <td>{{ violation.verdict }}</td>
+              <td>{{ violation.reason }}</td>
+              <td class="mono">{{ violation.ts }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      <footer>
+        devbox {{ version }} · this file is also machine-readable: the whole
+        model is in the <code>application/json</code> block below.
+        <br />© 2026 Ethan H.B. Zhou
+      </footer>
+    </main>
+    {#- Last, and not rendered. `</script>` inside JSON would end this element
+        early, so the encoder escapes the slash before it gets here. -#}
+    <script type="application/json" id="report">{{ json|safe }}</script>
+  </body>
+</html>

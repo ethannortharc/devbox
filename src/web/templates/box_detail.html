@@ -29,6 +29,8 @@
          {% if tab == "overview" %}aria-current="page"{% endif %}>Overview</a>
       <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=activity"
          {% if tab == "activity" %}aria-current="page"{% endif %}>Activity</a>
+      <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=runs"
+         {% if tab == "runs" %}aria-current="page"{% endif %}>Runs</a>
       <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=sets"
          {% if tab == "sets" %}aria-current="page"{% endif %}>Sets</a>
       <a href="/boxes/{{ boxinfo.name|urlencode_strict }}?tab=policy"
@@ -60,6 +62,9 @@
 
       {% elif tab == "activity" %}
       {% include "_activity_panel.html" %}
+
+      {% elif tab == "runs" %}
+      {% include "_runs_tab.html" %}
 
       {% elif tab == "sets" %}
       <div class="tab-intro"><span class="eyebrow">Environment composition</span><h2>Tool sets</h2><p>

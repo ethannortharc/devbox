@@ -1,0 +1,52 @@
+{#- The Runs tab: every execution this box has recorded (§4.6).
+
+    A list, not a dashboard. Each row is a run and links to its report, which
+    is the page that actually answers anything; the columns here exist to help
+    someone find the right run — when, how long, whether it worked, and how
+    much of it the capture layer could see.
+
+    `tablewrap` / `table.data` are the console's existing table, so this tab
+    inherits every fix the others get rather than growing a second one. -#}
+<div class="tab-intro">
+  <span class="eyebrow">Evidence per execution</span>
+  <h2>Runs</h2>
+  <p>
+    Every <code>devbox run</code>, <code>exec</code> and shell session in this
+    box. A run scopes capture to one command, so its report is what
+    <em>that command</em> did — not what the box did while it happened.
+  </p>
+</div>
+
+{% if runs.is_empty() %}
+<p class="muted">
+  No runs yet. <code>devbox run {{ boxname }} -- &lt;command&gt;</code> records
+  one and writes its report.
+</p>
+{% else %}
+<div class="tablewrap">
+  <table class="data">
+    <thead>
+      <tr>
+        <th>run</th><th>kind</th><th>started</th><th>duration</th>
+        <th>exit</th><th>coverage</th><th>refusals</th><th>command</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in runs %}
+      <tr>
+        <td>
+          <a href="/boxes/{{ boxname|urlencode_strict }}/runs/{{ row.run_id|urlencode_strict }}">{{ row.short_id() }}</a>
+        </td>
+        <td>{{ row.kind }}</td>
+        <td>{{ row.started }}</td>
+        <td class="run-num">{{ row.duration }}</td>
+        <td class="run-num run-exit-{{ row.status_class() }}">{{ row.exit }}</td>
+        <td><span class="run-coverage run-coverage-{{ row.coverage }}">{{ row.coverage }}</span></td>
+        <td class="run-num">{% if row.violations > 0 %}{{ row.violations }}{% endif %}</td>
+        <td class="run-cmd">{% if !row.label.is_empty() %}<strong>{{ row.label }}</strong> {% endif %}{{ row.command }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}

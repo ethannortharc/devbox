@@ -21,6 +21,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::event::Event;
+use super::run::{Attributor, RunTag};
 use super::store::{Retention, Store};
 
 /// Protocol version, matching `transport.ProtocolVersion` in Go.
@@ -307,6 +308,12 @@ pub struct Collector {
     connections: AtomicU64,
     /// Bytes of events accepted into the queue and not yet written.
     queued_bytes: std::sync::atomic::AtomicUsize,
+    /// Which run each event belongs to (§4.2).
+    ///
+    /// Lives beside the store rather than inside it because it is *history*,
+    /// not rows: the parent-chain rule can only answer "descends from the run's
+    /// root pid" for pids it has already watched go past.
+    attributor: Mutex<Attributor>,
 }
 
 /// An event on its way to the store, with the size it arrived as.
@@ -332,6 +339,7 @@ impl Collector {
             on_agent: None,
             connections: AtomicU64::new(0),
             queued_bytes: std::sync::atomic::AtomicUsize::new(0),
+            attributor: Mutex::new(Attributor::new()),
         }
     }
 
@@ -778,7 +786,39 @@ impl Collector {
             return;
         }
         let mut store = self.store.lock().await;
-        match store.insert_batch(batch) {
+
+        // Attribution is decided here, once per batch, not once per event.
+        //
+        // The live-run list is re-read from the same database the events are
+        // about to be written into — the CLI wrote the run row through a
+        // second connection under WAL, so this is the one read that cannot
+        // disagree with it. A file under `~/.devbox/runs/<box>/active` would
+        // have been a second source of truth needing a watcher, and would
+        // still have had to be reconciled with the table the report reads
+        // back. The query is a partial-index lookup returning at most a
+        // handful of rows, and a batch is up to 256 events or 250ms of them,
+        // so this costs at most a few reads a second on a busy box.
+        let tags: Vec<Option<RunTag>> = {
+            let mut attributor = self.attributor.lock().await;
+            match store.active_runs() {
+                Ok(active) => {
+                    if active.is_empty() && attributor.is_idle() {
+                        Vec::new()
+                    } else {
+                        attributor.set_active(active);
+                        batch.iter().map(|e| attributor.attribute(e)).collect()
+                    }
+                }
+                Err(e) => {
+                    // A report missing its attribution is recoverable; losing
+                    // the events is not. Store them unattributed and say so.
+                    tracing::warn!(error = %e, "could not read the live runs; events go unattributed");
+                    Vec::new()
+                }
+            }
+        };
+
+        match store.insert_batch_tagged(batch, &tags) {
             Ok(n) => {
                 self.stats.stored.fetch_add(n as u64, Ordering::Relaxed);
                 if let Err(e) = store.enforce_retention(self.retention) {
