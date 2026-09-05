@@ -591,6 +591,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         };
         // The byte counts are the reason this event exists; a `close` line
         // without them would be indistinguishable from the `connect` it
