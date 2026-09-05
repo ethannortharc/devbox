@@ -20,6 +20,9 @@ pub enum EventType {
     Exit,
     Connect,
     Accept,
+    /// Connection teardown. `Connect` and `Accept` record that a connection was
+    /// made; this records what crossed it and how long it lasted.
+    Close,
     Dns,
     Tls,
     File,
@@ -35,6 +38,7 @@ impl EventType {
         EventType::Exit,
         EventType::Connect,
         EventType::Accept,
+        EventType::Close,
         EventType::Dns,
         EventType::Tls,
         EventType::File,
@@ -50,6 +54,7 @@ impl EventType {
             EventType::Exit => "exit",
             EventType::Connect => "connect",
             EventType::Accept => "accept",
+            EventType::Close => "close",
             EventType::Dns => "dns",
             EventType::Tls => "tls",
             EventType::File => "file",
@@ -63,7 +68,11 @@ impl EventType {
     pub fn domain(&self) -> &'static str {
         match self {
             EventType::Exec | EventType::Exit => "process",
-            EventType::Connect | EventType::Accept | EventType::Dns | EventType::Tls => "network",
+            EventType::Connect
+            | EventType::Accept
+            | EventType::Close
+            | EventType::Dns
+            | EventType::Tls => "network",
             EventType::File => "file",
             EventType::Syscall => "syscall",
             EventType::Api => "api",
@@ -161,12 +170,26 @@ pub struct Net {
     #[serde(default, skip_serializing_if = "is_false")]
     pub response: bool,
 
+    /// Settled on a `close` event and nowhere else. Every probe that fires
+    /// while a connection is being *made* runs before any payload has crossed
+    /// it, so a `connect` carrying a byte count would be carrying a guess.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_tx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_rx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dur_ms: u64,
+
+    /// `out` for a dialled connection, `in` for an accepted one. Carried on a
+    /// `close`, whose type no longer says which; empty when it is unknown,
+    /// which is exactly when `orphan` is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
+    /// A `close` whose connect or accept was never captured — a connection
+    /// older than the agent. The bytes are real; the process identity is
+    /// whoever closed the socket, not whoever opened it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub orphan: bool,
 }
 
 /// Process-execution detail.
@@ -249,9 +272,11 @@ impl Event {
 
         let missing = match self.kind {
             EventType::Exec => self.exec.is_none(),
-            EventType::Connect | EventType::Accept | EventType::Dns | EventType::Tls => {
-                self.net.is_none()
-            }
+            EventType::Connect
+            | EventType::Accept
+            | EventType::Close
+            | EventType::Dns
+            | EventType::Tls => self.net.is_none(),
             EventType::File => self.file.is_none(),
             EventType::Api => self.api.is_none(),
             EventType::Policy => self.policy.is_none(),
@@ -319,6 +344,27 @@ impl Event {
                 let peer = self.peer().unwrap_or_default();
                 let port = n.map(|n| n.dport).unwrap_or(0);
                 format!("{} {peer}:{port}", self.kind)
+            }
+            EventType::Close => {
+                // The byte counts are the whole reason this event exists, so
+                // they belong on the one line the CLI prints for it.
+                let n = self.net.as_ref();
+                let peer = self.peer().unwrap_or_default();
+                let port = n.map(|n| n.dport).unwrap_or(0);
+                let tx = crate::cli::watch::human_bytes(n.map_or(0, |n| n.bytes_tx));
+                let rx = crate::cli::watch::human_bytes(n.map_or(0, |n| n.bytes_rx));
+                let dur = n.map_or(0, |n| n.dur_ms);
+                let mut text = format!("close {peer}:{port} \u{2191}{tx} \u{2193}{rx}");
+                if dur > 0 {
+                    text.push_str(&format!(" {dur}ms"));
+                }
+                if n.is_some_and(|n| n.orphan) {
+                    // Said out loud rather than left to be inferred from a
+                    // blank column: these bytes are real but unattributed, and
+                    // a reader adding them to a process's total would be wrong.
+                    text.push_str(" (orphan)");
+                }
+                text
             }
             EventType::Tls => {
                 let sni = self.net.as_ref().map(|n| n.sni.as_str()).unwrap_or("");
@@ -451,6 +497,58 @@ mod tests {
 
         e.pid = 0;
         assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn a_close_line_leads_with_what_crossed_the_connection() {
+        let mut e = Event {
+            ts_wall: "t".into(),
+            ts_mono_ns: 0,
+            box_id: "b".into(),
+            cgroup_id: 0,
+            pid: 812,
+            tid: 812,
+            ppid: 640,
+            comm: "curl".into(),
+            uid: 1000,
+            kind: EventType::Close,
+            net: Some(Net {
+                proto: "tcp".into(),
+                daddr: "151.101.0.223".into(),
+                dport: 443,
+                bytes_tx: 4102,
+                bytes_rx: 831_720,
+                dur_ms: 690,
+                dir: "out".into(),
+                ..Default::default()
+            }),
+            exec: None,
+            file: None,
+            api: None,
+            policy: None,
+        };
+        // The byte counts are the reason this event exists; a `close` line
+        // without them would be indistinguishable from the `connect` it
+        // settles.
+        let line = e.summary();
+        assert!(line.starts_with("close 151.101.0.223:443"), "{line}");
+        assert!(line.contains("4.0KB"), "{line}");
+        assert!(line.contains("812.2KB"), "{line}");
+        assert!(line.contains("690ms"), "{line}");
+        assert!(!line.contains("orphan"), "{line}");
+
+        // Unattributed traffic says so, because a reader who adds it to a
+        // process's total would be wrong.
+        e.net.as_mut().unwrap().orphan = true;
+        assert!(e.summary().ends_with("(orphan)"), "{}", e.summary());
+
+        // And a close is a network event, so the console's existing chip
+        // covers it rather than needing a new one.
+        assert_eq!(EventType::Close.domain(), "network");
+
+        // It carries a 5-tuple, so it needs the sub-object that holds one.
+        e.net = None;
+        assert!(e.validate().is_err(), "a close without its net sub-object");
     }
 
     #[test]

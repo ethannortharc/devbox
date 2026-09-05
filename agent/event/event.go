@@ -27,6 +27,11 @@ const (
 	TypeExit    Type = "exit"
 	TypeConnect Type = "connect"
 	TypeAccept  Type = "accept"
+	// TypeClose settles a connection: connect and accept record that one was
+	// made, this records what crossed it and how long it lasted. The byte
+	// counters live on this event alone, so a total is a sum over one kind of
+	// event rather than a guess about which halves to add.
+	TypeClose   Type = "close"
 	TypeDNS     Type = "dns"
 	TypeTLS     Type = "tls"
 	TypeFile    Type = "file"
@@ -37,7 +42,7 @@ const (
 
 // AllTypes lists every valid event type, in schema order.
 var AllTypes = []Type{
-	TypeExec, TypeExit, TypeConnect, TypeAccept, TypeDNS,
+	TypeExec, TypeExit, TypeConnect, TypeAccept, TypeClose, TypeDNS,
 	TypeTLS, TypeFile, TypeSyscall, TypeAPI, TypePolicy,
 }
 
@@ -57,7 +62,7 @@ func (t Type) SubObject() string {
 	switch t {
 	case TypeExec:
 		return "exec"
-	case TypeConnect, TypeAccept, TypeDNS, TypeTLS:
+	case TypeConnect, TypeAccept, TypeClose, TypeDNS, TypeTLS:
 		return "net"
 	case TypeFile:
 		return "file"
@@ -124,9 +129,22 @@ type Net struct {
 	Answers  []string `json:"answers,omitempty"`
 	Response bool     `json:"response,omitempty"`
 
+	// BytesTX/BytesRX/DurMS are settled on a `close` event and nowhere else.
+	// Every probe that fires while a connection is being made runs before any
+	// payload has crossed it, so a `connect` carrying a byte count would be
+	// carrying a guess; these stay zero there on purpose.
 	BytesTX uint64 `json:"bytes_tx,omitempty"`
 	BytesRX uint64 `json:"bytes_rx,omitempty"`
 	DurMS   uint64 `json:"dur_ms,omitempty"`
+
+	// Dir is "out" for a dialled connection and "in" for an accepted one.
+	// Populated on `close`, where the event type no longer says which — and
+	// empty when even that is unknown, which is exactly when Orphan is set.
+	Dir string `json:"dir,omitempty"`
+	// Orphan marks a `close` whose connect or accept was never captured: a
+	// connection older than the agent. The bytes are real; the process
+	// identity is whoever closed the socket, not who opened it.
+	Orphan bool `json:"orphan,omitempty"`
 }
 
 // Exec carries process-execution detail.

@@ -57,15 +57,27 @@ struct net_event {
 	__u8 family;    /* 2 = AF_INET, 10 = AF_INET6 */
 	__u8 proto;     /* 6 = TCP, 17 = UDP */
 	__u8 direction; /* 0 = connect, 1 = accept */
-	__u8 _pad;
+	__u8 flags;     /* NET_FLAG_*, below */
 	__u16 sport;
 	__u16 dport;
 	__u8 saddr[16];
 	__u8 daddr[16];
+	/* Final only on a NET_FLAG_CLOSE record. See handle_tcp_close. */
 	__u64 bytes_tx;
 	__u64 bytes_rx;
 	__u64 dur_ns;
 };
+
+/* This record settles a connection rather than opening one: the byte counters
+ * and the duration are final, and the decoder turns it into a `close` event.
+ * It occupies the byte that used to be explicit padding, so the record layout
+ * and its 112-byte size are unchanged. */
+#define NET_FLAG_CLOSE (1 << 0)
+/* A settlement whose opening this agent never saw — a connection older than
+ * the agent, or one whose handshake was missed. The identity on the record is
+ * the process that closed the socket, not the one that dialled it, and the
+ * direction field means nothing. */
+#define NET_FLAG_ORPHAN (1 << 1)
 
 struct file_event {
 	__u64 ts_mono_ns;
@@ -204,6 +216,57 @@ struct {
 	__type(value, struct conn_owner);
 } connecting SEC(".maps");
 
+// A connection that reached ESTABLISHED, kept until it closes.
+//
+// `connecting` only has to survive a handshake; this has to survive the whole
+// connection, because the byte counters are not readable until `tcp_close` and
+// by then the dialling process is long off-CPU — `tcp_close` runs in whoever
+// closes the fd, which after an fd is inherited or passed is not the process
+// that opened it. Establishment time lives here too: the kernel keeps no
+// "connected at" stamp a probe can read back, so the duration has to be
+// measured by remembering one end of it.
+//
+// LRU for the same reason `connecting` is: a socket whose close we never see
+// (the box is torn down, the probe is detached mid-flight) would otherwise
+// leak an entry per connection.
+struct conn_state {
+	struct conn_owner owner;
+	__u64 open_ts_ns;
+	/* The local port as the connect or accept record published it.
+	 *
+	 * Not re-read at close: a socket whose teardown finished before the fd
+	 * was closed has already been unhashed, and `skc_num` is then 0. That
+	 * was observed on a real box — an sshd connection settled with
+	 * `sport: 0` while its accept record said 22 — and the flow table joins
+	 * a close to its opening on exactly that tuple. Remembering the port is
+	 * the only way to keep the two halves of one connection together. */
+	__u16 sport;
+	__u8 direction; /* 0 = dialled, 1 = accepted */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);
+	__type(value, struct conn_state);
+} established SEC(".maps");
+
+// Remember an established connection so its close can be attributed and timed.
+static __always_inline void remember_established(struct sock *sk,
+						 const struct conn_owner *owner,
+						 __u64 opened_ns, __u16 sport,
+						 __u8 direction)
+{
+	struct conn_state state = {};
+	state.owner = *owner;
+	state.open_ts_ns = opened_ns;
+	state.sport = sport;
+	state.direction = direction;
+
+	__u64 key = (__u64)sk;
+	bpf_map_update_elem(&established, &key, &state, BPF_ANY);
+}
+
 static __always_inline int connect_enter(struct sock *sk)
 {
 	__u64 cgroup_id = bpf_get_current_cgroup_id();
@@ -227,16 +290,21 @@ static __always_inline int connect_enter(struct sock *sk)
 
 // Fill the address fields the decoder reads, for either family.
 //
-// Every byte is written, including the padding and the counters. The ring
+// Every byte is written, including the flags byte and the counters. The ring
 // buffer hands back *reused* memory, not zeroed memory, so a field left
 // untouched is whatever the previous record put there — which the Go decoder
 // then reports as real bytes transferred and a real duration.
+//
+// The counters are zeroed here and filled in only by `handle_tcp_close`. A
+// connect or accept record describes a connection that has just come into
+// existence, and no payload has moved across it yet; anything else this probe
+// could write into those fields would be a guess.
 static __always_inline void fill_net(struct net_event *rec, struct sock *sk,
 				     __u8 direction)
 {
 	rec->proto = 6; /* IPPROTO_TCP */
 	rec->direction = direction;
-	rec->_pad = 0;
+	rec->flags = 0;
 	rec->bytes_tx = 0;
 	rec->bytes_rx = 0;
 	rec->dur_ns = 0;
@@ -307,7 +375,16 @@ int BPF_KPROBE(handle_tcp_finish_connect, struct sock *sk)
 	__builtin_memcpy(rec->comm, owner->comm, COMM_LEN);
 	fill_net(rec, sk, 0 /* outbound */);
 
+	// Before the submit: the record is the ring buffer's once it is handed
+	// back, and reading it after that is reading whatever was written next.
+	__u64 opened = rec->ts_mono_ns;
+	__u16 sport = rec->sport;
 	bpf_ringbuf_submit(rec, 0);
+
+	// The dialler's identity moves from `connecting` (which only had to
+	// outlive the handshake) to `established` (which has to outlive the
+	// connection), so `tcp_close` can credit the bytes to it.
+	remember_established(sk, owner, opened, sport, 0 /* dialled */);
 	bpf_map_delete_elem(&connecting, &key);
 	return 0;
 }
@@ -332,7 +409,116 @@ int BPF_KRETPROBE(handle_accept, struct sock *sk)
 	// connection as a bogus IPv4 flow.
 	fill_net(rec, sk, 1 /* inbound */);
 
+	// Copied out before the submit, for the same reason as above.
+	struct conn_owner owner = {};
+	owner.cgroup_id = rec->cgroup_id;
+	owner.pid = rec->pid;
+	owner.tid = rec->tid;
+	owner.ppid = rec->ppid;
+	owner.uid = rec->uid;
+	__builtin_memcpy(owner.comm, rec->comm, COMM_LEN);
+	__u64 opened = rec->ts_mono_ns;
+	__u16 sport = rec->sport;
+
 	bpf_ringbuf_submit(rec, 0);
+	remember_established(sk, &owner, opened, sport, 1 /* accepted */);
+	return 0;
+}
+
+// Connection teardown, which is the first moment the byte counters are true.
+//
+// Every other network probe here fires while a connection is being *made*:
+// `tcp_v*_connect` at the syscall, `tcp_finish_connect` on the SYN-ACK,
+// `inet_csk_accept` on the listener. None of them can report traffic, because
+// at each of them no payload has crossed the socket yet — which is why the
+// byte and duration fields on a connect record were, and remain, zero.
+//
+// `tcp_sock` carries running totals (`bytes_sent`, `bytes_received`) that are
+// final once the socket is being closed, so this probe is where a connection
+// is settled. A kprobe, not a kretprobe: `tcp_close` unhashes the socket on
+// its way out, and after that the local port is gone and the 5-tuple no longer
+// matches the connect record it belongs to.
+//
+// `tcp_set_state` entering TCP_CLOSE was the alternative. It is rejected here
+// because it fires on every state transition of every TCP socket on the box
+// including in softirq, where the current process is unrelated to the socket,
+// and because it also fires for sockets that never carried a byte. `tcp_close`
+// fires once per socket, in the closing process's own context, which is what
+// makes the cgroup check below meaningful.
+#define TCP_STATE_CLOSE 7
+#define TCP_STATE_LISTEN 10
+
+SEC("kprobe/tcp_close")
+int BPF_KPROBE(handle_tcp_close, struct sock *sk)
+{
+	__u64 key = (__u64)sk;
+	struct conn_state *state = bpf_map_lookup_elem(&established, &key);
+	__u8 flags = NET_FLAG_CLOSE;
+
+	if (!state) {
+		// A connection this agent never saw open. Worth settling — it
+		// may have moved most of the box's traffic — but it is marked,
+		// because its process identity is only whoever is closing it.
+		if (!cgroup_is_traced(bpf_get_current_cgroup_id()))
+			return 0;
+		// A listener, or a socket that never left TCP_CLOSE, has
+		// nothing to settle, and its 5-tuple is zeros — which would
+		// decode into a connection to 0.0.0.0:0 that never happened.
+		__u8 sk_state = BPF_CORE_READ(sk, __sk_common.skc_state);
+		if (sk_state == TCP_STATE_LISTEN || sk_state == TCP_STATE_CLOSE)
+			return 0;
+		flags |= NET_FLAG_ORPHAN;
+	}
+
+	struct net_event *rec = bpf_ringbuf_reserve(&net_events, sizeof(*rec), 0);
+	if (!rec) {
+		bpf_map_delete_elem(&established, &key);
+		return 0;
+	}
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 dur = 0;
+	__u8 direction = 0;
+	if (state) {
+		rec->ts_mono_ns = now;
+		rec->cgroup_id = state->owner.cgroup_id;
+		rec->pid = state->owner.pid;
+		rec->tid = state->owner.tid;
+		rec->ppid = state->owner.ppid;
+		rec->uid = state->owner.uid;
+		__builtin_memcpy(rec->comm, state->owner.comm, COMM_LEN);
+		direction = state->direction;
+		// A monotonic clock cannot go backwards, but the map value is
+		// memory anything could have scribbled on; a wrapped subtraction
+		// would report a connection that lasted five hundred years.
+		if (now > state->open_ts_ns)
+			dur = now - state->open_ts_ns;
+	} else {
+		FILL_COMMON(rec);
+	}
+
+	fill_net(rec, sk, direction);
+	rec->flags = flags;
+	// The remembered port wins over the socket's own, which by now can be
+	// zero (see `conn_state.sport`). An orphan has nothing remembered and
+	// keeps whatever the socket still says.
+	if (state)
+		rec->sport = state->sport;
+
+	// `struct tcp_sock` starts with the `struct sock` this probe was handed,
+	// so the cast is the standard CO-RE way to reach the TCP-only counters.
+	// `bytes_sent` postdates `bytes_received` by several releases, so both
+	// are guarded: a kernel without one still loads, and reports zero for
+	// that direction rather than refusing to attach at all.
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	if (bpf_core_field_exists(tp->bytes_sent))
+		rec->bytes_tx = BPF_CORE_READ(tp, bytes_sent);
+	if (bpf_core_field_exists(tp->bytes_received))
+		rec->bytes_rx = BPF_CORE_READ(tp, bytes_received);
+	rec->dur_ns = dur;
+
+	bpf_ringbuf_submit(rec, 0);
+	bpf_map_delete_elem(&established, &key);
 	return 0;
 }
 

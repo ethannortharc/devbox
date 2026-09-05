@@ -173,6 +173,103 @@ func TestDecodeNetIPv4AndIPv6(t *testing.T) {
 	}
 }
 
+func TestDecodeNetCloseSettlesTheConnection(t *testing.T) {
+	t.Parallel()
+
+	// Same socket as the connect above, one settlement later. The flow table
+	// joins the two on this 5-tuple, so it has to survive the close probe
+	// unchanged — which is why that probe is a kprobe and not a kretprobe.
+	var r NetRecord
+	r.TSMonoNS = 3_000_000_000
+	r.PID, r.TID, r.PPID, r.UID = 812, 812, 640, 1000
+	FillString(r.Comm[:], "pip")
+	r.Family, r.Proto, r.Direction = 2, 6, DirConnect
+	r.Flags = NetFlagClose
+	r.SPort, r.DPort = 51234, 443
+	copy(r.SAddr[:4], []byte{10, 0, 0, 5})
+	copy(r.DAddr[:4], []byte{151, 101, 0, 223})
+	r.BytesTX, r.BytesRX, r.DurNS = 4102, 831720, 690_000_000
+
+	e, err := DecodeNet(r.Encode(), "myapp", testClock())
+	if err != nil {
+		t.Fatalf("DecodeNet: %v", err)
+	}
+	if e.Type != event.TypeClose {
+		t.Fatalf("type = %q, want close", e.Type)
+	}
+	if e.Net.BytesTX != 4102 || e.Net.BytesRX != 831720 {
+		t.Errorf("byte counters = %d/%d", e.Net.BytesTX, e.Net.BytesRX)
+	}
+	if e.Net.DurMS != 690 {
+		t.Errorf("dur_ms = %d", e.Net.DurMS)
+	}
+	if e.Net.DAddr != "151.101.0.223" || e.Net.DPort != 443 || e.Net.SPort != 51234 {
+		t.Errorf("the 5-tuple must survive the close: %+v", e.Net)
+	}
+	// The direction field still means what it meant at connect time; the
+	// close's own type no longer carries it, so the decoder republishes it.
+	if e.Net.Dir != "out" {
+		t.Errorf("dir = %q, want out", e.Net.Dir)
+	}
+	if e.Net.Orphan {
+		t.Error("a paired close is not an orphan")
+	}
+
+	// An accepted connection settles as inbound, not as an accept event.
+	r.Direction = DirAccept
+	e, err = DecodeNet(r.Encode(), "myapp", testClock())
+	if err != nil {
+		t.Fatalf("DecodeNet inbound close: %v", err)
+	}
+	if e.Type != event.TypeClose {
+		t.Errorf("type = %q — the close flag outranks the direction", e.Type)
+	}
+	if e.Net.Dir != "in" {
+		t.Errorf("dir = %q, want in", e.Net.Dir)
+	}
+
+	// An orphan knows the bytes and nothing about who or which way.
+	r.Flags = NetFlagClose | NetFlagOrphan
+	e, err = DecodeNet(r.Encode(), "myapp", testClock())
+	if err != nil {
+		t.Fatalf("DecodeNet orphan: %v", err)
+	}
+	if !e.Net.Orphan {
+		t.Error("the orphan flag was dropped")
+	}
+	if e.Net.Dir != "" {
+		t.Errorf("dir = %q — an orphan cannot know its direction", e.Net.Dir)
+	}
+	if e.Net.BytesRX != 831720 {
+		t.Error("an orphan's bytes are still real")
+	}
+}
+
+func TestDecodeNetOpeningRecordsCarryNoTraffic(t *testing.T) {
+	t.Parallel()
+
+	// The regression this whole change exists to prevent: a connect record is
+	// written by a probe that fires before a byte has crossed the socket, so
+	// any counter on it is either zero or a lie. If a future probe starts
+	// filling them, every consumer that also counts closes double-counts.
+	var r NetRecord
+	r.TSMonoNS, r.PID = 1, 812
+	r.Family, r.Proto = 2, 6
+	for _, direction := range []uint8{DirConnect, DirAccept} {
+		r.Direction = direction
+		e, err := DecodeNet(r.Encode(), "myapp", testClock())
+		if err != nil {
+			t.Fatalf("DecodeNet: %v", err)
+		}
+		if e.Net.BytesTX != 0 || e.Net.BytesRX != 0 || e.Net.DurMS != 0 {
+			t.Errorf("direction %d carried traffic: %+v", direction, e.Net)
+		}
+		if e.Net.Dir != "" || e.Net.Orphan {
+			t.Errorf("direction %d: only a close carries dir/orphan: %+v", direction, e.Net)
+		}
+	}
+}
+
 func TestDecodeFile(t *testing.T) {
 	t.Parallel()
 

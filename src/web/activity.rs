@@ -193,11 +193,11 @@ impl Flow {
     }
 }
 
-/// Collapse connect/accept/tls events into one row per flow.
+/// Collapse connect/accept/tls/close events into one row per flow.
 ///
-/// A connection and its TLS handshake are two events about one thing; showing
-/// them as separate rows is exactly the wall-of-events the flow table exists
-/// to replace. They are joined on (pid, address, port).
+/// A connection, its TLS handshake, and its settlement are events about one
+/// thing; showing them as separate rows is exactly the wall-of-events the flow
+/// table exists to replace. They are joined on (pid, address, port).
 pub fn flows(events: &[Event]) -> Vec<Flow> {
     use std::collections::BTreeMap;
 
@@ -210,6 +210,15 @@ pub fn flows(events: &[Event]) -> Vec<Flow> {
             EventType::Accept => "in",
             // TLS enriches a flow it does not create.
             EventType::Tls => "out",
+            // A close settles a flow. It usually lands on a row a connect or
+            // accept already opened, and then the row keeps that row's
+            // direction. When it does not — a connection older than the
+            // capture window — the record says which way it went, and "out"
+            // is only the fallback for an orphan that cannot say.
+            EventType::Close => match event.net.as_ref().map(|n| n.dir.as_str()) {
+                Some("in") => "in",
+                _ => "out",
+            },
             _ => continue,
         };
 
@@ -261,10 +270,19 @@ pub fn flows(events: &[Event]) -> Vec<Flow> {
         // them. One connection claiming `u64::MAX` in both directions would
         // otherwise panic a checked build and silently wrap a release one,
         // taking the flow table's sort order with it.
-        flow.bytes_tx = flow.bytes_tx.saturating_add(net.bytes_tx);
-        flow.bytes_rx = flow.bytes_rx.saturating_add(net.bytes_rx);
+        //
+        // Only the close carries them, as `behavior::summarize` and
+        // `Chain::bytes` also assume — a flow's bytes land in one event, so a
+        // row is either settled or still shows zeros, never a half-total.
+        if event.kind == EventType::Close {
+            flow.bytes_tx = flow.bytes_tx.saturating_add(net.bytes_tx);
+            flow.bytes_rx = flow.bytes_rx.saturating_add(net.bytes_rx);
+        }
         flow.dur_ms = flow.dur_ms.max(net.dur_ms);
-        if event.kind != EventType::Tls {
+        // Neither TLS nor a close names the direction of a flow that already
+        // has one: a close is stamped with whichever way its connect went, and
+        // an orphan close is guessing.
+        if matches!(event.kind, EventType::Connect | EventType::Accept) {
             flow.direction = direction;
         }
     }
@@ -1335,8 +1353,23 @@ mod tests {
         }
     }
 
-    fn connect(pid: u32, mono: u64, addr: &str, port: u16, tx: u64, rx: u64) -> Event {
+    /// A connection being made. It carries no byte counts, because the probe
+    /// that produces one runs before a byte has crossed the socket.
+    fn connect(pid: u32, mono: u64, addr: &str, port: u16) -> Event {
         let mut e = base(pid, mono, EventType::Connect);
+        e.net = Some(Net {
+            proto: "tcp".into(),
+            daddr: addr.into(),
+            dport: port,
+            ..Default::default()
+        });
+        e
+    }
+
+    /// The same connection, settled. Same 5-tuple, so it joins the row its
+    /// connect opened — and it is where a flow's traffic actually comes from.
+    fn settled(pid: u32, mono: u64, addr: &str, port: u16, tx: u64, rx: u64) -> Event {
+        let mut e = base(pid, mono, EventType::Close);
         e.net = Some(Net {
             proto: "tcp".into(),
             daddr: addr.into(),
@@ -1344,6 +1377,7 @@ mod tests {
             bytes_tx: tx,
             bytes_rx: rx,
             dur_ms: 690,
+            dir: "out".into(),
             ..Default::default()
         });
         e
@@ -1378,11 +1412,16 @@ mod tests {
         });
 
         let rows = flows(&[
-            connect(812, 1_000_000_000, "151.101.0.223", 443, 4102, 831_720),
+            connect(812, 1_000_000_000, "151.101.0.223", 443),
             tls,
+            settled(812, 3_000_000_000, "151.101.0.223", 443, 4102, 831_720),
         ]);
 
-        assert_eq!(rows.len(), 1, "two events about one connection is one row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "three events about one connection is one row"
+        );
         let f = &rows[0];
         assert_eq!(f.peer, "pypi.org", "the SNI names the flow");
         assert_eq!(f.addr, "151.101.0.223");
@@ -1393,11 +1432,56 @@ mod tests {
     }
 
     #[test]
+    fn a_flows_traffic_arrives_with_its_close() {
+        // Until a connection ends nothing knows what crossed it, so a live
+        // flow shows zeros and a settled one shows the total. What must never
+        // happen is the total being counted twice because a connect started
+        // carrying counters too.
+        let mut opening = connect(812, 1_000_000_000, "151.101.0.223", 443);
+        let net = opening.net.as_mut().unwrap();
+        net.bytes_tx = 777;
+        net.bytes_rx = 777;
+
+        let rows = flows(&[
+            opening,
+            settled(812, 2_000_000_000, "151.101.0.223", 443, 4102, 831_720),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bytes_tx, 4102, "the close settles the row");
+        assert_eq!(rows[0].bytes_rx, 831_720);
+        assert_eq!(rows[0].direction, "out");
+    }
+
+    #[test]
+    fn an_orphan_close_becomes_a_row_of_its_own_and_keeps_its_direction() {
+        // A connection older than the capture window: no connect to join, so
+        // the close is the only evidence it existed. Dropping it would lose
+        // real traffic, and defaulting it to outbound would invent a fact the
+        // record does not claim.
+        let mut orphan = base(4242, 1_000_000_000, EventType::Close);
+        orphan.net = Some(Net {
+            proto: "tcp".into(),
+            daddr: "203.0.113.7".into(),
+            dport: 51999,
+            bytes_tx: 10,
+            bytes_rx: 20,
+            dir: "in".into(),
+            orphan: true,
+            ..Default::default()
+        });
+
+        let rows = flows(&[orphan]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bytes_rx, 20);
+        assert_eq!(rows[0].direction, "in", "the record says which way it went");
+    }
+
+    #[test]
     fn flows_are_sorted_by_traffic() {
         let rows = flows(&[
-            connect(812, 1_000_000_000, "10.0.0.1", 80, 1, 1),
-            connect(812, 2_000_000_000, "10.0.0.2", 80, 1000, 9000),
-            connect(812, 3_000_000_000, "10.0.0.3", 80, 50, 50),
+            settled(812, 1_000_000_000, "10.0.0.1", 80, 1, 1),
+            settled(812, 2_000_000_000, "10.0.0.2", 80, 1000, 9000),
+            settled(812, 3_000_000_000, "10.0.0.3", 80, 50, 50),
         ]);
         assert_eq!(rows[0].addr, "10.0.0.2");
         assert_eq!(rows[2].addr, "10.0.0.1");
@@ -1406,8 +1490,8 @@ mod tests {
     #[test]
     fn different_processes_to_the_same_peer_are_different_flows() {
         let rows = flows(&[
-            connect(812, 1_000_000_000, "10.0.0.1", 443, 1, 1),
-            connect(900, 2_000_000_000, "10.0.0.1", 443, 1, 1),
+            connect(812, 1_000_000_000, "10.0.0.1", 443),
+            connect(900, 2_000_000_000, "10.0.0.1", 443),
         ]);
         assert_eq!(rows.len(), 2, "a flow belongs to a process");
     }
@@ -1451,7 +1535,7 @@ mod tests {
 
     #[test]
     fn non_dns_events_do_not_appear_in_the_dns_log() {
-        assert!(lookups(&[connect(1, 1, "10.0.0.1", 80, 0, 0)]).is_empty());
+        assert!(lookups(&[connect(1, 1, "10.0.0.1", 80)]).is_empty());
     }
 
     #[test]
@@ -1757,15 +1841,15 @@ mod tests {
     fn peers_collapse_repeated_connections_into_one_relationship() {
         // Distinct source ports, which is what makes the flow table treat two
         // sequential fetches from one host as two connections.
-        let mut first = connect(812, 1_000_000_000, "151.101.0.223", 443, 100, 900);
+        let mut first = settled(812, 1_000_000_000, "151.101.0.223", 443, 100, 900);
         first.net.as_mut().unwrap().sport = 42001;
-        let mut second = connect(812, 2_000_000_000, "151.101.0.223", 443, 100, 900);
+        let mut second = settled(812, 2_000_000_000, "151.101.0.223", 443, 100, 900);
         second.net.as_mut().unwrap().sport = 42002;
 
         let rows = flows(&[
             first,
             second,
-            connect(900, 3_000_000_000, "10.0.0.9", 80, 1, 1),
+            settled(900, 3_000_000_000, "10.0.0.9", 80, 1, 1),
         ]);
         assert_eq!(rows.len(), 3);
 
@@ -1787,7 +1871,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut flow = connect(812, 1_000_000_000, "1.2.3.4", 443, 0, 0);
+        let mut flow = connect(812, 1_000_000_000, "1.2.3.4", 443);
         flow.net.as_mut().unwrap().sni = "api.openai.com".into();
 
         let rolled = peers(&flows(&[flow]), &summary);
@@ -1808,7 +1892,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let events = vec![connect(812, 1, "10.0.0.9", 443, 1, 1)];
+        let events = vec![connect(812, 1, "10.0.0.9", 443)];
         let rolled = peers(&flows(&events), &summary);
 
         assert_eq!(rolled.len(), 2);
@@ -1829,7 +1913,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let allowed = flows(&[connect(812, 1, "10.0.0.9", 443, 1_000, 900_000)]);
+        let allowed = flows(&[settled(812, 1, "10.0.0.9", 443, 1_000, 900_000)]);
 
         let rolled = peers(&allowed, &summary);
         assert_eq!(rolled.len(), 2);
@@ -1873,7 +1957,7 @@ mod tests {
             domains: vec!["network".into()],
             ..Default::default()
         };
-        assert!(filter.matches(&connect(1, 1, "10.0.0.1", 80, 0, 0)));
+        assert!(filter.matches(&connect(1, 1, "10.0.0.1", 80)));
         assert!(!filter.matches(&base(1, 1, EventType::Exec)));
     }
 
@@ -1881,7 +1965,7 @@ mod tests {
     fn free_text_matches_the_correlated_name_not_only_the_address() {
         // The reason filtering happens after correlation: this event stores
         // `151.101.0.223` and is named `pypi.org` only by the DNS join.
-        let mut event = connect(812, 1, "151.101.0.223", 443, 0, 0);
+        let mut event = connect(812, 1, "151.101.0.223", 443);
         event.net.as_mut().unwrap().domain = "pypi.org".into();
 
         let filter = Filter::searching("pypi");
@@ -1959,7 +2043,7 @@ mod tests {
         let filter = Filter::from_query(&format!("q=%20PyPI%20&q2=x&{}", "&".repeat(0)));
         assert_eq!(filter.query, " PyPI ");
         assert!(filter.matches(&{
-            let mut e = connect(1, 1, "1.2.3.4", 443, 0, 0);
+            let mut e = connect(1, 1, "1.2.3.4", 443);
             e.net.as_mut().unwrap().domain = "pypi.org".into();
             e
         }));
@@ -2026,7 +2110,7 @@ mod tests {
         let events = vec![
             base(1, 1, EventType::Exec),
             base(1, 2, EventType::Exec),
-            connect(1, 3, "10.0.0.1", 80, 0, 0),
+            connect(1, 3, "10.0.0.1", 80),
         ];
         let filter = Filter {
             domains: vec!["network".into()],
