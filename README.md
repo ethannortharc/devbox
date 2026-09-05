@@ -12,13 +12,13 @@ every host it reached, every process it spawned, every credential it used.
 Then it hands you the receipt.
 
 ```console
-$ devbox run --label "update the version file" -- sh -c 'curl -sS -o /dev/null https://api.github.com/repos/rust-lang/rust; curl -sS -o /dev/null https://pypi.org/simple/requests/; printf "0.2.0\n" > /workspace/VERSION; sleep 1'
-run 01M1S6K0XSDYN51E45Y3JS6NK7 · 1.9s · exit 0 · finished
+$ devbox run --label "fetch a page and call an API" -- sh -c 'curl -s -o /dev/null https://example.com; curl -s "$DEVBOX_BROKER_URL/shot/v1/thing" -H "x-devbox-broker-token: $DEVBOX_BROKER_TOKEN"; echo hi > /workspace/shot.txt'
+run 01M1SD2Z4F842DVZSBZXA2B688 · 682ms · exit 0 · finished
   files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
-  network  2 peers · 2 DNS · ↑3.7KB ↓98.3KB
-  process  24 in the tree
-  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
-  report   ~/.devbox/runs/devtest/01M1S6K0XSDYN51E45Y3JS6NK7/report.html
+  network  2 peers · 2 DNS · ↑2.1KB ↓6.4KB
+  process  16 in the tree
+  coverage full (ebpf+packet+netfilter) · 61 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1SD2Z4F842DVZSBZXA2B688/report.html
 ```
 
 That is a real run on a real box, verbatim except for `$HOME`. The command is a
@@ -76,7 +76,7 @@ devbox secret set anthropic --from-env ANTHROPIC_API_KEY
 The value goes into the host keychain. It is never written into the box, into
 its environment, or into any file the box can read. A host-side broker holds it
 and injects it per request; the box gets a per-box token instead, and every use
-is recorded as a `credential` event — `devbox watch --type credential`.
+lands in the run's report and in `devbox watch --type credential`.
 
 ### Run the agent
 
@@ -105,16 +105,21 @@ disagree.
 
 ## What you get
 
-![The run report page in the devbox console: run identity and coverage, the files the run changed, and the peers it reached with byte counts](docs/screenshot-console.png)
+![The run report page in the devbox console: run identity and coverage, the file the run changed under scope run, the two peers it reached with byte counts, and the brokered credential it used](docs/screenshot-console.png)
+
+That is the report for the run at the top of this page. The rule across the
+middle is an elision: the Processes section sits between Network and
+Credentials and is left out here, because on a box with a broker configured it
+contains that box's broker token.
 
 Every run produces one report with these sections.
 
 | Section | What it answers |
 |---|---|
-| **Files** | What this run wrote, from the diff of the checkpoint taken before it against the checkpoint taken after — not the box's lifetime of changes. The report says which scope it used. |
+| **Files** | What this run wrote, from the diff of the checkpoint taken before it against the checkpoint taken after — not the box's lifetime of changes. The report says which scope it used. A second table, **Writes outside the workspace overlay**, names the directories the run wrote to that `devbox commit` would never sync — a package cache, a config file in `$HOME` — by directory, with opens and file counts. |
 | **Network** | One row per peer: connections, ports, whether TLS was seen, bytes each way, and how long the connection lasted. Bytes are settled at `close`, so an open connection reads 0 rather than a guess. TLS server names and DNS answers are listed under it. |
-| **Processes** | The process tree the run spawned, by pid, including devbox's own wrapper. Nothing is filtered out for looking untidy. |
-| **Credential use** | Which brokered credential the run used, how often, and first use. **Not yet populated:** the broker writes `credential` events (read them with `devbox watch --type credential`), but the report does not aggregate them yet, and the section says so rather than printing "none used". |
+| **Processes** | The process tree the run spawned, by pid. Devbox's own wrapper collapses to a single `[devbox wrapper]` row — folded, not dropped, because a tree that quietly lost three processes would not line up with `devbox watch --tree`. |
+| **Credential use** | Which brokered credential the run reached for, the upstream it went to, the methods, how many times, and when it was last used. A refusal is counted and shown — `2 (1 denied)` — because a line where every use was denied is the policy working, not the credential being used. |
 | **Coverage** | Which capture backends were live, the agent version, how many events were attributed to this run and by which rule, how many were dropped, and how many events in the same window belonged to something else. |
 
 Read them together and `devbox behavior diff` answers "what did this run do

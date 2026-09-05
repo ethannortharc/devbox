@@ -32,12 +32,12 @@ devbox run -- claude
 Everything about that command is recorded and rendered:
 
 ```
-run 01M1S6K0XSDYN51E45Y3JS6NK7 · 1.9s · exit 0 · finished
+run 01M1SD2Z4F842DVZSBZXA2B688 · 682ms · exit 0 · finished
   files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
-  network  2 peers · 2 DNS · ↑3.7KB ↓98.3KB
-  process  24 in the tree
-  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
-  report   ~/.devbox/runs/devtest/01M1S6K0XSDYN51E45Y3JS6NK7/report.html
+  network  2 peers · 2 DNS · ↑2.1KB ↓6.4KB
+  process  16 in the tree
+  coverage full (ebpf+packet+netfilter) · 61 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1SD2Z4F842DVZSBZXA2B688/report.html
 ```
 
 Useful flags:
@@ -72,10 +72,17 @@ can attribute events to them — see [observability.md](observability.md#run-att
 | Section | Reads |
 |---|---|
 | Files | The diff of the checkpoint taken before the run against the one taken after. `scope: run` means exactly that; `scope: box` would mean the whole box's overlay. |
+| Writes outside the workspace overlay | Directories the run wrote to that `devbox commit` would never sync — `~/.cache/uv`, `/etc` — by directory, with opens and file counts. The overlay only protects `/workspace`; this is the part of the run that escaped it. |
 | Network | One row per peer — connections, ports, TLS seen, bytes each way, duration. Plus TLS server names and DNS answers. |
-| Processes | The process tree, by pid, wrapper included. |
-| Credentials | Which brokered credential was used and how often. Not wired yet — the section prints an explicit "not recorded", and `devbox watch --type credential` is where the events are. |
+| Processes | The process tree, by pid. Devbox's own wrapper is folded into one `[devbox wrapper]` row, so the root of the tree is your command. |
+| Credentials | Each brokered credential the run reached for: provider, upstream, methods, uses, last use. `2 (1 denied)` means the scope refused one of them. |
 | Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. |
+
+The outside-overlay table is the one worth reading twice. `devbox discard`
+undoes `/workspace`; it does not undo a package the run installed into `$HOME`,
+and until v5 the report did not say that had happened. Its `opens` column counts
+capture events (the probe sees `open`/`create`, not each `write(2)`), so a 64 KB
+`dd` into one file counts as one.
 
 Two numbers surprise people the first time:
 
