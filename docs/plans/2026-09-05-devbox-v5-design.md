@@ -5,7 +5,7 @@
 **Author:** Ethan
 **Date:** 2026-09-05
 **Status:** Approved for implementation. This document is the source of truth for the v5 build. `DECISIONS.md` carries the ADRs; `PROGRESS.md` the build log.
-**Supersedes:** the product framing of `2026-08-06-devbox-v4-design.md`. The v4 sandbox core, web console, observability plane, and policy engine are kept. Components D and E of v4 (box lab, ZTP) move to a separate repository.
+**Supersedes:** the product framing of `2026-08-06-devbox-v4-design.md`. The v4 sandbox core, web console, observability plane, and policy engine are kept. Components D and E of v4 (box lab, ZTP) are removed; their code is archived outside this repository.
 
 ---
 
@@ -22,7 +22,7 @@ v5 therefore does five things and one removal:
 | **D. MCP sandboxing** | Any stdio MCP server runs inside a box under a posture and shows up in the audit; the host sees a plain stdio MCP server | `devbox mcp add/run/ls/rm` |
 | **E. Overlay checkpoints** | The overlay upper layer can be checkpointed, diffed, and restored; runs are bracketed by checkpoints so file changes are per-run | `devbox layer checkpoint/checkpoints/diff/restore` |
 | **G. Export** | Every event and report exports as OCSF and OTLP so enterprise control planes can ingest devbox without an adapter | `devbox export --format ocsf\|otlp-json\|jsonl` |
-| **Split** | `src/lab`, `ztpd`, `labkit`, the Labs console views, and their docs move to `devbox-lab` (working name), which depends on devbox as a library | — |
+| **Removal** | `src/lab`, `ztpd`, `labkit`, the Labs console views, and their docs leave devbox. The code is archived with its history in a local `devbox-lab` repository; a future lab, if any, will be a separate, container-based tool | — |
 
 Track C from the review (VM-level parallel workspaces) is deliberately deferred until dogfooding shows it is wanted.
 
@@ -291,7 +291,7 @@ Hand-rendered JSON (ADR-0018 spirit; no SDK).
 |---|---|---|
 | W0-1 merge `origin/main` (70 commits) | `v5/merge-main` | the 8 conflict files |
 | W0-2a remove labs/ZTP | `v5/lab-removal` | everything in `lab-manifest.md` |
-| W0-2b extract `devbox-lab` | new repo | read-only on devbox |
+| W0-2b archive the lab code with history (`~/Projects/design/devbox-lab`, no remote, no further work) | new repo | read-only on devbox |
 | W0-3 commit CO-RE objects, local eBPF agent, capture source in doctor/console | `v5/ebpf-local` | `build.rs`, `agent/bpf`, `.gitignore`, handshake, doctor capture line, capture bar |
 | W0-4 CLI: positional `NAME` everywhere, `--name` kept as hidden alias | after the above | every `src/cli/*.rs` |
 
@@ -319,12 +319,13 @@ Wire A↔E↔B↔D↔G, `devbox mcp self`, `exec`/`shell` as runs, README rewrit
 2. `devbox mcp add fetch -- uvx mcp-server-fetch`, `claude mcp add fetch -- devbox mcp run fetch`, use it once → `devbox mcp report fetch` shows the domains it reached.
 3. `devbox layer checkpoint`, edit, `devbox layer diff --from <id>`, `devbox layer restore <id>` → the edit is gone; `devbox diff` agrees.
 4. `devbox export --run <id> --format ocsf` validates against the OCSF schema for every class used; `--format otlp-json` is accepted by an OpenTelemetry Collector `otlp` receiver.
-5. `devbox --help` has no `lab`; `devbox-lab lab up clos-3node --substrate <box>` works from the other repository.
+5. `devbox --help` has no `lab`; nothing in the binary, console, or docs refers to labs or ZTP.
 
 ## 11. Open questions for Ethan
 
-1. Product name for the split (working name `devbox-lab`) and where its remote lives.
-2. Whether to rename devbox itself; `devbox` is also jetify's Nix tool.
-3. Whether `exec` and `shell` should render a report by default or only record the run (default here: record only).
+1. Whether to rename devbox itself; `devbox` is also jetify's Nix tool.
+2. Whether `exec` and `shell` should render a report by default or only record the run (default here: record only).
+
+Decided 2026-09-05: the lab is removed rather than split into a maintained product; a future lab will be container-based and separate.
 
 © 2026 Ethan H.B. Zhou
