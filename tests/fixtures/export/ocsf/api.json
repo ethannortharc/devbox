@@ -1,0 +1,55 @@
+{
+  "activity_id": 6,
+  "actor": {
+    "process": {
+      "name": "claude",
+      "pid": 941,
+      "tid": 941,
+      "user": {
+        "uid": "1000"
+      }
+    }
+  },
+  "category_uid": 4,
+  "class_uid": 4002,
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "dst_endpoint": {
+    "domain": "api.anthropic.com",
+    "hostname": "api.anthropic.com"
+  },
+  "http_request": {
+    "http_method": "POST",
+    "url": {
+      "hostname": "api.anthropic.com",
+      "path": "/v1/messages",
+      "scheme": "https",
+      "url_string": "https://api.anthropic.com/v1/messages"
+    }
+  },
+  "http_response": {
+    "code": 200
+  },
+  "message": "api POST api.anthropic.com/v1/messages",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "profiles": [
+      "host"
+    ],
+    "version": "1.3.0"
+  },
+  "severity_id": 1,
+  "time": 1786054449000,
+  "type_uid": 400206,
+  "unmapped": {
+    "endpoint": "messages",
+    "tokens": 142000
+  }
+}

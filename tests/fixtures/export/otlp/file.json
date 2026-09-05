@@ -1,0 +1,65 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.file"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "process.parent_pid",
+      "value": {
+        "intValue": "640"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "pip"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "1000"
+      }
+    },
+    {
+      "key": "file.path",
+      "value": {
+        "stringValue": "/workspace/.venv/lib/python3.12/site-packages/requests/__init__.py"
+      }
+    },
+    {
+      "key": "devbox.file.op",
+      "value": {
+        "stringValue": "write"
+      }
+    },
+    {
+      "key": "devbox.file.flags",
+      "value": {
+        "intValue": "577"
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "file write /workspace/.venv/lib/python3.12/site-packages/requests/__init__.py"
+  },
+  "eventName": "devbox.file",
+  "severityNumber": 9,
+  "severityText": "INFO",
+  "timeUnixNano": "1786054448114000000"
+}

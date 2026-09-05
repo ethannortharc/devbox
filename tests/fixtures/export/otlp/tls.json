@@ -1,0 +1,83 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.tls"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "process.parent_pid",
+      "value": {
+        "intValue": "640"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "pip"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "1000"
+      }
+    },
+    {
+      "key": "network.peer.address",
+      "value": {
+        "stringValue": "151.101.0.223"
+      }
+    },
+    {
+      "key": "network.peer.port",
+      "value": {
+        "intValue": "443"
+      }
+    },
+    {
+      "key": "network.transport",
+      "value": {
+        "stringValue": "tcp"
+      }
+    },
+    {
+      "key": "server.address",
+      "value": {
+        "stringValue": "pypi.org"
+      }
+    },
+    {
+      "key": "tls.client.server_name",
+      "value": {
+        "stringValue": "pypi.org"
+      }
+    },
+    {
+      "key": "devbox.tls.alpn",
+      "value": {
+        "stringValue": "h2"
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "tls pypi.org"
+  },
+  "eventName": "devbox.tls",
+  "severityNumber": 9,
+  "severityText": "INFO",
+  "timeUnixNano": "1786054447620000000"
+}

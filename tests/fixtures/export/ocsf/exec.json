@@ -1,0 +1,47 @@
+{
+  "activity_id": 1,
+  "actor": {
+    "process": {
+      "pid": 640
+    }
+  },
+  "category_uid": 1,
+  "class_uid": 1007,
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "message": "exec python3.12 -m pip install requests",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "version": "1.3.0"
+  },
+  "process": {
+    "cmd_line": "python3.12 -m pip install requests",
+    "file": {
+      "name": "python3.12",
+      "path": "/nix/store/abc-python3.12/bin/python3.12",
+      "type_id": 1
+    },
+    "name": "zsh",
+    "parent_process": {
+      "pid": 640
+    },
+    "pid": 812,
+    "tid": 812,
+    "user": {
+      "uid": "1000"
+    }
+  },
+  "severity_id": 1,
+  "time": 1786054447412,
+  "type_uid": 100701,
+  "unmapped": {
+    "cwd": "/workspace"
+  }
+}

@@ -9,6 +9,7 @@ pub mod diff;
 pub mod discard;
 pub mod doctor;
 pub mod exec;
+pub mod export;
 pub mod help;
 pub mod init;
 pub mod layer;
@@ -158,6 +159,9 @@ pub enum Command {
 
     /// Start the local web console
     Web(web::WebArgs),
+
+    /// Export a box's events as OCSF, OTLP/JSON, or JSON Lines
+    Export(export::ExportArgs),
 }
 
 impl Command {
@@ -219,6 +223,7 @@ impl Command {
             Command::Behavior(args) => behavior::run(args, manager).await,
             Command::Policy(args) => policy::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
+            Command::Export(args) => export::run(args, manager).await,
         }
     }
 }

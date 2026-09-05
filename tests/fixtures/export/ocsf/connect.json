@@ -1,0 +1,55 @@
+{
+  "activity_id": 1,
+  "actor": {
+    "process": {
+      "name": "pip",
+      "pid": 812,
+      "tid": 812,
+      "user": {
+        "uid": "1000"
+      }
+    }
+  },
+  "category_uid": 4,
+  "class_uid": 4001,
+  "connection_info": {
+    "direction_id": 2,
+    "protocol_name": "tcp"
+  },
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "dst_endpoint": {
+    "domain": "pypi.org",
+    "hostname": "pypi.org",
+    "ip": "151.101.0.223",
+    "port": 443
+  },
+  "duration": 690,
+  "message": "connect pypi.org:443",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "profiles": [
+      "host"
+    ],
+    "version": "1.3.0"
+  },
+  "severity_id": 1,
+  "src_endpoint": {
+    "ip": "10.0.0.5",
+    "port": 51234
+  },
+  "time": 1786054447612,
+  "traffic": {
+    "bytes": 835822,
+    "bytes_in": 831720,
+    "bytes_out": 4102
+  },
+  "type_uid": 400101
+}

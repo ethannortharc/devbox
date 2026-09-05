@@ -1,0 +1,72 @@
+{
+  "activity_id": 1,
+  "actor": {
+    "process": {
+      "name": "netfilter",
+      "pid": 4294967295,
+      "tid": 4294967295,
+      "user": {
+        "uid": "0"
+      }
+    }
+  },
+  "category_uid": 2,
+  "class_uid": 2004,
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "evidences": [
+    {
+      "connection_info": {
+        "direction_id": 2,
+        "protocol_name": "tcp"
+      },
+      "dst_endpoint": {
+        "ip": "93.184.216.34",
+        "port": 443
+      },
+      "process": {
+        "name": "netfilter",
+        "pid": 4294967295,
+        "tid": 4294967295,
+        "user": {
+          "uid": "0"
+        }
+      },
+      "src_endpoint": {
+        "ip": "10.0.2.15",
+        "port": 51234
+      }
+    }
+  ],
+  "finding_info": {
+    "desc": "not in allowlist",
+    "title": "egress policy block: 93.184.216.34:443",
+    "types": [
+      "egress-policy-block"
+    ],
+    "uid": "devbox:myapp:policy:84023297000"
+  },
+  "message": "policy block 93.184.216.34:443",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "profiles": [
+      "host"
+    ],
+    "version": "1.3.0"
+  },
+  "severity_id": 4,
+  "time": 1786054449310,
+  "type_uid": 200401,
+  "unmapped": {
+    "mode": "allowlist",
+    "target": "93.184.216.34:443",
+    "verdict": "block"
+  }
+}
