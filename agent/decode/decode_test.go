@@ -627,3 +627,35 @@ func TestSNIOverDeclaredRecordStaysIncomplete(t *testing.T) {
 		t.Errorf("a handshake message overrunning a whole record = %v, want ErrMalformed", err)
 	}
 }
+
+// FuzzSNI guards the one property that makes parsing an incomplete record safe
+// to do at all: whatever bytes arrive, the walk stays inside them. A parser
+// that is handed arbitrary prefixes of attacker-influenced traffic is exactly
+// where an off-by-one becomes a read past the end of the capture buffer.
+func FuzzSNI(f *testing.F) {
+	for _, name := range []string{"clienthello_pq.bin", "clienthello_pq_sni_last.bin"} {
+		record, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatalf("read fixture: %v", err)
+		}
+		f.Add(record)
+		f.Add(record[:mss])
+		f.Add(record[:100])
+	}
+	f.Add(clientHello("example.com", "h2"))
+	f.Add([]byte{0x16, 0x03, 0x01, 0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0xFF})
+
+	f.Fuzz(func(t *testing.T, record []byte) {
+		hello, err := SNI(record)
+		switch {
+		case err == nil && hello == nil:
+			t.Fatal("SNI returned neither a ClientHello nor an error")
+		case err != nil && hello != nil:
+			t.Fatalf("SNI returned both %+v and %v", hello, err)
+		case err != nil && !errors.Is(err, ErrNeedMore) && !errors.Is(err, ErrMalformed):
+			t.Fatalf("unclassified error: %v", err)
+		case errors.Is(err, ErrNeedMore) && errors.Is(err, ErrMalformed):
+			t.Fatal("an error must not be both incomplete and malformed")
+		}
+	})
+}
