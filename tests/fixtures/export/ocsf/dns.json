@@ -1,0 +1,61 @@
+{
+  "activity_id": 2,
+  "actor": {
+    "process": {
+      "name": "pip",
+      "pid": 812,
+      "tid": 812,
+      "user": {
+        "uid": "1000"
+      }
+    }
+  },
+  "answers": [
+    {
+      "rdata": "151.101.0.223",
+      "type": "A"
+    },
+    {
+      "rdata": "151.101.64.223",
+      "type": "A"
+    }
+  ],
+  "category_uid": 4,
+  "class_uid": 4003,
+  "connection_info": {
+    "direction_id": 2,
+    "protocol_name": "udp"
+  },
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "dst_endpoint": {
+    "ip": "10.0.0.5",
+    "port": 40001
+  },
+  "message": "dns pypi.org → 151.101.0.223, 151.101.64.223",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "profiles": [
+      "host"
+    ],
+    "version": "1.3.0"
+  },
+  "query": {
+    "hostname": "pypi.org",
+    "type": "A"
+  },
+  "severity_id": 1,
+  "src_endpoint": {
+    "ip": "10.0.0.1",
+    "port": 53
+  },
+  "time": 1786054447500,
+  "type_uid": 400302
+}

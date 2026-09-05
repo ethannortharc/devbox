@@ -1,0 +1,47 @@
+{
+  "activity_id": 1,
+  "actor": {
+    "process": {
+      "name": "sshd",
+      "pid": 900,
+      "tid": 900,
+      "user": {
+        "uid": "0"
+      }
+    }
+  },
+  "category_uid": 4,
+  "class_uid": 4001,
+  "connection_info": {
+    "direction_id": 1,
+    "protocol_name": "tcp"
+  },
+  "device": {
+    "hostname": "myapp",
+    "name": "myapp",
+    "type_id": 6
+  },
+  "dst_endpoint": {
+    "ip": "10.0.0.9",
+    "port": 51999
+  },
+  "message": "accept 10.0.0.9:51999",
+  "metadata": {
+    "product": {
+      "name": "devbox",
+      "vendor_name": "devbox",
+      "version": "0.0.0-test"
+    },
+    "profiles": [
+      "host"
+    ],
+    "version": "1.3.0"
+  },
+  "severity_id": 1,
+  "src_endpoint": {
+    "ip": "0.0.0.0",
+    "port": 22
+  },
+  "time": 1786054448001,
+  "type_uid": 400101
+}

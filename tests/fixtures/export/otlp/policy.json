@@ -1,0 +1,83 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.policy"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "4294967295"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "netfilter"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "4294967295"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "0"
+      }
+    },
+    {
+      "key": "network.peer.address",
+      "value": {
+        "stringValue": "93.184.216.34"
+      }
+    },
+    {
+      "key": "network.peer.port",
+      "value": {
+        "intValue": "443"
+      }
+    },
+    {
+      "key": "network.transport",
+      "value": {
+        "stringValue": "tcp"
+      }
+    },
+    {
+      "key": "devbox.policy.verdict",
+      "value": {
+        "stringValue": "block"
+      }
+    },
+    {
+      "key": "devbox.policy.mode",
+      "value": {
+        "stringValue": "allowlist"
+      }
+    },
+    {
+      "key": "devbox.policy.target",
+      "value": {
+        "stringValue": "93.184.216.34:443"
+      }
+    },
+    {
+      "key": "devbox.policy.reason",
+      "value": {
+        "stringValue": "not in allowlist"
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "policy block 93.184.216.34:443"
+  },
+  "eventName": "devbox.policy",
+  "severityNumber": 17,
+  "severityText": "ERROR",
+  "timeUnixNano": "1786054449310000000"
+}
