@@ -51,8 +51,8 @@ failed signal is warned about but never blocks the user's lifecycle command.
 The next command retries once the old collector or runtime recovers.
 
 `devbox doctor` reports the daemon identity and its last published counters,
-then probes running guests for BTF, nftables, vsock/Unix-socket transport, the
-installed agent version, and Lab dependencies. The daemon log is
+then probes running guests for BTF, nftables, vsock/Unix-socket transport, and
+the installed agent version. The daemon log is
 `~/.devbox/logs/collector.log`.
 
 ## Reading it
@@ -163,7 +163,7 @@ Observation becomes governance. Four postures:
 | `open` | Nothing blocked. With an allowlist set, out-of-policy connections are **flagged** — the useful first step. |
 | `allowlist` | Default-deny. Only listed domains and CIDRs. A bare `github.com` covers its subdomains; `evilgithub.com` is not a subdomain. |
 | `mirror-only` | Package mirrors and git hosts only. `pip`, `npm`, `cargo`, `nix` work; nothing phones home. |
-| `isolated` | No egress. Loopback and lab-internal only — including for hosts you explicitly allowlisted. |
+| `isolated` | No egress. Loopback and the private ranges a product running in the box has declared as its own — including for hosts you explicitly allowlisted. |
 
 ```bash
 devbox policy set mirror-only
