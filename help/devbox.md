@@ -117,7 +117,13 @@ every use is recorded as a `credential` event.
   devbox mcp add <name> --global -- <cmd>   ...visible from every directory
   devbox mcp ls                    List registered servers
   devbox mcp run <name>            What the agent launches
+  devbox mcp report <name>         The report for its most recent session
   devbox mcp rm <name>             Forget one (its log is kept)
+  devbox mcp self                  devbox's own MCP server, for the agent to query
+
+Each `mcp run` is a run (`kind = mcp`), so it gets the same checkpoints, event
+attribution and report a `devbox run` does. `mcp self` is the other direction:
+four read-only tools — list_runs, run_report, behavior_summary, watch.
 
 ## Configuration
   devbox init                      Generate devbox.toml

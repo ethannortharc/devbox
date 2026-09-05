@@ -243,6 +243,7 @@ machine, with your rights. `devbox mcp` moves it into a box.
 devbox mcp add fetch --box mcp-tools -- uvx mcp-server-fetch
 devbox mcp ls
 claude mcp add fetch -- devbox mcp run fetch
+devbox mcp report fetch                   # what its last session did
 ```
 
 `devbox mcp run` is a byte-exact stdio shim: it hands the agent's JSON-RPC
@@ -252,6 +253,28 @@ corrupt the protocol stream. `--posture` holds an egress posture for the
 duration and restores the box's own afterwards. Registration edits
 `devbox.toml` as text, so your comments survive; `--global` writes
 `~/.devbox/mcp.toml` instead, for servers you want from any directory.
+
+**A session is a run.** `mcp run` opens a run of `kind = mcp` labelled with the
+server's name, so an MCP server gets the same evidence a `devbox run` does — two
+checkpoints, an attributed event stream, a coverage line — and `devbox mcp report
+<name>` renders the most recent one. Because an agent's clean shutdown and a
+forced stop both exit 143, the run also records **how** it ended (`exit`,
+`signal`, `stdin-eof`, or `forced`), which is the more useful fact for a server
+that ran for hours.
+
+### And devbox as an MCP server
+
+```bash
+devbox mcp self
+claude mcp add devbox -- devbox mcp self
+```
+
+The other direction: `devbox mcp self` is a stdio JSON-RPC server that hands the
+agent four read-only tools — `list_runs`, `run_report`, `behavior_summary` and
+`watch` — so it can ask what a box has been doing instead of being told. It is
+read-only, starts no box, and reports a tool-level failure as `isError` rather
+than as a protocol error, because a client reads a protocol error as "this
+server is broken" and stops asking.
 
 ### Export: the same events, in someone else's schema
 
@@ -309,6 +332,8 @@ its own, the box name comes second — `devbox snapshot save nightly devtest`,
 | `devbox secret set` / `ls` / `rm` / `scope` | The credentials the broker holds |
 | `devbox broker status` / `start` / `stop` / `reach` | The host-side broker |
 | `devbox mcp add` / `run` / `ls` / `rm` | MCP servers that run inside a box |
+| `devbox mcp report <name>` | The report for that server's most recent session |
+| `devbox mcp self` | Run devbox's own MCP server: runs and events, as tools |
 | `devbox export --format <fmt>` | Export events as OCSF, OTLP/JSON, or JSON Lines |
 | `devbox web` | Start the local web console without touching a box |
 | `devbox code` | Open VS Code / Cursor into a box via Remote SSH |

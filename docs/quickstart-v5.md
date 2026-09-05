@@ -141,6 +141,7 @@ Two things this does *not* do:
 devbox mcp add fetch --box mcp-tools -- uvx mcp-server-fetch
 devbox mcp add gitsrv --box mcp-tools --posture mirror-only -- mcp-server-git
 devbox mcp ls
+devbox mcp report fetch     # the report for its most recent session
 devbox mcp rm fetch
 ```
 
@@ -157,6 +158,19 @@ server cannot corrupt the JSON-RPC stream. Registration edits `devbox.toml` as
 text so comments and ordering survive; `--global` writes `~/.devbox/mcp.toml`
 instead, which is what you want for a server you use from any directory.
 
+Each `mcp run` is a run: `kind = mcp`, labelled with the server's name,
+bracketed by two checkpoints, with its own report — `devbox mcp report <name>`
+renders the latest, and `devbox runs` lists them alongside everything else. The
+run also records how it ended, because an agent's shutdown handshake and a
+forced stop both exit 143:
+
+| `ended_by` | Meaning |
+|---|---|
+| `exit` | The server exited on its own |
+| `stdin-eof` | The agent closed the pipe — the normal MCP shutdown |
+| `signal` | `devbox mcp run` was signalled |
+| `forced` | The transport had to be killed to get out |
+
 If the box has no `uvx` or `npx`, `mcp add` says so at registration time and
 names the set that provides it:
 
@@ -165,6 +179,27 @@ Warning: box 'devtest' has no 'uvx' on its PATH.
   It comes with the 'python' set (uv, uvx and python3). Add it with:
     devbox upgrade devtest --tools python
 ```
+
+## devbox as an MCP server
+
+The other direction — let the agent ask what a box has been doing:
+
+```bash
+devbox mcp self
+claude mcp add devbox -- devbox mcp self
+```
+
+Four read-only tools, each with a JSON Schema: `list_runs`, `run_report`,
+`behavior_summary`, `watch`. It starts no box and changes nothing. A bad request
+gets a JSON-RPC error and the session continues; a tool that could not answer
+(no such box, a run id that is not a run id) comes back as a normal result with
+`isError: true`, because a client reads a protocol error as "this server is
+broken" and stops asking.
+
+Only stdio, and only tools: `resources/*`, `prompts/*`, `sampling/*` and the
+rest get `-32601`, which is the answer that tells a client to stop asking. A
+JSON-RPC batch array is not supported either — it has no top-level `method`, so
+it comes back as `-32600`.
 
 ## Export
 
@@ -220,7 +255,9 @@ directory.
   provisioning code that copied `~/.claude/.credentials.json`,
   `~/.codex/auth.json`, and a plaintext `~/.devbox-ai-env` into the guest is
   gone, and re-provisioning an old box deletes those files from it.
-- **`devbox mcp`** — MCP servers run inside a box instead of on your host.
+- **`devbox mcp`** — MCP servers run inside a box instead of on your host, each
+  session recorded as a run with its own report; and `devbox mcp self` exposes
+  devbox's own runs and events to the agent as tools.
 - **`devbox export`** — OCSF 1.3 and OTLP/JSON, for anything downstream.
 - **File events have a scope** — the agent exports file events only under
   declared prefixes (`/workspace` and the box user's home by default). The scope
