@@ -1,6 +1,6 @@
 [package]
 name = "devbox"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 # Edition 2024 needs 1.85 and let-chains need 1.88; `File::try_lock`, which is
 # how two devbox processes agree on who is rebuilding a box, needs 1.89. Both
