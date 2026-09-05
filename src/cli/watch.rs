@@ -190,7 +190,7 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         for event in &events {
             println!(
                 "{}  {:<8} pid={:<6} {}",
-                &event.ts_wall,
+                event.ts_wall,
                 event.kind.to_string(),
                 event.pid,
                 event.summary()

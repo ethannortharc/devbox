@@ -131,7 +131,7 @@ pub(crate) fn resolve_project_mounts(
     extra_mounts: &[Mount],
 ) -> Vec<Mount> {
     let mut configured: Vec<_> = config.mounts.iter().collect();
-    configured.sort_by(|(left, _), (right, _)| left.cmp(right));
+    configured.sort_by_key(|(name, _)| *name);
 
     let mut mounts: Vec<Mount> = configured
         .into_iter()

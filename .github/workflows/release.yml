@@ -35,15 +35,16 @@ jobs:
       - name: Install eBPF toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
-          # On Ubuntu 24.04 `bpftool` is a virtual package: the binary ships in
-          # a kernel-specific linux-tools package, and the wrapper script in
-          # linux-tools-common refuses to run when the runner's kernel (an
-          # Azure build) has no matching package. `btf dump` only needs libbpf,
-          # not a matching kernel, so use whichever real binary got installed.
-          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
-          BPFTOOL=$(ls -d /usr/lib/linux-tools/*/bpftool 2>/dev/null | head -n 1)
-          if [ -z "$BPFTOOL" ]; then echo "::error::no bpftool binary under /usr/lib/linux-tools"; exit 1; fi
+          sudo apt-get install -y clang llvm libbpf-dev
+          # Ubuntu's bpftool comes from kernel-specific linux-tools packages
+          # that do not exist for the runners' Azure kernels. libbpf publishes
+          # static builds per architecture; use one of those.
+          BPFTOOL_VERSION=v7.7.0
+          curl -fsSL -o /tmp/bpftool.tar.gz \
+            "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-${{ matrix.goarch }}.tar.gz"
+          tar -xzf /tmp/bpftool.tar.gz -C /tmp bpftool
+          sudo install -m 0755 /tmp/bpftool /usr/local/bin/bpftool
+          BPFTOOL=/usr/local/bin/bpftool
           "$BPFTOOL" version
           echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
 
