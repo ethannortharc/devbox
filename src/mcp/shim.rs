@@ -86,14 +86,37 @@ pub struct ShimOutcome {
     /// The shim had to kill the transport rather than watch it exit. The guest
     /// process may still be alive, which is what [`reaper_script`] is for.
     pub forced: bool,
+    /// Who decided the session was over.
+    ///
+    /// The exit code cannot say this: a server that shut down politely on EOF
+    /// and one the shim had to SIGKILL both report 143. For a run that lasted
+    /// hours, which of the two happened is the interesting half.
+    pub stopped_by: Stop,
 }
 
 /// Why the shim stopped waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stop {
+pub enum Stop {
+    /// The guest process exited on its own.
     Exited,
+    /// The agent closed its end of stdin — the MCP shutdown handshake.
     HostEof,
+    /// The shim was asked to terminate.
     Terminated,
+}
+
+impl Stop {
+    /// How this end is recorded on the run (§4.6), given whether the shim had
+    /// to kill the transport to make it happen.
+    pub fn ended_by(self, forced: bool) -> crate::obs::run::EndedBy {
+        use crate::obs::run::EndedBy;
+        match (self, forced) {
+            (Stop::Exited, _) => EndedBy::Exit,
+            (_, true) => EndedBy::Forced,
+            (Stop::HostEof, false) => EndedBy::StdinEof,
+            (Stop::Terminated, false) => EndedBy::Signal,
+        }
+    }
 }
 
 /// The guest-side wrapper.
@@ -271,6 +294,7 @@ where
     Ok(ShimOutcome {
         exit_code: exit_code(status),
         forced,
+        stopped_by: stop,
     })
 }
 

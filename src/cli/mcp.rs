@@ -22,6 +22,7 @@ use colored::Colorize;
 
 use crate::mcp::registry::{self, McpEntry};
 use crate::mcp::shim::{self, ShimOptions};
+use crate::obs::run::{RunKind, RunStatus, bootstrap};
 use crate::policy::{Policy, Posture};
 use crate::sandbox::SandboxManager;
 
@@ -44,6 +45,13 @@ pub enum McpCommand {
 
     /// Forget a registered server
     Rm(RmArgs),
+
+    /// Show the report for a server's most recent run
+    Report(ReportArgs),
+
+    /// Run devbox's own MCP server, exposing runs and events to the agent
+    #[command(name = "self")]
+    SelfServer,
 }
 
 #[derive(Args, Debug)]
@@ -87,6 +95,20 @@ pub struct RmArgs {
     pub name: String,
 }
 
+#[derive(Args, Debug)]
+pub struct ReportArgs {
+    /// Name of a registered server
+    pub name: String,
+
+    /// Which rendering to print
+    #[arg(long, value_enum, default_value = "md")]
+    pub format: crate::cli::report::Format,
+
+    /// Open the HTML report in a browser
+    #[arg(long)]
+    pub open: bool,
+}
+
 impl McpArgs {
     /// Only `run` touches a box, so only `run` starts the collector.
     ///
@@ -104,6 +126,8 @@ pub async fn run(args: McpArgs, manager: &SandboxManager) -> Result<()> {
         McpCommand::Run(a) => run_server(a, manager).await,
         McpCommand::Ls(a) => ls(a, manager),
         McpCommand::Rm(a) => rm(a, manager),
+        McpCommand::Report(a) => report(a, manager).await,
+        McpCommand::SelfServer => crate::mcp::rpc::serve(manager).await,
     }
 }
 
@@ -520,6 +544,73 @@ fn rm(args: RmArgs, manager: &SandboxManager) -> Result<()> {
     Ok(())
 }
 
+// ── report ──────────────────────────────────────────────
+
+/// `devbox mcp report <name>` — the last run this server had (§7.1).
+///
+/// A registration is a *name*, not a run, so this is two lookups: which box
+/// the server runs in, then the most recent `kind = mcp` run there carrying
+/// that name as its label. Delegating the rendering to `devbox report` is what
+/// keeps the two commands from growing different ideas of what a report is —
+/// including the stored-JSON-first fallback that makes a report readable after
+/// its events have aged out of the store.
+async fn report(args: ReportArgs, manager: &SandboxManager) -> Result<()> {
+    let dir = project_dir()?;
+    let (entry, _) = registry::find(&dir, &manager.state_dir, &args.name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no MCP server named '{}' in {} or {}",
+            args.name,
+            registry::config_path(&dir).display(),
+            registry::global_path(&manager.state_dir).display(),
+        )
+    })?;
+    let box_name = match &entry.box_name {
+        Some(name) => name.clone(),
+        None => manager.resolve_name(None)?,
+    };
+
+    let path = crate::obs::collector::store_path(&manager.state_dir, &box_name);
+    let run_id = if path.exists() {
+        crate::obs::Store::open(&path)
+            .with_context(|| format!("failed to open the event store for box '{box_name}'"))?
+            .list_runs(RUN_SEARCH_DEPTH)?
+            .into_iter()
+            .find(|run| run.kind_enum() == RunKind::Mcp && run.label == args.name)
+            .map(|run| run.run_id)
+    } else {
+        None
+    };
+    let Some(run_id) = run_id else {
+        bail!(
+            "MCP server '{}' has no recorded run on box '{box_name}' yet. \
+             An agent has to start it once — `devbox mcp run {}` is what \
+             `claude mcp add` wires up — before there is anything to report.",
+            args.name,
+            args.name
+        );
+    };
+
+    crate::cli::report::run(
+        crate::cli::report::ReportArgs {
+            run_id,
+            format: args.format,
+            open: args.open,
+            name: Some(box_name),
+        },
+        manager,
+    )
+    .await
+}
+
+/// How far back `mcp report` looks for a server's last run.
+///
+/// A busy box records a run per `exec` and per shell, so the newest `mcp` run
+/// carrying a given label can be some way down the list. Bounded because the
+/// answer is "the most recent one", and a server that has not run in two
+/// hundred runs is one the message about having never run describes just as
+/// well.
+const RUN_SEARCH_DEPTH: usize = 200;
+
 // ── run ─────────────────────────────────────────────────
 
 /// The shim. Everything it prints goes to stderr: stdout is the agent's
@@ -603,8 +694,72 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // preparation boundary, not the session, and an MCP session lasts hours.
     drop(claim);
 
+    // ── the run (§4.6, §7.1) ──
+    //
+    // An MCP server is a run like any other, and `kind = mcp` is the one that
+    // makes `mcp report` possible. The row goes in before the server starts so
+    // the collector is already attributing when its first event arrives.
+    //
+    // Fatal if it cannot be recorded, deliberately. The product is a box whose
+    // side effects are visible; a sandboxed MCP server that nothing is
+    // recording is the one thing this command exists to prevent, and starting
+    // it anyway would be sandboxing with the evidence quietly switched off.
+    let run_id = crate::obs::run::new_run_id();
+    let started_at = crate::cli::run::now();
+    crate::cli::run::insert_wrapped_run(
+        manager,
+        &box_name,
+        &run_id,
+        RunKind::Mcp,
+        &entry.command,
+        crate::cli::run::GUEST_CWD,
+        &args.name,
+        &started_at,
+        saved.egress,
+        entry.posture.unwrap_or(saved.egress),
+    )
+    .with_context(|| {
+        format!(
+            "MCP server '{}' was not started because its run could not be recorded",
+            args.name
+        )
+    })?;
+    let dropped_before = crate::obs::daemon::stats_snapshot(manager)
+        .map(|s| s.dropped + s.persist_failed)
+        .unwrap_or(0);
+    let checkpoint_start =
+        crate::cli::run::take_checkpoint(manager, &state, &box_name, &run_id, "run-start").await;
+    let readback = crate::cli::run::spawn_scope_readback(
+        manager,
+        manager.runtime_for_sandbox(&state)?,
+        &box_name,
+        &run_id,
+        &started_at,
+    );
+
+    // The environment the server sees: the broker's, this run's id, then the
+    // registration's own — last, so a `[mcp.x] env` entry wins over a name the
+    // broker happened to use.
+    let mut env = crate::cli::run::run_env(manager, runtime.as_ref(), &box_name, &run_id).await;
+    for (key, value) in &entry.env {
+        env.retain(|(existing, _)| existing != key);
+        env.push((key.clone(), value.clone()));
+    }
+
+    // Three layers, and the order is the whole design:
+    //
+    //   sh -c <pgid wrapper>            ← mine: records the process group
+    //     sh -c <A's run bootstrap>     ← A's:  enters the run's cgroup
+    //       env -- K=V … <server>       ← the server itself
+    //
+    // A's wrapper *inside* mine, so the run's cgroup covers the server and
+    // everything it spawns, while the process group I recorded still covers
+    // A's wrapper too — which is what lets the reaper take the whole tree down
+    // when the transport has to be killed.
     let pgid_file = shim::pgid_file_path(&args.name);
-    let guest = shim::wrap_guest_command(&pgid_file, entry.env.iter(), &entry.command);
+    let mut inner = bootstrap(&run_id, crate::cli::run::GUEST_CWD);
+    inner.extend(crate::broker::with_env(&env, &entry.command));
+    let guest = shim::wrap_guest_command(&pgid_file, std::iter::empty(), &inner);
     let guest_refs: Vec<&str> = guest.iter().map(String::as_str).collect();
     let argv = runtime.argv(&box_name, &guest_refs, false);
 
@@ -620,13 +775,27 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         shim::termination_signal(),
     )
     .await;
+    let ended_at = crate::cli::run::now();
 
     // Cleanup runs whatever happened above, including a shim that failed to
     // start: `wrap_guest_command` may already have written the file.
     reap(runtime.as_ref(), &box_name, &pgid_file, &outcome).await;
+    let scope = readback.await.ok().flatten();
     if switched {
         restore_posture(manager, &box_name).await;
     }
+    close_the_run(
+        manager,
+        &state,
+        &box_name,
+        &run_id,
+        &ended_at,
+        &outcome,
+        checkpoint_start,
+        dropped_before,
+        scope.is_none(),
+    )
+    .await;
 
     // Always exit explicitly, including on success.
     //
@@ -686,8 +855,18 @@ async fn wait_for_the_box_claim(
             return Ok(claim);
         }
         if std::time::Instant::now() >= deadline {
+            // `concat!` with positional arguments, not a `\`-continued literal:
+            // rustfmt joins those back onto one line and keeps the
+            // continuation's indentation *inside* the string, so the message
+            // reaches the user with a run of twenty spaces in the middle of a
+            // sentence. It did, for one release of this very message.
             bail!(
-                "box '{box_name}' has been busy for {}s, so this MCP server was not started.                  Another devbox process is holding it — a rebuild, a `devbox use`, or a                  start that is not finishing.",
+                concat!(
+                    "box '{}' has been busy for {}s, so this MCP server was not ",
+                    "started. Another devbox process is holding it — a rebuild, ",
+                    "a `devbox use`, or a start that is not finishing.",
+                ),
+                box_name,
                 CLAIM_WAIT.as_secs()
             );
         }
@@ -696,6 +875,109 @@ async fn wait_for_the_box_claim(
             announced = true;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Close the run out and write its report.
+///
+/// Everything here is best effort and nothing is printed to stdout: the run is
+/// evidence about a session that has already ended, and the session's stdout
+/// belongs to the agent. A report that cannot be written is a warning on
+/// stderr, not a reason to change the exit code the agent sees.
+#[allow(clippy::too_many_arguments)]
+async fn close_the_run(
+    manager: &SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    box_name: &str,
+    run_id: &str,
+    ended_at: &str,
+    outcome: &Result<shim::ShimOutcome>,
+    checkpoint_start: Option<crate::sandbox::checkpoint::Checkpoint>,
+    dropped_before: u64,
+    no_scope: bool,
+) {
+    // The last batch is still in the collector's linger window.
+    tokio::time::sleep(crate::cli::run::SETTLE).await;
+
+    let (exit_code, ended_by) = match outcome {
+        Ok(outcome) => (
+            Some(outcome.exit_code),
+            Some(outcome.stopped_by.ended_by(outcome.forced)),
+        ),
+        // The transport never started or died in a way we could not read. The
+        // run is `aborted`, and we do not know who ended it.
+        Err(_) => (None, None),
+    };
+    let status = if exit_code.is_some() {
+        RunStatus::Finished
+    } else {
+        RunStatus::Aborted
+    };
+
+    let health = crate::obs::health::load(&manager.state_dir, box_name)
+        .ok()
+        .flatten();
+    let sources = health
+        .as_ref()
+        .map(crate::obs::health::capture_composition)
+        .unwrap_or_default();
+    let agent_version = health.map(|h| h.agent_version).unwrap_or_default();
+    let dropped = crate::obs::daemon::stats_snapshot(manager)
+        .map(|s| (s.dropped + s.persist_failed).saturating_sub(dropped_before))
+        .unwrap_or(0);
+
+    let checkpoint_end =
+        crate::cli::run::take_checkpoint(manager, state, box_name, run_id, "run-end").await;
+
+    let store = match crate::obs::Store::open(&crate::obs::collector::store_path(
+        &manager.state_dir,
+        box_name,
+    )) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("devbox mcp: could not close the run: {error:#}");
+            return;
+        }
+    };
+    if checkpoint_start.is_some() || checkpoint_end.is_some() {
+        let start = checkpoint_start.as_ref().map(|c| c.id.as_str());
+        let end = checkpoint_end.as_ref().map(|c| c.id.as_str());
+        if let Err(e) = store.set_run_checkpoints(run_id, start, end) {
+            tracing::warn!(error = %e, "could not record a run's checkpoints");
+        }
+    }
+    if let Err(error) = store.finish_run(
+        run_id,
+        ended_at,
+        exit_code,
+        status,
+        &sources,
+        &agent_version,
+        dropped,
+        ended_by,
+    ) {
+        eprintln!("devbox mcp: could not close the run: {error:#}");
+    }
+
+    if let Ok(runtime) = manager.runtime_for_sandbox(state) {
+        let argv = crate::obs::run::cleanup_argv(run_id);
+        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let _ = runtime.exec_cmd(box_name, &refs, false).await;
+    }
+    if no_scope {
+        eprintln!(
+            "devbox mcp: box '{box_name}' did not report a cgroup for this run, so its \
+             events were attributed by process ancestry only."
+        );
+    }
+
+    match crate::cli::run::build_report(manager, &store, run_id, box_name, state).await {
+        Ok(Some(report)) => match crate::report::write(&manager.state_dir, &report) {
+            Ok(rendered) => eprintln!("devbox mcp: report {}", rendered.html.display()),
+            Err(error) => eprintln!("devbox mcp: could not write the run report: {error:#}"),
+        },
+        Ok(None) => {}
+        Err(error) => eprintln!("devbox mcp: could not build the run report: {error:#}"),
     }
 }
 
@@ -934,17 +1216,46 @@ mod tests {
         );
     }
 
-    /// `mcp report` is A's, and lands in the integration wave (§7.1). Until it
-    /// exists it must not be advertised.
+    /// The whole surface §7.1 specifies, and nothing that is not implemented.
     #[test]
-    fn report_is_not_in_the_help_yet() {
+    fn the_help_offers_the_whole_component() {
         let mcp = Cli::command()
             .get_subcommands()
             .find(|c| c.get_name() == "mcp")
             .expect("mcp is registered")
             .clone();
         let names: Vec<&str> = mcp.get_subcommands().map(|c| c.get_name()).collect();
-        assert_eq!(names, ["add", "run", "ls", "rm"], "the mcp surface changed");
+        assert_eq!(
+            names,
+            ["add", "run", "ls", "rm", "report", "self"],
+            "the mcp surface changed"
+        );
+    }
+
+    /// `mcp self` is a server, not a box command: it takes no box and starts no
+    /// collector, because it only *reads* what other runs recorded.
+    #[test]
+    fn self_takes_no_arguments_and_starts_no_collector() {
+        let cli = parse(&["devbox", "mcp", "self"]);
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!()
+        };
+        assert!(matches!(args.command, McpCommand::SelfServer));
+        assert!(!args.needs_collector());
+    }
+
+    #[test]
+    fn report_takes_the_server_name_and_a_format() {
+        let cli = parse(&["devbox", "mcp", "report", "fetch", "--format", "json"]);
+        let Some(Command::Mcp(args)) = cli.command else {
+            panic!()
+        };
+        let McpCommand::Report(report) = args.command else {
+            panic!("not a report")
+        };
+        assert_eq!(report.name, "fetch");
+        assert!(matches!(report.format, crate::cli::report::Format::Json));
+        assert!(!report.open);
     }
 
     /// The two that decide whether a published MCP server can run at all.

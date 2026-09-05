@@ -14,7 +14,8 @@ use clap::Args;
 use crate::cli::box_arg::BoxArg;
 use crate::obs::collector::store_path;
 use crate::obs::run::{
-    self, GuestScope, RunKind, RunRecord, RunStatus, bootstrap, cleanup_argv, readback_argv,
+    self, EndedBy, GuestScope, RunKind, RunRecord, RunStatus, bootstrap, cleanup_argv,
+    readback_argv,
 };
 use crate::obs::{Query, Store};
 use crate::policy::{Policy, Posture};
@@ -25,7 +26,7 @@ use crate::sandbox::config::DevboxConfig;
 use crate::sandbox::overlay::OverlayChange;
 
 /// The default working directory inside a box.
-const GUEST_CWD: &str = "/workspace";
+pub(crate) const GUEST_CWD: &str = "/workspace";
 
 /// How long the host waits for the wrapper to publish its cgroup.
 ///
@@ -40,7 +41,7 @@ const SCOPE_READBACK_MS: u64 = 5_000;
 /// The collector batches with a 250ms linger, so the last events of a command
 /// are still in memory when the command's exit reaches us. Reading immediately
 /// produced reports that were reliably missing their own final connections.
-const SETTLE: Duration = Duration::from_millis(750);
+pub(crate) const SETTLE: Duration = Duration::from_millis(750);
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -89,28 +90,19 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     };
     let posture_during = requested.unwrap_or(posture_before);
 
-    let record = RunRecord {
-        run_id: run_id.clone(),
-        box_id: name.clone(),
-        kind: RunKind::Run.as_str().to_string(),
-        argv: args.command.clone(),
-        cwd: args.cwd.clone(),
-        label: args.label.clone().unwrap_or_default(),
-        started_at: started_at.clone(),
-        status: RunStatus::Running.as_str().to_string(),
-        posture_before: posture_before.to_string(),
-        posture_during: posture_during.to_string(),
-        ..Default::default()
-    };
-
     let path = store_path(&manager.state_dir, &name);
-    // The run row goes in before the command starts, so the collector — which
-    // re-reads the live runs on every flush — is already attributing by the
-    // time the first event arrives.
-    Store::open(&path)
-        .context("failed to open the box's event store")?
-        .insert_run(&record)
-        .context("failed to record the run")?;
+    insert_wrapped_run(
+        manager,
+        &name,
+        &run_id,
+        RunKind::Run,
+        &args.command,
+        &args.cwd,
+        &args.label.clone().unwrap_or_default(),
+        &started_at,
+        posture_before,
+        posture_during,
+    )?;
 
     let dropped_before = crate::obs::daemon::stats_snapshot(manager)
         .map(|s| s.dropped + s.persist_failed)
@@ -147,33 +139,13 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // the wrapper is the command. A task rather than a poll loop of execs —
     // one `sh` waiting in the guest costs one round trip instead of a hundred,
     // and does not fill the box's own event stream with the act of watching it.
-    let readback = {
-        let manager_dir = manager.state_dir.clone();
-        let name = name.clone();
-        let run_id = run_id.clone();
-        let started = started_at.clone();
-        let state = state.clone();
-        let runtime = manager.runtime_for_sandbox(&state)?;
-        tokio::spawn(async move {
-            let argv = readback_argv(&run_id, SCOPE_READBACK_MS);
-            let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-            let result = runtime.exec_cmd(&name, &refs, false).await.ok()?;
-            let scope: GuestScope = serde_json::from_str(result.stdout.trim()).ok()?;
-            let cgroup = scope.exclusive_cgroup_id();
-            let store = Store::open(&store_path(&manager_dir, &name)).ok()?;
-            store.set_run_scope(&run_id, cgroup, scope.root_pid).ok()?;
-            // And claim what the run's cgroup already produced. The collector
-            // could not have attributed those: they were written before this
-            // line, which is the first moment the host knew which cgroup to
-            // look for. Everything after it the collector handles itself.
-            match store.backfill_run(&run_id, cgroup, &started) {
-                Ok(n) if n > 0 => tracing::debug!(run = %run_id, claimed = n, "back-filled"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "could not back-fill a run's early events"),
-            }
-            Some(scope)
-        })
-    };
+    let readback = spawn_scope_readback(
+        manager,
+        manager.runtime_for_sandbox(&state)?,
+        &name,
+        &run_id,
+        &started_at,
+    );
 
     // stdin decides, not a flag.
     //
@@ -224,6 +196,10 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     } else {
         RunStatus::Aborted
     };
+    // `devbox run` owns its command's whole life, so the only two answers it
+    // can give are "it exited" and "we lost it". A run that ends in a way the
+    // exit code cannot express is what `mcp run` needs the column for.
+    let ended_by = exit_code.map(|_| EndedBy::Exit);
 
     // The last batch is still in the collector's linger window.
     tokio::time::sleep(SETTLE).await;
@@ -259,6 +235,7 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
             &sources,
             &agent_version,
             dropped,
+            ended_by,
         )
         .context("failed to close the run")?;
 
@@ -296,13 +273,13 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
 }
 
 /// Build, write and print a run's report.
-async fn render(
+pub(crate) async fn build_report(
     manager: &SandboxManager,
     store: &Store,
     run_id: &str,
     name: &str,
     state: &crate::sandbox::state::SandboxState,
-) -> Result<Option<report::Rendered>> {
+) -> Result<Option<RunReport>> {
     let Some(record) = store.get_run(run_id)? else {
         return Ok(None);
     };
@@ -329,15 +306,31 @@ async fn render(
     // `report` is deliberately synchronous and knows nothing about runtimes.
     let (changes, scope) = file_changes(manager, state, name, &record).await;
 
-    let report = RunReport::build(
+    Ok(Some(RunReport::build(
         record,
         &events,
         Box::new(move || Ok(changes.clone())),
         scope,
         attribution,
         unattributed,
-    );
+    )))
+}
 
+/// Build, write and *print* a run's report — the `devbox run` ending.
+///
+/// Split from [`build_report`] because `devbox mcp run` needs the same report
+/// and cannot have the printing: its stdout is the agent's JSON-RPC channel,
+/// and one `println!` into it ends the session with a parse error.
+pub(crate) async fn render(
+    manager: &SandboxManager,
+    store: &Store,
+    run_id: &str,
+    name: &str,
+    state: &crate::sandbox::state::SandboxState,
+) -> Result<Option<report::Rendered>> {
+    let Some(report) = build_report(manager, store, run_id, name, state).await? else {
+        return Ok(None);
+    };
     print!("{}", report::markdown::render_summary(&report));
     let rendered = report::write(&manager.state_dir, &report)?;
     println!("  report   {}", rendered.html.display());
@@ -370,7 +363,7 @@ pub async fn run_env(
 /// Never fatal. The point of a run is to execute the command; the checkpoint
 /// makes the report sharper, and a box that cannot give one still produces a
 /// report — with `scope: box` on its Files section, which says so.
-async fn take_checkpoint(
+pub(crate) async fn take_checkpoint(
     manager: &SandboxManager,
     state: &crate::sandbox::state::SandboxState,
     name: &str,
@@ -465,8 +458,87 @@ impl PostureGuard {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Open the run row a *wrapped* run starts from.
+///
+/// `devbox run` and `devbox mcp run` are the two commands that give their
+/// guest command the wrapper, and therefore the two whose rows carry a scope,
+/// a posture pair and a report. One constructor, because a field one of them
+/// forgets to set is a field the report renders as empty and nobody notices.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_wrapped_run(
+    manager: &SandboxManager,
+    name: &str,
+    run_id: &str,
+    kind: RunKind,
+    argv: &[String],
+    cwd: &str,
+    label: &str,
+    started_at: &str,
+    posture_before: Posture,
+    posture_during: Posture,
+) -> Result<()> {
+    let record = RunRecord {
+        run_id: run_id.to_string(),
+        box_id: name.to_string(),
+        kind: kind.as_str().to_string(),
+        argv: argv.to_vec(),
+        cwd: cwd.to_string(),
+        label: label.to_string(),
+        started_at: started_at.to_string(),
+        status: RunStatus::Running.as_str().to_string(),
+        posture_before: posture_before.to_string(),
+        posture_during: posture_during.to_string(),
+        ..Default::default()
+    };
+    // The run row goes in before the command starts, so the collector — which
+    // re-reads the live runs on every flush — is already attributing by the
+    // time the first event arrives.
+    Store::open(&store_path(&manager.state_dir, name))
+        .context("failed to open the box's event store")?
+        .insert_run(&record)
+        .context("failed to record the run")
+}
+
+/// Learn the guest scope while the command runs.
+///
+/// Not before: the cgroup only exists once the wrapper has entered it, and the
+/// wrapper is the command. A task rather than a poll loop of execs — one `sh`
+/// waiting in the guest costs one round trip instead of a hundred, and does
+/// not fill the box's own event stream with the act of watching it.
+pub(crate) fn spawn_scope_readback(
+    manager: &SandboxManager,
+    runtime: Box<dyn crate::runtime::Runtime>,
+    name: &str,
+    run_id: &str,
+    started_at: &str,
+) -> tokio::task::JoinHandle<Option<GuestScope>> {
+    let manager_dir = manager.state_dir.clone();
+    let name = name.to_string();
+    let run_id = run_id.to_string();
+    let started = started_at.to_string();
+    tokio::spawn(async move {
+        let argv = readback_argv(&run_id, SCOPE_READBACK_MS);
+        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let result = runtime.exec_cmd(&name, &refs, false).await.ok()?;
+        let scope: GuestScope = serde_json::from_str(result.stdout.trim()).ok()?;
+        let cgroup = scope.exclusive_cgroup_id();
+        let store = Store::open(&store_path(&manager_dir, &name)).ok()?;
+        store.set_run_scope(&run_id, cgroup, scope.root_pid).ok()?;
+        // And claim what the run's cgroup already produced. The collector
+        // could not have attributed those: they were written before this
+        // line, which is the first moment the host knew which cgroup to
+        // look for. Everything after it the collector handles itself.
+        match store.backfill_run(&run_id, cgroup, &started) {
+            Ok(n) if n > 0 => tracing::debug!(run = %run_id, claimed = n, "back-filled"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not back-fill a run's early events"),
+        }
+        Some(scope)
+    })
 }
 
 /// Record a run for a command that is not `devbox run` (§4.6).
@@ -544,6 +616,7 @@ impl SimpleRun {
                 &sources,
                 &agent_version,
                 0,
+                exit_code.map(|_| EndedBy::Exit),
             )
         });
         if let Err(e) = result {
