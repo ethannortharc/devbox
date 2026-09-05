@@ -126,6 +126,29 @@ ssh yourserver -t "devbox shell shared-api"
 
 ---
 
+## IDE Integration
+
+Use your local VS Code, Cursor, or Windsurf to edit code inside the sandbox — full IntelliSense, extensions, and debugging, all running in the isolated VM.
+
+```bash
+devbox code                       # Open VS Code into the sandbox
+devbox code --editor cursor       # Use Cursor instead
+devbox code --editor windsurf     # Use Windsurf
+devbox code myapp                 # Open a specific sandbox
+devbox code --path /workspace/src # Open a specific directory
+```
+
+Devbox automatically:
+1. Configures `~/.ssh/config` for the sandbox VM
+2. Refreshes the overlay layer (clears stale file handles)
+3. Launches the editor with Remote SSH pointed at `/workspace`
+
+Works with any editor that supports [Remote SSH](https://code.visualstudio.com/docs/remote/ssh) — VS Code, Cursor, Windsurf, and others.
+
+> **NixOS compatibility:** Devbox enables `nix-ld` in the VM so VS Code Server and other dynamically linked binaries run without issues.
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -306,6 +329,7 @@ All layer operations are also available in the **DevBox Management Panel** insid
 | `devbox destroy` | Remove a sandbox |
 | `devbox list` | List all sandboxes |
 | `devbox status` | Show detailed sandbox status |
+| `devbox code` | Open VS Code / Cursor into sandbox via Remote SSH |
 | `devbox use <name>` | Switch sandbox to current directory |
 | `devbox upgrade --tools <set>` | Add tools to a running sandbox |
 | `devbox sets list/apply` | Inspect or rebuild the declarative set selection |
@@ -413,9 +437,10 @@ git, lazygit (TUI), gh (GitHub CLI), git-lfs, git-crypt, pre-commit
 </details>
 
 <details>
-<summary><b>ai-code</b> -- 6 packages (AI coding assistants)</summary>
+<summary><b>ai-code</b> -- 5 packages (AI coding assistants)</summary>
 
-claude-code, codex, opencode, aider-chat, aichat, continue
+codex, opencode, aider-chat, aichat, continue — plus the latest claude-code,
+installed via npm during provisioning
 
 </details>
 
@@ -473,7 +498,7 @@ editor = true               # neovim, helix, nano
 git = true                  # git, lazygit, gh
 container = false           # docker, compose, lazydocker
 network = false             # FRR/lab services + network diagnostics
-ai_code = true              # claude-code, codex, aider, aichat, ...
+ai_code = true              # claude-code (npm), codex, aider, aichat, ...
 ai_infra = false            # ollama, open-webui
 
 [languages]

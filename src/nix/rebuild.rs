@@ -13,8 +13,15 @@ pub const REBUILD_SHELL: &str = "export NIX_PATH=\"nixos-config=/etc/nixos/confi
 
 /// Argv that rebuilds a NixOS box, for callers that spawn the process
 /// themselves (the streamed console rebuild).
-pub fn rebuild_argv() -> [&'static str; 4] {
-    ["sudo", "bash", "-lc", REBUILD_SHELL]
+///
+/// Privilege is decided in the guest (ADR-0040): an Incus exec is already root
+/// and `sudo` there fails PAM on NixOS 25.11, while a Lima user needs it.
+pub fn rebuild_argv() -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        crate::policy::enforce::elevated_login(REBUILD_SHELL),
+    ]
 }
 
 /// Execute `nixos-rebuild switch` inside a sandbox VM.
@@ -24,7 +31,7 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
     let before = crate::web::build::current_generation(runtime, sandbox_name).await;
 
     let result = runtime
-        .exec_cmd(sandbox_name, &rebuild_argv(), false)
+        .run_as_root(sandbox_name, REBUILD_SHELL, false)
         .await?;
 
     if result.exit_code != 0 {
@@ -46,11 +53,7 @@ pub async fn nixos_rebuild(runtime: &dyn Runtime, sandbox_name: &str) -> Result<
         eprintln!("Attempting rollback...");
 
         let rollback = runtime
-            .exec_cmd(
-                sandbox_name,
-                &["sudo", "nixos-rebuild", "switch", "--rollback"],
-                false,
-            )
+            .run_as_root(sandbox_name, "nixos-rebuild switch --rollback", false)
             .await;
 
         match rollback {
@@ -79,19 +82,10 @@ pub async fn write_state_toml(
     sandbox_name: &str,
     toml_content: &str,
 ) -> Result<()> {
-    // Use tee to write the file as root
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &[
-                "sudo", "bash", "-c",
-                &format!(
-                    "mkdir -p /etc/devbox && cat > /etc/devbox/devbox-state.toml << 'DEVBOX_EOF'\n{toml_content}\nDEVBOX_EOF"
-                ),
-            ],
-            false,
-        )
-        .await?;
+    let cmd = format!(
+        "mkdir -p /etc/devbox && tee /etc/devbox/devbox-state.toml > /dev/null << 'DEVBOX_EOF'\n{toml_content}\nDEVBOX_EOF"
+    );
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!(
@@ -145,18 +139,10 @@ pub async fn write_nix_file(
     filename: &str,
     content: &str,
 ) -> Result<()> {
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &[
-                "sudo", "bash", "-c",
-                &format!(
-                    "mkdir -p /etc/devbox/sets && cat > /etc/devbox/sets/{filename} << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
-                ),
-            ],
-            false,
-        )
-        .await?;
+    let cmd = format!(
+        "mkdir -p /etc/devbox/sets && tee /etc/devbox/sets/{filename} > /dev/null << 'DEVBOX_EOF'\n{content}\nDEVBOX_EOF"
+    );
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to write {filename}: {}", result.stderr.trim());

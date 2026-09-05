@@ -14,16 +14,9 @@ const STASH_DIR: &str = "/var/devbox/overlay/stash";
 /// List files changed in the overlay upper layer.
 /// Returns a list of (status, path) tuples.
 pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<OverlayChange>> {
-    // List all files in the upper directory
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &[
-                "sudo", "find", UPPER, "-not", "-path", UPPER, "-printf", "%y %P\\n",
-            ],
-            false,
-        )
-        .await?;
+    // List all files in the upper directory (needs root for overlay dirs)
+    let cmd = format!("find {UPPER} -not -path {UPPER} -printf '%y %P\\n'");
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to scan overlay changes: {}", result.stderr.trim());
@@ -182,8 +175,7 @@ pub async fn commit(
         return Ok(filtered.len());
     }
 
-    // Sync: rsync from upper to lower for each changed file
-    // We need to handle additions, modifications, and deletions
+    // Sync: copy from upper to lower for each changed file
     let mut committed = 0;
 
     for change in &filtered {
@@ -193,9 +185,8 @@ pub async fn commit(
         match change.status {
             ChangeStatus::Added | ChangeStatus::Modified => {
                 if change.is_dir {
-                    let result = runtime
-                        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &lower_path], false)
-                        .await?;
+                    let cmd = format!("mkdir -p {lower_path}");
+                    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
                     if result.exit_code != 0 {
                         eprintln!(
                             "Warning: failed to create dir {}: {}",
@@ -214,18 +205,12 @@ pub async fn commit(
                             .unwrap_or_default()
                     );
                     if !parent.is_empty() && parent != LOWER {
-                        let _ = runtime
-                            .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", &parent], false)
-                            .await;
+                        let cmd = format!("mkdir -p {parent}");
+                        let _ = runtime.run_as_root(sandbox_name, &cmd, false).await;
                     }
 
-                    let result = runtime
-                        .exec_cmd(
-                            sandbox_name,
-                            &["sudo", "cp", "-a", &upper_path, &lower_path],
-                            false,
-                        )
-                        .await?;
+                    let cmd = format!("cp -a {upper_path} {lower_path}");
+                    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
                     if result.exit_code != 0 {
                         eprintln!(
                             "Warning: failed to commit {}: {}",
@@ -237,9 +222,8 @@ pub async fn commit(
                 }
             }
             ChangeStatus::Deleted => {
-                let result = runtime
-                    .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &lower_path], false)
-                    .await?;
+                let cmd = format!("rm -rf {lower_path}");
+                let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
                 if result.exit_code != 0 {
                     eprintln!(
                         "Warning: failed to delete {}: {}",
@@ -275,9 +259,8 @@ pub async fn discard(
         let mut discarded = 0;
         for path in filter_paths {
             let upper_path = format!("{UPPER}/{}", path.trim_start_matches('/'));
-            let result = runtime
-                .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", &upper_path], false)
-                .await?;
+            let cmd = format!("rm -rf {upper_path}");
+            let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
             if result.exit_code == 0 {
                 println!("  Discarded: {path}");
                 discarded += 1;
@@ -289,18 +272,8 @@ pub async fn discard(
         Ok(discarded)
     } else {
         // Clear entire upper layer
-        let result = runtime
-            .exec_cmd(
-                sandbox_name,
-                &[
-                    "sudo",
-                    "bash",
-                    "-c",
-                    &format!("rm -rf {UPPER}/* {UPPER}/.[!.]* 2>/dev/null; true"),
-                ],
-                false,
-            )
-            .await?;
+        let cmd = format!("rm -rf {UPPER}/* {UPPER}/.[!.]* 2>/dev/null; true");
+        let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
         if result.exit_code != 0 {
             bail!("Failed to clear overlay: {}", result.stderr.trim());
@@ -319,18 +292,16 @@ pub async fn stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     }
 
     // Move upper to stash
-    let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "mv", UPPER, STASH_DIR], false)
-        .await?;
+    let cmd = format!("mv {UPPER} {STASH_DIR}");
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to stash overlay: {}", result.stderr.trim());
     }
 
     // Recreate empty upper directory
-    let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "mkdir", "-p", UPPER], false)
-        .await?;
+    let cmd = format!("mkdir -p {UPPER}");
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!(
@@ -353,18 +324,15 @@ pub async fn stash_pop(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> 
     let merge_cmd = format!(
         "cp -a {STASH_DIR}/* {UPPER}/ 2>/dev/null; cp -a {STASH_DIR}/.[!.]* {UPPER}/ 2>/dev/null; true"
     );
-    let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &merge_cmd], false)
-        .await?;
+    let result = runtime.run_as_root(sandbox_name, &merge_cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to restore stash: {}", result.stderr.trim());
     }
 
     // Remove the stash directory
-    let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "rm", "-rf", STASH_DIR], false)
-        .await?;
+    let cmd = format!("rm -rf {STASH_DIR}");
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         bail!("Failed to clean up stash: {}", result.stderr.trim());
@@ -379,7 +347,7 @@ pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool
     // Check if stash directory exists and has contents
     let check_cmd = format!("test -d {STASH_DIR} && [ \"$(ls -A {STASH_DIR} 2>/dev/null)\" ]");
     let result = runtime
-        .exec_cmd(sandbox_name, &["bash", "-c", &check_cmd], false)
+        .exec_cmd(sandbox_name, &["bash", "-lc", &check_cmd], false)
         .await?;
 
     Ok(result.exit_code == 0)
@@ -392,13 +360,8 @@ pub async fn has_stash(runtime: &dyn Runtime, sandbox_name: &str) -> Result<bool
 /// unmount and remount with the same options instead.
 pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
     // Try simple remount first (works on older kernels)
-    let result = runtime
-        .exec_cmd(
-            sandbox_name,
-            &["sudo", "mount", "-o", "remount", WORKSPACE],
-            false,
-        )
-        .await?;
+    let cmd = format!("mount -o remount {WORKSPACE}");
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code == 0 {
         println!("Overlay refreshed — host changes are now visible.");
@@ -412,7 +375,7 @@ pub async fn refresh(runtime: &dyn Runtime, sandbox_name: &str) -> Result<()> {
          -o lowerdir={LOWER},upperdir={UPPER},workdir={WORK} {WORKSPACE}"
     );
     let result = runtime
-        .exec_cmd(sandbox_name, &["sudo", "bash", "-c", &remount_cmd], false)
+        .run_as_root(sandbox_name, &remount_cmd, false)
         .await?;
 
     if result.exit_code != 0 {
@@ -445,7 +408,7 @@ pub async fn conflicts(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<
             upper_path, lower_path, upper_path, lower_path
         );
         let result = runtime
-            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .exec_cmd(sandbox_name, &["bash", "-lc", &diff_cmd], false)
             .await?;
 
         if result.stdout.trim() == "CONFLICT" {
@@ -483,9 +446,7 @@ pub async fn lower_layer_changes(runtime: &dyn Runtime, sandbox_name: &str) -> R
         "find {} -newer {} -not -path {} -type f -printf '%P\\n' 2>/dev/null | head -50",
         LOWER, WORK, LOWER
     );
-    let result = runtime
-        .exec_cmd(sandbox_name, &["bash", "-c", &cmd], false)
-        .await?;
+    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
 
     if result.exit_code != 0 {
         return Ok(vec![]);
@@ -522,7 +483,7 @@ pub async fn conflicts_quiet(
             upper_path, lower_path, upper_path, lower_path
         );
         let result = runtime
-            .exec_cmd(sandbox_name, &["bash", "-c", &diff_cmd], false)
+            .exec_cmd(sandbox_name, &["bash", "-lc", &diff_cmd], false)
             .await?;
 
         if result.stdout.trim() == "CONFLICT" {

@@ -29,7 +29,7 @@ impl IncusRuntime {
     fn remote_image(image_type: &str) -> &'static str {
         match image_type {
             "ubuntu" => "images:ubuntu/24.04",
-            _ => "images:nixos/24.11",
+            _ => "images:nixos/25.11",
         }
     }
 
@@ -223,6 +223,62 @@ impl IncusRuntime {
         }
         Ok(())
     }
+
+    /// Detect the UID of the first non-root user in the VM.
+    /// Filters to users with home under /home/ to exclude NixOS nixbld* users
+    /// (UID 30001+ with home /var/empty).
+    async fn detect_vm_uid(vm: &str) -> Option<String> {
+        let result = run_cmd(
+            "incus",
+            &["exec", vm, "--", "bash", "-lc",
+              "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $3; exit }' /etc/passwd"],
+        ).await.ok()?;
+        let uid = result.stdout.trim().to_string();
+        if uid.is_empty() { None } else { Some(uid) }
+    }
+
+    /// Detect the HOME directory for a given UID in the VM.
+    async fn detect_vm_home(vm: &str, uid: &str) -> String {
+        // Use bash -lc to get login shell PATH (getent is in /run/current-system/sw/bin/ on NixOS)
+        let result = run_cmd(
+            "incus",
+            &[
+                "exec",
+                vm,
+                "--",
+                "bash",
+                "-lc",
+                &format!("getent passwd {uid} | cut -d: -f6"),
+            ],
+        )
+        .await;
+        match result {
+            Ok(r) if !r.stdout.trim().is_empty() => {
+                format!("HOME={}", r.stdout.trim())
+            }
+            _ => "HOME=/home/dev".to_string(),
+        }
+    }
+
+    /// Wait for the Incus VM agent to become ready (up to 120 seconds).
+    /// The agent starts after the guest OS boots and runs incus-agent.
+    async fn wait_for_agent(vm: &str) -> Result<()> {
+        let max_attempts = 40; // 40 * 3s = 120s
+        for i in 0..max_attempts {
+            let result = run_cmd("incus", &["exec", vm, "--", "echo", "ready"]).await?;
+            if result.exit_code == 0 && result.stdout.trim() == "ready" {
+                println!("VM agent is ready.");
+                return Ok(());
+            }
+            if i > 0 && i % 10 == 0 {
+                println!("  Still waiting for VM agent... ({i}s)", i = i * 3);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        bail!(
+            "VM agent did not become ready within 120 seconds. The VM may still be booting — try `devbox shell` in a minute."
+        )
+    }
 }
 
 #[async_trait]
@@ -239,6 +295,10 @@ impl Runtime for IncusRuntime {
         30
     }
 
+    fn exec_runs_as_root(&self) -> bool {
+        true
+    }
+
     async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
         let vm = Self::vm_name(&opts.name);
 
@@ -252,13 +312,25 @@ impl Runtime for IncusRuntime {
             );
         }
 
-        // Ensure the base image is available (auto-download if missing).
-        Self::ensure_image(&opts.image).await?;
+        // Determine which image to launch from: cached or base
+        let image = if let Some(cached) = &opts.cached_image {
+            println!("Launching from cached image '{cached}'...");
+            cached.clone()
+        } else {
+            Self::ensure_image(&opts.image).await?;
+            Self::image_alias(&opts.image).to_string()
+        };
 
         // Launch the VM
         println!("Creating Incus VM '{vm}'...");
-        let image = Self::image_alias(&opts.image);
-        let mut launch_args = vec!["launch", image, &vm, "--vm"];
+        let mut launch_args = vec![
+            "launch",
+            &image,
+            &vm,
+            "--vm",
+            "-c",
+            "security.secureboot=false",
+        ];
 
         let cpu_str;
         if opts.cpu > 0 {
@@ -267,14 +339,32 @@ impl Runtime for IncusRuntime {
             launch_args.push(&cpu_str);
         }
 
-        let mem_str;
-        if !opts.memory.is_empty() {
-            mem_str = format!("limits.memory={}", opts.memory);
-            launch_args.push("-c");
-            launch_args.push(&mem_str);
-        }
+        // Default to 4GiB memory for Incus VMs — NixOS rebuild needs 2-4GB
+        // for evaluating the full module system. The default Incus 1GB is too little.
+        let memory = if opts.memory.is_empty() {
+            "4GiB"
+        } else {
+            &opts.memory
+        };
+        let mem_str = format!("limits.memory={memory}");
+        launch_args.push("-c");
+        launch_args.push(&mem_str);
 
         run_ok("incus", &launch_args).await?;
+
+        // Expand disk only for base images (cached images already have 20GB)
+        if opts.cached_image.is_none() {
+            let _ = run_ok(
+                "incus",
+                &["config", "device", "override", &vm, "root", "size=20GiB"],
+            )
+            .await;
+        }
+
+        // Wait for the VM agent to be ready before provisioning.
+        // The guest agent takes time to start after boot.
+        println!("Waiting for VM agent to be ready...");
+        Self::wait_for_agent(&vm).await?;
 
         // Add mounts
         for (i, m) in opts.mounts.iter().enumerate() {
@@ -306,6 +396,7 @@ impl Runtime for IncusRuntime {
     async fn start(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         run_ok("incus", &["start", &vm]).await?;
+        Self::wait_for_agent(&vm).await?;
         Ok(())
     }
 
@@ -338,6 +429,42 @@ impl Runtime for IncusRuntime {
         argv.push("--".to_string());
         argv.extend(cmd.iter().map(|s| s.to_string()));
         argv
+    }
+
+    /// Execute an interactive command as the non-root user.
+    /// Incus exec defaults to root, so we detect the first UID >= 1000
+    /// and set --user, HOME, and CWD for proper user sessions.
+    async fn exec_as_user(&self, name: &str, cmd: &[&str]) -> Result<ExecResult> {
+        let vm = Self::vm_name(name);
+        let uid_str = Self::detect_vm_uid(&vm).await.unwrap_or("1000".to_string());
+        let home_env = Self::detect_vm_home(&vm, &uid_str).await;
+
+        // Detect the user's home directory from the HOME env string
+        let home_dir = home_env.strip_prefix("HOME=").unwrap_or("/home/dev");
+        let path_env = format!(
+            "PATH={home_dir}/.npm-global/bin:{home_dir}/.local/bin:{home_dir}/.claude/bin:\
+             /run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:\
+             /usr/local/bin:/usr/bin:/bin"
+        );
+
+        let mut args = vec![
+            "exec".to_string(),
+            vm,
+            "--user".to_string(),
+            uid_str,
+            "--cwd".to_string(),
+            "/workspace".to_string(),
+            "--env".to_string(),
+            home_env,
+            "--env".to_string(),
+            path_env,
+            "--".to_string(),
+        ];
+        for c in cmd {
+            args.push(c.to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_interactive("incus", &arg_refs).await
     }
 
     async fn destroy(&self, name: &str) -> Result<()> {
@@ -445,6 +572,49 @@ impl Runtime for IncusRuntime {
 
     fn supports_mount_updates(&self) -> bool {
         true
+    }
+
+    async fn cached_image(&self, cache_key: &str) -> Option<String> {
+        let alias = format!("devbox-cache-{cache_key}");
+        let result = run_cmd(
+            "incus",
+            &[
+                "image",
+                "list",
+                &format!("local:{alias}"),
+                "--format",
+                "json",
+            ],
+        )
+        .await
+        .ok()?;
+        if result.exit_code == 0
+            && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&result.stdout)
+            && !arr.is_empty()
+        {
+            return Some(alias);
+        }
+        None
+    }
+
+    async fn cache_image(&self, name: &str, cache_key: &str) -> Result<()> {
+        let vm = Self::vm_name(name);
+        let alias = format!("devbox-cache-{cache_key}");
+
+        println!("Caching provisioned image as '{alias}'...");
+
+        // Stop VM before publishing (required by incus publish)
+        let _ = run_cmd("incus", &["stop", &vm]).await;
+
+        // Publish the VM as a reusable image
+        run_ok("incus", &["publish", &vm, "--alias", &alias]).await?;
+
+        // Restart the VM
+        run_ok("incus", &["start", &vm]).await?;
+        Self::wait_for_agent(&vm).await?;
+
+        println!("Image cached successfully.");
+        Ok(())
     }
 
     async fn update_mounts(&self, name: &str, mounts: &[super::Mount]) -> Result<MountUpdate> {

@@ -365,14 +365,8 @@ pub(crate) fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
             "trippy",
             "doggo",
         ],
-        "ai-code" => vec![
-            "claude-code",
-            "codex",
-            "opencode",
-            "aider-chat",
-            "aichat",
-            "continue",
-        ],
+        // claude-code is installed separately via npm (latest version, smaller footprint)
+        "ai-code" => vec!["codex", "opencode", "aider-chat", "aichat", "continue"],
         "ai-infra" => vec![
             "ollama",
             "open-webui",
@@ -409,6 +403,54 @@ pub(crate) fn nix_packages_for_set(set: &str) -> Vec<&'static str> {
         "lang-ruby" => vec!["ruby_3_3", "bundler", "solargraph", "rubocop"],
         _ => vec![],
     }
+}
+
+// ── Cache Key ───────────────────────────────────────────────
+
+/// Hash of all embedded nix configuration files.
+/// Changes when any nix set file or module is updated → automatic cache invalidation.
+fn config_version() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for (_, content) in crate::nix::sets::NIX_SET_FILES {
+        content.hash(&mut hasher);
+    }
+    NIX_DEVBOX_MODULE.hash(&mut hasher);
+    NIX_OBSD_MODULE.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compute a deterministic cache key for one provisioning outcome.
+///
+/// Everything provisioning bakes into the guest is an input: the image, the
+/// mount mode, the sets, the languages, the ad-hoc packages *with their
+/// sources* (a flake-sourced package installs something different from the
+/// nixpkgs attribute of the same name), and the embedded Nix configuration via
+/// `config_version`. Same inputs, same key; any change invalidates the cache.
+pub fn cache_key(
+    image: &str,
+    sets: &[String],
+    languages: &[String],
+    mount_mode: &str,
+    packages: &[(String, String)],
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    image.hash(&mut hasher);
+    mount_mode.hash(&mut hasher);
+    let mut sorted_sets: Vec<&String> = sets.iter().collect();
+    sorted_sets.sort();
+    sorted_sets.hash(&mut hasher);
+    let mut sorted_langs: Vec<&String> = languages.iter().collect();
+    sorted_langs.sort();
+    sorted_langs.hash(&mut hasher);
+    let mut sorted_packages: Vec<&(String, String)> = packages.iter().collect();
+    sorted_packages.sort();
+    sorted_packages.hash(&mut hasher);
+    config_version().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -524,6 +566,30 @@ async fn run_install_step(
     }
 }
 
+/// Wait for the guest to answer an exec again after system activation.
+///
+/// On Incus, `nixos-rebuild switch` restarts the guest agent and the exec
+/// session dies with it; on Lima the SSH session may drop briefly. Either way
+/// the next step needs a guest that answers, and "it will probably be back" is
+/// not a state provisioning can continue from — so this is bounded and fails.
+async fn wait_for_guest_exec(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let max_attempts = 40; // 40 * 3s = 120s
+    for i in 0..max_attempts {
+        if let Ok(r) = runtime.exec_cmd(name, &["echo", "ready"], false).await
+            && r.exit_code == 0
+            && r.stdout.trim() == "ready"
+        {
+            return Ok(());
+        }
+        if i > 0 && i % 10 == 0 {
+            println!("  Still waiting for the guest... ({}s)", i * 3);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    bail!("the guest did not answer within 120 seconds after system activation")
+}
+
 fn require_install_success(result: &ExecResult, step: &str, retry: &str) -> Result<()> {
     if result.exit_code == 0 {
         return Ok(());
@@ -541,6 +607,113 @@ fn require_install_success(result: &ExecResult, step: &str, retry: &str) -> Resu
     )
 }
 
+/// Lightweight setup after launching from a cached image.
+///
+/// The cache key already covers everything `nixos-rebuild` produced, so this
+/// applies only what is specific to *this* box or *this* host: the state file,
+/// the host's git and AI-tool configuration, the devbox binary, and the
+/// observability agent — which is version-pinned to the host binary and must
+/// match it even when the cached guest was published by an older release.
+pub async fn post_cache_setup(
+    runtime: &dyn Runtime,
+    name: &str,
+    sets: &[String],
+    languages: &[String],
+    image: &str,
+    mount_mode: &str,
+    packages: &[(String, String)],
+) -> Result<()> {
+    let username = whoami();
+
+    // Cached images may boot with a different NIC name/MAC than the original VM.
+    // Restart networking to ensure DHCP picks up an IP on the new interface.
+    ensure_network_after_cache(runtime, name).await?;
+
+    // Detect VM user/home (no network needed — just reading /etc/passwd)
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
+
+    // The same projection provisioning uses (see `provision_vm_full_reported`):
+    // NixOS state names attribute paths, Ubuntu names installables.
+    let package_names: Vec<String> = if image == "ubuntu" {
+        packages.iter().map(|(n, s)| installable(n, s)).collect()
+    } else {
+        check_packages_supported(image, packages)?;
+        packages
+            .iter()
+            .map(|(n, s)| nixos_attr_path(n, s).to_string())
+            .collect()
+    };
+
+    // Update state file with current sandbox metadata
+    let state_toml = generate_state_toml(sets, languages, &username, mount_mode, &package_names);
+    write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
+
+    if let Err(error) = install_obsd_binary(runtime, name).await {
+        eprintln!("Warning: observability agent was not installed: {error}");
+    }
+
+    // Copy current host git config (host-specific, may have changed)
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
+
+    // Update devbox binary + help files (may have been updated since cache was created)
+    copy_devbox_to_vm(runtime, name).await?;
+    setup_help_in_vm(runtime, name).await?;
+    setup_management_script(runtime, name).await?;
+    setup_ai_tool_configs(runtime, name, &vm_user, &vm_home).await?;
+
+    Ok(())
+}
+
+/// Ensure network is up after launching from a cached image.
+/// The cached image may have been built with a different NIC name/MAC.
+/// We restart DHCP/NetworkManager and wait for an IP address.
+async fn ensure_network_after_cache(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Restart networking services to pick up DHCP on potentially new interfaces
+    let _ = run_in_vm(
+        runtime,
+        name,
+        "systemctl restart systemd-networkd 2>/dev/null; \
+         systemctl restart NetworkManager 2>/dev/null; \
+         systemctl restart dhcpcd 2>/dev/null; \
+         true",
+        false,
+    )
+    .await;
+
+    // Wait for an IP address to appear (up to 30s)
+    let attempts = 10;
+    for i in 0..attempts {
+        let result = runtime
+            .exec_cmd(
+                name,
+                &[
+                    "bash",
+                    "-lc",
+                    "ip -4 addr show scope global | grep -q 'inet '",
+                ],
+                false,
+            )
+            .await;
+        if let Ok(r) = result
+            && r.exit_code == 0
+        {
+            return Ok(());
+        }
+        if i == 0 {
+            print!("Waiting for network...");
+        } else {
+            print!(".");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    println!();
+    eprintln!("Warning: VM may not have network connectivity. SSH and package installs may fail.");
+    Ok(())
+}
+
 // ── NixOS Provisioning ─────────────────────────────────────
 
 /// Provision a NixOS VM: push nix config files + nixos-rebuild switch.
@@ -556,21 +729,18 @@ async fn provision_nixos(
 ) -> Result<()> {
     let username = whoami();
 
+    // 0. Wait for network connectivity (DNS resolution can lag behind the agent)
+    wait_for_network(runtime, name).await?;
+
     // 1. Create directory structure
     println!("Setting up NixOS configuration...");
-    runtime
-        .exec_cmd(
-            name,
-            &[
-                "sudo",
-                "mkdir",
-                "-p",
-                "/etc/devbox/sets",
-                "/etc/devbox/help",
-            ],
-            false,
-        )
-        .await?;
+    run_in_vm(
+        runtime,
+        name,
+        "mkdir -p /etc/devbox/sets /etc/devbox/help",
+        false,
+    )
+    .await?;
 
     // The agent and its module are part of the same host binary, so a box can
     // never accidentally retain a sidecar from another devbox release.
@@ -589,16 +759,34 @@ async fn provision_nixos(
     )
     .await?;
 
-    // 2. Generate base NixOS config if it doesn't exist
+    // 2. Ensure NixOS channel is available (images:nixos/* may not have it)
+    //    nixos-rebuild needs `<nixpkgs/nixos>` in NIX_PATH, which comes from
+    //    the nixos channel. If the channel isn't set up, add and update it.
+    ensure_nixos_channel(runtime, name).await?;
+
+    // 3. Generate base NixOS config if it doesn't exist
     //    NixOS Lima images ship with an empty /etc/nixos/ — we need to
     //    run nixos-generate-config to create the hardware and base configs.
     ensure_nixos_config(runtime, name, obsd_installed).await?;
 
-    // 3. Push devbox-state.toml (includes mount_mode for overlay setup)
+    // 4. Ensure user home directory exists (the user may not exist yet on
+    //    fresh images:nixos/* images — nixos-rebuild will create it via
+    //    devbox-module.nix, but we need the homedir for writing config files
+    //    before rebuild. We create it manually and let NixOS fix ownership later.)
+    let home_dir = format!("/home/{username}");
+    run_in_vm(
+        runtime,
+        name,
+        &format!("mkdir -p {home_dir} && chown $(id -u {username} 2>/dev/null || echo 1000):users {home_dir} 2>/dev/null; true"),
+        false,
+    )
+    .await?;
+
+    // 5. Push devbox-state.toml (includes mount_mode for overlay setup)
     let state_toml = generate_state_toml(sets, languages, &username, mount_mode, packages);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
-    // 4. Push devbox-module.nix
+    // 6. Push devbox-module.nix
     write_file_to_vm(
         runtime,
         name,
@@ -613,45 +801,66 @@ async fn provision_nixos(
         write_file_to_vm(runtime, name, &path, content).await?;
     }
 
-    // 6. Run nixos-rebuild switch (interactive so user sees progress)
-    //    NixOS Lima images use flake-based NIX_PATH (nixpkgs=flake:nixpkgs)
-    //    which doesn't include nixos-config. We must set it explicitly.
+    // 8. Run nixos-rebuild switch (interactive so user sees progress)
+    //    We must set NIX_PATH explicitly because:
+    //    - incus exec doesn't source /etc/profile (no login shell)
+    //    - images:nixos/* may not have channels in the default NIX_PATH
+    //    - After nix-channel --update, nixpkgs lives at the channel profile path
     println!("Installing packages via nixos-rebuild (this may take a few minutes)...");
-    let rebuild_cmd = concat!(
-        "export NIX_PATH=\"nixos-config=/etc/nixos/configuration.nix:$NIX_PATH\" && ",
-        "export NIXPKGS_ALLOW_UNFREE=1 && ",
-        "nixos-rebuild switch"
-    );
-    let result = run_install_step(
-        runtime,
-        name,
-        &["sudo", "bash", "-c", rebuild_cmd],
-        reporter,
-    )
-    .await?;
+    // NIX_PATH is set explicitly rather than inherited: `incus exec` gives a
+    // bare environment, `images:nixos/*` may carry no channel in the default
+    // path, and after `nix-channel --update` nixpkgs lives at the channel
+    // profile. On a Lima guest this is exactly what root's login shell already
+    // exports, so it is a no-op there and a fix on Incus.
+    let rebuild_cmd = "\
+         export NIX_PATH=\"nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:\
+         nixos-config=/etc/nixos/configuration.nix:\
+         /nix/var/nix/profiles/per-user/root/channels\" && \
+         export NIXPKGS_ALLOW_UNFREE=1 && \
+         nixos-rebuild switch";
+    let elevated = crate::policy::enforce::elevated_login(rebuild_cmd);
+    let rebuild_argv = ["sh", "-c", elevated.as_str()];
+    let mut result = run_install_step(runtime, name, &rebuild_argv, reporter).await?;
+
+    // `nixos-rebuild switch` restarts the guest agent during activation on
+    // Incus, which drops the exec session with exit 255 whether or not the
+    // switch finished. That code is not a verdict, so wait for the guest to
+    // answer again and run the (idempotent) switch once more: a completed
+    // activation makes it a fast no-op, an interrupted one is finished, and a
+    // real failure is reported by the rerun instead of being assumed away.
+    if result.exit_code == 255 {
+        println!("Connection lost during system activation; waiting for the guest to return...");
+        wait_for_guest_exec(runtime, name).await?;
+        result = run_install_step(runtime, name, &rebuild_argv, reporter).await?;
+    }
     let retry = format!("devbox exec --name {name} -- sudo nixos-rebuild switch");
     require_install_success(&result, "nixos-rebuild switch", &retry)?;
     println!("NixOS rebuild complete.");
 
-    // 8. Set up user shell (zshrc with PATH, aliases, etc.)
-    setup_nixos_shell(runtime, name).await?;
+    // Detect the actual VM user/home after nixos-rebuild (may differ from
+    // host username — e.g. Lima creates "ethan.linux" from host "ethan").
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
 
-    // 9. Install latest claude-code (nixpkgs version lags behind)
+    // 9. Set up user shell (zshrc with PATH, aliases, etc.)
+    setup_nixos_shell(runtime, name, &vm_user, &vm_home).await?;
+
+    // 10. Install latest claude-code (nixpkgs version lags behind)
     if sets.iter().any(|s| s == "ai-code" || s == "ai_code") {
-        install_latest_claude_code(runtime, name).await;
+        install_latest_claude_code(runtime, name, &vm_user, &vm_home).await;
     }
 
-    // 10. Copy host git config into VM
-    setup_git_config(runtime, name).await?;
+    // 11. Copy host git config into VM
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
 
-    // 11. Copy devbox binary + help files + tool configs
+    // 12. Copy devbox binary + help files + tool configs
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
     setup_management_script(runtime, name).await?;
-    setup_yazi_config(runtime, name).await?;
-    setup_aichat_config(runtime, name).await?;
-    setup_ai_tool_configs(runtime, name).await?;
+    setup_yazi_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_aichat_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_ai_tool_configs(runtime, name, &vm_user, &vm_home).await?;
 
     Ok(())
 }
@@ -762,21 +971,23 @@ fi"#;
     // 5. Set up shell environment
     setup_ubuntu_shell(runtime, name).await?;
 
+    // Detect the actual VM user/home (may differ from host username)
+    let vm_user = detect_vm_username(runtime, name).await;
+    let vm_home = detect_vm_home(runtime, name, &vm_user).await;
+
     // 6. Copy host git config into VM
-    setup_git_config(runtime, name).await?;
+    setup_git_config(runtime, name, &vm_user, &vm_home).await?;
 
     // 7. Create devbox directories and copy binary + help
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", "/etc/devbox/help"], false)
-        .await?;
+    run_in_vm(runtime, name, "mkdir -p /etc/devbox/help", false).await?;
 
     println!("Copying devbox into VM...");
     copy_devbox_to_vm(runtime, name).await?;
     setup_help_in_vm(runtime, name).await?;
     setup_management_script(runtime, name).await?;
-    setup_yazi_config(runtime, name).await?;
-    setup_aichat_config(runtime, name).await?;
-    setup_ai_tool_configs(runtime, name).await?;
+    setup_yazi_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_aichat_config(runtime, name, &vm_user, &vm_home).await?;
+    setup_ai_tool_configs(runtime, name, &vm_user, &vm_home).await?;
 
     // Observability is useful but not a prerequisite for a usable box. Keep it
     // after package and shell setup, and leave a loud warning if its runtime-
@@ -802,11 +1013,11 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
     if needs_docker {
         print!("  Setting up Docker service...");
         let cmd = "export DEBIAN_FRONTEND=noninteractive && \
-            sudo apt-get update -qq && \
-            sudo apt-get install -y -qq docker.io >/dev/null 2>&1 && \
-            sudo usermod -aG docker $(whoami) && \
-            sudo systemctl enable --now docker";
-        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+            apt-get update -qq && \
+            apt-get install -y -qq docker.io >/dev/null 2>&1 && \
+            usermod -aG docker $(whoami) && \
+            systemctl enable --now docker";
+        let result = run_in_vm(runtime, name, cmd, false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -816,8 +1027,8 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
     if needs_tailscale {
         print!("  Setting up Tailscale service...");
         let cmd = "curl -fsSL https://tailscale.com/install.sh | sh && \
-            sudo systemctl enable --now tailscaled";
-        let result = runtime.exec_cmd(name, &["bash", "-c", cmd], false).await;
+            systemctl enable --now tailscaled";
+        let result = run_in_vm(runtime, name, cmd, false).await;
         match result {
             Ok(r) if r.exit_code == 0 => println!(" done"),
             _ => println!(" skipped"),
@@ -837,8 +1048,8 @@ async fn setup_ubuntu_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
 # Set zsh as default shell if installed via Nix
 NIX_ZSH="$(. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && which zsh 2>/dev/null)"
 if [ -n "$NIX_ZSH" ]; then
-  echo "$NIX_ZSH" | sudo tee -a /etc/shells >/dev/null
-  sudo chsh -s "$NIX_ZSH" {username}
+  echo "$NIX_ZSH" | tee -a /etc/shells >/dev/null
+  chsh -s "$NIX_ZSH" {username}
 fi
 
 # Create .zshrc with Nix integration
@@ -887,7 +1098,7 @@ ZSHRC
 "#
     );
 
-    let result = runtime.exec_cmd(name, &["bash", "-c", &setup], false).await;
+    let result = run_in_vm(runtime, name, &setup, false).await;
     if let Ok(r) = result
         && r.exit_code != 0
     {
@@ -898,9 +1109,13 @@ ZSHRC
 }
 
 /// Set up user shell environment on NixOS (zshrc with PATH, aliases, workspace cd).
-async fn setup_nixos_shell(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let zshrc_path = format!("/home/{username}/.zshrc");
+async fn setup_nixos_shell(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) -> Result<()> {
+    let zshrc_path = format!("{vm_home}/.zshrc");
 
     // Only create if .zshrc doesn't exist yet (don't overwrite user customizations)
     let check = runtime
@@ -943,14 +1158,17 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 "#;
         write_file_to_vm(runtime, name, &zshrc_path, zshrc).await?;
 
-        let chown_cmd = format!("chown {username}:users {zshrc_path}");
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(
+            runtime,
+            name,
+            &format!("chown {vm_user}:users {zshrc_path}"),
+            false,
+        )
+        .await?;
     }
 
     // Also create .profile for bash login shells (used by layout panes with bash -lc)
-    let profile_path = format!("/home/{username}/.profile");
+    let profile_path = format!("{vm_home}/.profile");
     let profile_check = runtime
         .exec_cmd(name, &["test", "-f", &profile_path], false)
         .await?;
@@ -960,10 +1178,13 @@ export DEVBOX_RUNTIME="${DEVBOX_RUNTIME:-unknown}"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 "#;
         write_file_to_vm(runtime, name, &profile_path, profile).await?;
-        let chown_cmd = format!("chown {username}:users {profile_path}");
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(
+            runtime,
+            name,
+            &format!("chown {vm_user}:users {profile_path}"),
+            false,
+        )
+        .await?;
     }
 
     Ok(())
@@ -973,7 +1194,12 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
 /// Copy host ~/.gitconfig into the VM so git user.name, user.email,
 /// remote aliases, and other settings carry over automatically.
-async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
+async fn setup_git_config(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let gitconfig_path = home.join(".gitconfig");
 
@@ -986,14 +1212,11 @@ async fn setup_git_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let username = whoami();
-    let vm_path = format!("/home/{username}/.gitconfig");
+    let vm_path = format!("{vm_home}/.gitconfig");
     write_file_to_vm(runtime, name, &vm_path, &content).await?;
 
-    let chown_cmd = format!("chown {username}:users {vm_path}");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    let chown_cmd = format!("chown {vm_user}:users {vm_path}");
+    run_in_vm(runtime, name, &chown_cmd, false).await?;
 
     println!("Synced host git config to VM.");
     Ok(())
@@ -1106,10 +1329,13 @@ static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
 /// Detect AI tool configurations on the host and copy them into the VM.
 /// Checks for config files and API key env vars in priority order:
 /// claude-code → opencode → codex → aichat.
-async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> {
+async fn setup_ai_tool_configs(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
-    let username = whoami();
-    let vm_home = format!("/home/{username}");
     let mut copied_any = false;
 
     for tool in AI_TOOL_CONFIGS {
@@ -1162,18 +1388,14 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
             // Ensure parent directory exists with correct ownership
             let vm_parent = vm_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(&vm_path);
-            runtime
-                .exec_cmd(name, &["sudo", "mkdir", "-p", vm_parent], false)
-                .await?;
+            run_in_vm(runtime, name, &format!("mkdir -p {vm_parent}"), false).await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
             println!("  copied: ~/{host_suffix} → {vm_path}");
 
             // Set restrictive permissions for credential/auth files
             if vm_suffix.contains("credential") || vm_suffix.contains("auth") {
-                runtime
-                    .exec_cmd(name, &["sudo", "chmod", "600", &vm_path], false)
-                    .await?;
+                run_in_vm(runtime, name, &format!("chmod 600 {vm_path}"), false).await?;
             }
             copied_any = true;
         }
@@ -1202,11 +1424,9 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
 
         // Fix ownership for all copied files
         let chown_cmd = format!(
-            "chown -R {username}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
+            "chown -R {vm_user}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
         );
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(runtime, name, &chown_cmd, false).await?;
     }
 
     if copied_any {
@@ -1217,15 +1437,16 @@ async fn setup_ai_tool_configs(runtime: &dyn Runtime, name: &str) -> Result<()> 
     let has_aichat_config = home.join(".config/aichat/config.yaml").exists();
     if !has_aichat_config && let Some(config) = generate_aichat_config_from_credentials(&home) {
         let config_dir = format!("{vm_home}/.config/aichat");
-        runtime
-            .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
-            .await?;
+        run_in_vm(runtime, name, &format!("mkdir -p {config_dir}"), false).await?;
         let config_path = format!("{config_dir}/config.yaml");
         write_file_to_vm(runtime, name, &config_path, &config).await?;
-        let chown_cmd = format!("chown -R {username}:users {config_dir}");
-        runtime
-            .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-            .await?;
+        run_in_vm(
+            runtime,
+            name,
+            &format!("chown -R {vm_user}:users {config_dir}"),
+            false,
+        )
+        .await?;
         println!("Generated aichat config from detected AI tool credentials.");
     }
 
@@ -1293,7 +1514,20 @@ fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<Str
     None
 }
 
-/// Write a file into the VM using base64-encoded content via exec_cmd.
+/// Run a command as root inside the VM with a login shell.
+/// Delegates to `runtime.run_as_root()` which handles the platform
+/// difference: Incus runs as root directly, Lima wraps in `sudo`.
+async fn run_in_vm(
+    runtime: &dyn Runtime,
+    name: &str,
+    cmd: &str,
+    interactive: bool,
+) -> Result<crate::runtime::ExecResult> {
+    runtime.run_as_root(name, cmd, interactive).await
+}
+
+/// Write a file into the VM using base64-encoded content.
+/// Runs the entire pipeline as root via `run_as_root`.
 async fn write_file_to_vm(
     runtime: &dyn Runtime,
     name: &str,
@@ -1302,8 +1536,8 @@ async fn write_file_to_vm(
 ) -> Result<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-    let cmd = format!("echo '{encoded}' | base64 -d | sudo tee {path} > /dev/null");
-    let result = runtime.exec_cmd(name, &["bash", "-c", &cmd], false).await?;
+    let cmd = format!("echo '{encoded}' | base64 -d | tee {path} > /dev/null");
+    let result = runtime.run_as_root(name, &cmd, false).await?;
     if result.exit_code != 0 {
         bail!("failed to write {path}: {}", result.stderr.trim());
     }
@@ -1549,6 +1783,122 @@ async fn install_ubuntu_obsd_service(runtime: &dyn Runtime, name: &str) -> Resul
     Ok(())
 }
 
+/// Wait for network connectivity inside the VM.
+///
+/// On freshly booted Incus VMs, the network (especially DNS) may not be ready
+/// even after the agent responds. We first wait for basic IP connectivity
+/// (ping), then check DNS resolution. If basic connectivity never comes up,
+/// we bail early with actionable diagnostics instead of letting every
+/// subsequent download time out.
+async fn wait_for_network(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Phase 1: Wait for basic IP connectivity (ping 8.8.8.8)
+    // This distinguishes "network not ready yet" from "no route / firewall blocks"
+    let ping_attempts = 10; // 10 * 3s = 30s
+    let mut got_ping = false;
+    for i in 0..ping_attempts {
+        let result = run_in_vm(
+            runtime,
+            name,
+            "ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && echo ok",
+            false,
+        )
+        .await?;
+        if result.exit_code == 0 && result.stdout.trim() == "ok" {
+            got_ping = true;
+            break;
+        }
+        if i == 0 {
+            print!("Waiting for network connectivity...");
+        } else if i % 5 == 0 {
+            print!(" ({}s)", i * 3);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    if !got_ping {
+        println!();
+        eprintln!("\x1b[31mError: VM has no network connectivity.\x1b[0m");
+        eprintln!("The VM cannot reach the internet. This is usually caused by");
+        eprintln!("missing iptables FORWARD rules for the Incus bridge.\n");
+        eprintln!("Quick fix (run on the host):");
+        eprintln!("  sudo iptables -I FORWARD -i incusbr0 -j ACCEPT");
+        eprintln!(
+            "  sudo iptables -I FORWARD -o incusbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        );
+        eprintln!(
+            "  sudo iptables -t nat -A POSTROUTING -s 10.195.64.0/24 ! -o incusbr0 -j MASQUERADE\n"
+        );
+        eprintln!("Run `devbox doctor` for full network diagnostics.");
+        anyhow::bail!(
+            "VM network connectivity check failed — cannot provision without internet access"
+        );
+    }
+
+    // Phase 2: Wait for DNS resolution
+    let dns_attempts = 10; // 10 * 3s = 30s
+    for i in 0..dns_attempts {
+        let result = run_in_vm(
+            runtime,
+            name,
+            "getent hosts cache.nixos.org >/dev/null 2>&1 && echo ok",
+            false,
+        )
+        .await?;
+        if result.exit_code == 0 && result.stdout.trim() == "ok" {
+            println!(" ready.");
+            return Ok(());
+        }
+        if i % 5 == 0 {
+            print!(" (DNS {}s)", i * 3);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    println!();
+    eprintln!(
+        "Warning: DNS resolution not working yet — provisioning will continue but downloads may fail."
+    );
+    Ok(())
+}
+
+/// Ensure the NixOS channel is available so `nixos-rebuild` can find `<nixpkgs/nixos>`.
+///
+/// The `images:nixos/*` Incus images may not have channels configured, causing
+/// `nixos-rebuild` to fail with "file 'nixpkgs/nixos' was not found in the Nix search path".
+/// We check if the nixos channel exists and add it if missing.
+async fn ensure_nixos_channel(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    // Check if the nixos channel is already available for root.
+    // We check the channel profile path directly since NIX_PATH may not be set
+    // in the non-login incus exec shell.
+    let check = run_in_vm(
+        runtime,
+        name,
+        "test -d /nix/var/nix/profiles/per-user/root/channels/nixos && echo found",
+        false,
+    )
+    .await?;
+
+    if check.stdout.trim() == "found" {
+        return Ok(());
+    }
+
+    println!("Setting up NixOS channel (required for nixos-rebuild)...");
+    let channel_cmd = concat!(
+        "nix-channel --add https://nixos.org/channels/nixos-25.05 nixos && ",
+        "nix-channel --update"
+    );
+    let result = run_in_vm(runtime, name, channel_cmd, true).await?;
+    if result.exit_code != 0 {
+        eprintln!(
+            "Warning: failed to set up NixOS channel: {}",
+            result.stderr.trim()
+        );
+    } else {
+        println!("NixOS channel configured.");
+    }
+
+    Ok(())
+}
+
 /// Ensure /etc/nixos/configuration.nix and hardware-configuration.nix exist.
 ///
 /// NixOS Lima images ship with an empty /etc/nixos/ directory.
@@ -1571,9 +1921,7 @@ async fn ensure_nixos_config(
 
     if hw_check.exit_code != 0 {
         println!("  Generating hardware configuration...");
-        let result = runtime
-            .exec_cmd(name, &["sudo", "nixos-generate-config"], false)
-            .await?;
+        let result = run_in_vm(runtime, name, "nixos-generate-config", false).await?;
         if result.exit_code != 0 {
             eprintln!(
                 "Warning: nixos-generate-config failed: {}",
@@ -1660,20 +2008,13 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
         if let Ok(r) = result
             && r.exit_code == 0
         {
-            let _ = runtime
-                .exec_cmd(
-                    name,
-                    &[
-                        "sudo",
-                        "install",
-                        "-m",
-                        "755",
-                        "/tmp/devbox",
-                        "/usr/local/bin/devbox",
-                    ],
-                    false,
-                )
-                .await;
+            let _ = run_in_vm(
+                runtime,
+                name,
+                "install -m 755 /tmp/devbox /usr/local/bin/devbox",
+                false,
+            )
+            .await;
             let _ = runtime.exec_cmd(name, &["rm", "/tmp/devbox"], false).await;
         }
     }
@@ -1681,14 +2022,16 @@ async fn copy_devbox_to_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
 }
 
 /// Push yazi config files to all user home directories in the VM.
-async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let config_dir = format!("/home/{username}/.config/yazi");
+async fn setup_yazi_config(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) -> Result<()> {
+    let config_dir = format!("{vm_home}/.config/yazi");
 
     // Create config directory
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &config_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("mkdir -p {config_dir}"), false).await?;
 
     // Write all yazi config files
     let files: &[(&str, &str)] = &[
@@ -1704,9 +2047,7 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
     // Write glow previewer plugin
     let plugin_dir = format!("{config_dir}/plugins/glow.yazi");
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &plugin_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("mkdir -p {plugin_dir}"), false).await?;
     write_file_to_vm(
         runtime,
         name,
@@ -1716,24 +2057,29 @@ async fn setup_yazi_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
     .await?;
 
     // Fix ownership
-    let chown_cmd = format!("chown -R {username}:users /home/{username}/.config/yazi");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    run_in_vm(
+        runtime,
+        name,
+        &format!("chown -R {vm_user}:users {vm_home}/.config/yazi"),
+        false,
+    )
+    .await?;
 
     Ok(())
 }
 
 /// Push aichat config (roles) to user home directory in the VM.
 /// Writes both legacy roles.yaml and modern roles/*.md format for compatibility.
-async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
-    let username = whoami();
-    let config_dir = format!("/home/{username}/.config/aichat");
+async fn setup_aichat_config(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) -> Result<()> {
+    let config_dir = format!("{vm_home}/.config/aichat");
     let roles_dir = format!("{config_dir}/roles");
 
-    runtime
-        .exec_cmd(name, &["sudo", "mkdir", "-p", &roles_dir], false)
-        .await?;
+    run_in_vm(runtime, name, &format!("mkdir -p {roles_dir}"), false).await?;
 
     // Legacy format (older aichat versions)
     write_file_to_vm(
@@ -1753,10 +2099,13 @@ async fn setup_aichat_config(runtime: &dyn Runtime, name: &str) -> Result<()> {
         write_file_to_vm(runtime, name, &format!("{roles_dir}/{filename}"), content).await?;
     }
 
-    let chown_cmd = format!("chown -R {username}:users {config_dir}");
-    runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await?;
+    run_in_vm(
+        runtime,
+        name,
+        &format!("chown -R {vm_user}:users {config_dir}"),
+        false,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1770,13 +2119,7 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
         MANAGEMENT_SCRIPT,
     )
     .await?;
-    runtime
-        .exec_cmd(
-            name,
-            &["sudo", "chmod", "+x", "/etc/devbox/management.sh"],
-            false,
-        )
-        .await?;
+    run_in_vm(runtime, name, "chmod +x /etc/devbox/management.sh", false).await?;
     Ok(())
 }
 
@@ -1785,33 +2128,38 @@ async fn setup_management_script(runtime: &dyn Runtime, name: &str) -> Result<()
 /// On NixOS, the official binary installer fails (non-standard dynamic linker),
 /// and `npm install -g` fails (Nix store is read-only). We work around this by
 /// setting NPM_CONFIG_PREFIX to ~/.npm-global, then adding that to PATH.
-async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
-    let username = whoami();
+async fn install_latest_claude_code(
+    runtime: &dyn Runtime,
+    name: &str,
+    vm_user: &str,
+    vm_home: &str,
+) {
     println!("Installing latest claude-code...");
 
     // Install via npm with a writable global prefix.
-    // On NixOS, npm may not be in PATH (claude-code nix pkg bundles its own node
-    // but doesn't expose npm). Use nix-env (stable, no experimental features needed)
-    // to install nodejs to user profile first if needed.
-    let install_cmd = concat!(
-        "export PATH=\"$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; ",
-        "export NPM_CONFIG_PREFIX=\"$HOME/.npm-global\"; ",
-        "mkdir -p \"$HOME/.npm-global\"; ",
-        "if ! command -v npm >/dev/null 2>&1; then ",
-        "echo 'npm not found, installing nodejs via nix-env...'; ",
-        "nix-env -iA nixos.nodejs_22 2>&1; ",
-        "export PATH=\"$HOME/.nix-profile/bin:$PATH\"; ",
-        "fi; ",
-        "echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; ",
-        "if command -v npm >/dev/null 2>&1; then ",
-        "npm install -g @anthropic-ai/claude-code@latest 2>&1; ",
-        "echo \"Installed: $($HOME/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; ",
-        "else ",
-        "echo 'ERROR: npm still not available after nix-env install'; ",
-        "fi"
+    // We explicitly set HOME to the VM user's home directory because on
+    // Incus exec_cmd runs as root ($HOME=/root). We need claude installed
+    // to the user's home so Zellij panes (which run as user) find it.
+    let install_cmd = format!(
+        "export HOME={vm_home}; \
+         export PATH=\"{vm_home}/.nix-profile/bin:/run/current-system/sw/bin:$PATH\"; \
+         export NPM_CONFIG_PREFIX=\"{vm_home}/.npm-global\"; \
+         mkdir -p \"{vm_home}/.npm-global\"; \
+         if ! command -v npm >/dev/null 2>&1; then \
+           echo 'npm not found, installing nodejs via nix-env...'; \
+           nix-env -iA nixos.nodejs_22 2>&1; \
+           export PATH=\"{vm_home}/.nix-profile/bin:$PATH\"; \
+         fi; \
+         echo \"Using npm: $(which npm 2>/dev/null || echo 'not found')\"; \
+         if command -v npm >/dev/null 2>&1; then \
+           npm install -g @anthropic-ai/claude-code@latest 2>&1; \
+           echo \"Installed: $({vm_home}/.npm-global/bin/claude --version 2>/dev/null || echo 'failed')\"; \
+         else \
+           echo 'ERROR: npm still not available after nix-env install'; \
+         fi"
     );
     let result = runtime
-        .exec_cmd(name, &["bash", "-lc", install_cmd], true)
+        .exec_cmd(name, &["bash", "-lc", &install_cmd], true)
         .await;
     match result {
         Ok(r) if r.exit_code == 0 => {
@@ -1822,13 +2170,19 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
         }
     }
 
+    // Fix ownership of installed files (may have been created as root on Incus)
+    let _ = run_in_vm(
+        runtime, name,
+        &format!("chown -R {vm_user}:users {vm_home}/.npm-global {vm_home}/.nix-profile 2>/dev/null; true"),
+        false,
+    ).await;
+
     // Ensure ~/.npm-global/bin is at front of PATH in both .zshrc and .profile
     // so latest claude takes precedence over the nixpkgs system version.
-    // .profile is needed because layout panes use `bash -lc` (not zsh).
     let path_line =
         r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH""#;
     for rc_file in &[".zshrc", ".profile"] {
-        let rc_path = format!("/home/{username}/{rc_file}");
+        let rc_path = format!("{vm_home}/{rc_file}");
         let add_path_cmd = format!(
             "grep -qF '.npm-global/bin' {rc_path} 2>/dev/null || \
              echo '{path_line}' >> {rc_path}"
@@ -1838,12 +2192,13 @@ async fn install_latest_claude_code(runtime: &dyn Runtime, name: &str) {
             .await;
     }
     // Fix ownership
-    let chown_cmd = format!(
-        "chown {username}:users /home/{username}/.zshrc /home/{username}/.profile 2>/dev/null; true"
-    );
-    let _ = runtime
-        .exec_cmd(name, &["sudo", "bash", "-c", &chown_cmd], false)
-        .await;
+    let _ = run_in_vm(
+        runtime,
+        name,
+        &format!("chown {vm_user}:users {vm_home}/.zshrc {vm_home}/.profile 2>/dev/null; true"),
+        false,
+    )
+    .await;
 }
 
 /// Write embedded help files to /etc/devbox/help/ inside the VM.
@@ -1855,10 +2210,53 @@ async fn setup_help_in_vm(runtime: &dyn Runtime, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns the host username (for state TOML and NixOS user creation).
 fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "dev".to_string())
+}
+
+/// Detect the actual non-root username inside the VM.
+/// On Incus, exec_cmd runs as root so we can't use `whoami` — instead we
+/// find the first user with UID >= 1000 from /etc/passwd.
+/// On Lima, exec_cmd runs as the Lima user, so `whoami` works.
+/// Falls back to the host username if detection fails.
+///
+/// Filters: UID 1000-65533, home under /home/ (excludes NixOS nixbld* users
+/// which have UID 30001+ but home /var/empty).
+async fn detect_vm_username(runtime: &dyn Runtime, name: &str) -> String {
+    let result = runtime
+        .exec_cmd(
+            name,
+            &["bash", "-lc", "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $1; exit }' /etc/passwd"],
+            false,
+        )
+        .await;
+    match result {
+        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
+        _ => whoami(),
+    }
+}
+
+/// Detect the home directory for a given username inside the VM.
+/// Falls back to /home/{username}.
+async fn detect_vm_home(runtime: &dyn Runtime, name: &str, username: &str) -> String {
+    let result = runtime
+        .exec_cmd(
+            name,
+            &[
+                "bash",
+                "-lc",
+                &format!("getent passwd {username} | cut -d: -f6"),
+            ],
+            false,
+        )
+        .await;
+    match result {
+        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
+        _ => format!("/home/{username}"),
+    }
 }
 
 // Overlay mount is now handled declaratively by devbox-module.nix via
@@ -2227,6 +2625,62 @@ mod tests {
             let pkgs = nix_packages_for_set(set);
             assert!(!pkgs.is_empty(), "set '{set}' should have packages");
         }
+    }
+
+    #[test]
+    fn cache_key_deterministic() {
+        let sets = vec!["system".to_string(), "shell".to_string()];
+        let langs = vec!["go".to_string()];
+        let k1 = cache_key("nixos", &sets, &langs, "overlay", &[]);
+        let k2 = cache_key("nixos", &sets, &langs, "overlay", &[]);
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len(), 16); // 16-char hex string
+    }
+
+    #[test]
+    fn cache_key_order_independent() {
+        let sets_a = vec!["shell".to_string(), "system".to_string()];
+        let sets_b = vec!["system".to_string(), "shell".to_string()];
+        let langs = vec!["go".to_string()];
+        let k1 = cache_key("nixos", &sets_a, &langs, "overlay", &[]);
+        let k2 = cache_key("nixos", &sets_b, &langs, "overlay", &[]);
+        assert_eq!(k1, k2, "cache key should be order-independent");
+    }
+
+    #[test]
+    fn cache_key_differs_on_inputs() {
+        let sets = vec!["system".to_string()];
+        let langs = vec![];
+        let k_nixos = cache_key("nixos", &sets, &langs, "overlay", &[]);
+        let k_ubuntu = cache_key("ubuntu", &sets, &langs, "overlay", &[]);
+        assert_ne!(k_nixos, k_ubuntu, "different image → different key");
+
+        let k_overlay = cache_key("nixos", &sets, &langs, "overlay", &[]);
+        let k_writable = cache_key("nixos", &sets, &langs, "writable", &[]);
+        assert_ne!(
+            k_overlay, k_writable,
+            "different mount_mode → different key"
+        );
+
+        let sets2 = vec!["system".to_string(), "ai-code".to_string()];
+        let k_more = cache_key("nixos", &sets2, &langs, "overlay", &[]);
+        assert_ne!(k_nixos, k_more, "different sets → different key");
+
+        let pkgs = vec![("ripgrep".to_string(), "nixpkgs".to_string())];
+        let k_pkgs = cache_key("nixos", &sets, &langs, "overlay", &pkgs);
+        assert_ne!(k_nixos, k_pkgs, "an ad-hoc package → different key");
+        let flake = vec![("ripgrep".to_string(), "github:u/r#ripgrep".to_string())];
+        let k_flake = cache_key("nixos", &sets, &langs, "overlay", &flake);
+        assert_ne!(
+            k_pkgs, k_flake,
+            "same name, different source → different key"
+        );
+    }
+
+    #[test]
+    fn config_version_nonzero() {
+        let v = config_version();
+        assert_ne!(v, 0, "config_version should be non-zero");
     }
 }
 
