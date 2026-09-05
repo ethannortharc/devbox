@@ -96,7 +96,7 @@ impl McpArgs {
 
 pub async fn run(args: McpArgs, manager: &SandboxManager) -> Result<()> {
     match args.command {
-        McpCommand::Add(a) => add(a, manager),
+        McpCommand::Add(a) => add(a, manager).await,
         McpCommand::Run(a) => run_server(a, manager).await,
         McpCommand::Ls(a) => ls(a, manager),
         McpCommand::Rm(a) => rm(a),
@@ -114,7 +114,7 @@ fn project_dir() -> Result<PathBuf> {
 
 // ── add ─────────────────────────────────────────────────
 
-fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
+async fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
     registry::validate_name(&args.name)?;
     shim::validate_command(&args.command)?;
     let posture = args
@@ -171,6 +171,8 @@ fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
         warn_about_posture_on_a_project_box(manager, &entry, posture);
     }
 
+    warn_if_the_box_cannot_run_it(manager, &entry).await;
+
     println!("\nTell the agent to use it:");
     println!(
         "  claude mcp add {} -- devbox mcp run {}",
@@ -185,6 +187,101 @@ fn add(args: AddArgs, manager: &SandboxManager) -> Result<()> {
         args.name, args.name
     );
     Ok(())
+}
+
+/// The Nix set that would put `program` on a box's PATH.
+///
+/// The two that matter are `uvx` and `npx`: between them they launch most of
+/// the MCP servers anyone publishes, and neither is in a `--bare` box. Naming
+/// the set is the difference between "command not found" three days later,
+/// inside an agent's log, and a one-line fix now.
+fn set_that_provides(program: &str) -> Option<(&'static str, &'static str)> {
+    let program = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    let set = match program {
+        "uvx" | "uv" | "python" | "python3" | "pip" | "pip3" | "pipx" | "ruff" | "pyright"
+        | "ipython" | "pytest" => ("python", "uv, uvx and python3"),
+        "npx" | "node" | "npm" | "pnpm" | "bun" | "bunx" | "tsc" | "typescript" => {
+            ("node", "nodejs, npx, bun and pnpm")
+        }
+        "go" | "gofmt" => ("go", "the Go toolchain"),
+        "cargo" | "rustc" | "rustup" => ("rust", "the Rust toolchain"),
+        "java" | "javac" | "mvn" | "gradle" => ("java", "a JDK"),
+        "ruby" | "gem" | "bundle" | "bundler" => ("ruby", "Ruby and bundler"),
+        "docker" | "podman" | "docker-compose" => ("container", "docker and compose"),
+        "git" => ("git", "git"),
+        _ => return None,
+    };
+    Some(set)
+}
+
+/// Say now, not at the agent's first tool call, that the box has no `uvx`.
+///
+/// Only against a box that is already running: registering a server is not a
+/// reason to boot a VM, and an unstartable or absent box is not an error here
+/// — `mcp add` records an intention, and the box can be built afterwards.
+async fn warn_if_the_box_cannot_run_it(manager: &SandboxManager, entry: &McpEntry) {
+    let Some(program) = entry.command.first() else {
+        return;
+    };
+    let Some(box_name) = entry.box_name.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|dir| manager.name_from_dir(&dir))
+    }) else {
+        return;
+    };
+    let Ok(state) = manager.get_sandbox(&box_name) else {
+        return;
+    };
+    let Ok(runtime) = manager.runtime_for_sandbox(&state) else {
+        return;
+    };
+    if !matches!(
+        runtime.status(&box_name).await,
+        Ok(crate::runtime::SandboxStatus::Running)
+    ) {
+        return;
+    }
+
+    // `sh -lc` with the program as `$1`, so nothing about it is re-parsed —
+    // and a login shell, because a NixOS box keeps its tools on a PATH that
+    // only the profile sets.
+    let probe = [
+        "sh",
+        "-lc",
+        "command -v \"$1\" >/dev/null 2>&1",
+        "devbox-mcp-probe",
+        program,
+    ];
+    let found = tokio::time::timeout(
+        Duration::from_secs(30),
+        runtime.exec_cmd(&box_name, &probe, false),
+    )
+    .await;
+    // A probe that could not run says nothing about the box; only a clean
+    // "not found" is worth a warning.
+    let Ok(Ok(result)) = found else { return };
+    if result.exit_code == 0 {
+        return;
+    }
+
+    eprintln!(
+        "\n{} box '{box_name}' has no '{program}' on its PATH.",
+        "Warning:".yellow().bold()
+    );
+    match set_that_provides(program) {
+        Some((set, contents)) => {
+            eprintln!("  It comes with the '{set}' set ({contents}). Add it with:");
+            eprintln!("    devbox upgrade {box_name} --tools {set}");
+        }
+        None => {
+            eprintln!("  Install it in the box, or add the set that carries it:");
+            eprintln!("    devbox sets list {box_name}");
+        }
+    }
 }
 
 /// §7.2: posture is box-granular, so a posture on a shared box moves the whole
@@ -651,6 +748,19 @@ mod tests {
             .clone();
         let names: Vec<&str> = mcp.get_subcommands().map(|c| c.get_name()).collect();
         assert_eq!(names, ["add", "run", "ls", "rm"], "the mcp surface changed");
+    }
+
+    /// The two that decide whether a published MCP server can run at all.
+    #[test]
+    fn uvx_and_npx_name_the_set_that_carries_them() {
+        assert_eq!(set_that_provides("uvx").map(|s| s.0), Some("python"));
+        assert_eq!(set_that_provides("npx").map(|s| s.0), Some("node"));
+        // Registered as an absolute path, which is how a user pins one.
+        assert_eq!(
+            set_that_provides("/home/ethan/.local/bin/uvx").map(|s| s.0),
+            Some("python")
+        );
+        assert_eq!(set_that_provides("mcp-server-fetch"), None);
     }
 
     #[test]
