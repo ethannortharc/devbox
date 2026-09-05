@@ -555,6 +555,29 @@ pub async fn restore(
     Ok(())
 }
 
+/// Refuse to delete a checkpoint a run's report is built on.
+///
+/// The same rule [`prune_plan`] applies silently, said out loud: a run report
+/// cites its start and end checkpoints for the Files section, so deleting one
+/// leaves a report whose evidence is gone. `prune` can skip such a checkpoint
+/// because it is choosing what to drop; an explicit `checkpoint-rm` has been
+/// told which one, so the only honest answers are "no" and "if you insist".
+///
+/// Pure and over the record rather than over a guest, so the message — which
+/// is the whole point of the refusal — is testable.
+pub fn refuse_pinned_delete(box_name: &str, checkpoint: &Checkpoint) -> Result<()> {
+    let Some(run_id) = checkpoint.run_id.as_deref() else {
+        return Ok(());
+    };
+    // One literal, not a `\`-continued one: rustfmt rejoins a continued string
+    // and the continuation's indentation survives into the message.
+    bail!(
+        "Checkpoint {} belongs to run {run_id}, whose report cites it for what the run changed. Delete it with `devbox layer checkpoint-rm {} {box_name} --force`, or run `devbox report {run_id}` first to see what would be lost.",
+        checkpoint.id,
+        checkpoint.id,
+    );
+}
+
 /// Delete one checkpoint.
 pub async fn delete(runtime: &dyn Runtime, box_name: &str, id: &CheckpointId) -> Result<()> {
     let known = list(runtime, box_name).await?;

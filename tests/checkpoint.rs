@@ -8,8 +8,8 @@
 
 use devbox::obs::run::ActiveRun;
 use devbox::sandbox::checkpoint::{
-    Checkpoint, CheckpointId, diff_trees, parse_manifests, prune_plan, refuse_while_running,
-    resolve_id,
+    Checkpoint, CheckpointId, diff_trees, parse_manifests, prune_plan, refuse_pinned_delete,
+    refuse_while_running, resolve_id,
 };
 use devbox::sandbox::overlay::{
     ChangeStatus, EntryKind, OverlayChange, TreeEntry, parse_tree_listing,
@@ -505,6 +505,29 @@ fn a_checkpoint_pinned_to_a_run_is_never_pruned() {
     assert_eq!(doomed, vec!["01kfx9m2"]);
 }
 
+/// `checkpoint-rm` names one checkpoint, so it cannot skip a pinned one the
+/// way `prune` does — it has to say no.
+#[test]
+fn deleting_a_checkpoint_a_run_depends_on_is_refused() {
+    let pinned = manifest("01kfx9m1", Some("01kfx9m1zzzz"));
+    let error = refuse_pinned_delete("devtest", &pinned)
+        .expect_err("a run's evidence is not deleted by accident");
+    let message = error.to_string();
+    // The run id and the way out both have to be in the message: a refusal
+    // that does not say which run, or how to insist, sends the reader nowhere.
+    assert!(message.contains("01kfx9m1zzzz"), "{message}");
+    assert!(message.contains("--force"), "{message}");
+    assert!(message.contains("devtest"), "{message}");
+    // rustfmt rejoins a `\`-continued literal and leaves the continuation's
+    // indentation in the text; this is the assertion that notices.
+    assert!(!message.contains("  "), "{message}");
+}
+
+#[test]
+fn an_unpinned_checkpoint_is_deleted_without_argument() {
+    assert!(refuse_pinned_delete("devtest", &manifest("01kfx9m2", None)).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // The command line
 // ---------------------------------------------------------------------------
@@ -535,6 +558,7 @@ mod cli {
             vec!["layer", "checkpoints", "devtest"],
             vec!["layer", "diff", "devtest", "--from", "01kfx9"],
             vec!["layer", "restore", "01kfx9", "devtest"],
+            vec!["layer", "checkpoint-rm", "01kfx9", "devtest"],
         ] {
             assert_eq!(
                 layer(&argv).boxarg().name(),
@@ -547,6 +571,7 @@ mod cli {
             vec!["layer", "checkpoint", "--name", "devtest"],
             vec!["layer", "checkpoints", "--name", "devtest"],
             vec!["layer", "restore", "01kfx9", "--name", "devtest"],
+            vec!["layer", "checkpoint-rm", "01kfx9", "--name", "devtest"],
         ] {
             assert_eq!(
                 layer(&argv).boxarg().name(),
@@ -565,6 +590,32 @@ mod cli {
             None,
             "the lone positional is the checkpoint, not the box"
         );
+        assert_eq!(
+            layer(&["layer", "checkpoint-rm", "01kfx9"]).boxarg().name(),
+            None,
+            "the lone positional is the checkpoint, not the box"
+        );
+    }
+
+    /// `--force` is the whole difference between "delete this" and "delete
+    /// this even though a run report cites it", so it defaults to off.
+    #[test]
+    fn checkpoint_rm_needs_force_spelled_out() {
+        let LayerAction::CheckpointRm { id, force, boxarg } =
+            layer(&["layer", "checkpoint-rm", "01kfx9m2", "devtest"])
+        else {
+            panic!("not a checkpoint-rm");
+        };
+        assert_eq!(id, "01kfx9m2");
+        assert_eq!(boxarg.name(), Some("devtest"));
+        assert!(!force);
+
+        let LayerAction::CheckpointRm { force, .. } =
+            layer(&["layer", "checkpoint-rm", "01kfx9m2", "devtest", "--force"])
+        else {
+            panic!("not a checkpoint-rm");
+        };
+        assert!(force);
     }
 
     #[test]
