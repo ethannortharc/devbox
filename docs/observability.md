@@ -123,6 +123,44 @@ running guests for BTF, nftables, vsock/Unix-socket transport, the installed
 agent, the capture source and the file scope. The daemon log is
 `~/.devbox/logs/collector.log`.
 
+## Secrets that reach an argv
+
+Every runtime's exec API takes an argv and no environment, so devbox passes the
+broker's variables on the command line (`env -- K=V … cmd`) — the only form
+that works the same on Lima, Incus and Docker. The cost is that a box's own
+credentials appear in the `exec` events the agent captures, and therefore in
+the run report's process tree, in `report.json` and the JSON embedded in
+`report.html`, in `devbox watch --tree`, and in every export.
+
+They are redacted by **variable name**, in three places:
+
+| Where | Why there |
+|---|---|
+| The agent, before the event leaves the box (`agent/capture/redact.go`) | So nothing is written down. Counted in the agent's status file as `argv_redacted`; non-zero is normal on a box with a broker and says the rule ran. |
+| The collector, on arrival (`src/obs/redact.rs`) | An agent one release behind is the ordinary state of a box between upgrades. |
+| The store, on the way out | Rows written before any of this existed cannot be reached by the other two. Every read path — `watch`, the report, the console, every export, and the run's own recorded argv — decodes through one function, so a new consumer cannot forget. |
+
+The matched names: anything ending `_TOKEN`, `_SECRET`, `_KEY` or
+`_CREDENTIALS`; anything containing `PASSWORD`; the bare `TOKEN`, `SECRET`,
+`PASSWD`, `CREDENTIALS`; and the headers `Authorization`,
+`Proxy-Authorization`, `Cookie`, `Set-Cookie`, plus anything ending `-token`,
+`-key`, `-secret`, `-password`. The value becomes `***`. Matching is done
+*inside* a word rather than by splitting on the first `=`, because a runtime's
+outermost login shell carries the whole command — broker environment included —
+as one quoted argument, and that is the exact shape that put a live token into
+a report.
+
+A name-based rule accepts false positives: `SORT_KEY` loses its value. That is
+the trade the other direction cannot be made — a value-shaped rule misses the
+credential it has never seen before.
+
+Two things this is not. It is **not a containment boundary**: the box can read
+`/proc/*/cmdline` and see the same bytes, and the broker's token is per box and
+rotates at box start. And it does **not rewrite history**: an event recorded
+before this landed still holds the original bytes in its `raw` column on the
+host's own disk, and is redacted when it is read. What is protected is
+everything devbox renders — which is what leaves the machine.
+
 ## Run attribution
 
 A run is a command devbox started; attribution decides which events belong to
