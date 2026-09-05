@@ -2130,3 +2130,47 @@ agent, the scope carried in the handshake and shown by `doctor`) — dispatched
 as W2-0; and the summary should scan newest-first, to be done with track A.
 
 **Gate on `v5-main`** — 653 tests, clippy clean, Go clean, release build.
+
+## 2026-09-05T17:40Z — Runs are wired end to end; file events have a scope
+
+**Landed on `v5-main`.** `v5/broker` (credentials stay on the host: OS
+keychain, per-service reverse proxy, per-box rotating tokens, scopes,
+`credential` events; the v4 code that copied `.credentials.json`,
+`auth.json`, and a plaintext `~/.devbox-ai-env` into the guest is gone),
+`v5/file-scope` (the `openat` probe is filtered in the agent to
+`/workspace` and the user's home; the scope rides in the handshake and
+`doctor` prints it; 60 s of file events fell from 1,446 to 90), and `v5/run`
+with its integration wave: a run is bracketed by two checkpoints, its file
+changes come from the checkpoint diff rather than the box, bytes come from
+`close`, the broker environment rides inside the wrapper's argv,
+`behavior summary` scans newest-first, `export --run` resolves the run to a
+row-id range first (7 s → 12 ms), and a v4 store that could not be opened by
+the binary meant to migrate it now can.
+
+**Verified on `devtest`**, integrated binary, one command:
+
+```
+$ devbox run devtest --label int-check -- sh -c 'curl -s -o /dev/null https://example.com; echo hi > /workspace/int-check.txt; sleep 1'
+run 01M1S4M245XA0DBDZKR6CV8YGF · 1.5s · exit 0 · finished
+  files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
+  network  1 peers · 1 DNS · ↑1.9KB ↓6.3KB
+  process  23 in the tree
+  coverage full (ebpf+packet+netfilter) · 42 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1S4M245XA0DBDZKR6CV8YGF/report.html
+```
+
+That line is the v5 thesis in one screen: what the run wrote, who it talked
+to and how much, what it spawned, and how much of that the collector actually
+saw.
+
+**Gate** — 767 tests, clippy clean, Go clean, release build.
+
+**Process notes.** Merging two branches that each added a field to `Event`
+compiled the library and not the tests, and the gate's pipeline swallowed
+the compile error; the gate runs under `pipefail` now. Two executors
+replacing the same box's agent in parallel stacked bind mounts on each
+other; agent-replacing tasks get one box each from here on.
+
+**Next.** W2-2 (`mcp run` as a run, `mcp report`, `mcp self`), W2-3 (the
+sweep of small gaps each track left), then docs, README, screenshot,
+ADRs 0059+, version 0.2.0 and a release.
