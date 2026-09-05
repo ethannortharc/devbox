@@ -236,12 +236,15 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
             // previous blanket RFC 1918 exemption let an isolated box reach
             // the home or corporate LAN behind it, which is egress by any
             // reading.
-            for prefix in &ctx.lab_prefixes {
+            for prefix in &ctx.declared_prefixes {
                 let family = if prefix.contains(':') { "ip6" } else { "ip" };
                 let _ = writeln!(nft, "    {family} daddr {prefix} accept");
             }
-            if ctx.lab_prefixes.is_empty() {
-                let _ = writeln!(nft, "    # no lab on this box: loopback only");
+            if ctx.declared_prefixes.is_empty() {
+                let _ = writeln!(
+                    nft,
+                    "    # no declared private prefixes on this box: loopback only"
+                );
             }
             emit_block_log(nft);
         }
@@ -336,10 +339,10 @@ pub const ALLOW_TTL_SECS: u64 = 3600;
 pub struct Context {
     /// The resolvers this box is configured to use, from `/etc/resolv.conf`.
     pub resolvers: Vec<String>,
-    /// Prefixes a product running in this box has declared as its own, read
-    /// from `/etc/devbox/lab/*/prefixes` (ADR-0046). Kept under that name
-    /// because the on-guest path is the published contract.
-    pub lab_prefixes: Vec<String>,
+    /// Private prefixes a service running in this box has declared as its own,
+    /// read from `/etc/devbox/prefixes/*` (ADR-0046). Empty unless something
+    /// in the box wrote them there, which is the strict reading.
+    pub declared_prefixes: Vec<String>,
     /// Networks nested containers send from.
     ///
     /// Retained for the allow-set seeding; the forward chain no longer keys on
@@ -649,7 +652,7 @@ mod tests {
         // into namespaces.
         let ctx = Context {
             resolvers: vec!["192.0.2.53".into()],
-            lab_prefixes: vec!["10.99.0.0/16".into()],
+            declared_prefixes: vec!["10.99.0.0/16".into()],
             ..Default::default()
         };
         let nft = ruleset_with(&policy(Posture::Allowlist, &["10.0.0.0/8"]), &ctx);
@@ -991,9 +994,9 @@ mod tests {
     }
 
     #[test]
-    fn isolated_permits_this_labs_subnets_and_no_others() {
+    fn isolated_permits_the_declared_prefixes_and_no_others() {
         let ctx = Context {
-            lab_prefixes: vec!["10.99.0.0/16".into()],
+            declared_prefixes: vec!["10.99.0.0/16".into()],
             ..Default::default()
         };
         let nft = ruleset_with(&policy(Posture::Isolated, &[]), &ctx);
@@ -1008,14 +1011,14 @@ mod tests {
     }
 
     #[test]
-    fn isolated_without_a_lab_permits_nothing_beyond_loopback() {
+    fn isolated_without_a_declared_prefix_permits_nothing_beyond_loopback() {
         let nft = ruleset(&policy(Posture::Isolated, &[]));
         let chain = nft.split("chain output {").nth(1).unwrap();
         assert!(
             chain.contains("127.0.0.0/8 accept"),
             "loopback is not egress"
         );
-        assert!(chain.contains("no lab on this box"));
+        assert!(chain.contains("no declared private prefixes on this box"));
         assert!(!chain.contains("10.0.0.0/8"));
     }
 

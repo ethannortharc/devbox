@@ -163,7 +163,7 @@ Observation becomes governance. Four postures:
 | `open` | Nothing blocked. With an allowlist set, out-of-policy connections are **flagged** — the useful first step. |
 | `allowlist` | Default-deny. Only listed domains and CIDRs. A bare `github.com` covers its subdomains; `evilgithub.com` is not a subdomain. |
 | `mirror-only` | Package mirrors and git hosts only. `pip`, `npm`, `cargo`, `nix` work; nothing phones home. |
-| `isolated` | No egress. Loopback and the private ranges a product running in the box has declared as its own — including for hosts you explicitly allowlisted. |
+| `isolated` | No egress. Loopback only, plus any private prefixes a service hosted in the box declares under `/etc/devbox/prefixes/` — this overrides hosts you explicitly allowlisted. |
 
 ```bash
 devbox policy set mirror-only

@@ -431,19 +431,26 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         resolvers.extend(upstream.into_iter().filter(|r| !is_loopback_resolver(r)));
     }
 
-    // Hosted prefixes: anything that stands subnets up inside a box writes
-    // them to /etc/devbox/lab/<name>/prefixes on the way up and removes them
-    // on teardown. Reading that directory here is the whole handoff
-    // (ADR-0046):
-    // the ruleset generator runs on the host and has no other way to learn
-    // those subnets exist. The path is the contract, so it does not move.
+    // Declared prefixes: a service that stands subnets up inside a box writes
+    // them under /etc/devbox/prefixes/ on the way up — one file per owner, one
+    // CIDR per line — and removes its file on teardown. Reading that directory
+    // here is the whole handoff (ADR-0046): the ruleset generator runs on the
+    // host and has no other way to learn those subnets exist.
     //
-    // A box that declares none gets none, and `isolated` then means loopback
-    // only — which is what the posture says.
-    let lab_prefixes = runtime
+    // The glob is the contract. With no directory, or an empty one, `sh` passes
+    // the pattern through unmatched and `cat` exits 1 (measured, not assumed —
+    // `2>/dev/null` hides the message, not the status). The `exit_code == 0`
+    // filter below turns that into an empty list, which is the answer we want:
+    // a box that declares nothing gets nothing, and `isolated` then means
+    // loopback only, which is what the posture says.
+    //
+    // Failing to empty is also the safe direction for a *partial* failure. An
+    // unreadable entry loses every prefix in the directory, not just its own,
+    // so the ruleset gets stricter rather than accidentally permissive.
+    let declared_prefixes = runtime
         .exec_cmd(
             sandbox_name,
-            &["sh", "-c", "cat /etc/devbox/lab/*/prefixes 2>/dev/null"],
+            &["sh", "-c", "cat /etc/devbox/prefixes/* 2>/dev/null"],
             false,
         )
         .await
@@ -481,7 +488,7 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
 
     super::nftables::Context {
         resolvers,
-        lab_prefixes,
+        declared_prefixes,
         container_prefixes,
         internal_ifaces,
     }
