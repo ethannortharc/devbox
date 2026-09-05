@@ -119,35 +119,89 @@ impl Stop {
     }
 }
 
-/// The guest-side wrapper.
+/// Read this process's group id, in POSIX sh, on Linux and on macOS.
 ///
-/// `sh -c SCRIPT devbox-mcp <pgid-file> <argv...>`: record the process group
-/// the box gave this ssh channel, then `exec` the real command into it, so the
-/// pid that ends up running the server is the one the file describes and the
-/// group covers everything the server itself spawns (`uvx` → `python`, `npx` →
-/// `node`).
+/// `/proc/self/stat` where there is a `/proc`, `ps` where there is not. The
+/// second half is not padding: the test that covers reaping used to skip
+/// itself on macOS for want of `/proc`, so the first time this code ran on
+/// Linux was on CI, and what it did there was kill `cargo test`.
 ///
-/// Recording is best effort — a guest without `/proc` writes nothing and the
-/// shim falls back to closing the transport, which is enough for any server
-/// that reads its stdin.
-const GUEST_WRAPPER: &str = "read -r _ _ _ _ g _ < /proc/self/stat 2>/dev/null && \
-printf '%s' \"$g\" > \"$1\" 2>/dev/null; shift; exec \"$@\"";
+/// The braces matter. `read … < /proc/self/stat 2>/dev/null` redirects the
+/// *input* first, so a missing `/proc` is reported by the shell before the
+/// `2>/dev/null` that was meant to silence it — which on macOS put
+/// `devbox-mcp-reap: /proc/self/stat: No such file or directory` into every
+/// MCP session's log. Redirecting the group covers the redirection too.
+const READ_PGID: &str = "g=$({ read -r _ _ _ _ p _ < /proc/self/stat && \
+printf '%s' \"$p\"; } 2>/dev/null) || g=; \
+[ -n \"$g\" ] || g=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')";
 
-/// Kill the process group recorded by [`GUEST_WRAPPER`], then remove the file.
+/// The guest-side wrapper, stage 1: be certain we own a process group.
 ///
-/// One line, like the wrapper, because both of these are `exec`ed inside the
-/// box and therefore appear verbatim in `devbox watch --type exec`. A
-/// ten-line script renders as ten lines of shell in the audit of every MCP
-/// session, which buries the events the audit is for.
+/// `sh -c STAGE1 devbox-mcp <pgid-file> STAGE2 <argv...>`.
+///
+/// The shim asks the OS for a new group when it spawns us
+/// (`CommandExt::process_group`), and this checks that it worked instead of
+/// assuming it. The check is `pgid == $$`: a process that is its own group
+/// leader has a group nothing else is in, and a process that is not never
+/// has. Where the check fails and `setsid` exists we make our own — `setsid`
+/// does not fork when its caller is not already a group leader, which is
+/// exactly the case we reach it in, so the pid survives and the shim goes on
+/// tracking the process it spawned.
+///
+/// This matters because the number the next stage records is later handed to
+/// `kill`. A group id that is not ours alone is an instruction to kill
+/// somebody else's processes.
+const GUEST_WRAPPER_STAGE1: &str = "f=$1; s=$2; shift 2; PGID_READ; \
+if [ \"$g\" != \"$$\" ] && command -v setsid >/dev/null 2>&1; then \
+exec setsid sh -c \"$s\" devbox-mcp \"$f\" \"$@\"; fi; \
+exec sh -c \"$s\" devbox-mcp \"$f\" \"$@\"";
+
+/// Stage 2: record the group — but only if it is ours — then become the server.
+///
+/// Writing nothing is an answer, not a failure to have one. It tells the host
+/// there is no group it may reap, and the host then confines itself to the one
+/// process it can name. Fewer processes cleaned up is a bug; the wrong
+/// processes killed is an outage.
+const GUEST_WRAPPER_STAGE2: &str = "f=$1; shift; PGID_READ; \
+if [ \"$g\" = \"$$\" ]; then printf '%s' \"$g\" > \"$f\" 2>/dev/null; fi; exec \"$@\"";
+
+/// Kill the process group stage 2 recorded, then remove the file.
+///
+/// One line, like the wrapper, because both are `exec`ed inside the box and
+/// therefore appear verbatim in `devbox watch --type exec`. A ten-line script
+/// renders as ten lines of shell in the audit of every MCP session.
 ///
 /// TERM first, KILL only if the group is still there five seconds later: an
-/// MCP server that is mid-write to a file it owns deserves the same courtesy
-/// as any other process.
+/// MCP server mid-write to a file it owns deserves the same courtesy as any
+/// other process.
+///
+/// The first thing it does is refuse to signal its own group **or its
+/// parent's**. Inside the box neither can be the recorded one — the reaper
+/// arrives down a fresh exec, in a session of its own — but the same script
+/// runs in-process in the tests, where its group *is* the harness's. The
+/// parent's group is checked too because "my own group" stops being enough
+/// the moment some caller runs the reaper in a group of its own: the thing
+/// that must not be killed is whoever asked for the cleanup, and that is the
+/// parent whether or not we share a group with it.
 const GUEST_REAPER: &str = "p=$(cat \"$1\" 2>/dev/null); rm -f \"$1\" 2>/dev/null; \
-case \"$p\" in ''|*[!0-9]*) exit 0;; esac; kill -0 -$p 2>/dev/null || exit 0; \
+case \"$p\" in ''|*[!0-9]*) exit 0;; esac; PGID_READ; \
+pp=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' '); \
+pg=; [ -n \"$pp\" ] && pg=$(ps -o pgid= -p \"$pp\" 2>/dev/null | tr -d ' '); \
+if [ \"$p\" = \"$g\" ] || { [ -n \"$pg\" ] && [ \"$p\" = \"$pg\" ]; }; then \
+echo \"devbox: refusing to signal process group $p — it is mine or my parent's\" >&2; exit 2; fi; \
+kill -0 -$p 2>/dev/null || exit 0; \
 kill -TERM -$p 2>/dev/null; i=0; \
 while [ $i -lt 25 ] && kill -0 -$p 2>/dev/null; do sleep 0.2; i=$((i+1)); done; \
 kill -0 -$p 2>/dev/null && kill -KILL -$p 2>/dev/null; exit 0";
+
+/// The three scripts with `PGID_READ` expanded.
+///
+/// A `const` cannot call `str::replace`, and the alternative — writing the
+/// same eight-word incantation into three scripts — is how two of them end up
+/// reading a different field from the third.
+fn script(template: &str) -> String {
+    template.replace("PGID_READ", READ_PGID)
+}
 
 /// `$0` for the wrapper's shell, and for the reaper's, so `ps` says what they
 /// are — and so [`is_wrapper_command`] can recognise them without matching on
@@ -182,8 +236,12 @@ pub fn is_wrapper_command(argv: &[String]) -> bool {
     if word(3) == WRAPPER_ARGV0 || word(3) == REAPER_ARGV0 {
         return true;
     }
-    argv.iter()
-        .any(|a| a == GUEST_WRAPPER || a == GUEST_REAPER || a.starts_with(PGID_PATH_PREFIX))
+    argv.iter().any(|a| {
+        a == &script(GUEST_WRAPPER_STAGE1)
+            || a == &script(GUEST_WRAPPER_STAGE2)
+            || a == &script(GUEST_REAPER)
+            || a.starts_with(PGID_PATH_PREFIX)
+    })
 }
 
 /// The argv to hand [`crate::runtime::Runtime::argv`] for a registered server.
@@ -198,9 +256,10 @@ where
     let mut argv = vec![
         "sh".to_string(),
         "-c".to_string(),
-        GUEST_WRAPPER.to_string(),
+        script(GUEST_WRAPPER_STAGE1),
         WRAPPER_ARGV0.to_string(),
         pgid_file.to_string(),
+        script(GUEST_WRAPPER_STAGE2),
     ];
     let assignments: Vec<String> = env
         .into_iter()
@@ -219,7 +278,7 @@ pub fn reaper_script(pgid_file: &str) -> Vec<String> {
     vec![
         "sh".to_string(),
         "-c".to_string(),
-        GUEST_REAPER.to_string(),
+        script(GUEST_REAPER),
         REAPER_ARGV0.to_string(),
         pgid_file.to_string(),
     ]
@@ -352,30 +411,105 @@ async fn settle(
         return (status.ok(), false);
     }
     if let Some(pid) = pid {
-        signal_group(pid, "TERM");
-        if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-            return (status.ok(), true);
+        // The child's pid *is* its group id, because the shim asked for a new
+        // group when it spawned it and the wrapper verified that it got one.
+        // If the guard below refuses, the group is not ours to signal and the
+        // fall-through — killing the one process we can name — is all that is
+        // left. Saying so is the point: a shim that quietly cleans up less
+        // than it promised is how orphans become somebody's afternoon.
+        match signal_group(pid, libc::SIGTERM) {
+            Ok(()) => {
+                if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await
+                {
+                    return (status.ok(), true);
+                }
+                if let Err(error) = signal_group(pid, libc::SIGKILL) {
+                    eprintln!("devbox mcp: {error}");
+                }
+            }
+            Err(error) => eprintln!("devbox mcp: {error}"),
         }
-        signal_group(pid, "KILL");
     }
     let _ = child.start_kill();
     (child.wait().await.ok(), true)
 }
 
-/// Signal the child's whole process group.
+/// This process's own group id.
+pub fn own_process_group() -> i32 {
+    // SAFETY: `getpgrp` takes no arguments, touches no memory, and cannot fail.
+    unsafe { libc::getpgrp() }
+}
+
+/// The process group of whoever started us, when it can be read.
 ///
-/// Through `kill(1)` rather than `killpg(2)`: devbox does not depend on
-/// `libc`, and this is the shutdown path — one bounded subprocess, on a code
-/// path that runs once per MCP session. If a future change brings `libc` in
-/// for other reasons, this is the first thing that should use it.
-fn signal_group(pid: i32, signal: &str) {
-    let _ = std::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// `getppid` is exact; turning a ppid into its group needs `getpgid`, which
+/// returns `ESRCH` if the parent has already gone — a `None` this treats as
+/// "nothing to protect", because a parent that has exited cannot be killed.
+fn parent_process_group() -> Option<i32> {
+    // SAFETY: neither call takes a pointer, and `getpgid` reports failure
+    // through its return value rather than through memory.
+    let parent = unsafe { libc::getppid() };
+    if parent <= 0 {
+        return None;
+    }
+    let group = unsafe { libc::getpgid(parent) };
+    (group > 0).then_some(group)
+}
+
+/// Signal a process group, refusing the ones that are not safe to name.
+///
+/// Three refusals, and each of them has a way of being reached:
+///
+/// - **`0`** means "the sender's own group" to `kill(2)`. A zero that reached
+///   here would take out the shim, its parent, and everything sharing their
+///   group, and it would do it while looking like an ordinary cleanup.
+/// - **`1`** is `init`'s group, and `kill(-1, …)` is "every process this user
+///   may signal".
+/// - **our own group**, which is the same disaster as `0` reached the long way
+///   round. It is not hypothetical: on a Linux CI runner this function's
+///   predecessor sent SIGTERM to a group that turned out to contain
+///   `cargo test`, and the whole step died with 143.
+///
+/// Through `killpg(2)` rather than `kill(1)`: the shell tool differs between
+/// procps, util-linux and BSD, needs a PATH lookup on the shutdown path, and
+/// puts a whole subprocess spawn between deciding to signal and signalling —
+/// which is exactly the window a reaped-and-recycled pid needs to become
+/// somebody else's.
+fn signal_group(pgid: i32, signal: i32) -> std::result::Result<(), String> {
+    if pgid <= 1 {
+        return Err(format!(
+            "refusing to signal process group {pgid}: it names this process's own \
+             group or every process on the host"
+        ));
+    }
+    let ours = own_process_group();
+    if pgid == ours {
+        return Err(format!(
+            "refusing to signal process group {pgid}: it is the group this shim is \
+             in, so the signal would come back to us"
+        ));
+    }
+    // And our parent's, for the case our own group is not the caller's: a shim
+    // that someone launched into a group of its own would pass the check above
+    // while still being able to signal the process that launched it.
+    if let Some(parent) = parent_process_group()
+        && pgid == parent
+    {
+        return Err(format!(
+            "refusing to signal process group {pgid}: it is the group of the process \
+             that started this shim"
+        ));
+    }
+    // SAFETY: `killpg` takes two integers and cannot write through a pointer.
+    // A group that has already gone is `ESRCH`, which is the normal outcome of
+    // cleaning up after something that cleaned up after itself.
+    if unsafe { libc::killpg(pgid, signal) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("could not signal process group {pgid}: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// The code the agent sees.
@@ -806,11 +940,13 @@ mod tests {
         let command = vec!["uvx".to_string(), "mcp-server-fetch".to_string()];
         let env = std::collections::BTreeMap::new();
         let argv = wrap_guest_command("/tmp/x.pgid", env.iter(), &command);
+        // sh -c <stage 1> devbox-mcp <pgid file> <stage 2> <command…>
         assert_eq!(&argv[..2], &["sh".to_string(), "-c".to_string()]);
         assert_eq!(argv[3], "devbox-mcp");
         assert_eq!(argv[4], "/tmp/x.pgid");
-        assert_eq!(&argv[5..], &command[..]);
-        assert!(argv[2].contains("exec \"$@\""), "{}", argv[2]);
+        assert_eq!(&argv[6..], &command[..]);
+        assert!(argv[2].contains("exec setsid"), "stage 1: {}", argv[2]);
+        assert!(argv[5].contains("exec \"$@\""), "stage 2: {}", argv[5]);
     }
 
     /// Both guest snippets are `exec`ed inside the box, so they are printed
@@ -818,7 +954,12 @@ mod tests {
     /// session pushes the events the audit is for off the screen.
     #[test]
     fn the_guest_snippets_are_one_line_each() {
-        for (what, script) in [("wrapper", GUEST_WRAPPER), ("reaper", GUEST_REAPER)] {
+        for (what, script) in [
+            ("wrapper stage 1", GUEST_WRAPPER_STAGE1),
+            ("wrapper stage 2", GUEST_WRAPPER_STAGE2),
+            ("reaper", GUEST_REAPER),
+            ("pgid read", READ_PGID),
+        ] {
             assert!(
                 !script.contains('\n'),
                 "the guest {what} spans lines and will do so in every audit:\n{script}"
@@ -834,20 +975,15 @@ mod tests {
             "a value with $HOME and 'quotes'".to_string(),
         );
         let argv = wrap_guest_command("/tmp/x.pgid", env.iter(), &["srv".to_string()]);
-        assert_eq!(argv[5], "env");
-        assert_eq!(argv[6], "A=a value with $HOME and 'quotes'");
-        assert_eq!(argv[7], "srv");
+        assert_eq!(argv[6], "env");
+        assert_eq!(argv[7], "A=a value with $HOME and 'quotes'");
+        assert_eq!(argv[8], "srv");
     }
 
     /// The wrapper and the reaper agree on where the process group id lives,
     /// and the pair works against a real process group.
     #[tokio::test]
     async fn the_wrapper_records_a_group_the_reaper_can_kill() {
-        if !Path::new("/proc/self/stat").exists() {
-            // The wrapper reads Linux `/proc`; every devbox guest is Linux,
-            // but the host running this test need not be.
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let pgid_file = dir.path().join("run.pgid");
         let argv = wrap_guest_command(
@@ -871,11 +1007,23 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let recorded = std::fs::read_to_string(&pgid_file).unwrap();
+        let recorded: i32 = std::fs::read_to_string(&pgid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(
-            recorded.trim().parse::<i32>().unwrap(),
+            recorded,
             child.id().unwrap() as i32,
             "the wrapper recorded a group that is not the child's"
+        );
+        // The assertion this file exists for. Everything else here is about
+        // whether cleanup works; this is about whom it works on.
+        assert_ne!(
+            recorded,
+            own_process_group(),
+            "the wrapper recorded the *test harness's* process group — reaping it \
+             would kill the process running this assertion"
         );
 
         let reaper = reaper_script(pgid_file.to_str().unwrap());
@@ -931,6 +1079,94 @@ mod tests {
             done.load(std::sync::atomic::Ordering::SeqCst),
             "the drain gave up on a task that was about to finish"
         );
+    }
+
+    /// The failure itself, staged: spawn the wrapper *without* giving it a
+    /// group of its own, exactly as a caller who forgot would.
+    ///
+    /// The old wrapper recorded whatever group it landed in — its caller's —
+    /// and the reaper then killed it. Now the wrapper either makes itself a
+    /// group (`setsid`, where there is one) or records nothing, and either way
+    /// the number the reaper is handed can no longer be the caller's.
+    #[tokio::test]
+    async fn a_wrapper_denied_its_own_group_never_records_the_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pgid_file = dir.path().join("run.pgid");
+        let argv = wrap_guest_command(
+            pgid_file.to_str().unwrap(),
+            std::collections::BTreeMap::new().iter(),
+            &["sleep".to_string(), "5".to_string()],
+        );
+        // No `.process_group(0)`. This is the whole point of the test.
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..60 {
+            if pgid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if pgid_file.exists() {
+            let recorded: i32 = std::fs::read_to_string(&pgid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // `setsid` was available, so the wrapper made itself a group.
+            assert_ne!(
+                recorded,
+                own_process_group(),
+                "the wrapper recorded its caller's group"
+            );
+        }
+        // Whatever it recorded or did not, the reaper must not turn it into a
+        // signal aimed at us.
+        let reaper = reaper_script(pgid_file.to_str().unwrap());
+        let out = Command::new(&reaper[0])
+            .args(&reaper[1..])
+            .output()
+            .await
+            .unwrap();
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "the reaper had to refuse, which means the wrapper recorded us: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = child.start_kill();
+    }
+
+    /// The guard that makes the CI failure impossible rather than unlikely.
+    #[test]
+    fn the_shim_refuses_to_signal_a_group_that_would_include_itself() {
+        for (pgid, why) in [
+            (0, "0 means the sender's own group"),
+            (1, "1 is init and -1 is everything"),
+            (own_process_group(), "our own group"),
+        ]
+        .into_iter()
+        .chain(parent_process_group().map(|g| (g, "our parent's group")))
+        {
+            let error = signal_group(pgid, libc::SIGTERM)
+                .expect_err(&format!("signalling {pgid} was accepted, and {why}"));
+            assert!(error.contains("refusing"), "{error}");
+        }
+    }
+
+    /// A group that has already gone is the normal end of a cleanup, not an
+    /// error to report at the user.
+    #[test]
+    fn signalling_a_group_that_has_already_gone_is_not_an_error() {
+        // A pgid that cannot be live: `pid_max` is at most 2^22 on Linux and
+        // 99999 on macOS.
+        signal_group(0x7fff_fffe, libc::SIGTERM).expect("ESRCH is success here");
     }
 
     #[test]

@@ -32,6 +32,12 @@ thiserror = "2"
 
 # Utilities
 dirs = "6"
+# Only for process-group control in `mcp::shim`. Signalling a process *group*
+# has no safe shell equivalent: `kill(1)` differs between procps, util-linux
+# and BSD, needs a PATH lookup on the shutdown path, and puts a whole
+# subprocess spawn between deciding to signal and signalling — which is the
+# window a recycled pid needs. `killpg(2)` and `getpgrp(2)` are two calls.
+libc = "0.2"
 which = "7"
 base64 = "0.22"
 axum = { version = "0.8.9", features = ["ws", "macros"] }
