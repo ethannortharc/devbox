@@ -364,8 +364,9 @@ fn the_markdown_report_states_every_fact_it_was_built_from() {
         "curl [901] curl -s https://example.com",
         // policy
         "| `10.1.2.3:22` | block | not in allowlist |",
-        // and the thing that must never read as "no credentials were used"
-        "Not recorded — the credential broker is not wired in this build.",
+        // The broker is wired now, so an empty section is a fact about the
+        // run rather than a fact about the build.
+        "No credential use recorded.",
     ] {
         assert!(
             report.contains(expected),
@@ -451,6 +452,137 @@ fn a_connection_the_window_did_not_see_start_is_still_reported() {
     assert_eq!(row.closes, 1);
     assert_eq!(row.bytes_rx, 4096);
     assert_eq!(row.conns_human(), "0 (+1 closed)", "and it says so");
+}
+
+#[test]
+fn the_renderers_show_what_the_overlay_and_the_broker_saw() {
+    use devbox::obs::event::{Credential, File as FileDetail};
+
+    let mut events = Vec::new();
+    // A run that installed something: nothing in the workspace, a lot in a
+    // cache the overlay does not carry. Before this section such a run read
+    // "No file changes", which is true of the workspace and false of the box.
+    for i in 0..12 {
+        let mut write = base(
+            EventType::File,
+            ROOT_PID,
+            1,
+            CGROUP,
+            "2026-09-05T10:00:00.400Z",
+        );
+        write.file = Some(FileDetail {
+            path: format!("/home/dev/.cache/uv/wheel-{i}.whl"),
+            op: "write".into(),
+            flags: 0,
+        });
+        events.push(write);
+    }
+    // The wrapper's own exec, which is where `$HOME` comes from and which the
+    // process tree must fold away.
+    let mut wrapper = base(
+        EventType::Exec,
+        ROOT_PID,
+        1,
+        CGROUP,
+        "2026-09-05T10:00:00.000Z",
+    );
+    wrapper.exec = Some(Exec {
+        path: "/bin/sh".into(),
+        argv: vec![
+            "/bin/sh".into(),
+            format!("/tmp/.devbox-run-{RUN}.sh"),
+            "--devbox-scoped".into(),
+            "systemd-user".into(),
+            RUN.into(),
+            format!("/run/devbox/runs/{RUN}.json"),
+            "/workspace".into(),
+            "/home/dev".into(),
+            "dev".into(),
+            "uv".into(),
+            "sync".into(),
+        ],
+        cwd: "/workspace".into(),
+    });
+    events.push(wrapper);
+
+    let mut user = base(
+        EventType::Exec,
+        950,
+        ROOT_PID,
+        CGROUP,
+        "2026-09-05T10:00:00.100Z",
+    );
+    user.comm = "uv".into();
+    user.exec = Some(Exec {
+        path: "/bin/uv".into(),
+        argv: vec!["uv".into(), "sync".into()],
+        cwd: "/workspace".into(),
+    });
+    events.push(user);
+
+    // Two broker requests, one refused. These have no pid at all.
+    for (verdict, ts) in [
+        ("allowed", "2026-09-05T10:00:00.600Z"),
+        ("denied", "2026-09-05T10:00:00.700Z"),
+    ] {
+        let mut credential = base(EventType::Credential, u32::MAX, 0, 0, ts);
+        credential.comm = "broker".into();
+        credential.credential = Some(Credential {
+            provider: "anthropic".into(),
+            method: "POST".into(),
+            host: "api.anthropic.com".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+            verdict: verdict.into(),
+            ..Default::default()
+        });
+        events.push(credential);
+    }
+
+    let report = RunReport::build(
+        record(),
+        &events,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let text = markdown::render(&report);
+
+    for expected in [
+        // The overlay saw nothing; the box saw twelve wheels.
+        "No changes to the workspace overlay.",
+        "### Writes outside the workspace overlay",
+        "| `~/.cache/uv` | 12 | 12 |",
+        "not part of what `devbox commit` would sync",
+        // The broker's two requests, grouped, with the refusal called out.
+        "| `anthropic` | `api.anthropic.com` | POST | 2 (1 denied) | 2026-09-05T10:00:00.700Z |",
+        // And the wrapper is one line, with the user's command as the root.
+        "devbox [900] [devbox wrapper]",
+        "uv [950] uv sync",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the report does not say {expected:?}\n---\n{text}"
+        );
+    }
+    // The wrapper's argv must not survive anywhere in the rendered tree.
+    let tree = text
+        .split("## Processes")
+        .nth(1)
+        .and_then(|s| s.split("## Credentials").next())
+        .expect("a process section");
+    assert!(
+        !tree.contains("--devbox-scoped"),
+        "the wrapper's argv is still in the tree:\n{tree}"
+    );
+
+    // The HTML says the same things.
+    let page = html::render(&report).unwrap();
+    assert!(page.contains("~/.cache/uv"));
+    assert!(page.contains("api.anthropic.com"));
+    assert!(page.contains("[devbox wrapper]"));
+    assert!(!page.contains("not wired in this build"));
 }
 
 #[test]

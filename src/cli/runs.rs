@@ -27,6 +27,13 @@ pub struct RunsArgs {
 
 pub async fn run(args: RunsArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.boxarg.name())?;
+    // "No event store yet" reads as "this box has not been observed", which is
+    // the wrong thing to tell someone whose box was destroyed — and after
+    // `destroy` removes the reports as well, it is the *only* thing left to
+    // tell them. Say which of the two it is.
+    if !manager.sandbox_exists(&name) {
+        anyhow::bail!("Box '{name}' not found.");
+    }
     let path = store_path(&manager.state_dir, &name);
     if !path.exists() {
         println!("Box '{name}' has no event store yet, so no runs.");

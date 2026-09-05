@@ -157,7 +157,8 @@ fn files(out: &mut String, report: &RunReport) {
     out.push_str("## Files\n\n");
     out.push_str(&format!("_scope: {}_\n\n", report.files.scope));
     if report.files.is_empty() {
-        out.push_str("No file changes.\n\n");
+        out.push_str("No changes to the workspace overlay.\n\n");
+        outside(out, report);
         return;
     }
     out.push_str("| | path |\n|---|---|\n");
@@ -180,6 +181,27 @@ fn files(out: &mut String, report: &RunReport) {
         out.push_str(&format!(" (and {} directories)", report.files.directories));
     }
     out.push_str("\n\n");
+    outside(out, report);
+}
+
+/// Writes the overlay does not carry, which is most of what a package manager
+/// does.
+fn outside(out: &mut String, report: &RunReport) {
+    if !report.files.has_outside() {
+        return;
+    }
+    out.push_str("### Writes outside the workspace overlay\n\n");
+    out.push_str("| directory | writes | files |\n|---|---|---|\n");
+    for row in &report.files.outside {
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            row.prefix, row.writes, row.paths
+        ));
+    }
+    out.push_str(
+        "\nThese are inside the box's file scope but not part of what \
+`devbox commit` would sync.\n\n",
+    );
 }
 
 fn network(out: &mut String, report: &RunReport) {
@@ -260,17 +282,18 @@ fn processes(out: &mut String, report: &RunReport) {
 fn credentials(out: &mut String, report: &RunReport) {
     out.push_str("## Credentials\n\n");
     if report.credential_use.is_empty() {
-        // Not "none used". The broker does not exist yet in this build, and a
-        // report that says "no credentials" when nothing was watching is the
-        // single most misleading line it could print.
-        out.push_str("Not recorded — the credential broker is not wired in this build.\n\n");
+        out.push_str("No credential use recorded.\n\n");
         return;
     }
-    out.push_str("| credential | provider | uses | first |\n|---|---|---|---|\n");
-    for use_ in &report.credential_use {
+    out.push_str("| provider | upstream | method | uses | last |\n|---|---|---|---|---|\n");
+    for row in &report.credential_use {
         out.push_str(&format!(
-            "| `{}` | {} | {} | {} |\n",
-            use_.name, use_.provider, use_.uses, use_.first_use
+            "| `{}` | `{}` | {} | {} | {} |\n",
+            row.provider,
+            blank(&row.host),
+            blank(&row.method),
+            row.uses_human(),
+            row.last_use,
         ));
     }
     out.push('\n');

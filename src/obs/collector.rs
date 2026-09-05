@@ -901,18 +901,28 @@ pub fn store_path(state_dir: &Path, box_id: &str) -> PathBuf {
 /// guest cannot reach its audit record. That separation also means sandbox
 /// state removal cannot clean them implicitly; destroy must call this too or
 /// a later box with the same name inherits an unrelated timeline.
+///
+/// Two trees, for one reason. `boxes/<name>` is the event store and the
+/// capture health; `runs/<name>` is the rendered reports. Leaving the second
+/// behind left `devbox report <id>` answering for a box that no longer exists,
+/// and — because a report is found by id across every box — handing the next
+/// box created under that name a predecessor's evidence.
 pub fn remove_box_data(state_dir: &Path, box_id: &str) -> Result<()> {
     if !crate::sandbox::state::is_safe_name(box_id) {
         bail!("refusing to remove observability data for unsafe box name {box_id:?}");
     }
-    let directory = state_dir.join("boxes").join(box_id);
-    if directory.exists() {
-        std::fs::remove_dir_all(&directory).with_context(|| {
-            format!(
-                "failed to remove observability data at {}",
-                directory.display()
-            )
-        })?;
+    for directory in [
+        state_dir.join("boxes").join(box_id),
+        state_dir.join("runs").join(box_id),
+    ] {
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory).with_context(|| {
+                format!(
+                    "failed to remove observability data at {}",
+                    directory.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -958,10 +968,32 @@ mod tests {
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         std::fs::write(&database, b"old timeline").unwrap();
 
+        // The rendered reports too. A report is found by id across every box,
+        // so one left behind answers for a box that no longer exists — and
+        // hands the next box created under that name a predecessor's evidence.
+        let report = dir.path().join("runs").join("old-box").join("01ABC");
+        std::fs::create_dir_all(&report).unwrap();
+        std::fs::write(report.join("report.json"), b"{}").unwrap();
+
+        // A neighbour's, to prove the removal is scoped to the one box.
+        let neighbour = dir.path().join("runs").join("other-box").join("01DEF");
+        std::fs::create_dir_all(&neighbour).unwrap();
+        std::fs::write(neighbour.join("report.json"), b"{}").unwrap();
+
         remove_box_data(dir.path(), "old-box").unwrap();
         assert!(!database.exists());
+        assert!(
+            !dir.path().join("runs").join("old-box").exists(),
+            "the reports outlived the box they describe"
+        );
+        assert!(neighbour.join("report.json").exists());
+
         assert!(remove_box_data(dir.path(), "../escape").is_err());
         assert!(dir.path().exists());
+
+        // Idempotent: a destroy that already cleaned up, or a box that never
+        // produced a report, is not an error.
+        remove_box_data(dir.path(), "old-box").unwrap();
     }
 
     #[test]
