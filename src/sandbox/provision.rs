@@ -2267,23 +2267,78 @@ async fn detect_vm_username(runtime: &dyn Runtime, name: &str) -> String {
 }
 
 /// Detect the home directory for a given username inside the VM.
-/// Falls back to /home/{username}.
+///
+/// Asks the guest for three things in one command — who the shell is running
+/// as, what `$HOME` is, and what `/etc/passwd` says — because on Lima those
+/// last two disagree and the file everything reads is the one `$HOME` names.
+/// See [`pick_vm_home`] for which wins.
+///
+/// Markers rather than bare lines: this is a login shell, and a profile that
+/// prints a banner would otherwise be parsed as the answer.
 async fn detect_vm_home(runtime: &dyn Runtime, name: &str, username: &str) -> String {
+    let probe = format!(
+        "printf 'devbox-user=%s\\n' \"$(id -un 2>/dev/null)\"; \
+         printf 'devbox-home=%s\\n' \"$([ -d \"$HOME\" ] && echo \"$HOME\")\"; \
+         printf 'devbox-passwd=%s\\n' \"$(getent passwd {username} | cut -d: -f6)\""
+    );
     let result = runtime
-        .exec_cmd(
-            name,
-            &[
-                "bash",
-                "-lc",
-                &format!("getent passwd {username} | cut -d: -f6"),
-            ],
-            false,
-        )
+        .exec_cmd(name, &["bash", "-lc", &probe], false)
         .await;
-    match result {
-        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
-        _ => format!("/home/{username}"),
+    let stdout = match result {
+        Ok(r) => r.stdout,
+        Err(_) => String::new(),
+    };
+    let field = |key: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    pick_vm_home(
+        username,
+        &field("devbox-user="),
+        &field("devbox-home="),
+        &field("devbox-passwd="),
+    )
+}
+
+/// Which of the guest's two answers is the home devbox should write into.
+///
+/// The login shell's `$HOME` wins, when the shell is running as the user we
+/// asked about. Lima gives its guest user the *host's* uid and a home of
+/// `/home/<user>.guest` that the passwd entry does not name — measured on
+/// devtest, where `getent passwd ethan` says `/home/ethan` while every shell
+/// in the box has `HOME=/home/ethan.guest`, sshd finds `authorized_keys`
+/// under the latter, and provisioning had been writing `.gitconfig`, `.zshrc`
+/// and the AI tool settings into the former, where nothing ever read them.
+///
+/// The identity check is what makes this safe on the other runtimes: Incus and
+/// Docker exec as root, so their `$HOME` is `/root` and says nothing about the
+/// box user. There, `id -un` is not `username` and passwd — which is right on
+/// those runtimes — is used instead.
+///
+/// `shell_home` arrives empty unless the guest confirmed it is a directory —
+/// `write_file_to_vm` does not create parents, so a `$HOME` that does not
+/// exist yet would turn every settings write into a failure rather than into a
+/// misplaced file.
+///
+/// Pure, so the decision can be tested without a hypervisor; the probe above
+/// is the only part that needs one.
+fn pick_vm_home(username: &str, shell_user: &str, shell_home: &str, passwd_home: &str) -> String {
+    // A home becomes a path prefix for a dozen guest writes, so anything that
+    // is not a single absolute path is treated as no answer at all.
+    let usable =
+        |path: &str| path.starts_with('/') && path != "/" && path.split_whitespace().count() == 1;
+
+    if shell_user == username && usable(shell_home) {
+        return shell_home.to_string();
     }
+    if usable(passwd_home) {
+        return passwd_home.to_string();
+    }
+    format!("/home/{username}")
 }
 
 // Overlay mount is now handled declaratively by devbox-module.nix via
@@ -2295,6 +2350,51 @@ async fn detect_vm_home(runtime: &dyn Runtime, name: &str, username: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured from devtest (Lima 2.x, vmType vz, NixOS): the guest user has
+    /// the host's uid 501, so passwd and the shell disagree about home and the
+    /// shell is the one that is right.
+    #[test]
+    fn lima_home_comes_from_the_login_shell_not_from_passwd() {
+        assert_eq!(
+            pick_vm_home("ethan", "ethan", "/home/ethan.guest", "/home/ethan"),
+            "/home/ethan.guest",
+        );
+    }
+
+    /// Incus and Docker exec as root, so `$HOME` is `/root` and describes the
+    /// exec, not the box user. Preferring it there would put the gitconfig and
+    /// every AI tool setting in root's home.
+    #[test]
+    fn a_root_exec_does_not_donate_its_home_to_the_box_user() {
+        assert_eq!(
+            pick_vm_home("dev", "root", "/root", "/home/dev"),
+            "/home/dev",
+        );
+    }
+
+    #[test]
+    fn passwd_is_the_fallback_when_the_shell_says_nothing_useful() {
+        // No `$HOME` at all, and a `$HOME` that is not one absolute path.
+        assert_eq!(pick_vm_home("dev", "dev", "", "/home/dev"), "/home/dev");
+        assert_eq!(pick_vm_home("dev", "dev", "/", "/home/dev"), "/home/dev");
+        assert_eq!(
+            pick_vm_home("dev", "dev", "/home/a b", "/home/dev"),
+            "/home/dev",
+        );
+        assert_eq!(
+            pick_vm_home("dev", "dev", "relative/path", "/home/dev"),
+            "/home/dev",
+        );
+    }
+
+    /// A box that answers nothing at all still gets a home rather than an
+    /// empty prefix that would turn `{home}/.gitconfig` into `/.gitconfig`.
+    #[test]
+    fn a_silent_box_falls_back_to_the_conventional_path() {
+        assert_eq!(pick_vm_home("dev", "", "", ""), "/home/dev");
+        assert_eq!(pick_vm_home("dev", "dev", "", "not-a-path"), "/home/dev");
+    }
 
     #[test]
     fn a_nonzero_guest_install_is_a_provisioning_error() {
