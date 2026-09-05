@@ -52,7 +52,8 @@ func readResolvers(path string) (map[netip.Addr]struct{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read DNS resolvers from %s: %w", path, err)
 	}
-	defer file.Close()
+	// Read-only; a failed close has nothing to tell the caller.
+	defer func() { _ = file.Close() }()
 
 	resolvers := make(map[netip.Addr]struct{})
 	scanner := bufio.NewScanner(file)

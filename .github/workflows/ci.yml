@@ -101,6 +101,9 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.13.2
+          # The eBPF loader and its generated bindings are behind the tag;
+          # lint them too, now that the CO-RE pairs are committed.
+          args: --build-tags=ebpf
 
   ebpf:
     name: eBPF (privileged Linux)

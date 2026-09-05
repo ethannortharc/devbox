@@ -31,7 +31,8 @@ func CapturePCAP(ctx context.Context, filter PCAPFilter, out io.Writer) (int, er
 	if err != nil {
 		return 0, fmt.Errorf("open flow capture (CAP_NET_RAW is required): %w", err)
 	}
-	defer unix.Close(fd)
+	// The socket only ever received; a failed close cannot lose captured data.
+	defer func() { _ = unix.Close(fd) }()
 	if err := writePCAPHeader(out); err != nil {
 		return 0, err
 	}
