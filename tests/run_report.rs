@@ -41,6 +41,7 @@ fn base(kind: EventType, pid: u32, ppid: u32, cgroup: u64, ts: &str) -> Event {
         file: None,
         api: None,
         policy: None,
+        credential: None,
     }
 }
 

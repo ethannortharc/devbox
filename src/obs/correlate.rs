@@ -46,11 +46,20 @@ impl Chain {
     }
 
     /// Total bytes sent and received across this process's connections.
+    ///
+    /// From `close` events alone, matching `behavior::summarize`: a connection
+    /// is settled once, when it ends, and every other network event about it
+    /// was emitted before a byte had moved. Saturating, because these counters
+    /// arrive from the guest and a plain `+` would panic a debug build on a
+    /// pair of them that overflowed.
     pub fn bytes(&self) -> (u64, u64) {
         self.events
             .iter()
+            .filter(|e| e.kind == EventType::Close)
             .filter_map(|e| e.net.as_ref())
-            .fold((0, 0), |(tx, rx), n| (tx + n.bytes_tx, rx + n.bytes_rx))
+            .fold((0, 0), |(tx, rx), n| {
+                (tx.saturating_add(n.bytes_tx), rx.saturating_add(n.bytes_rx))
+            })
     }
 }
 
@@ -370,6 +379,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         }
     }
 
@@ -396,14 +406,27 @@ mod tests {
         e
     }
 
-    fn connect(pid: u32, mono: u64, addr: &str, tx: u64, rx: u64) -> Event {
+    fn connect(pid: u32, mono: u64, addr: &str) -> Event {
         let mut e = base(pid, 640, mono, EventType::Connect);
+        e.net = Some(Net {
+            proto: "tcp".into(),
+            daddr: addr.into(),
+            dport: 443,
+            ..Default::default()
+        });
+        e
+    }
+
+    /// The connection ending, which is where its traffic is reported.
+    fn close(pid: u32, mono: u64, addr: &str, tx: u64, rx: u64) -> Event {
+        let mut e = base(pid, 640, mono, EventType::Close);
         e.net = Some(Net {
             proto: "tcp".into(),
             daddr: addr.into(),
             dport: 443,
             bytes_tx: tx,
             bytes_rx: rx,
+            dir: "out".into(),
             ..Default::default()
         });
         e
@@ -424,11 +447,13 @@ mod tests {
         vec![
             exec(812, 640, 1_000, "pip", &["pip", "install", "requests"]),
             dns(812, 2_000, "pypi.org", &["151.101.0.223"]),
-            connect(812, 3_000, "151.101.0.223", 4102, 831_720),
+            connect(812, 3_000, "151.101.0.223"),
             dns(812, 4_000, "files.pythonhosted.org", &["151.101.1.63"]),
-            connect(812, 5_000, "151.101.1.63", 900, 61_000),
+            connect(812, 5_000, "151.101.1.63"),
             file(812, 6_000, "/workspace/.venv/lib/requests/__init__.py"),
             file(812, 7_000, "/workspace/.venv/lib/requests/api.py"),
+            close(812, 8_000, "151.101.0.223", 4102, 831_720),
+            close(812, 9_000, "151.101.1.63", 900, 61_000),
         ]
     }
 
@@ -441,13 +466,35 @@ mod tests {
         assert_eq!(c.pid, 812);
         assert_eq!(c.comm, "pip");
         assert_eq!(c.command.as_deref(), Some("pip install requests"));
-        assert_eq!(c.events.len(), 7);
-        assert_eq!(c.peers.len(), 4, "two names and two addresses");
+        assert_eq!(c.events.len(), 9);
+        assert_eq!(
+            c.peers.len(),
+            4,
+            "two names and two addresses; a close names the peer its connect already did"
+        );
         assert_eq!(c.files.len(), 2);
 
         let (tx, rx) = c.bytes();
         assert_eq!(tx, 5002);
         assert_eq!(rx, 892_720);
+    }
+
+    #[test]
+    fn a_chains_bytes_come_from_its_closes_only() {
+        // `watch --tree` credits a process with what its connections moved.
+        // The credit has to come from one event per connection, or the day a
+        // connect probe starts filling counters every tree doubles.
+        let mut events = pip_install();
+        let opening = events
+            .iter_mut()
+            .find(|e| e.kind == EventType::Connect)
+            .expect("the run dials something");
+        let net = opening.net.as_mut().unwrap();
+        net.bytes_tx = 999_999;
+        net.bytes_rx = 999_999;
+
+        let c = &chains(&events)[0];
+        assert_eq!(c.bytes(), (5002, 892_720));
     }
 
     #[test]
@@ -517,9 +564,9 @@ mod tests {
     #[test]
     fn peers_and_files_deduplicate_but_keep_order() {
         let events = vec![
-            connect(812, 1_000, "10.0.0.1", 0, 0),
-            connect(812, 2_000, "10.0.0.2", 0, 0),
-            connect(812, 3_000, "10.0.0.1", 0, 0),
+            connect(812, 1_000, "10.0.0.1"),
+            connect(812, 2_000, "10.0.0.2"),
+            connect(812, 3_000, "10.0.0.1"),
             file(812, 4_000, "/a"),
             file(812, 5_000, "/a"),
             file(812, 6_000, "/b"),
@@ -543,7 +590,10 @@ mod tests {
         assert_eq!(named("151.101.1.63"), vec!["files.pythonhosted.org"]);
 
         let labelled = apply_dns_map(&mut events, &map);
-        assert_eq!(labelled, 2, "both connections gained a name");
+        assert_eq!(
+            labelled, 4,
+            "both connections and both settlements gained a name"
+        );
 
         let c = &chains(&events)[0];
         assert!(c.peers.contains(&"pypi.org".to_string()));
@@ -577,9 +627,9 @@ mod tests {
         const SEC: u64 = 1_000_000_000;
         let mut events = vec![
             dns(812, SEC, "first.example", &["10.0.0.9"]),
-            connect(812, 2 * SEC, "10.0.0.9", 0, 0),
+            connect(812, 2 * SEC, "10.0.0.9"),
             dns(812, 3 * SEC, "second.example", &["10.0.0.9"]),
-            connect(812, 4 * SEC, "10.0.0.9", 0, 0),
+            connect(812, 4 * SEC, "10.0.0.9"),
         ];
 
         let map = dns_map(&events);
@@ -594,7 +644,7 @@ mod tests {
 
     #[test]
     fn apply_dns_map_never_overwrites_a_name_the_agent_already_supplied() {
-        let mut events = vec![connect(812, 1_000, "10.0.0.9", 0, 0)];
+        let mut events = vec![connect(812, 1_000, "10.0.0.9")];
         events[0].net.as_mut().unwrap().domain = "authoritative.example".into();
 
         let mut map: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();

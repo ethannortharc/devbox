@@ -502,11 +502,16 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
     // have inherited the exemption.
     let internal_ifaces = Vec::new();
 
+    // The credential broker's address, resolved inside the box: `host_reach`
+    // may return a name (`host.lima.internal`), and nftables needs an address.
+    let broker = crate::broker::policy_exemption(runtime, sandbox_name).await;
+
     super::nftables::Context {
         resolvers,
         declared_prefixes,
         container_prefixes,
         internal_ifaces,
+        broker,
     }
 }
 

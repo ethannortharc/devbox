@@ -1,0 +1,98 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.dns"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "process.parent_pid",
+      "value": {
+        "intValue": "640"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "pip"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "1000"
+      }
+    },
+    {
+      "key": "network.peer.address",
+      "value": {
+        "stringValue": "10.0.0.5"
+      }
+    },
+    {
+      "key": "network.peer.port",
+      "value": {
+        "intValue": "40001"
+      }
+    },
+    {
+      "key": "network.transport",
+      "value": {
+        "stringValue": "udp"
+      }
+    },
+    {
+      "key": "dns.question.name",
+      "value": {
+        "stringValue": "pypi.org"
+      }
+    },
+    {
+      "key": "devbox.dns.qtype",
+      "value": {
+        "stringValue": "A"
+      }
+    },
+    {
+      "key": "devbox.dns.answers",
+      "value": {
+        "arrayValue": {
+          "values": [
+            {
+              "stringValue": "151.101.0.223"
+            },
+            {
+              "stringValue": "151.101.64.223"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "key": "devbox.dns.response",
+      "value": {
+        "boolValue": true
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "dns pypi.org → 151.101.0.223, 151.101.64.223"
+  },
+  "eventName": "devbox.dns",
+  "severityNumber": 9,
+  "severityText": "INFO",
+  "timeUnixNano": "1786054447500000000"
+}

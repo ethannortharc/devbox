@@ -27,18 +27,27 @@ const (
 	TypeExit    Type = "exit"
 	TypeConnect Type = "connect"
 	TypeAccept  Type = "accept"
+	// TypeClose settles a connection: connect and accept record that one was
+	// made, this records what crossed it and how long it lasted. The byte
+	// counters live on this event alone, so a total is a sum over one kind of
+	// event rather than a guess about which halves to add.
+	TypeClose   Type = "close"
 	TypeDNS     Type = "dns"
 	TypeTLS     Type = "tls"
 	TypeFile    Type = "file"
 	TypeSyscall Type = "syscall"
 	TypeAPI     Type = "api"
 	TypePolicy  Type = "policy"
+	// TypeCredential is written by the host-side credential broker, not by
+	// this agent. It is in the shared contract because the collector stores
+	// it in the same table and the console renders it with the same code.
+	TypeCredential Type = "credential"
 )
 
 // AllTypes lists every valid event type, in schema order.
 var AllTypes = []Type{
-	TypeExec, TypeExit, TypeConnect, TypeAccept, TypeDNS,
-	TypeTLS, TypeFile, TypeSyscall, TypeAPI, TypePolicy,
+	TypeExec, TypeExit, TypeConnect, TypeAccept, TypeClose, TypeDNS,
+	TypeTLS, TypeFile, TypeSyscall, TypeAPI, TypePolicy, TypeCredential,
 }
 
 // Valid reports whether t is a known event type.
@@ -57,7 +66,7 @@ func (t Type) SubObject() string {
 	switch t {
 	case TypeExec:
 		return "exec"
-	case TypeConnect, TypeAccept, TypeDNS, TypeTLS:
+	case TypeConnect, TypeAccept, TypeClose, TypeDNS, TypeTLS:
 		return "net"
 	case TypeFile:
 		return "file"
@@ -65,6 +74,8 @@ func (t Type) SubObject() string {
 		return "api"
 	case TypePolicy:
 		return "policy"
+	case TypeCredential:
+		return "credential"
 	default:
 		return ""
 	}
@@ -96,11 +107,12 @@ type Event struct {
 	// Exactly one sub-object is populated, chosen by Type. Absent rather than
 	// null on the wire (ADR-0015): at 10k events/s the five null fields cost
 	// more than they explain.
-	Net    *Net    `json:"net,omitempty"`
-	Exec   *Exec   `json:"exec,omitempty"`
-	File   *File   `json:"file,omitempty"`
-	API    *API    `json:"api,omitempty"`
-	Policy *Policy `json:"policy,omitempty"`
+	Net        *Net        `json:"net,omitempty"`
+	Exec       *Exec       `json:"exec,omitempty"`
+	File       *File       `json:"file,omitempty"`
+	API        *API        `json:"api,omitempty"`
+	Policy     *Policy     `json:"policy,omitempty"`
+	Credential *Credential `json:"credential,omitempty"`
 }
 
 // Net carries connection, DNS, and TLS detail.
@@ -124,9 +136,22 @@ type Net struct {
 	Answers  []string `json:"answers,omitempty"`
 	Response bool     `json:"response,omitempty"`
 
+	// BytesTX/BytesRX/DurMS are settled on a `close` event and nowhere else.
+	// Every probe that fires while a connection is being made runs before any
+	// payload has crossed it, so a `connect` carrying a byte count would be
+	// carrying a guess; these stay zero there on purpose.
 	BytesTX uint64 `json:"bytes_tx,omitempty"`
 	BytesRX uint64 `json:"bytes_rx,omitempty"`
 	DurMS   uint64 `json:"dur_ms,omitempty"`
+
+	// Dir is "out" for a dialled connection and "in" for an accepted one.
+	// Populated on `close`, where the event type no longer says which — and
+	// empty when even that is unknown, which is exactly when Orphan is set.
+	Dir string `json:"dir,omitempty"`
+	// Orphan marks a `close` whose connect or accept was never captured: a
+	// connection older than the agent. The bytes are real; the process
+	// identity is whoever closed the socket, not who opened it.
+	Orphan bool `json:"orphan,omitempty"`
 }
 
 // Exec carries process-execution detail.
@@ -162,6 +187,27 @@ type Policy struct {
 	Mode   string `json:"mode"`
 	Target string `json:"target,omitempty"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// Credential carries one brokered credential use (§6.5 of the v5 design).
+//
+// There is deliberately no field for the credential, and none for any request
+// or response header: this row lands in the same store the console and the
+// export read, and an audit record that can leak the secret it audits is worse
+// than no record at all.
+type Credential struct {
+	Provider string `json:"provider"`
+	Method   string `json:"method,omitempty"`
+	// Host is the upstream the broker spoke to, or would have.
+	Host string `json:"host,omitempty"`
+	// Path is the upstream path with the query string stripped.
+	Path      string `json:"path,omitempty"`
+	Status    uint16 `json:"status,omitempty"`
+	ReqBytes  uint64 `json:"req_bytes,omitempty"`
+	RespBytes uint64 `json:"resp_bytes,omitempty"`
+	// Verdict is allowed, denied, or error.
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // Now formats a time the way TSWall expects.
@@ -212,6 +258,10 @@ func (e *Event) Validate() error {
 	case "policy":
 		if e.Policy == nil {
 			return fmt.Errorf("policy event requires a policy sub-object")
+		}
+	case "credential":
+		if e.Credential == nil {
+			return fmt.Errorf("credential event requires a credential sub-object")
 		}
 	}
 	return nil

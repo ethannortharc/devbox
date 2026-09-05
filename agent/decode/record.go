@@ -47,6 +47,19 @@ const (
 	DirAccept  uint8 = 1
 )
 
+// Flags on a network record, matching the NET_FLAG_* macros in devbox.bpf.c.
+const (
+	// NetFlagClose marks a settlement record: the connection is over, and
+	// its byte counters and duration are final. A record without this flag
+	// describes a connection being *made*, where nothing has crossed the
+	// socket yet, and its counters are zero by construction.
+	NetFlagClose uint8 = 1 << 0
+	// NetFlagOrphan marks a settlement whose opening was never seen — a
+	// connection older than the agent. Its process identity is whoever
+	// closed the socket, and its direction is unknown.
+	NetFlagOrphan uint8 = 1 << 1
+)
+
 // File operations, matching the C enum.
 const (
 	FileOpen   uint32 = 0
@@ -82,14 +95,16 @@ type NetRecord struct {
 	Family    uint8 // 2 = AF_INET, 10 = AF_INET6
 	Proto     uint8 // 6 = TCP, 17 = UDP
 	Direction uint8
-	_         uint8
-	SPort     uint16
-	DPort     uint16
-	SAddr     [16]byte
-	DAddr     [16]byte
-	BytesTX   uint64
-	BytesRX   uint64
-	DurNS     uint64
+	// Flags occupies what used to be explicit padding, so adding the close
+	// record cost the layout nothing — NetRecordSize is still 112.
+	Flags   uint8
+	SPort   uint16
+	DPort   uint16
+	SAddr   [16]byte
+	DAddr   [16]byte
+	BytesTX uint64
+	BytesRX uint64
+	DurNS   uint64
 }
 
 // FileRecord mirrors `struct file_event`.
@@ -215,7 +230,12 @@ func DecodeExec(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 	}, nil
 }
 
-// DecodeNet parses a connect/accept record.
+// DecodeNet parses a connect/accept/close record.
+//
+// One record type covers all three because they describe one connection at
+// different moments, and the flow table joins them on the 5-tuple they share.
+// Which moment it is comes from the flags, not from the direction: a close
+// still has to say whether the connection was dialled or accepted.
 //
 //nolint:revive // The explicit Decode prefix keeps all wire decoders searchable together.
 func DecodeNet(raw []byte, boxID string, clock Clock) (*event.Event, error) {
@@ -224,8 +244,23 @@ func DecodeNet(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 		return nil, fmt.Errorf("decode net record (%d bytes): %w", len(raw), err)
 	}
 
+	orphan := r.Flags&NetFlagOrphan != 0
 	ty := event.TypeConnect
-	if r.Direction == DirAccept {
+	dir := ""
+	switch {
+	case r.Flags&NetFlagClose != 0:
+		ty = event.TypeClose
+		// Only on a close, and only when the opening was seen. Connect and
+		// accept say their direction by their type; an orphan cannot say
+		// it at all, and guessing "out" would be indistinguishable from
+		// knowing it.
+		if !orphan {
+			dir = "out"
+			if r.Direction == DirAccept {
+				dir = "in"
+			}
+		}
+	case r.Direction == DirAccept:
 		ty = event.TypeAccept
 	}
 
@@ -242,7 +277,9 @@ func DecodeNet(raw []byte, boxID string, clock Clock) (*event.Event, error) {
 			SAddr: addr(r.Family, r.SAddr), SPort: r.SPort,
 			DAddr: addr(r.Family, r.DAddr), DPort: r.DPort,
 			BytesTX: r.BytesTX, BytesRX: r.BytesRX,
-			DurMS: r.DurNS / 1_000_000,
+			DurMS:  r.DurNS / 1_000_000,
+			Dir:    dir,
+			Orphan: orphan,
 		},
 	}, nil
 }

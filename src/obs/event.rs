@@ -20,12 +20,19 @@ pub enum EventType {
     Exit,
     Connect,
     Accept,
+    /// Connection teardown. `Connect` and `Accept` record that a connection was
+    /// made; this records what crossed it and how long it lasted.
+    Close,
     Dns,
     Tls,
     File,
     Syscall,
     Api,
     Policy,
+    /// A brokered credential use (§6.5). Produced on the host by
+    /// `devbox __broker`, never by the guest agent — the whole point is that
+    /// the guest never holds the credential that made the request possible.
+    Credential,
 }
 
 impl EventType {
@@ -35,12 +42,14 @@ impl EventType {
         EventType::Exit,
         EventType::Connect,
         EventType::Accept,
+        EventType::Close,
         EventType::Dns,
         EventType::Tls,
         EventType::File,
         EventType::Syscall,
         EventType::Api,
         EventType::Policy,
+        EventType::Credential,
     ];
 
     /// The wire name, which is also the stored value and the filter token.
@@ -50,12 +59,14 @@ impl EventType {
             EventType::Exit => "exit",
             EventType::Connect => "connect",
             EventType::Accept => "accept",
+            EventType::Close => "close",
             EventType::Dns => "dns",
             EventType::Tls => "tls",
             EventType::File => "file",
             EventType::Syscall => "syscall",
             EventType::Api => "api",
             EventType::Policy => "policy",
+            EventType::Credential => "credential",
         }
     }
 
@@ -63,11 +74,16 @@ impl EventType {
     pub fn domain(&self) -> &'static str {
         match self {
             EventType::Exec | EventType::Exit => "process",
-            EventType::Connect | EventType::Accept | EventType::Dns | EventType::Tls => "network",
+            EventType::Connect
+            | EventType::Accept
+            | EventType::Close
+            | EventType::Dns
+            | EventType::Tls => "network",
             EventType::File => "file",
             EventType::Syscall => "syscall",
             EventType::Api => "api",
             EventType::Policy => "policy",
+            EventType::Credential => "credential",
         }
     }
 }
@@ -127,6 +143,8 @@ pub struct Event {
     pub api: Option<Api>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<Credential>,
 }
 
 /// Connection, DNS, and TLS detail.
@@ -161,12 +179,26 @@ pub struct Net {
     #[serde(default, skip_serializing_if = "is_false")]
     pub response: bool,
 
+    /// Settled on a `close` event and nowhere else. Every probe that fires
+    /// while a connection is being *made* runs before any payload has crossed
+    /// it, so a `connect` carrying a byte count would be carrying a guess.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_tx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub bytes_rx: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dur_ms: u64,
+
+    /// `out` for a dialled connection, `in` for an accepted one. Carried on a
+    /// `close`, whose type no longer says which; empty when it is unknown,
+    /// which is exactly when `orphan` is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
+    /// A `close` whose connect or accept was never captured — a connection
+    /// older than the agent. The bytes are real; the process identity is
+    /// whoever closed the socket, not whoever opened it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub orphan: bool,
 }
 
 /// Process-execution detail.
@@ -218,6 +250,37 @@ pub struct Policy {
     pub reason: String,
 }
 
+/// One brokered credential use (§6.5).
+///
+/// Deliberately without a field for the credential itself, or for any header:
+/// this row is written to the same store the console and the export read, and
+/// an audit record that can leak the secret it audits is worse than no record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credential {
+    /// The broker provider name: `anthropic`, `github`, `http:<name>`, ...
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    /// The upstream host the broker spoke to, or the one it would have.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    /// The upstream path, query string stripped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// Upstream HTTP status, or 0 when the request never reached upstream.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub req_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub resp_bytes: u64,
+    /// `allowed`, `denied`, or `error`.
+    pub verdict: String,
+    /// Why a request was denied, or how it failed. Never a header value.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -249,12 +312,15 @@ impl Event {
 
         let missing = match self.kind {
             EventType::Exec => self.exec.is_none(),
-            EventType::Connect | EventType::Accept | EventType::Dns | EventType::Tls => {
-                self.net.is_none()
-            }
+            EventType::Connect
+            | EventType::Accept
+            | EventType::Close
+            | EventType::Dns
+            | EventType::Tls => self.net.is_none(),
             EventType::File => self.file.is_none(),
             EventType::Api => self.api.is_none(),
             EventType::Policy => self.policy.is_none(),
+            EventType::Credential => self.credential.is_none(),
             EventType::Exit | EventType::Syscall => false,
         };
         if missing {
@@ -269,6 +335,13 @@ impl Event {
     /// domain that resolved to the address, falling back to the address. This
     /// is what makes the flow table show `pypi.org` rather than `151.101.0.223`.
     pub fn peer(&self) -> Option<String> {
+        if self.kind == EventType::Credential {
+            return self
+                .credential
+                .as_ref()
+                .map(|c| c.host.clone())
+                .filter(|host| !host.is_empty());
+        }
         let net = self.net.as_ref()?;
         for candidate in [&net.qname, &net.domain, &net.sni, &net.daddr] {
             if !candidate.is_empty() {
@@ -283,6 +356,11 @@ impl Event {
         match self.kind {
             EventType::File => self.file.as_ref().map(|f| f.path.as_str()),
             EventType::Exec => self.exec.as_ref().map(|e| e.path.as_str()),
+            EventType::Credential => self
+                .credential
+                .as_ref()
+                .map(|c| c.path.as_str())
+                .filter(|path| !path.is_empty()),
             _ => None,
         }
     }
@@ -320,6 +398,27 @@ impl Event {
                 let port = n.map(|n| n.dport).unwrap_or(0);
                 format!("{} {peer}:{port}", self.kind)
             }
+            EventType::Close => {
+                // The byte counts are the whole reason this event exists, so
+                // they belong on the one line the CLI prints for it.
+                let n = self.net.as_ref();
+                let peer = self.peer().unwrap_or_default();
+                let port = n.map(|n| n.dport).unwrap_or(0);
+                let tx = crate::cli::watch::human_bytes(n.map_or(0, |n| n.bytes_tx));
+                let rx = crate::cli::watch::human_bytes(n.map_or(0, |n| n.bytes_rx));
+                let dur = n.map_or(0, |n| n.dur_ms);
+                let mut text = format!("close {peer}:{port} \u{2191}{tx} \u{2193}{rx}");
+                if dur > 0 {
+                    text.push_str(&format!(" {dur}ms"));
+                }
+                if n.is_some_and(|n| n.orphan) {
+                    // Said out loud rather than left to be inferred from a
+                    // blank column: these bytes are real but unattributed, and
+                    // a reader adding them to a process's total would be wrong.
+                    text.push_str(" (orphan)");
+                }
+                text
+            }
             EventType::Tls => {
                 let sni = self.net.as_ref().map(|n| n.sni.as_str()).unwrap_or("");
                 format!("tls {sni}")
@@ -347,6 +446,17 @@ impl Event {
                     "policy {} {}",
                     p.map(|p| p.verdict.as_str()).unwrap_or(""),
                     p.map(|p| p.target.as_str()).unwrap_or("")
+                )
+            }
+            EventType::Credential => {
+                let c = self.credential.as_ref();
+                format!(
+                    "credential {} {} {}{} {}",
+                    c.map(|c| c.verdict.as_str()).unwrap_or(""),
+                    c.map(|c| c.provider.as_str()).unwrap_or(""),
+                    c.map(|c| c.host.as_str()).unwrap_or(""),
+                    c.map(|c| c.path.as_str()).unwrap_or(""),
+                    c.map(|c| c.status).unwrap_or(0),
                 )
             }
             EventType::Syscall => "syscall".to_string(),
@@ -439,6 +549,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         };
         assert!(e.validate().is_ok());
 
@@ -451,6 +562,59 @@ mod tests {
 
         e.pid = 0;
         assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn a_close_line_leads_with_what_crossed_the_connection() {
+        let mut e = Event {
+            ts_wall: "t".into(),
+            ts_mono_ns: 0,
+            box_id: "b".into(),
+            cgroup_id: 0,
+            pid: 812,
+            tid: 812,
+            ppid: 640,
+            comm: "curl".into(),
+            uid: 1000,
+            kind: EventType::Close,
+            net: Some(Net {
+                proto: "tcp".into(),
+                daddr: "151.101.0.223".into(),
+                dport: 443,
+                bytes_tx: 4102,
+                bytes_rx: 831_720,
+                dur_ms: 690,
+                dir: "out".into(),
+                ..Default::default()
+            }),
+            exec: None,
+            file: None,
+            api: None,
+            policy: None,
+            credential: None,
+        };
+        // The byte counts are the reason this event exists; a `close` line
+        // without them would be indistinguishable from the `connect` it
+        // settles.
+        let line = e.summary();
+        assert!(line.starts_with("close 151.101.0.223:443"), "{line}");
+        assert!(line.contains("4.0KB"), "{line}");
+        assert!(line.contains("812.2KB"), "{line}");
+        assert!(line.contains("690ms"), "{line}");
+        assert!(!line.contains("orphan"), "{line}");
+
+        // Unattributed traffic says so, because a reader who adds it to a
+        // process's total would be wrong.
+        e.net.as_mut().unwrap().orphan = true;
+        assert!(e.summary().ends_with("(orphan)"), "{}", e.summary());
+
+        // And a close is a network event, so the console's existing chip
+        // covers it rather than needing a new one.
+        assert_eq!(EventType::Close.domain(), "network");
+
+        // It carries a 5-tuple, so it needs the sub-object that holds one.
+        e.net = None;
+        assert!(e.validate().is_err(), "a close without its net sub-object");
     }
 
     #[test]
@@ -475,6 +639,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         };
         assert_eq!(e.peer().as_deref(), Some("151.101.0.223"));
 

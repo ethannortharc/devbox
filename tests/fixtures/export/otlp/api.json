@@ -1,0 +1,83 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.api"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "941"
+      }
+    },
+    {
+      "key": "process.parent_pid",
+      "value": {
+        "intValue": "640"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "claude"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "941"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "1000"
+      }
+    },
+    {
+      "key": "http.request.method",
+      "value": {
+        "stringValue": "POST"
+      }
+    },
+    {
+      "key": "url.full",
+      "value": {
+        "stringValue": "https://api.anthropic.com/v1/messages"
+      }
+    },
+    {
+      "key": "server.address",
+      "value": {
+        "stringValue": "api.anthropic.com"
+      }
+    },
+    {
+      "key": "http.response.status_code",
+      "value": {
+        "intValue": "200"
+      }
+    },
+    {
+      "key": "devbox.api.tokens",
+      "value": {
+        "intValue": "142000"
+      }
+    },
+    {
+      "key": "devbox.api.endpoint",
+      "value": {
+        "stringValue": "messages"
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "api POST api.anthropic.com/v1/messages"
+  },
+  "eventName": "devbox.api",
+  "severityNumber": 9,
+  "severityText": "INFO",
+  "timeUnixNano": "1786054449000000000"
+}

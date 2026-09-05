@@ -1116,6 +1116,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         };
         for i in 0..600u64 {
             // 200 KB each: six hundred of them is well past the byte budget,

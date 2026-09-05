@@ -208,6 +208,23 @@ pub trait Runtime: Send + Sync {
         Ok(())
     }
 
+    /// The address this box can reach a host listener on — §6.6.
+    ///
+    /// Verified rather than assumed: the default implementation probes the
+    /// runtime's candidate addresses by opening a TCP connection to `port`
+    /// from inside the guest, and each runtime supplies the candidates it
+    /// believes in. A runtime with no answer says so instead of returning a
+    /// documented address that does not work, because the failure mode of a
+    /// wrong guess here is an agent that reports a network error for a
+    /// credential problem.
+    async fn host_reach(&self, name: &str, port: u16) -> Result<crate::broker::reach::HostReach> {
+        let _ = (name, port);
+        anyhow::bail!(
+            "runtime '{}' has no verified way for a box to reach a host listener",
+            self.name()
+        )
+    }
+
     /// Execute a shell command as root with a login shell.
     ///
     /// This is the correct abstraction for running privileged commands:
