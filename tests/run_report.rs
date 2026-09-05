@@ -12,7 +12,8 @@
 
 use devbox::obs::event::{Event, EventType, Exec, File, Net, Policy};
 use devbox::obs::run::{
-    ActiveRun, Attribution, Attributor, RunKind, RunRecord, RunStatus, is_run_id, new_run_id,
+    ActiveRun, Attribution, Attributor, EndedBy, RunKind, RunRecord, RunStatus, is_run_id,
+    new_run_id,
 };
 use devbox::obs::store::{Query, Store};
 use devbox::report::model::{RunReport, SCOPE_BOX};
@@ -252,6 +253,7 @@ fn loaded() -> Store {
             &run.capture_sources,
             &run.agent_version,
             0,
+            Some(EndedBy::Exit),
         )
         .expect("finish run");
     store
@@ -522,6 +524,7 @@ fn a_run_with_nothing_captured_reports_that_rather_than_reporting_nothing() {
             "",
             "",
             0,
+            Some(EndedBy::Exit),
         )
         .unwrap();
 

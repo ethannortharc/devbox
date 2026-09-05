@@ -22,4 +22,5 @@
 //!   [`shim::wrap_guest_command`] and [`shim::reaper_script`] are the answer.
 
 pub mod registry;
+pub mod rpc;
 pub mod shim;
