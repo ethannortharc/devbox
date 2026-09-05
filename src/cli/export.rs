@@ -30,7 +30,7 @@ pub struct ExportArgs {
     #[arg(long, value_name = "T")]
     pub to: Option<String>,
 
-    /// Export one run's events (integrated in v5 wave 2)
+    /// Export one run's events (`devbox runs` lists the ids)
     #[arg(long, value_name = "ID", conflicts_with_all = ["from", "to"])]
     pub run: Option<String>,
 
@@ -44,14 +44,12 @@ pub struct ExportArgs {
 }
 
 pub async fn run(args: ExportArgs, manager: &SandboxManager) -> Result<()> {
-    // The flag parses today so a script written against the documented CLI
-    // fails with a sentence instead of "unexpected argument", and so the
-    // integration is one function body rather than an argument redesign.
-    if let Some(run_id) = &args.run {
+    if let Some(run_id) = &args.run
+        && !crate::obs::run::is_run_id(run_id)
+    {
         bail!(
-            "--run {run_id} is not available yet: run evidence (v5 component A) \
-             is not integrated with export. It works once the runs table lands; \
-             until then select the run's window with --from/--to."
+            "'{run_id}' is not a run id. Run ids are 26 characters; \
+             `devbox runs [NAME]` lists them."
         );
     }
 
@@ -77,16 +75,30 @@ pub async fn run(args: ExportArgs, manager: &SandboxManager) -> Result<()> {
 
     let store = Store::open(&path)?;
     let ctx = export::Context::new(&name);
+    let run_id = args.run.as_deref();
+
+    // Say so rather than exporting nothing. An empty OCSF document for a run
+    // id that does not exist on this box is indistinguishable from a run that
+    // did nothing, and only one of those is worth investigating.
+    if let Some(run_id) = run_id
+        && store.get_run(run_id)?.is_none()
+    {
+        bail!(
+            "box '{name}' has no run '{run_id}'. `devbox runs {name}` lists the \
+             runs it has recorded."
+        );
+    }
 
     let stats = match &args.out {
         None => {
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
-            let stats = export::run(&store, &window, &ctx, args.format, &mut out)?;
+            let stats =
+                export::run_selection(&store, &window, run_id, &ctx, args.format, &mut out)?;
             out.flush().context("failed to flush the export")?;
             stats
         }
-        Some(dest) => write_to_file(&store, &window, &ctx, args.format, dest)?,
+        Some(dest) => write_to_file(&store, &window, run_id, &ctx, args.format, dest)?,
     };
 
     // An export that lost rows is worse than one that failed: it is a record
@@ -133,6 +145,7 @@ pub async fn run(args: ExportArgs, manager: &SandboxManager) -> Result<()> {
 fn write_to_file(
     store: &Store,
     window: &Window,
+    run_id: Option<&str>,
     ctx: &export::Context,
     format: Format,
     dest: &PathBuf,
@@ -148,7 +161,7 @@ fn write_to_file(
         .with_context(|| format!("failed to open a temporary file in {}", dir.display()))?;
     let stats = {
         let mut out = BufWriter::new(&temp);
-        let stats = export::run(store, window, ctx, format, &mut out)?;
+        let stats = export::run_selection(store, window, run_id, ctx, format, &mut out)?;
         out.flush().context("failed to flush the export")?;
         stats
     };

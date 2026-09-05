@@ -105,8 +105,6 @@ fn fixture() -> Vec<Event> {
         proto: "tcp".into(),
         daddr: "93.184.216.34".into(),
         dport: 443,
-        bytes_tx: 812,
-        bytes_rx: 4096,
         ..Default::default()
     });
 
@@ -124,6 +122,27 @@ fn fixture() -> Vec<Event> {
         dport: 443,
         sni: "example.com".into(),
         alpn: "h2".into(),
+        ..Default::default()
+    });
+
+    // The same connection, settled. Traffic lives here and nowhere else: a
+    // `connect` fires before any payload has crossed the socket.
+    let mut close = base(
+        EventType::Close,
+        901,
+        ROOT_PID,
+        CGROUP,
+        "2026-09-05T10:00:00.350Z",
+    );
+    close.comm = "curl".into();
+    close.net = Some(Net {
+        proto: "tcp".into(),
+        daddr: "93.184.216.34".into(),
+        dport: 443,
+        bytes_tx: 812,
+        bytes_rx: 4096,
+        dur_ms: 690,
+        dir: "out".into(),
         ..Default::default()
     });
 
@@ -171,7 +190,9 @@ fn fixture() -> Vec<Event> {
         ..Default::default()
     });
 
-    vec![wrapper, curl, dns, connect, tls, write, refused, stranger]
+    vec![
+        wrapper, curl, dns, connect, tls, close, write, refused, stranger,
+    ]
 }
 
 fn record() -> RunRecord {
@@ -281,11 +302,11 @@ fn a_run_claims_its_own_events_and_leaves_the_rest_alone() {
             ..Default::default()
         })
         .unwrap();
-    // Six of the eight: the stranger's exec belongs to no run, and so does
+    // Eight of the nine: the stranger's exec belongs to no run, and so does
     // nothing else on the box.
     assert_eq!(
         mine.len(),
-        7,
+        8,
         "{:#?}",
         mine.iter().map(|e| (&e.comm, e.pid)).collect::<Vec<_>>()
     );
@@ -298,7 +319,7 @@ fn a_run_claims_its_own_events_and_leaves_the_rest_alone() {
         store.attribution_counts(RUN).unwrap().into_iter().collect();
     // The wrapper's own exec has the run's cgroup, so it is a cgroup match;
     // so is everything the wrapper spawned inside it.
-    assert_eq!(counts.get(&Attribution::Cgroup), Some(&6));
+    assert_eq!(counts.get(&Attribution::Cgroup), Some(&7));
     // The pid-less refusal can only be a window decision.
     assert_eq!(counts.get(&Attribution::Window), Some(&1));
 
@@ -326,7 +347,7 @@ fn the_markdown_report_states_every_fact_it_was_built_from() {
         // coverage — the badge and the arithmetic behind it
         "`full` — ebpf+packet+netfilter",
         "| agent | 0.1.6 |",
-        "| … by cgroup | 6 |",
+        "| … by cgroup | 7 |",
         "| … by window | 1 |",
         "| unattributed in the window | 1 |",
         // files, with the caveat that wave 1 owes the reader
@@ -334,7 +355,7 @@ fn the_markdown_report_states_every_fact_it_was_built_from() {
         "| + | `/workspace/run-a.txt` |",
         "(and 1 directories)",
         // network
-        "| `example.com` | 1 | 443 | yes | 812B | 4.0KB |",
+        "| `example.com` | 1 | 443 | yes | 812B | 4.0KB | 690ms |",
         "TLS server names: `example.com`",
         "DNS: `example.com`",
         // processes, as a tree
@@ -349,6 +370,85 @@ fn the_markdown_report_states_every_fact_it_was_built_from() {
             "the report does not say {expected:?}\n---\n{report}"
         );
     }
+}
+
+#[test]
+fn traffic_is_counted_from_close_and_only_from_close() {
+    // The regression this guards is double counting. `connect` fires from a
+    // probe that runs before any payload has crossed the socket, so its
+    // counters are zero today — but the day a source starts filling both ends,
+    // a report that summed them would quietly double every number in it.
+    let store = loaded();
+    let report = built(&store);
+    let row = &report.network.domains[0];
+    assert_eq!(row.peer, "example.com");
+    assert_eq!((row.bytes_tx, row.bytes_rx), (812, 4096));
+    assert_eq!(row.dur_ms, 690);
+    assert_eq!(row.connections, 1, "one connect");
+    assert_eq!(row.closes, 1, "one close");
+    assert_eq!(row.conns_human(), "1", "matched pairs stay quiet");
+    // The section total agrees with the row, and with `behavior::summarize`.
+    assert_eq!(
+        (report.network.bytes_tx, report.network.bytes_rx),
+        (812, 4096)
+    );
+
+    // Now the same connection with counters on *both* events, which is what a
+    // future source might send. The close still decides.
+    let mut doubled = fixture();
+    for event in &mut doubled {
+        if event.kind == EventType::Connect
+            && let Some(net) = &mut event.net
+        {
+            net.bytes_tx = 812;
+            net.bytes_rx = 4096;
+        }
+    }
+    let report = RunReport::build(
+        record(),
+        &doubled,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    assert_eq!(
+        (
+            report.network.domains[0].bytes_tx,
+            report.network.domains[0].bytes_rx
+        ),
+        (812, 4096),
+        "the connect's counters must not be added to the close's"
+    );
+}
+
+#[test]
+fn a_connection_the_window_did_not_see_start_is_still_reported() {
+    // A run that inherits an open socket sees the close and never the connect.
+    // Dropping it would lose the only record of that traffic; counting it as
+    // an ordinary connection would claim the run opened something it did not.
+    let only_close: Vec<_> = fixture()
+        .into_iter()
+        .filter(|e| e.kind != EventType::Connect && e.kind != EventType::Accept)
+        .collect();
+    let report = RunReport::build(
+        record(),
+        &only_close,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let row = report
+        .network
+        .domains
+        .iter()
+        .find(|d| d.peer == "example.com")
+        .expect("the peer survives with no connect");
+    assert_eq!(row.connections, 0);
+    assert_eq!(row.closes, 1);
+    assert_eq!(row.bytes_rx, 4096);
+    assert_eq!(row.conns_human(), "0 (+1 closed)", "and it says so");
 }
 
 #[test]
@@ -374,7 +474,7 @@ fn the_json_report_round_trips_through_its_own_renderer() {
 
     let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
     assert_eq!(value["run"]["run_id"], RUN);
-    assert_eq!(value["coverage"]["attribution"]["cgroup"], 6);
+    assert_eq!(value["coverage"]["attribution"]["cgroup"], 7);
     assert_eq!(value["network"]["domains"][0]["peer"], "example.com");
     assert_eq!(value["files"]["scope"], SCOPE_BOX);
 }
@@ -546,13 +646,13 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
             })
             .unwrap()
             .len(),
-        7
+        8
     );
 
     // Re-opening is not a second migration.
     let reopened = Store::open(&path).unwrap();
     assert_eq!(reopened.schema_version().unwrap(), 2);
-    assert_eq!(reopened.count().unwrap(), 9);
+    assert_eq!(reopened.count().unwrap(), 10);
 }
 
 #[test]
@@ -586,7 +686,7 @@ fn the_start_of_a_run_is_recovered_once_the_host_learns_its_cgroup() {
     let claimed = store
         .backfill_run(RUN, CGROUP, "2026-09-05T10:00:00.000Z")
         .unwrap();
-    assert_eq!(claimed, 6, "every event in the run's own cgroup");
+    assert_eq!(claimed, 7, "every event in the run's own cgroup");
 
     let mine = store
         .query(&Query {

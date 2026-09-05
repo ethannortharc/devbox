@@ -127,11 +127,18 @@ impl Network {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DomainRow {
     pub peer: String,
+    /// Connection *starts* observed: `connect` and `accept`.
     pub connections: usize,
+    /// Connection *ends* observed: `close`. Not the same number, and the
+    /// difference is information — a run that inherited an open socket has a
+    /// close with no connect, and a run still holding one has the reverse.
+    pub closes: usize,
     /// Destination ports seen, sorted.
     pub ports: Vec<u16>,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
+    /// Summed connection lifetime, from `close`.
+    pub dur_ms: u64,
     /// Whether a TLS handshake to this peer was observed.
     pub tls: bool,
 }
@@ -154,6 +161,31 @@ impl DomainRow {
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The connection count, and the closes that had no start in this window.
+    ///
+    /// Quiet in the ordinary case, where the two are equal. Loud exactly when
+    /// the run's window clipped a connection — which is the case where a bare
+    /// count would understate what the peer was actually used for.
+    pub fn conns_human(&self) -> String {
+        if self.closes > self.connections {
+            format!(
+                "{} (+{} closed)",
+                self.connections,
+                self.closes - self.connections
+            )
+        } else {
+            self.connections.to_string()
+        }
+    }
+
+    pub fn dur_human(&self) -> String {
+        if self.dur_ms == 0 {
+            String::new()
+        } else {
+            human_duration(Some(self.dur_ms as i64))
+        }
     }
 }
 
@@ -334,12 +366,35 @@ fn network(events: &[Event], summary: &Summary) -> Network {
                     ..Default::default()
                 });
                 row.connections += 1;
+                if let Some(net) = &event.net
+                    && net.dport != 0
+                    && !row.ports.contains(&net.dport)
+                {
+                    row.ports.push(net.dport);
+                }
+            }
+            EventType::Close => {
+                // Traffic is counted here and only here — the same rule
+                // `behavior::summarize` follows, and for the same reason: a
+                // `connect` fires from a probe that runs before any payload
+                // has crossed the socket, so its counters are zero by
+                // construction. Adding both ends would start double-counting
+                // the day a source begins filling them.
+                let row = by_peer.entry(peer.clone()).or_insert_with(|| DomainRow {
+                    peer: peer.clone(),
+                    ..Default::default()
+                });
+                row.closes += 1;
                 if let Some(net) = &event.net {
                     if net.dport != 0 && !row.ports.contains(&net.dport) {
                         row.ports.push(net.dport);
                     }
+                    // Saturating: the agent supplies these and nothing
+                    // validates them, so two events claiming most of a `u64`
+                    // between them would panic a checked build.
                     row.bytes_tx = row.bytes_tx.saturating_add(net.bytes_tx);
                     row.bytes_rx = row.bytes_rx.saturating_add(net.bytes_rx);
+                    row.dur_ms = row.dur_ms.saturating_add(net.dur_ms);
                 }
             }
             EventType::Tls => {

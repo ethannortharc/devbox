@@ -151,16 +151,17 @@
       {% if !report.network.domains.is_empty() %}
       <div class="scroll">
         <table>
-          <thead><tr><th>peer</th><th>conns</th><th>ports</th><th>tls</th><th>sent</th><th>received</th></tr></thead>
+          <thead><tr><th>peer</th><th>conns</th><th>ports</th><th>tls</th><th>sent</th><th>received</th><th>time</th></tr></thead>
           <tbody>
             {% for row in report.network.domains %}
             <tr>
               <td class="peer">{{ row.peer }}</td>
-              <td class="num">{{ row.connections }}</td>
+              <td class="num">{{ row.conns_human() }}</td>
               <td class="mono">{{ row.ports_human() }}</td>
               <td>{% if row.tls %}yes{% endif %}</td>
               <td class="num">{{ row.tx_human() }}</td>
               <td class="num">{{ row.rx_human() }}</td>
+              <td class="num">{{ row.dur_human() }}</td>
             </tr>
             {% endfor %}
           </tbody>

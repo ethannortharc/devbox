@@ -3,6 +3,7 @@ use clap::{Args, Subcommand};
 
 use crate::cli::box_arg::BoxArg;
 use crate::cli::watch::human_bytes;
+use crate::obs::Store;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::checkpoint::{self, CheckpointId, Target};
 use crate::sandbox::overlay;
@@ -279,7 +280,15 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
         }
         LayerAction::Restore { id, .. } => {
             let id = CheckpointId::parse(&id)?;
-            checkpoint::restore(runtime.as_ref(), &name, &id).await?;
+            // The store is how `restore` finds out whether a run is still
+            // going. A box with no store has never been observed, which is the
+            // same answer as "no live runs" — so an absent database is not a
+            // reason to refuse the restore.
+            let store = Store::open(&crate::obs::collector::store_path(
+                &manager.state_dir,
+                &name,
+            ))?;
+            checkpoint::restore(runtime.as_ref(), &store, &name, &id).await?;
         }
     }
 

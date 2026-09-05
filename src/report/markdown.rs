@@ -189,17 +189,20 @@ fn network(out: &mut String, report: &RunReport) {
         return;
     }
     if !report.network.domains.is_empty() {
-        out.push_str("| peer | conns | ports | tls | ↑ | ↓ |\n|---|---|---|---|---|---|\n");
+        out.push_str(
+            "| peer | conns | ports | tls | ↑ | ↓ | time |\n|---|---|---|---|---|---|---|\n",
+        );
         for row in &report.network.domains {
             let ports = row.ports_human();
             out.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} | {} |\n",
+                "| `{}` | {} | {} | {} | {} | {} | {} |\n",
                 row.peer,
-                row.connections,
+                row.conns_human(),
                 blank(&ports),
                 if row.tls { "yes" } else { "" },
                 row.tx_human(),
                 row.rx_human(),
+                row.dur_human(),
             ));
         }
         out.push('\n');

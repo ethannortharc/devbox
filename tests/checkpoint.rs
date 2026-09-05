@@ -6,8 +6,10 @@
 //! against output captured verbatim from the devtest guest (NixOS, kernel
 //! 6.19, GNU findutils 4.10.0, coreutils 9.8) rather than from imagination.
 
+use devbox::obs::run::ActiveRun;
 use devbox::sandbox::checkpoint::{
-    Checkpoint, CheckpointId, diff_trees, parse_manifests, prune_plan, resolve_id,
+    Checkpoint, CheckpointId, diff_trees, parse_manifests, prune_plan, refuse_while_running,
+    resolve_id,
 };
 use devbox::sandbox::overlay::{
     ChangeStatus, EntryKind, OverlayChange, TreeEntry, parse_tree_listing,
@@ -70,6 +72,16 @@ fn manifest(id: &str, run_id: Option<&str>) -> Checkpoint {
         run_id: run_id.map(str::to_string),
         files: 0,
         bytes: 0,
+    }
+}
+
+fn live_run(id: &str) -> ActiveRun {
+    ActiveRun {
+        run_id: id.to_string(),
+        cgroup_id: 17557,
+        root_pid: 900,
+        started_at: "2026-09-05T07:42:11.000Z".into(),
+        ended_at: None,
     }
 }
 
@@ -646,4 +658,61 @@ mod cli {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Restoring under a live run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_restore_is_refused_while_a_run_is_still_going() {
+    // A restore replaces /workspace wholesale. Under a live run that destroys
+    // the thing the run's report is about — its end checkpoint would describe
+    // a tree the command never produced — and nothing afterwards can tell.
+    assert!(refuse_while_running("devtest", &[]).is_ok());
+
+    let one = refuse_while_running("devtest", &[live_run("01K4SZ0000000000000000ABCD")])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        one.contains("01K4SZ0000000000000000ABCD"),
+        "the refusal has to name the run, or the reader has nothing to go on: {one}"
+    );
+    assert!(one.contains("devbox runs devtest"), "{one}");
+    assert!(
+        !one.contains("  "),
+        "a line-continued literal leaked its indentation into the message: {one}"
+    );
+
+    let two = refuse_while_running(
+        "devtest",
+        &[
+            live_run("01K4SZ0000000000000000ABCD"),
+            live_run("01K4SZ0000000000000000EFGH"),
+        ],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(two.contains("2 run(s)"), "{two}");
+    assert!(two.contains("01K4SZ0000000000000000EFGH"), "{two}");
+}
+
+#[test]
+fn a_runs_checkpoints_are_never_pruned() {
+    // The report links to them. A report whose evidence has been
+    // garbage-collected is worse than a slightly larger directory.
+    let checkpoints = vec![
+        manifest("01k4sz000000000000", None),
+        manifest("01k4sz000000000001", Some("01K4SZ0000000000000000ABCD")),
+        manifest("01k4sz000000000002", None),
+        manifest("01k4sz000000000003", Some("01K4SZ0000000000000000ABCD")),
+        manifest("01k4sz000000000004", None),
+    ];
+    let doomed: Vec<String> = prune_plan(&checkpoints, 1)
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect();
+    // Two of the three unpinned ones go; neither pinned one is touched, and
+    // the pinned pair does not consume the keep budget either.
+    assert_eq!(doomed, vec!["01k4sz000000000000", "01k4sz000000000002"]);
 }

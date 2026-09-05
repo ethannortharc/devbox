@@ -31,7 +31,30 @@ pub async fn run(args: ExecArgs, manager: &SandboxManager) -> Result<()> {
     // show an empty one. See `SimpleRun` for what these runs can and cannot
     // attribute — they get no wrapper, so no cgroup and no root pid.
     let record = SimpleRun::start(manager, &name, RunKind::Exec, &args.command);
-    let outcome = manager.exec_in_sandbox(&name, &args.command, false).await;
+
+    // The broker's environment, and the run's own id, on the command line.
+    // `exec` has no guest wrapper, so this is its only route to either — and
+    // without it a command run through `exec` cannot reach the broker at all
+    // while the same command through `devbox run` can, which is the kind of
+    // difference nobody would guess from the help text.
+    let command = match manager
+        .get_sandbox(&name)
+        .ok()
+        .and_then(|state| manager.runtime_for_sandbox(&state).ok())
+    {
+        Some(runtime) => {
+            let env = crate::cli::run::run_env(
+                manager,
+                runtime.as_ref(),
+                &name,
+                record.as_ref().map(SimpleRun::run_id).unwrap_or_default(),
+            )
+            .await;
+            crate::broker::with_env(&env, &args.command)
+        }
+        None => args.command.clone(),
+    };
+    let outcome = manager.exec_in_sandbox(&name, &command, false).await;
     if let Some(record) = record {
         record.finish(manager, &name, outcome.as_ref().ok().copied());
     }

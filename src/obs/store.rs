@@ -203,18 +203,25 @@ impl Store {
         )
         .context("failed to create the event schema")?;
 
-        // The collector re-reads the live runs on every flush, so that read is
-        // the hot one. Partial, so it costs one entry per running command
-        // rather than one per run the box has ever done.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS runs_running ON runs (status) WHERE status = 'running';",
-        )
-        .context("failed to index the live runs")?;
-
         // A store created by v4 has the two `events` columns missing and no
         // `schema` key. Both are additive: an old row simply reads back with a
         // NULL `run_id`, which is the truth — it belongs to no run.
+        //
+        // Before the indexes below, not after: `events_run` names a column
+        // that only exists once the migration has added it, and creating it
+        // first made a v4 database fail to *open* — "no such column: run_id",
+        // from a binary whose whole job at that moment was to upgrade it.
         Self::migrate(&conn)?;
+
+        // Both partial, and both on the hot read. `runs_running` is what the
+        // collector re-queries on every flush, so it costs one entry per
+        // running command rather than one per run the box has ever done;
+        // `events_run` bounds a run-scoped export to the run's own rows.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS runs_running ON runs (status) WHERE status = 'running';
+             CREATE INDEX IF NOT EXISTS events_run ON events (run_id) WHERE run_id IS NOT NULL;",
+        )
+        .context("failed to index the runs")?;
 
         // A generation, written once when the store is created.
         //
@@ -653,30 +660,63 @@ impl Store {
         limit: usize,
         max_bytes: usize,
     ) -> Result<(Vec<Event>, i64)> {
+        self.scan_window(after_id, up_to_id, limit, max_bytes, None)
+    }
+
+    /// [`Store::tail_scan`], optionally restricted to one run.
+    ///
+    /// The run filter is in SQL and not in the caller because a decoded
+    /// [`Event`] has no `run_id`: attribution is a host conclusion stored
+    /// beside the event, not a field the agent sends, so there is nothing to
+    /// test once the row has been turned back into an `Event`.
+    pub fn scan_window(
+        &self,
+        after_id: i64,
+        up_to_id: i64,
+        limit: usize,
+        max_bytes: usize,
+        run_id: Option<&str>,
+    ) -> Result<(Vec<Event>, i64)> {
         // The size test is in the projection, not the predicate: an oversized
         // row must still advance the scan, or it wedges the tail exactly the
         // way an undecodable one did.
+        // Not `LENGTH(raw)`. On a TEXT value SQLite's `LENGTH` counts
+        // *characters*, so a cap meant as sixty-four kilobytes admitted four
+        // times that for any event carrying multibyte content — which a
+        // command line or a domain name routinely does. The cast measures
+        // storage.
+        let sql = format!(
+            "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END
+               FROM events WHERE id > ? AND id <= ?{}
+              ORDER BY id ASC LIMIT ?",
+            if run_id.is_some() {
+                " AND run_id = ?"
+            } else {
+                ""
+            }
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                // Not `LENGTH(raw)`. On a TEXT value SQLite's `LENGTH` counts
-                // *characters*, so a cap meant as sixty-four kilobytes admitted
-                // four times that for any event carrying multibyte content —
-                // which a command line or a domain name routinely does. The
-                // cast measures storage.
-                "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END
-                   FROM events WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
-            )
+            .prepare(&sql)
             .context("failed to prepare the tail scan")?;
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(max_bytes as i64),
+            Box::new(after_id),
+            Box::new(up_to_id),
+        ];
+        if let Some(run_id) = run_id {
+            args.push(Box::new(run_id.to_string()));
+        }
+        args.push(Box::new(limit as i64));
         let rows = stmt
-            .query_map(
-                params![max_bytes as i64, after_id, up_to_id, limit as i64],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
+            .query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
             .context("failed to run the tail scan")?;
 
         let mut events = Vec::new();
         let mut scanned_to = after_id;
+        let mut undecodable = Undecodable::new("a live tail");
         for row in rows {
             let (id, raw) = row.context("failed to read a row")?;
             scanned_to = scanned_to.max(id);
@@ -686,7 +726,7 @@ impl Store {
             };
             match serde_json::from_str(&raw) {
                 Ok(event) => events.push(event),
-                Err(e) => tracing::warn!(error = %e, "stored event no longer decodes"),
+                Err(e) => undecodable.record(&e),
             }
         }
         Ok((events, scanned_to))
@@ -775,6 +815,9 @@ impl Store {
             .context("failed to run query")?;
 
         let mut out = Vec::new();
+        // A row that no longer parses is schema drift, not a reason to fail
+        // the whole query — count it and keep the rest usable.
+        let mut undecodable = Undecodable::new("a query");
         for row in rows {
             let (_, raw) = row.context("failed to read a row")?;
             // Nulled by the size cap. A window that is mostly oversized comes
@@ -783,9 +826,7 @@ impl Store {
             let Some(raw) = raw else { continue };
             match serde_json::from_str(&raw) {
                 Ok(event) => out.push(event),
-                // A row that no longer parses is a schema drift, not a reason
-                // to fail the whole query — log it and keep the rest usable.
-                Err(e) => tracing::warn!(error = %e, "stored event no longer decodes"),
+                Err(e) => undecodable.record(&e),
             }
         }
         Ok(out)
@@ -844,6 +885,7 @@ impl Store {
         let mut budget = bytes;
         let mut truncated = false;
         let mut out = Vec::new();
+        let mut undecodable = Undecodable::new("an export");
         let mut cursor = stmt
             .query(params_from_iter(args.iter().map(|a| a.as_ref())))
             .context("failed to run export")?;
@@ -868,12 +910,126 @@ impl Store {
                     // The export is now missing an event it was asked for.
                     // Silence here let an incomplete audit present itself as a
                     // complete one, which is the one thing this flag exists to
-                    // prevent.
+                    // prevent — so the *flag* stays per row even though the
+                    // logging is now per read.
                     truncated = true;
-                    tracing::warn!(error = %e, "stored event no longer decodes");
+                    undecodable.record(&e);
                 }
             }
         }
+        Ok((out, truncated))
+    }
+
+    /// The inclusive row-id range a selection occupies, or `None` if it is empty.
+    ///
+    /// A scan bounded by ids costs the rows in the range; the same scan
+    /// bounded only by a predicate in the caller costs the whole table. On a
+    /// 442k-row store the difference was seven seconds of reading events for
+    /// an export that wanted a handful of them — the rows still had to be
+    /// decoded from JSON before anything could look at their timestamps.
+    ///
+    /// `MIN`/`MAX` over an indexed column, so this is two index probes rather
+    /// than a scan of its own.
+    pub fn id_bounds(
+        &self,
+        from: Option<&str>,
+        until: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        let mut sql = String::from("SELECT MIN(id), MAX(id) FROM events WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(from) = from {
+            sql.push_str(" AND ts_wall >= ?");
+            args.push(Box::new(normalize_ts(from)));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND ts_wall < ?");
+            args.push(Box::new(normalize_ts(until)));
+        }
+        if let Some(run_id) = run_id {
+            sql.push_str(" AND run_id = ?");
+            args.push(Box::new(run_id.to_string()));
+        }
+
+        let bounds: (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                &sql,
+                params_from_iter(args.iter().map(|a| a.as_ref())),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("failed to read a selection's row-id bounds")?;
+        Ok(match bounds {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None,
+        })
+    }
+
+    /// The *newest* events in a window, returned oldest-first.
+    ///
+    /// [`Store::export`] reads from the beginning, which is right for an audit
+    /// trail and wrong for a summary: a box with two million events answered
+    /// "what has this been doing" with its first seven minutes, from weeks
+    /// ago, and said only that the scan was cut short. A summary with no
+    /// `--since` means "lately".
+    ///
+    /// The `bool` is the same truncation flag `export` returns, and means the
+    /// same thing — there is more in this window than was read — except that
+    /// what was left out is *older* rather than newer.
+    pub fn recent(
+        &self,
+        since: Option<&str>,
+        rows: usize,
+        bytes: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let mut sql = String::from("SELECT raw FROM events WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = since {
+            sql.push_str(" AND ts_wall >= ?");
+            args.push(Box::new(normalize_ts(since)));
+        }
+        // One more than asked for, so "there is another row" is observed
+        // rather than inferred — the same reason `export` does it.
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        args.push(Box::new(rows as i64 + 1));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare the recent-events read")?;
+        let mut scanned = 0usize;
+        let mut budget = bytes;
+        let mut truncated = false;
+        let mut out = Vec::new();
+        let mut undecodable = Undecodable::new("a summary");
+        let mut cursor = stmt
+            .query(params_from_iter(args.iter().map(|a| a.as_ref())))
+            .context("failed to read recent events")?;
+        while let Some(row) = cursor.next().context("failed to read a row")? {
+            if scanned == rows {
+                truncated = true;
+                break;
+            }
+            scanned += 1;
+            let raw: String = row.get(0)?;
+            match budget.checked_sub(raw.len()) {
+                Some(left) => budget = left,
+                None => {
+                    truncated = true;
+                    break;
+                }
+            }
+            match serde_json::from_str(&raw) {
+                Ok(event) => out.push(event),
+                Err(e) => {
+                    truncated = true;
+                    undecodable.record(&e);
+                }
+            }
+        }
+        // Read newest-first so the limit keeps the recent events; returned
+        // oldest-first so every caller sees the same order `export` gives.
+        out.reverse();
         Ok((out, truncated))
     }
 
@@ -1095,6 +1251,57 @@ const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, e
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events";
 
+/// Counts rows a read could not decode, and says so exactly once.
+///
+/// Every one of these was a `warn!` per row. A store holding events from a
+/// newer schema — which is what happens the moment one binary on the box is
+/// ahead of another, and happened for real when the broker's `credential`
+/// events met a build that predated them — turned a single `devbox watch`
+/// into thousands of identical lines, with the useful output somewhere in the
+/// middle of them.
+///
+/// One line per read, on drop, so no caller has to remember to emit it. The
+/// count is the part that matters: one undecodable row is schema drift, ten
+/// thousand is a store this build should not be reading.
+#[derive(Debug)]
+struct Undecodable {
+    what: &'static str,
+    count: u64,
+    first: Option<String>,
+}
+
+impl Undecodable {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            count: 0,
+            first: None,
+        }
+    }
+
+    fn record(&mut self, error: &serde_json::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(error.to_string());
+        }
+    }
+}
+
+impl Drop for Undecodable {
+    fn drop(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        tracing::warn!(
+            skipped = self.count,
+            error = self.first.as_deref().unwrap_or(""),
+            "{} skipped stored events it could not decode; they were written by a \
+             newer schema than this build understands, or are damaged",
+            self.what,
+        );
+    }
+}
+
 fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let argv: String = row.get(3)?;
     Ok(RunRecord {
@@ -1142,6 +1349,79 @@ fn normalize_ts(ts: &str) -> String {
 mod tests {
     use super::*;
     use crate::obs::event::{Exec, Net};
+
+    #[test]
+    fn a_summary_with_no_since_reads_the_newest_events_not_the_oldest() {
+        // The failure this fixes: a box with a long history answered "what has
+        // this been doing" with its *first* few minutes, from weeks ago, and
+        // said only that the scan had been cut short.
+        let mut store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..50)
+            .map(|i| {
+                event(
+                    EventType::Exec,
+                    1000 + i,
+                    &format!("2026-08-06T22:{:02}:00.000Z", i),
+                )
+            })
+            .collect();
+        store.insert_batch(&events).unwrap();
+
+        let (recent, truncated) = store.recent(None, 10, usize::MAX).unwrap();
+        assert!(truncated, "there is more than one scan can read");
+        assert_eq!(recent.len(), 10);
+        // Oldest-first in the result, newest-first in what it kept.
+        assert_eq!(recent.first().unwrap().pid, 1040);
+        assert_eq!(recent.last().unwrap().pid, 1049);
+
+        // `export` still reads from the beginning, which is what an audit
+        // trail wants; the two are deliberately different.
+        let (oldest, _) = store.export(None, 10, usize::MAX).unwrap();
+        assert_eq!(oldest.first().unwrap().pid, 1000);
+
+        // A window that fits is not reported as truncated by either.
+        let (all, truncated) = store.recent(None, 500, usize::MAX).unwrap();
+        assert_eq!(all.len(), 50);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn id_bounds_narrow_a_scan_to_the_rows_a_selection_occupies() {
+        let mut store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..20)
+            .map(|i| {
+                event(
+                    EventType::Exec,
+                    1000 + i,
+                    &format!("2026-08-06T22:{:02}:00.000Z", i),
+                )
+            })
+            .collect();
+        store.insert_batch(&events).unwrap();
+
+        let (first, last) = store
+            .id_bounds(
+                Some("2026-08-06T22:05:00.000Z"),
+                Some("2026-08-06T22:08:00.000Z"),
+                None,
+            )
+            .unwrap()
+            .expect("the window holds rows");
+        // 22:05, 22:06 and 22:07 — rows 6, 7 and 8 of twenty. The lower bound
+        // is inclusive and the upper is not, which is what `Query::until` and
+        // `Window::contains` both mean, so the ids agree with the filter that
+        // still runs over them.
+        assert_eq!((first, last), (6, 8));
+
+        // A window with nothing in it is `None`, not an empty range that a
+        // caller could mistake for "scan from 0".
+        assert!(
+            store
+                .id_bounds(Some("2099-01-01T00:00:00Z"), None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn writers_wait_for_a_short_sqlite_handoff_instead_of_dropping_immediately() {

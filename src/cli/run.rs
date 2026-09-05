@@ -18,9 +18,11 @@ use crate::obs::run::{
 };
 use crate::obs::{Query, Store};
 use crate::policy::{Policy, Posture};
-use crate::report::{self, RunReport, SCOPE_BOX};
+use crate::report::{self, RunReport, SCOPE_BOX, SCOPE_RUN};
 use crate::sandbox::SandboxManager;
+use crate::sandbox::checkpoint::{self, Checkpoint, CheckpointId, Target};
 use crate::sandbox::config::DevboxConfig;
+use crate::sandbox::overlay::OverlayChange;
 
 /// The default working directory inside a box.
 const GUEST_CWD: &str = "/workspace";
@@ -114,6 +116,13 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         .map(|s| s.dropped + s.persist_failed)
         .unwrap_or(0);
 
+    // A checkpoint before the command, so the report's Files section can be
+    // about *this run* rather than about everything the box has accumulated.
+    // Best effort in both directions: a box in writable mode has no upper to
+    // copy, and a copy that fails is a reason to fall back to the box-wide
+    // diff — never a reason to refuse to run the command someone asked for.
+    let checkpoint_start = take_checkpoint(manager, &state, &name, &run_id, "run-start").await;
+
     // Posture, and the guard that puts it back. ADR-0047: reverse only a
     // switch that happened — and if the apply itself failed, we do not know
     // how far it got, so reversing is the recoverable side of the mistake.
@@ -173,8 +182,20 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // not a TTY" and the command never runs at all. So the check is here, and
     // it is `stdin`, because that is the stream a pty is for.
     let interactive = std::io::stdin().is_terminal();
+
+    // The environment wraps the *command*, not the bootstrap.
+    //
+    // `env -- K=V …` in front of the whole wrapper would be lost on the
+    // `sudo -n systemd-run` path, because sudo resets the environment. Inside
+    // the wrapper's argv it is carried verbatim through every hop — the
+    // wrapper only ever passes `"$@"` along — so it survives sudo, the
+    // transient scope, and the re-exec into stage 2.
+    let env = match manager.runtime_for_sandbox(&state) {
+        Ok(runtime) => run_env(manager, runtime.as_ref(), &name, &run_id).await,
+        Err(_) => Vec::new(),
+    };
     let mut argv = bootstrap(&run_id, &args.cwd);
-    argv.extend(args.command.iter().cloned());
+    argv.extend(crate::broker::with_env(&env, &args.command));
 
     let outcome = manager.exec_in_sandbox(&name, &argv, interactive).await;
     let ended_at = now();
@@ -219,7 +240,16 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         .map(|s| (s.dropped + s.persist_failed).saturating_sub(dropped_before))
         .unwrap_or(0);
 
+    let checkpoint_end = take_checkpoint(manager, &state, &name, &run_id, "run-end").await;
+
     let store = Store::open(&path).context("failed to reopen the box's event store")?;
+    if checkpoint_start.is_some() || checkpoint_end.is_some() {
+        let start = checkpoint_start.as_ref().map(|c| c.id.as_str());
+        let end = checkpoint_end.as_ref().map(|c| c.id.as_str());
+        if let Err(e) = store.set_run_checkpoints(&run_id, start, end) {
+            tracing::warn!(error = %e, "could not record a run's checkpoints");
+        }
+    }
     store
         .finish_run(
             &run_id,
@@ -285,29 +315,25 @@ async fn render(
     let unattributed =
         store.unattributed_in_window(&record.started_at, record.ended_at.as_deref())?;
 
-    // The file section, wave 1 (§4.4, and the brief's own caveat).
+    // The Files section (§4.4).
     //
-    // `overlay::diff` answers "what has changed in this box since it was
-    // created", which is a superset of this run. Component E's checkpoint diff
-    // is the run-scoped answer, and this closure is the seam it lands in: at
-    // integration its body becomes `checkpoint::diff(start, end)` and the
-    // scope string becomes `SCOPE_RUN`. Awaited here rather than inside,
-    // because the source is a synchronous closure by design — the report
-    // module has no business being async.
-    let changes = if state.mount_mode == "writable" {
-        Vec::new()
-    } else {
-        let runtime = manager.runtime_for_sandbox(state)?;
-        crate::sandbox::overlay::diff(runtime.as_ref(), name)
-            .await
-            .unwrap_or_default()
-    };
+    // Two checkpoints bracket the run, so the diff between them is what *this
+    // command* changed. Without both — a writable box has no upper to copy, a
+    // checkpoint can fail, an older run predates this code — the answer falls
+    // back to `overlay::diff`, which is everything the box has accumulated
+    // since it was created. That is a superset, not an approximation, so the
+    // scope string changes with it and all three renderings print which one
+    // the reader is holding.
+    //
+    // Resolved here rather than inside the closure because it needs the guest:
+    // `report` is deliberately synchronous and knows nothing about runtimes.
+    let (changes, scope) = file_changes(manager, state, name, &record).await;
 
     let report = RunReport::build(
         record,
         &events,
         Box::new(move || Ok(changes.clone())),
-        SCOPE_BOX,
+        scope,
         attribution,
         unattributed,
     );
@@ -316,6 +342,94 @@ async fn render(
     let rendered = report::write(&manager.state_dir, &report)?;
     println!("  report   {}", rendered.html.display());
     Ok(Some(rendered))
+}
+
+/// The environment a run's command sees: the broker's, plus its own identity.
+///
+/// One builder for all three entry points (`run`, `exec`, `shell`), because
+/// there is no other place a guest command's environment is assembled — every
+/// runtime's `exec_cmd` takes an argv and no environment, and two of the three
+/// silently drop `CreateOpts.env`. `broker::with_env` puts it on the command
+/// line with `env --`, which is the only form that works uniformly.
+///
+/// `DEVBOX_RUN_ID` is here rather than only in the guest wrapper because
+/// `exec` and `shell` have no wrapper: this is their sole route to it.
+pub async fn run_env(
+    manager: &SandboxManager,
+    runtime: &dyn crate::runtime::Runtime,
+    name: &str,
+    run_id: &str,
+) -> Vec<(String, String)> {
+    let mut env = manager.broker_env(runtime, name).await;
+    env.push(("DEVBOX_RUN_ID".to_string(), run_id.to_string()));
+    env
+}
+
+/// Checkpoint the box for a run, or explain why there is none.
+///
+/// Never fatal. The point of a run is to execute the command; the checkpoint
+/// makes the report sharper, and a box that cannot give one still produces a
+/// report — with `scope: box` on its Files section, which says so.
+async fn take_checkpoint(
+    manager: &SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+    run_id: &str,
+    label: &str,
+) -> Option<Checkpoint> {
+    if state.mount_mode == "writable" {
+        return None;
+    }
+    let runtime = match manager.runtime_for_sandbox(state) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::debug!(error = %e, "no runtime for a run checkpoint");
+            return None;
+        }
+    };
+    match checkpoint::create_for_run(runtime.as_ref(), name, run_id, Some(label)).await {
+        Ok(checkpoint) => Some(checkpoint),
+        Err(e) => {
+            eprintln!("Warning: could not take the {label} checkpoint: {e:#}");
+            eprintln!("         The report's file section will cover the whole box instead.");
+            None
+        }
+    }
+}
+
+/// The run's file changes, and the scope they actually describe.
+async fn file_changes(
+    manager: &SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    name: &str,
+    record: &crate::obs::run::RunRecord,
+) -> (Vec<OverlayChange>, &'static str) {
+    if state.mount_mode == "writable" {
+        return (Vec::new(), SCOPE_BOX);
+    }
+    let Ok(runtime) = manager.runtime_for_sandbox(state) else {
+        return (Vec::new(), SCOPE_BOX);
+    };
+
+    if let (Some(start), Some(end)) = (&record.checkpoint_start, &record.checkpoint_end)
+        && let (Ok(start), Ok(end)) = (CheckpointId::parse(start), CheckpointId::parse(end))
+    {
+        match checkpoint::diff(runtime.as_ref(), name, &start, Target::Checkpoint(end)).await {
+            Ok(changes) => return (changes, SCOPE_RUN),
+            Err(e) => {
+                // Falling back rather than failing, but loudly: a Files section
+                // that silently widened from the run to the box would be the
+                // report's most confident lie.
+                eprintln!("Warning: could not diff this run's checkpoints: {e:#}");
+                eprintln!("         Falling back to the box-wide overlay diff.");
+            }
+        }
+    }
+
+    let changes = crate::sandbox::overlay::diff(runtime.as_ref(), name)
+        .await
+        .unwrap_or_default();
+    (changes, SCOPE_BOX)
 }
 
 fn open_report(path: &std::path::Path) {
@@ -398,6 +512,11 @@ impl SimpleRun {
                 None
             }
         }
+    }
+
+    /// This run's id, so a caller can put it in the command's environment.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
     }
 
     /// Close it out. A row left `running` is what `aborted` is for, so this is

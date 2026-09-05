@@ -20,7 +20,18 @@ pub async fn run(args: ShellArgs, manager: &SandboxManager) -> Result<()> {
     // some days. `attach` chooses the shell itself, so the argv recorded here
     // is the intent rather than the command line.
     let record = SimpleRun::start(manager, &name, RunKind::Shell, &["shell".to_string()]);
-    let outcome = manager.attach(&name).await;
+    let extra: Vec<(String, String)> = record
+        .as_ref()
+        .map(|r| {
+            vec![(
+                "DEVBOX_RUN_ID".to_string(),
+                SimpleRun::run_id(r).to_string(),
+            )]
+        })
+        .unwrap_or_default();
+    // `attach` already puts the broker's environment on the shell's command
+    // line; this adds the one variable it cannot know.
+    let outcome = manager.attach_with_env(&name, &extra).await;
     if let Some(record) = record {
         record.finish(manager, &name, outcome.as_ref().ok().map(|_| 0));
     }
