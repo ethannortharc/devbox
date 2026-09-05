@@ -120,8 +120,18 @@ mod tests {
     ///
     /// `devbox create` is absent on purpose: its `--name` names a box that does
     /// not exist yet, so it is not the same argument. `devbox use <NAME>`
-    /// requires its box and was already positional. `devbox policy allow` has
-    /// its own test below.
+    /// requires its box and was already positional. `devbox policy allow` and
+    /// `devbox report` have their own tests below.
+    ///
+    /// `devbox secret` and `devbox broker status|start|stop` are absent
+    /// because they name no box at all: the broker and its credentials are
+    /// host state shared by every box, and only `broker reach` probes from
+    /// inside one.
+    ///
+    /// This list is not maintained by hand any more than it has to be:
+    /// `every_command_with_a_box_positional_is_covered` walks the real command
+    /// tree and fails when a new subcommand flattens [`BoxArg`] without
+    /// appearing here.
     fn cases() -> Vec<Case> {
         vec![
             case(&["shell"], &[], &["--name"]),
@@ -157,6 +167,18 @@ mod tests {
             case(&["layer", "conflicts"], &[], &["--name"]),
             case(&["layer", "stash"], &[], &["--name"]),
             case(&["layer", "stash-pop"], &[], &["--name"]),
+            case(&["layer", "checkpoint"], &[], &["--name"]),
+            case(&["layer", "checkpoints"], &[], &["--name"]),
+            // The checkpoint id is the first positional on both of these, so
+            // the box is the second one — the `snapshot save` shape.
+            case(&["layer", "restore", "01kfx9m2"], &[], &["--name"]),
+            case(&["layer", "checkpoint-rm", "01kfx9m2"], &[], &["--name"]),
+            // `run`'s trailing command is `last = true`, so the box still has
+            // to be readable from in front of the `--`.
+            case(&["run"], &["--", "true"], &["--name"]),
+            case(&["runs"], &[], &["--name"]),
+            case(&["export"], &["--format", "jsonl"], &["--name"]),
+            case(&["broker", "reach"], &[], &["--name"]),
             case(&["sets", "list"], &[], &["--name"]),
             case(&["sets", "apply"], &["--set", "system"], &["--name"]),
             case(&["behavior", "summary"], &[], &["--name"]),
@@ -218,7 +240,7 @@ mod tests {
     /// wrong slot, such as `snapshot save nightly devtest` binding `nightly`
     /// as the box.
     fn selected_box(argv: &[String]) -> Option<String> {
-        use crate::cli::{behavior, nix_cmd, policy, sets, snapshot};
+        use crate::cli::{behavior, broker, nix_cmd, policy, sets, snapshot};
 
         let cli = Cli::try_parse_from(argv).expect("argv should parse");
         match cli.command.expect("a subcommand") {
@@ -232,6 +254,13 @@ mod tests {
             Command::Diff(a) => a.boxarg.name().map(str::to_string),
             Command::Discard(a) => a.boxarg.name().map(str::to_string),
             Command::Reprovision(a) => a.boxarg.name().map(str::to_string),
+            Command::Run(a) => a.boxarg.name().map(str::to_string),
+            Command::Runs(a) => a.boxarg.name().map(str::to_string),
+            Command::Export(a) => a.boxarg.name().map(str::to_string),
+            Command::BrokerCmd(a) => match a.command {
+                broker::BrokerCommand::Reach(a) => a.boxarg.name().map(str::to_string),
+                other => panic!("devbox broker {other:?} does not select a box"),
+            },
             Command::Code(a) => a.boxarg.name().map(str::to_string),
             Command::Watch(a) => a.boxarg.name().map(str::to_string),
             Command::Snapshot(a) => match a.action {
@@ -414,6 +443,77 @@ mod tests {
         assert_eq!(
             flag.get_help().map(|h| h.to_string()).as_deref(),
             Some(BOX_NAME_HELP),
+        );
+    }
+
+    /// `devbox report <RUN_ID>` is the second documented exception.
+    ///
+    /// Its `--name` looks like the others and is not: omitting it means
+    /// "search every box for this run", not "use the box registered for the
+    /// current directory". Turning it into a `[NAME]` positional would make
+    /// [`BOX_NAME_HELP`] — which is the shared promise — a lie, so it keeps a
+    /// visible flag with its own description. If the default ever becomes the
+    /// current directory's box, this test is what should stop working.
+    #[test]
+    fn report_keeps_its_own_name_flag_because_its_default_is_different() {
+        let cmd = find_subcommand(&Cli::command(), &["report"]);
+        assert!(
+            cmd.get_arguments().all(|a| a.get_id() != "name_pos"),
+            "report grew a [NAME] positional; it needs a case() entry, not an exception"
+        );
+        let flag = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "name")
+            .expect("report keeps --name");
+        assert!(!flag.is_hide_set(), "--name is the only form here");
+        assert_ne!(
+            flag.get_help().map(|h| h.to_string()).as_deref(),
+            Some(BOX_NAME_HELP),
+            "report's default is not the current directory's box, so it must not \
+             claim the shared description",
+        );
+    }
+
+    /// The one guard that does not need updating when a command is added.
+    ///
+    /// The hand-written list above is the thing that drifts — `layer
+    /// checkpoint`, `run`, `runs`, `export` and `broker reach` all shipped
+    /// without it, so the shared-argument tests silently covered less of the
+    /// CLI every release. This walks the command tree instead: anything that
+    /// flattens `BoxArg` gets a `name_pos`, and anything with a `name_pos`
+    /// must appear in `cases()`.
+    #[test]
+    fn every_command_with_a_box_positional_is_covered() {
+        fn walk(cmd: &clap::Command, path: Vec<String>, found: &mut Vec<Vec<String>>) {
+            if cmd.get_arguments().any(|a| a.get_id() == "name_pos") {
+                found.push(path.clone());
+            }
+            for sub in cmd.get_subcommands() {
+                let mut deeper = path.clone();
+                deeper.push(sub.get_name().to_string());
+                walk(sub, deeper, found);
+            }
+        }
+
+        let root = Cli::command();
+        let mut found: Vec<Vec<String>> = vec![];
+        for sub in root.get_subcommands() {
+            walk(sub, vec![sub.get_name().to_string()], &mut found);
+        }
+
+        let covered: Vec<Vec<String>> = cases()
+            .iter()
+            .map(|c| c.command_path().iter().map(|s| s.to_string()).collect())
+            .collect();
+
+        let missing: Vec<String> = found
+            .iter()
+            .filter(|path| !covered.contains(path))
+            .map(|path| format!("devbox {}", path.join(" ")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these commands take a [NAME] positional but are not in cases(): {missing:?}"
         );
     }
 
