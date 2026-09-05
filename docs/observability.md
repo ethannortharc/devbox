@@ -289,7 +289,7 @@ devbox export --format jsonl
 
 | Format | What comes out |
 |---|---|
-| `ocsf` | OCSF 1.3, one JSON object per line. Process Activity 1007, File System Activity 1001, Network Activity 4001, DNS Activity 4003, HTTP Activity 4002, Detection Finding 2004, API Activity 6003. |
+| `ocsf` | OCSF 1.3, one JSON object per line. Process Activity 1007, File System Activity 1001, Network Activity 4001, DNS Activity 4003, HTTP Activity 4002, Detection Finding 2004. |
 | `otlp-json` | One OTLP/JSON `ExportLogsServiceRequest`: 64-bit fields as decimal strings, enums as integers, semconv attribute names where one exists and `devbox.*` where none does. |
 | `jsonl` | The canonical devbox event, unchanged. |
 
@@ -297,9 +297,16 @@ devbox export --format jsonl
 out of a large store costs the run, not the store.
 
 An event kind with no honest OCSF class is counted as **unmapped** and skipped,
-not filed under a neighbouring class. The invariant `matched == written +
-unmapped` is checked, and an export that does not balance fails rather than
-printing a plausible-looking partial record.
+not filed under a neighbouring class, and the summary names the kinds it
+dropped. Two kinds are in that position today: `syscall`, which OCSF has no
+class for, and `credential` — API Activity 6003 is where a brokered request
+belongs and the encoder already makes room for it (6003 has no `device`
+attribute, so the common envelope skips one there), but no event is mapped onto
+it yet. `--format jsonl` always carries everything.
+
+The invariant `matched == written + unmapped` is checked, and an export that
+does not balance fails rather than printing a plausible-looking partial
+record.
 
 Where a required OCSF field has no observed value, the export says so instead of
 inventing one: `tls.version` is `"Unknown"` because the agent reads only the

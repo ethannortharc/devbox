@@ -284,20 +284,31 @@ server is broken" and stops asking.
 ### Export: the same events, in someone else's schema
 
 ```bash
-devbox export --run 01M1S6K0XSDYN51E45Y3JS6NK7 --format ocsf
+devbox export --run 01M1SD2Z4F842DVZSBZXA2B688 --format ocsf
 devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
 devbox export --format jsonl
 ```
 
-`ocsf` emits OCSF 1.3 (Process Activity, File System Activity, Network
-Activity, DNS Activity, HTTP Activity, Detection Finding, API Activity), one
-JSON object per line, every class validated against the OCSF schema server.
-`otlp-json` emits one OTLP/JSON `ExportLogsServiceRequest`, accepted by a
-stock OpenTelemetry Collector. `jsonl` is devbox's own event, unchanged.
+`ocsf` emits OCSF 1.3 — Process Activity, File System Activity, Network
+Activity, DNS Activity, HTTP Activity and Detection Finding — one JSON object
+per line, every class validated against the OCSF schema server. `otlp-json`
+emits one OTLP/JSON `ExportLogsServiceRequest`, accepted by a stock
+OpenTelemetry Collector. `jsonl` is devbox's own event, unchanged.
 
 An event kind with no honest mapping is counted as unmapped and skipped rather
-than filed under a nearby class, and a run that does not balance
-(`matched == written + unmapped`) fails instead of printing a partial export.
+than filed under a nearby class, and the export says which kinds it dropped:
+
+```
+Exported 60 of 61 event(s) as ocsf to run.ocsf.jsonl (scanned 61).
+warning: 1 event(s) have no ocsf class in this build and were not written:
+credential=1. Use --format jsonl for the complete record.
+```
+
+`credential` and `syscall` are the two kinds in that position today — API
+Activity 6003 is where a brokered request belongs, and the plumbing for it is
+in place, but nothing is mapped onto it yet. `jsonl` carries everything. An
+export whose counts do not balance (`matched == written + unmapped`) fails
+rather than printing a plausible-looking partial record.
 
 ---
 

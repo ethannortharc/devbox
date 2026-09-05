@@ -211,7 +211,7 @@ it comes back as `-32600`.
 ## Export
 
 ```bash
-devbox export --run 01M1S6K0XSDYN51E45Y3JS6NK7 --format ocsf
+devbox export --run 01M1SD2Z4F842DVZSBZXA2B688 --format ocsf
 devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
 devbox export --format jsonl
 ```
@@ -220,6 +220,11 @@ devbox export --format jsonl
 440k-event store is a scan of that run, not of the store. `ocsf` is OCSF 1.3,
 one JSON object per line; `otlp-json` is a single OTLP/JSON
 `ExportLogsServiceRequest`; `jsonl` is devbox's own event, unchanged.
+
+`ocsf` skips what it cannot map honestly, and names it on the way out —
+`credential` and `syscall` have no class in this build, so a run that used a
+credential exports one event fewer and says so. Use `jsonl` when you need the
+complete record.
 
 ## The CLI, by task
 
