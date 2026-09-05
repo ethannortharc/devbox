@@ -152,6 +152,58 @@ func TestHandshakeSucceeds(t *testing.T) {
 	}
 }
 
+func TestHandshakeCarriesTheFileScope(t *testing.T) {
+	t.Parallel()
+
+	// `file` in Capture says the probe is attached; this says how much of the
+	// filesystem it reports. Without it a collector cannot tell a box with no
+	// workspace writes from one whose scope excluded the directory in
+	// question.
+	var toAgent, fromAgent bytes.Buffer
+	if err := WriteJSON(&toAgent, HelloAck{Protocol: ProtocolVersion, Accepted: true}); err != nil {
+		t.Fatal(err)
+	}
+	sent := Hello{
+		Version: "0.1.6", BoxID: "myapp",
+		Capture:   []string{"file"},
+		Source:    "ebpf",
+		EBPF:      true,
+		FileScope: []string{"/workspace", "/home/dev"},
+	}
+	if err := Handshake(pipe{in: &toAgent, out: &fromAgent}, sent); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+
+	var hello Hello
+	if err := ReadJSON(&fromAgent, &hello); err != nil {
+		t.Fatalf("collector could not read the Hello: %v", err)
+	}
+	if len(hello.FileScope) != 2 ||
+		hello.FileScope[0] != "/workspace" || hello.FileScope[1] != "/home/dev" {
+		t.Fatalf("Hello.FileScope = %v", hello.FileScope)
+	}
+
+	// An agent from before the field says nothing, and that must decode as
+	// "not narrowed" rather than as an error.
+	var older Hello
+	if err := ReadJSON(bytes.NewReader(frame(t, `{"protocol":1,"box_id":"b","ebpf":true}`)), &older); err != nil {
+		t.Fatalf("an older agent's Hello was refused: %v", err)
+	}
+	if older.FileScope != nil {
+		t.Fatalf("FileScope = %v, want none", older.FileScope)
+	}
+}
+
+// frame wraps a payload the way the wire carries it.
+func frame(t *testing.T, payload string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 func TestHandshakeRejectsAVersionMismatch(t *testing.T) {
 	t.Parallel()
 

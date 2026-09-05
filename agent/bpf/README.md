@@ -10,7 +10,24 @@ CO-RE programs that feed the observability plane (§7.1).
 | `handle_tcp_finish_connect` | kprobe `tcp_finish_connect` | established outbound `connect` — 5-tuple |
 | `handle_accept` | kretprobe `inet_csk_accept` | `accept` — 5-tuple |
 | `handle_tcp_close` | kprobe `tcp_close` | `close` — 5-tuple, bytes sent/received, duration |
-| `handle_openat` | tracepoint `syscalls/sys_enter_openat` | `file` — path, flags, op |
+| `handle_openat` | tracepoint `syscalls/sys_enter_openat` | `file` — path, flags, op (userspace filters by path prefix, `/workspace` by default) |
+
+`handle_openat` fires for every process in the traced cgroup, which is far more
+than §7.1 promises ("file: open/create/write **under the workspace**"): an idle
+box produced 6750 file events in 80 seconds, almost all of them /nix/store,
+/etc/passwd and journald sockets. The scope is applied in userspace, by
+`capture.Scope`, so the probe and its object file stay unchanged and the
+prefix list is a runtime flag (`devbox-obsd -file-scope`) rather than a
+recompile. What it suppresses is counted and published — `file_out_of_scope` in
+the agent's status file — because a filter nobody can see looks exactly like a
+probe that stopped firing.
+
+One consequence is worth knowing when reading the code: the tracepoint records
+`args[1]`, the pathname, and not `args[0]`, the directory fd it resolves
+against. A relative pathname therefore cannot be placed in a subtree from
+userspace and is treated as out of scope. On a real box those are about 16% of
+file events, and they are path-walk fragments (`lib`, `..`, `run`) rather than
+opens anyone would want to read.
 
 DNS and TLS SNI are **not** eBPF programs: they are parsed from the flow by
 `agent/decode` (see `wire.go`). A ClientHello is plaintext by design and a DNS

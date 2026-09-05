@@ -194,6 +194,8 @@ struct Launch {
     attempts: u32,
     /// Cleared when this collector is retired.
     live: Arc<std::sync::Mutex<bool>>,
+    /// The path prefixes this box's agent reports file events from.
+    file_scope: String,
 }
 
 struct RetryState {
@@ -627,6 +629,7 @@ impl Supervisor {
                             ebpf: hello.ebpf,
                             capture: hello.capture.clone(),
                             source: hello.source.clone(),
+                            file_scope: hello.file_scope.clone(),
                             agent_version: hello.version.clone(),
                             ..CaptureHealth::new(&health_box, CaptureState::Streaming)
                                 .with_transport(transport)
@@ -663,6 +666,12 @@ impl Supervisor {
                 .with_attempts(attempts),
         );
         if !crate::obs::uses_host_socket(runtime.name()) {
+            // Asked of the guest, once per attach, and only for the transport
+            // that starts an agent from here: the answer differs per box —
+            // NixOS names the user after the host account, Ubuntu images do
+            // not — and a scope naming the wrong home would silently drop
+            // every file event a session produced.
+            let file_scope = guest_file_scope(runtime.as_ref(), name).await;
             return self
                 .start_remote(
                     name,
@@ -673,6 +682,7 @@ impl Supervisor {
                         claim,
                         attempts,
                         live: retirement,
+                        file_scope,
                     },
                 )
                 .map(Some);
@@ -755,8 +765,10 @@ impl Supervisor {
             claim,
             attempts,
             live,
+            file_scope,
         } = launch;
-        let agent_args = remote_agent_args(name, crate::obs::uses_ebpf(runtime.name()));
+        let agent_args =
+            remote_agent_args(name, crate::obs::uses_ebpf(runtime.name()), &file_scope);
         let agent_refs: Vec<&str> = agent_args.iter().map(String::as_str).collect();
         let argv = runtime.argv(name, &agent_refs, false);
         let (program, args) = argv
@@ -1009,7 +1021,74 @@ fn try_claim_collector(state_dir: &std::path::Path, name: &str) -> Result<Option
     }
 }
 
-fn remote_agent_args(name: &str, has_ebpf: bool) -> Vec<String> {
+/// How long the box gets to name its user's home before the scope falls back.
+const HOME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The paths a box's agent reports file events from.
+///
+/// `/workspace` is the promise §7.1 makes and is always in the list. The box
+/// user's home is the second half of it in practice: an agent session that
+/// never leaves `~/.config` or `~/.cache` would otherwise look like a box
+/// doing nothing at all, and those are the reads worth seeing.
+///
+/// The same `/etc/passwd` filter `detect_vm_username` uses, asked in one
+/// command rather than two. A box that cannot answer gets `/home`, which is
+/// broader than one user's directory and still excludes the /nix/store and
+/// /etc traffic this scope exists to keep out.
+pub(crate) async fn guest_file_scope(runtime: &dyn crate::runtime::Runtime, name: &str) -> String {
+    const FALLBACK: &str = "/workspace,/home";
+    let probe = runtime.exec_cmd(
+        name,
+        &[
+            "sh",
+            "-c",
+            "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $6; exit }' /etc/passwd",
+        ],
+        false,
+    );
+    let home = match tokio::time::timeout(HOME_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(result)) if result.exit_code == 0 => result.stdout.trim().to_string(),
+        _ => return FALLBACK.to_string(),
+    };
+    let scope = scope_with_home(&home);
+    // Only when the box named *something* and it was rejected. A box that
+    // named nothing is the ordinary case and has its own explanation below.
+    if home.starts_with('/') && scope == FALLBACK {
+        tracing::warn!(
+            box_id = %name,
+            home = %home,
+            "the box named an unusable home directory; scoping file events to /workspace and /home"
+        );
+    }
+    scope
+}
+
+/// The scope for one detected home, or the fallback when it cannot be used.
+///
+/// Separated from the probe because this is the part that can be wrong on its
+/// own: the value comes from a file inside the box and becomes a capture rule,
+/// where a comma would append a second prefix and `/` would turn the scope
+/// back into "everything".
+///
+/// An empty home is the common case rather than a fault: Lima gives its user
+/// the *host* uid — 501 on a Mac — so the "ordinary user" filter every other
+/// probe uses finds nobody, and that box's real home is `/home/<user>.guest`
+/// rather than the `/home/<user>` its passwd entry names. `/home` covers both,
+/// and still excludes the /nix/store and /etc traffic that made this scope
+/// necessary.
+fn scope_with_home(home: &str) -> String {
+    const FALLBACK: &str = "/workspace,/home";
+    if !home.starts_with('/')
+        || home == "/"
+        || home.contains(',')
+        || home.split_whitespace().count() != 1
+    {
+        return FALLBACK.to_string();
+    }
+    format!("/workspace,{home}")
+}
+
+fn remote_agent_args(name: &str, has_ebpf: bool, file_scope: &str) -> Vec<String> {
     // Decide privilege in the guest. Docker exec commonly starts as root and
     // minimal images have no sudo; VM runtimes start as an ordinary user. The
     // fixed shell script forwards every following token through "$@", so the
@@ -1027,6 +1106,13 @@ fn remote_agent_args(name: &str, has_ebpf: bool) -> Vec<String> {
         // reads the policy for capture/posture context but must not race the
         // service's delete+add updates to the DNS-backed allow sets.
         "-restore-policy=false".to_string(),
+        // The openat probe fires for every process in the box. Without a scope
+        // the agent exports /nix/store, /etc/passwd and journald's sockets at
+        // thousands of events a minute — which is what filled one box's store
+        // with 258 MB of system noise and pushed `behavior summary` past its
+        // scan limit. Its own token, never interpolated into shell syntax.
+        "-file-scope".to_string(),
+        file_scope.to_string(),
     ];
     if !has_ebpf {
         direct.push("-no-ebpf".to_string());
@@ -1084,7 +1170,11 @@ mod tests {
 
     #[test]
     fn remote_agent_privilege_is_decided_inside_the_guest_without_touching_stdio() {
-        let args = remote_agent_args("alpha", crate::obs::uses_ebpf("docker"));
+        let args = remote_agent_args(
+            "alpha",
+            crate::obs::uses_ebpf("docker"),
+            "/workspace,/home/dev",
+        );
         assert_eq!(&args[..2], ["sh", "-c"]);
         assert!(args[2].contains("id -u"));
         assert!(args[2].contains("exec \"$@\""));
@@ -1096,6 +1186,32 @@ mod tests {
             args.iter().any(|arg| arg == "-no-ebpf"),
             "a Docker exec agent must not trace the shared kernel"
         );
+        // Its own argv token, so a box-controlled home cannot reach shell
+        // syntax — and present at all, because an unscoped agent exports
+        // every path every process in the box opens.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-file-scope", "/workspace,/home/dev"]),
+            "the exec agent was started without a file scope: {args:?}"
+        );
+    }
+
+    #[test]
+    fn a_detected_home_widens_the_scope_only_when_it_is_usable() {
+        assert_eq!(
+            scope_with_home("/home/ubuntu"),
+            "/workspace,/home/ubuntu",
+            "an ordinary home should be watched alongside the workspace"
+        );
+        // A box that names no ordinary user — every Lima guest, whose user
+        // carries the host's uid — still gets a bounded scope.
+        assert_eq!(scope_with_home(""), "/workspace,/home");
+        // And a box whose passwd entry would widen the scope back to
+        // everything, or smuggle a second prefix past the flag, gets neither.
+        assert_eq!(scope_with_home("/"), "/workspace,/home");
+        assert_eq!(scope_with_home("/home/a,/etc"), "/workspace,/home");
+        assert_eq!(scope_with_home("/home/a b"), "/workspace,/home");
+        assert_eq!(scope_with_home("relative"), "/workspace,/home");
     }
 
     #[tokio::test]

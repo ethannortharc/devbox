@@ -64,6 +64,9 @@ type config struct {
 	// policy is the path to the generated egress policy. When set, the agent
 	// keeps the firewall's allow sets in step with the DNS it captures.
 	policy string
+	// fileScope bounds which paths produce file events, as a comma-separated
+	// prefix list. Empty exports every path the probe sees.
+	fileScope string
 }
 
 // defaultQueue bounds the buffer between capture and transport.
@@ -125,6 +128,13 @@ func run(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Said once, at startup. An empty scope is a legitimate request — "show me
+	// every path" — but it is also what a mis-set flag looks like, and the
+	// difference is thousands of events a minute.
+	if len(source.Prefixes()) == 0 {
+		_, _ = fmt.Fprintln(out,
+			"devbox-obsd: -file-scope is empty; every file path this box opens will be exported")
+	}
 
 	stopStatus := startCaptureStatus(ctx, cfg, source, out)
 	defer stopStatus()
@@ -138,7 +148,7 @@ func run(args []string, out io.Writer) error {
 // captureOnly keeps policy enforcement and its DNS feed alive when no host
 // collector is attached. VM services use this between console sessions; the
 // host starts a second, stdio-connected agent while the console is open.
-func captureOnly(ctx context.Context, cfg config, source capture.Source, out io.Writer) error {
+func captureOnly(ctx context.Context, cfg config, source *capture.Scope, out io.Writer) error {
 	defer func() { _ = capture.Close(source) }()
 	enforcer, err := loadEnforcer(cfg, ownsPolicy(cfg))
 	if err != nil {
@@ -200,7 +210,16 @@ func captureOnly(ctx context.Context, cfg config, source capture.Source, out io.
 // primary source rather than inside it: refusals come from the kernel ring
 // buffer while execs and connections come from eBPF or /proc, and they are one
 // timeline to whoever reads them.
-func chooseSource(cfg config) (capture.Source, error) {
+//
+// Whatever the composition, it is wrapped in the file scope: the openat
+// tracepoint fires for every process in the traced cgroup, and §7.1 promises
+// file events from *under the workspace*. Filtering here rather than in the
+// consumer means an out-of-scope path never reaches the pending queue.
+func chooseSource(cfg config) (*capture.Scope, error) {
+	prefixes, err := capture.ParseFileScope(cfg.fileScope)
+	if err != nil {
+		return nil, err
+	}
 	primary, err := primarySource(cfg)
 	if err != nil {
 		return nil, err
@@ -209,7 +228,7 @@ func chooseSource(cfg config) (capture.Source, error) {
 	// buffer is live kernel state from another, and mixing them would put
 	// events in a timeline that never happened.
 	if cfg.fixture != "" || cfg.policy == "" {
-		return primary, nil
+		return capture.NewScope(primary, prefixes), nil
 	}
 	blocked := &capture.Blocked{
 		BoxID: cfg.boxID,
@@ -229,9 +248,9 @@ func chooseSource(cfg config) (capture.Source, error) {
 			"devbox-obsd: no policy events — cannot read %s (%v). "+
 				"The posture is still enforced by the kernel; only the record of "+
 				"refusals is missing.\n", capture.KmsgPath, err)
-		return primary, nil
+		return capture.NewScope(primary, prefixes), nil
 	}
-	return capture.NewMulti(primary, blocked), nil
+	return capture.NewScope(capture.NewMulti(primary, blocked), prefixes), nil
 }
 
 // posture reads the egress posture currently in force.
@@ -309,9 +328,19 @@ type captureStatus struct {
 	Capture          []string `json:"capture"`
 	EBPF             bool     `json:"ebpf"`
 	PolicyConfigured bool     `json:"policy_configured"`
+	// FileScope is the path prefixes file events must be under. Empty means
+	// every path is exported.
+	FileScope []string `json:"file_scope,omitempty"`
+	// FileOutOfScope and ExecKernelNoise count what capture deliberately did
+	// not send. Separate from the transport's `dropped`, and published rather
+	// than merely applied: a filter nobody can see is indistinguishable from a
+	// probe that stopped firing, and "the workspace looks idle" is exactly the
+	// question these numbers answer.
+	FileOutOfScope  uint64 `json:"file_out_of_scope"`
+	ExecKernelNoise uint64 `json:"exec_kernel_noise"`
 }
 
-func currentCaptureStatus(cfg config, source capture.Source) captureStatus {
+func currentCaptureStatus(cfg config, source *capture.Scope) captureStatus {
 	domains := source.Domains()
 	captureNames := make([]string, 0, len(domains))
 	for _, domain := range domains {
@@ -324,6 +353,9 @@ func currentCaptureStatus(cfg config, source capture.Source) captureStatus {
 		Capture:          captureNames,
 		EBPF:             sourceIncludes(source, "ebpf"),
 		PolicyConfigured: cfg.policy != "",
+		FileScope:        source.Prefixes(),
+		FileOutOfScope:   source.FileOutOfScope(),
+		ExecKernelNoise:  source.KernelNoise(),
 	}
 }
 
@@ -334,7 +366,7 @@ func currentCaptureStatus(cfg config, source capture.Source) captureStatus {
 // file and refuses a DNS-backed default-deny table until "dns" is live. The
 // retrying packet source changes Domains in-process, and this loop publishes
 // that transition without restarting the agent or clearing nftables sets.
-func startCaptureStatus(ctx context.Context, cfg config, source capture.Source, out io.Writer) func() {
+func startCaptureStatus(ctx context.Context, cfg config, source *capture.Scope, out io.Writer) func() {
 	if cfg.statusFile == "" {
 		return func() {}
 	}
@@ -458,7 +490,7 @@ func readUptime(path string) (time.Duration, error) {
 }
 
 // stream connects, handshakes, and pumps events until the context ends.
-func stream(ctx context.Context, cfg config, source capture.Source, out io.Writer) error {
+func stream(ctx context.Context, cfg config, source *capture.Scope, out io.Writer) error {
 	// Privileged sources are prepared before this function so their advertised
 	// capabilities are truthful. Always release them, including when policy
 	// restoration or the first handshake fails before Source.Run starts.
@@ -490,11 +522,12 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		domains = append(domains, string(d))
 	}
 	hello := transport.Hello{
-		Version: buildinfo.Version,
-		BoxID:   cfg.boxID,
-		Capture: domains,
-		Source:  source.Name(),
-		EBPF:    sourceIncludes(source, "ebpf"),
+		Version:   buildinfo.Version,
+		BoxID:     cfg.boxID,
+		Capture:   domains,
+		Source:    source.Name(),
+		EBPF:      sourceIncludes(source, "ebpf"),
+		FileScope: source.Prefixes(),
 	}
 
 	// Capture starts before the collector is reachable, and keeps running when
@@ -899,6 +932,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		"in-agent event buffer depth")
 	fs.StringVar(&cfg.policy, "policy", "",
 		"egress policy JSON; keeps the nftables allow sets in step with DNS")
+	fs.StringVar(&cfg.fileScope, "file-scope", capture.DefaultFileScope,
+		"comma-separated path prefixes that file events must be under; empty captures every path")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -917,6 +952,11 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	}
 	if cfg.socket != "" && strings.HasPrefix(cfg.socket, "vsock://") {
 		return config{}, errors.New("vsock transport lands with the VM runtimes; use a unix socket")
+	}
+	// Parsed here so an unusable scope is refused at startup rather than
+	// quietly admitting everything for the life of the agent.
+	if _, err := capture.ParseFileScope(cfg.fileScope); err != nil {
+		return config{}, fmt.Errorf("-file-scope: %w", err)
 	}
 	return cfg, nil
 }

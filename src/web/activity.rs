@@ -501,9 +501,20 @@ pub fn capture_view(
             // the same string from the same record.
             headline: format!("Capturing · {}", capture_composition(health)),
             detail: if health.ebpf {
-                "Kernel probes are attached: every exec, connection, lookup and \
-                 handshake is seen at the syscall boundary."
-                    .into()
+                // The scope belongs in the same sentence as the claim it
+                // qualifies: "every file open" is not what is stored, and a
+                // reader who takes the headline literally would read an empty
+                // file feed as a quiet box.
+                match crate::obs::health::file_scope(health) {
+                    Some(scope) => format!(
+                        "Kernel probes are attached: every exec, connection, lookup and \
+                         handshake is seen at the syscall boundary. File events are \
+                         scoped to {scope}."
+                    ),
+                    None => "Kernel probes are attached: every exec, connection, lookup and \
+                             handshake is seen at the syscall boundary."
+                        .into(),
+                }
             } else {
                 format!(
                     "No kernel probes here, so capture is degraded: activity is \

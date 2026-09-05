@@ -440,7 +440,7 @@ async fn print_agent_freshness(runtime: &dyn crate::runtime::Runtime, name: &str
 }
 
 fn print_capture_source(state_dir: &Path, name: &str) {
-    use crate::obs::health::{CaptureState, capture_source, load};
+    use crate::obs::health::{CaptureState, capture_source, file_scope, load};
 
     match load(state_dir, name) {
         Ok(Some(health)) if health.state == CaptureState::Streaming => {
@@ -449,6 +449,18 @@ fn print_capture_source(state_dir: &Path, name: &str) {
                 "    capture: \x1b[{colour}m{}\x1b[0m",
                 capture_source(&health)
             );
+            // Under the capture line because it qualifies it. `file` in that
+            // list says the probe is attached; this says how much of the
+            // filesystem it reports, and an empty Activity view under a
+            // directory means one of the two — with no way to tell which
+            // until this is on the screen.
+            match file_scope(&health) {
+                Some(scope) => println!("    file scope: \x1b[32m{scope}\x1b[0m"),
+                None => println!(
+                    "    file scope: \x1b[33mevery path\x1b[0m — this agent did not narrow \
+                     one, so system opens (/nix/store, /etc, journald) are stored too"
+                ),
+            }
         }
         Ok(Some(health)) => {
             let detail = if health.detail.is_empty() {

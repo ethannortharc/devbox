@@ -70,6 +70,15 @@ pub struct CaptureHealth {
     /// go through [`capture_source`], which falls back to `ebpf`.
     #[serde(default)]
     pub source: String,
+    /// Path prefixes the agent narrowed file events to — `/workspace`, plus
+    /// the box user's home. Empty means it was not narrowed, which is both an
+    /// older agent and a deliberate "report every path".
+    ///
+    /// Recorded because the alternative is unfalsifiable: an Activity view
+    /// with no file events under a directory is either a quiet box or a scope
+    /// that excluded it, and without this nobody can tell which.
+    #[serde(default)]
+    pub file_scope: Vec<String>,
     #[serde(default)]
     pub agent_version: String,
     /// Why the last attempt ended, empty while it has not.
@@ -96,6 +105,7 @@ impl CaptureHealth {
             ebpf: false,
             capture: Vec::new(),
             source: String::new(),
+            file_scope: Vec::new(),
             agent_version: String::new(),
             detail: String::new(),
             attempts: 0,
@@ -158,6 +168,18 @@ pub fn capture_composition(health: &CaptureHealth) -> String {
     } else {
         health.source.clone()
     }
+}
+
+/// The file scope as one line, or `None` when the agent did not narrow one.
+///
+/// One function, for the same reason [`capture_source`] is one: `devbox
+/// doctor` and the console's capture bar answer this from the same record and
+/// must not word it differently.
+pub fn file_scope(health: &CaptureHealth) -> Option<String> {
+    if health.file_scope.is_empty() {
+        return None;
+    }
+    Some(health.file_scope.join(", "))
 }
 
 /// Publish a box's capture health, replacing any previous record.
@@ -313,6 +335,22 @@ mod tests {
 
         let polling = CaptureHealth::new("alpha", CaptureState::Streaming);
         assert!(capture_source(&polling).starts_with("proc (degraded:"));
+    }
+
+    #[test]
+    fn a_narrowed_capture_says_what_it_watches() {
+        let mut health = CaptureHealth::new("alpha", CaptureState::Streaming);
+        health.ebpf = true;
+        health.file_scope = vec!["/workspace".into(), "/home/dev".into()];
+        assert_eq!(
+            file_scope(&health).as_deref(),
+            Some("/workspace, /home/dev")
+        );
+
+        // An agent that reports every path, and one from before the field,
+        // are the same thing to a reader: nothing was narrowed.
+        let every = CaptureHealth::new("alpha", CaptureState::Streaming);
+        assert_eq!(file_scope(&every), None);
     }
 
     #[test]
