@@ -200,8 +200,10 @@ pub static NIX_SETS: &[NixSet] = &[
         ],
     },
     NixSet {
+        // claude-code is installed separately via npm (latest release, and
+        // without the ~500MB sharp/libvips the nixpkgs package bundles).
         name: "ai-code",
-        packages: &["claude-code", "codex", "opencode", "aider-chat", "aichat"],
+        packages: &["codex", "opencode", "aider-chat", "aichat"],
     },
     NixSet {
         name: "ai-infra",

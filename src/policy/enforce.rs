@@ -258,6 +258,22 @@ pub fn elevated(script: &str) -> String {
     )
 }
 
+/// Like [`elevated`], but the script runs in a *login* shell.
+///
+/// Provisioning and rebuild commands need the guest's login `PATH` and
+/// `NIX_PATH`: `incus exec` hands out a bare environment where `nixos-rebuild`
+/// is not even on the path, and `sudo` resets the environment on a VM. Deciding
+/// root-or-sudo in the guest stays the same as `elevated`; only the inner shell
+/// differs. `sh -c` is the outer shell because it exists on every guest,
+/// including containers without bash.
+pub fn elevated_login(script: &str) -> String {
+    format!(
+        "if [ \"$(id -u)\" -eq 0 ]; then bash -lc '{}'; else sudo bash -lc '{}'; fi",
+        shell_quote(script),
+        shell_quote(script)
+    )
+}
+
 /// Escape a script for embedding in a single-quoted shell string.
 fn shell_quote(script: &str) -> String {
     script.replace('\'', "'\\''")

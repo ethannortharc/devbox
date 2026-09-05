@@ -96,6 +96,7 @@ vmOpts:
 
 cpus: {cpu}
 memory: "{memory}"
+disk: "20GiB"
 
 mounts:
 {mounts_yaml}
@@ -273,6 +274,7 @@ impl Runtime for LimaRuntime {
         } else {
             "NixOS"
         };
+
         println!("Creating {image_label} VM '{vm}'...");
         println!("  (first run downloads {image_label} image, this may take a few minutes)");
         run_ok(
@@ -659,6 +661,10 @@ impl Runtime for LimaRuntime {
         }
         Ok(())
     }
+
+    // Lima caching disabled — the stop/copy-disk/restart cycle adds ~1 minute
+    // overhead on macOS, which isn't worth it for typical single-VM usage.
+    // Caching remains active for Incus (Linux) where `incus publish` is fast.
 }
 
 #[cfg(test)]
@@ -690,6 +696,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("cpus: 4"));
@@ -717,6 +724,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("cpus: 4"));
@@ -753,6 +761,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "ubuntu".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("ubuntu-24.04"));
@@ -777,6 +786,7 @@ mod tests {
             bare: false,
             writable: false,
             image: "nixos".to_string(),
+            cached_image: None,
         };
         let yaml = LimaRuntime::generate_yaml(&opts);
         assert!(yaml.contains("nixos-lima"));

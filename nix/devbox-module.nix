@@ -79,8 +79,29 @@ in {
     ++ customPackages;
 
   # ── Services ───────────────────────────────────────
+  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      PermitRootLogin = "no";
+    };
+  };
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);
   services.tailscale.enable = lib.mkDefault (sets.network or false);
+
+  # ── Networking ──────────────────────────────────────
+  # Enable DHCP on all interfaces so the VM gets an IP regardless of
+  # interface name (e.g. after launching from a cached image where the
+  # NIC name may have changed).
+  networking.useDHCP = lib.mkDefault true;
+
+  # ── Incus/LXD Agent ─────────────────────────────────
+  # Required for `incus exec` to work after nixos-rebuild.
+  # This NixOS module installs the agent service with proper udev rules,
+  # 9p mount setup, and critically: restartIfChanged=false / stopIfChanged=false
+  # so nixos-rebuild doesn't kill the agent mid-switch (which would drop our
+  # incus exec connection).
+  virtualisation.incus.agent.enable = true;
 
   # ── Dynamic linker compat ─────────────────────────
   # Required for VS Code Server, Cursor, and other dynamically linked

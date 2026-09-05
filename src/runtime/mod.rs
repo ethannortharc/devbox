@@ -66,6 +66,9 @@ pub struct CreateOpts {
     pub writable: bool,
     /// Base image type: "nixos" or "ubuntu"
     pub image: String,
+    /// If set, create from this cached image instead of the base image.
+    /// For Incus: an image alias; for Lima: a path to a cached disk file.
+    pub cached_image: Option<String>,
 }
 
 /// A host-to-VM mount point.
@@ -178,4 +181,49 @@ pub trait Runtime: Send + Sync {
     /// Roll back an update whose corresponding sandbox state could not be
     /// persisted. Implementations must leave the next start on the old mounts.
     async fn rollback_mounts(&self, name: &str, update: &MountUpdate) -> Result<()>;
+
+    /// Execute an interactive command as the non-root user.
+    /// Used for shell attach — defaults to exec_cmd with interactive=true.
+    /// Runtimes like Incus override this to set --user, HOME, and CWD.
+    async fn exec_as_user(&self, name: &str, cmd: &[&str]) -> Result<ExecResult> {
+        self.exec_cmd(name, cmd, true).await
+    }
+
+    /// Whether exec_cmd runs as root by default.
+    /// Incus: true (incus exec defaults to root)
+    /// Lima: false (limactl shell runs as the configured user)
+    fn exec_runs_as_root(&self) -> bool {
+        false
+    }
+
+    /// Check if a cached provisioned image exists for the given cache key.
+    /// Returns the image alias/path if found.
+    async fn cached_image(&self, _cache_key: &str) -> Option<String> {
+        None
+    }
+
+    /// Cache the current VM as a provisioned image for reuse.
+    /// Called after successful provisioning to speed up future creates.
+    async fn cache_image(&self, _name: &str, _cache_key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Execute a shell command as root with a login shell.
+    ///
+    /// This is the correct abstraction for running privileged commands:
+    /// - Incus: `bash -lc <cmd>` (already root, login shell for PATH)
+    /// - Lima:  `sudo bash -lc <cmd>` (elevate, login shell for PATH)
+    ///
+    /// Unlike a simple `sudo` prefix, this wraps the ENTIRE command inside
+    /// the sudo boundary, so environment variables set within `cmd` (like
+    /// `export NIX_PATH=...`) are preserved for the privileged process.
+    async fn run_as_root(&self, name: &str, cmd: &str, interactive: bool) -> Result<ExecResult> {
+        if self.exec_runs_as_root() {
+            self.exec_cmd(name, &["bash", "-lc", cmd], interactive)
+                .await
+        } else {
+            self.exec_cmd(name, &["sudo", "bash", "-lc", cmd], interactive)
+                .await
+        }
+    }
 }

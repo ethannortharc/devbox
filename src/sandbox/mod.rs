@@ -462,6 +462,41 @@ impl SandboxManager {
             config.custom_packages.keys().cloned().collect()
         };
 
+        // Names *and* sources, so each provisioning path can use what it
+        // needs. NixOS writes `[custom_packages]` keys that the module
+        // resolves as attribute paths under `pkgs`, so it wants the key;
+        // Ubuntu runs `nix profile install`, so it wants the complete
+        // reference. Handing both paths the same string was wrong for one
+        // of them either way — first by dropping flake packages, then by
+        // turning `terraform` into a `nixpkgs#terraform` key that resolves
+        // to nothing.
+        let package_pairs: Vec<(String, String)> = if bare {
+            Vec::new()
+        } else {
+            config
+                .custom_packages
+                .iter()
+                .map(|(name, source)| (name.clone(), source.clone()))
+                .collect()
+        };
+
+        // A cached image is a fully provisioned guest for exactly this
+        // selection; the key covers everything provisioning bakes in, so a
+        // stale cache invalidates itself. A bare box asks for no
+        // provisioning and therefore never launches from, or publishes, one.
+        let cache_key = provision::cache_key(
+            config.sandbox.image.as_str(),
+            &selected_sets,
+            &selected_languages,
+            &config.sandbox.mount_mode,
+            &package_pairs,
+        );
+        let cached = if bare {
+            None
+        } else {
+            runtime.cached_image(&cache_key).await
+        };
+
         let opts = CreateOpts {
             name: name.to_string(),
             mounts,
@@ -480,6 +515,7 @@ impl SandboxManager {
             bare,
             writable: config.sandbox.mount_mode == "writable",
             image: config.sandbox.image.clone(),
+            cached_image: cached.clone(),
         };
 
         // Prepare the recovery record before the runtime side effect. Runtime
@@ -594,30 +630,41 @@ impl SandboxManager {
 
         let provisioned = if bare {
             Ok(())
-        } else {
-            provision::provision_vm_full_reported(
+        } else if cached.is_some() {
+            // Launched from a cached, fully provisioned guest: skip the rebuild
+            // and apply only what is specific to this box and this host.
+            println!("Using cached image — skipping provisioning.");
+            provision::post_cache_setup(
                 runtime,
                 name,
                 &active_sets,
                 &active_langs,
                 image,
                 mount_mode,
-                // Names *and* sources, so each provisioning path can use what it
-                // needs. NixOS writes `[custom_packages]` keys that the module
-                // resolves as attribute paths under `pkgs`, so it wants the key;
-                // Ubuntu runs `nix profile install`, so it wants the complete
-                // reference. Handing both paths the same string was wrong for one
-                // of them either way — first by dropping flake packages, then by
-                // turning `terraform` into a `nixpkgs#terraform` key that resolves
-                // to nothing.
-                &config
-                    .custom_packages
-                    .iter()
-                    .map(|(name, source)| (name.clone(), source.clone()))
-                    .collect::<Vec<_>>(),
-                provision_reporter,
+                &package_pairs,
             )
             .await
+        } else {
+            let result = provision::provision_vm_full_reported(
+                runtime,
+                name,
+                &active_sets,
+                &active_langs,
+                image,
+                mount_mode,
+                &package_pairs,
+                provision_reporter,
+            )
+            .await;
+            // Publish only a guest that provisioned completely. A cache built
+            // from a half-provisioned box would hand every later create the
+            // same failure with a success message in front of it.
+            if result.is_ok()
+                && let Err(error) = runtime.cache_image(name, &cache_key).await
+            {
+                eprintln!("Warning: could not cache the provisioned image: {error}");
+            }
+            result
         };
 
         // A runtime object without its selected tools is not a successful
@@ -742,7 +789,7 @@ impl SandboxManager {
 
         println!("Attaching to sandbox '{name}'...");
         let shell = crate::web::service::detect_shell(runtime.as_ref(), name).await;
-        runtime.exec_cmd(name, &[shell, "-l"], true).await?;
+        runtime.exec_as_user(name, &[shell, "-l"]).await?;
         Ok(())
     }
 

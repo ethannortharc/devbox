@@ -391,7 +391,9 @@ async fn apply_after_snapshot(
     // changed the profile should be reversed.
     let before = current_generation(runtime, box_name).await;
 
-    let argv = runtime.argv(box_name, &crate::nix::rebuild::rebuild_argv(), false);
+    let rebuild = crate::nix::rebuild::rebuild_argv();
+    let rebuild: Vec<&str> = rebuild.iter().map(String::as_str).collect();
+    let argv = runtime.argv(box_name, &rebuild, false);
     publish(&format!("devbox: {}", argv.join(" ")));
 
     let code = stream_command(&argv, |line| publish(line)).await?;
