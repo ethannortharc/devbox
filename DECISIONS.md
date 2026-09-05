@@ -1529,3 +1529,92 @@ absence of `-f` on mgmtd, and the guard.
 change — `vtysh` already distributes whatever the file contains. What would
 need revisiting is the per-daemon `-f`, which becomes dead weight once nothing
 is left that only one daemon owns.
+
+## ADR-0056 — the lab leaves devbox
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** v4 shipped two products in one binary: a glass-box sandbox for
+AI coding agents and a multi-node network lab with a ZTP fabric. The
+September 2026 review found they share no user: the lab existed to exercise a
+network-automation skill set (v4 design §19), and it took one of three
+top-level console tabs, the README screenshot, and about a fifth of the code.
+The first plan was to split it into a maintained product that depends on
+devbox as a library. Ethan then decided the same day that any future lab
+would be rebuilt separately on containers, so there is nothing to maintain.
+
+**Decision.** Remove `src/lab`, `ztpd`, `labkit`, the Labs console views and
+templates, the lab e2e tests, the lab CI lanes, and the lab documentation.
+The code is archived with its full history in a local repository
+(`devbox-lab`, no remote, no further work). Three things stay because they
+are not lab-specific: the `network` Nix set (tools), the private-prefix
+contract that `isolated` honours — renamed from `/etc/devbox/lab/*/prefixes`
+to `/etc/devbox/prefixes/*` and from `is_lab_internal` to
+`is_private_range`, behaviour unchanged — and `install_embedded_binary`,
+which becomes `pub` as the stable entry for installing any guest binary.
+
+**Consequences.** 87 files, about 16,000 lines gone; the unit test count
+drops by 137. `GET /labs` is a 404 and a regression test pins it.
+`docs/screenshot-console.png` still shows a ZTP topology and must be replaced
+by a run report (wave 2). §9–§10 of the v4 design are history, not
+description.
+
+## ADR-0057 — CO-RE objects are committed per architecture, and a source build embeds the eBPF agent
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** `build.rs` cross-compiled the Go agent without the `ebpf` tag,
+because the bpf2go objects were generated only in release CI, and no v4
+release was ever cut. Every source build therefore embedded the portable
+proc+packet agent, and on a Lima box that meant connections with pid
+4294967295, no TLS or file events, and zero byte counts — while `doctor` said
+only `agent: devbox-obsd 0.1.3`. The product's central claim was silently
+false on the only build path anyone had used.
+
+**Decision.** Commit `agent/bpf/devbox_<arch>_bpfel.{go,o}` per guest
+architecture, as the cilium/ebpf ecosystem does. `build.rs` builds the agent
+with `-tags ebpf` when the object for the target architecture exists and
+prints a `cargo:warning` naming the fallback when it does not. The arm64
+object was generated inside a NixOS guest with BTF; the amd64 object comes
+from the CI `ebpf` job as an artifact. CI compares the committed `.go`
+bindings byte-for-byte and fails on drift; it does not compare `.o` bytes,
+which vary with the clang and BTF on the runner. The agent's handshake now
+carries `source`, and `doctor` and the console print which capture sources
+are live.
+
+**Consequences.** Anyone who changes `devbox.bpf.c` or the record layout in
+`agent/decode/record.go` must regenerate the objects; CI cannot catch a
+stale `.o` whose bindings did not change, so this rule is documented rather
+than enforced. Two defects that eBPF does not fix surfaced in the same
+verification and got their own work items: the SNI parser drops a
+ClientHello that spans two TCP segments (W0-5a), and no probe fills the byte
+counters (W0-5b). An existing box does not receive a new agent until
+provisioning runs again (W0-5c).
+
+## ADR-0058 — merging main: a login shell that checks for root, and a cache key that knows what v4 provisions
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** `v4` branched from a March commit; `origin/main` gained 70
+commits after it: Incus cached-image networking, VM user and home detection,
+a `run_as_root` abstraction, image caching, and `devbox code` fixes. Eight
+files conflicted, the largest being `provision.rs`. Two of main's changes
+cut across v4's design: main dropped the literal `sudo` because Incus with
+NixOS 25.11 cannot pass PAM, and main's image cache snapshots a provisioned
+VM — before v4 taught provisioning to push set modules wholesale, install
+the agent, and apply policy.
+
+**Decision.** Keep main's `run_as_root` and add `policy::enforce::
+elevated_login`, which decides in the guest whether it is already root and
+otherwise elevates through a login shell; `rebuild_argv` uses it. A rebuild
+that exits 255 waits for the guest to answer `exec` again and reruns once
+before judging. The image cache key includes the package list and the obsd
+module hash; post-cache setup redoes v4's steps (state file with packages,
+agent install, tool configuration); bare boxes neither consult nor publish
+the cache, and only a successful provision publishes. `attach` runs as the
+detected guest user. Version becomes 0.1.6.
+
+**Consequences.** The Incus paths that main fixed could not be exercised on
+this host and are marked unverified until CI or an Incus machine runs them.
+The browser terminal still starts as root on Incus (`interactive_argv` has no
+`--user`), a pre-existing gap recorded as its own work item.
