@@ -1,23 +1,23 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::nix;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::config::DevboxConfig;
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
+    #[command(flatten)]
+    pub boxarg: BoxArg,
+
     /// Tools/sets to add (comma-separated)
     #[arg(long, value_delimiter = ',', required = true)]
     pub tools: Vec<String>,
-
-    /// Sandbox name
-    #[arg(long)]
-    pub name: Option<String>,
 }
 
 pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);
@@ -62,7 +62,7 @@ pub async fn run(args: UpgradeArgs, manager: &SandboxManager) -> Result<()> {
     // is whatever project the operator happened to be standing in. Inserting
     // the box's packages on top of that left the other project's still in the
     // map — and since `apply_config` now writes the whole map into guest
-    // state, `devbox upgrade --name box-b` run from project A rebuilt A's
+    // state, `devbox upgrade box-b` run from project A rebuilt A's
     // packages into B, where nothing recorded them and nothing would remove
     // them. Clearing first is what makes the box its own authority.
     config.custom_packages.clear();

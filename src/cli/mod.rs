@@ -1,4 +1,5 @@
 pub mod behavior;
+pub mod box_arg;
 pub mod code;
 pub mod commit;
 pub mod config;

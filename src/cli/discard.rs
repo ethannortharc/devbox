@@ -1,22 +1,22 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::sandbox::SandboxManager;
 use crate::sandbox::overlay;
 
 #[derive(Args, Debug)]
 pub struct DiscardArgs {
+    #[command(flatten)]
+    pub boxarg: BoxArg,
+
     /// Only discard specific paths
     #[arg(long)]
     pub path: Option<Vec<String>>,
-
-    /// Sandbox name
-    #[arg(long)]
-    pub name: Option<String>,
 }
 
 pub async fn run(args: DiscardArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);

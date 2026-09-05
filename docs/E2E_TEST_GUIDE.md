@@ -154,10 +154,10 @@ Sets:        system, shell, tools, editor, git, container
 ## 5. Exec one-off commands
 
 ```bash
-devbox exec --name e2e-test -- echo "hello from VM"
-devbox exec --name e2e-test -- uname -a
-devbox exec --name e2e-test -- whoami
-devbox exec --name e2e-test -- cat /etc/os-release
+devbox exec e2e-test -- echo "hello from VM"
+devbox exec e2e-test -- uname -a
+devbox exec e2e-test -- whoami
+devbox exec e2e-test -- cat /etc/os-release
 ```
 
 **Expected:**
@@ -225,7 +225,7 @@ exit
 
 **If any tool is missing**, nixos-rebuild may have failed. Check with:
 ```bash
-devbox exec --name e2e-test -- sudo nixos-rebuild switch
+devbox exec e2e-test -- sudo nixos-rebuild switch
 ```
 
 ## 7. Guide system (inside VM)
@@ -400,10 +400,10 @@ devbox list                # Should show "No sandboxes found."
 
 ```bash
 devbox create --name overlay-test --bare
-devbox exec --name overlay-test -- touch /workspace/upper/testfile.txt
-devbox diff --name overlay-test
-devbox discard --name overlay-test
-devbox diff --name overlay-test
+devbox exec overlay-test -- touch /workspace/upper/testfile.txt
+devbox diff overlay-test
+devbox discard overlay-test
+devbox diff overlay-test
 devbox destroy overlay-test --force
 ```
 
@@ -453,13 +453,13 @@ If provisioning fails during `nixos-rebuild switch`, you can retry manually:
 
 ```bash
 # Re-run nixos-rebuild inside the VM
-devbox exec --name <sandbox> -- sudo nixos-rebuild switch --show-trace
+devbox exec <sandbox> -- sudo nixos-rebuild switch --show-trace
 
 # Check what NixOS configuration is active
-devbox exec --name <sandbox> -- nixos-rebuild list-generations
+devbox exec <sandbox> -- nixos-rebuild list-generations
 
 # View the devbox state file
-devbox exec --name <sandbox> -- cat /etc/devbox/devbox-state.toml
+devbox exec <sandbox> -- cat /etc/devbox/devbox-state.toml
 ```
 
 ### VM won't start
@@ -482,11 +482,11 @@ This usually means nixos-rebuild encountered an error. Check:
 
 ```bash
 # View the pushed configuration
-devbox exec --name <sandbox> -- cat /etc/devbox/devbox-module.nix
-devbox exec --name <sandbox> -- cat /etc/devbox/devbox-state.toml
+devbox exec <sandbox> -- cat /etc/devbox/devbox-module.nix
+devbox exec <sandbox> -- cat /etc/devbox/devbox-state.toml
 
 # Re-run rebuild
-devbox exec --name <sandbox> -- sudo nixos-rebuild switch 2>&1
+devbox exec <sandbox> -- sudo nixos-rebuild switch 2>&1
 ```
 
 ## Known Behaviors

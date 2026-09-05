@@ -30,8 +30,8 @@ terminal in the browser.
   devbox layer stash-pop           Restore stashed changes
 
 ## Safety
-  devbox snapshot save NAME        Create checkpoint
-  devbox snapshot restore NAME     Rollback
+  devbox snapshot save SNAP        Create checkpoint
+  devbox snapshot restore SNAP     Rollback
   devbox diff                      Show changes vs host files
   devbox commit                    Sync changes back to host
   devbox discard                   Throw away all changes

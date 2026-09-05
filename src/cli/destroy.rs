@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::cli::box_arg::BoxArg;
 use crate::sandbox::SandboxManager;
 
 #[derive(Args, Debug)]
 pub struct DestroyArgs {
-    /// Sandbox name (default: current directory's sandbox)
-    pub name: Option<String>,
+    #[command(flatten)]
+    pub boxarg: BoxArg,
 
     /// Skip confirmation prompt
     #[arg(long, short)]
@@ -14,7 +15,7 @@ pub struct DestroyArgs {
 }
 
 pub async fn run(args: DestroyArgs, manager: &SandboxManager) -> Result<()> {
-    let name = manager.resolve_name(args.name.as_deref())?;
+    let name = manager.resolve_name(args.boxarg.name())?;
 
     if !manager.sandbox_exists(&name) {
         anyhow::bail!("Sandbox '{}' not found.", name);

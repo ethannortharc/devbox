@@ -833,7 +833,7 @@ async fn provision_nixos(
         wait_for_guest_exec(runtime, name).await?;
         result = run_install_step(runtime, name, &rebuild_argv, reporter).await?;
     }
-    let retry = format!("devbox exec --name {name} -- sudo nixos-rebuild switch");
+    let retry = format!("devbox exec {name} -- sudo nixos-rebuild switch");
     require_install_success(&result, "nixos-rebuild switch", &retry)?;
     println!("NixOS rebuild complete.");
 
@@ -960,7 +960,7 @@ fi"#;
         );
         let result =
             run_install_step(runtime, name, &["bash", "-c", &install_cmd], reporter).await?;
-        let retry = format!("devbox exec --name {name} -- nix profile install <packages>");
+        let retry = format!("devbox exec {name} -- nix profile install <packages>");
         require_install_success(&result, "nix profile install", &retry)?;
         println!("Nix package installation complete.");
     }
@@ -2284,7 +2284,7 @@ mod tests {
         let error = require_install_success(
             &result,
             "nixos-rebuild switch",
-            "devbox exec --name demo -- sudo nixos-rebuild switch",
+            "devbox exec demo -- sudo nixos-rebuild switch",
         )
         .expect_err("a launched guest command with a non-zero exit is not success");
         let message = error.to_string();
