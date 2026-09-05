@@ -6,7 +6,7 @@
     <meta name="referrer" content="no-referrer" />
     <meta name="theme-color" content="#0b100c" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#f5f8f3" media="(prefers-color-scheme: light)" />
-    <meta name="description" content="A local control plane for isolated development boxes and network labs." />
+    <meta name="description" content="A local control plane for isolated development boxes." />
     <title>{% block title %}devbox{% endblock %}</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/assets/css/app.css" />
@@ -55,7 +55,6 @@
         </a>
         <nav class="nav" aria-label="Primary navigation">
           <a href="/" {% if nav == "dashboard" %}aria-current="page"{% endif %}>Boxes</a>
-          <a href="/labs" {% if nav == "labs" %}aria-current="page"{% endif %}>Network labs</a>
           <a href="/help" {% if nav == "help" %}aria-current="page"{% endif %}>Guides</a>
         </nav>
         <span class="spacer"></span>

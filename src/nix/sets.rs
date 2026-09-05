@@ -10,8 +10,8 @@ use std::collections::HashMap;
 /// it. Anything a set expressed that a bare list of attribute names cannot —
 /// a comment, a `runCommand` wrapper, a `tryEval` guard — survived provisioning
 /// and then vanished. The `network` set lost the derivation that puts FRR's
-/// routing daemons on PATH, which is the entire reason `devbox lab` can find
-/// them, and the box reported `missing: zebra bgpd` after a rebuild that
+/// routing daemons on PATH, which is the entire reason anything on the box can
+/// find them, and the box reported `missing: zebra bgpd` after a rebuild that
 /// claimed success.
 ///
 /// [`NIX_SETS`] keeps its job: it is the package *index* — what the console
@@ -178,13 +178,13 @@ pub static NIX_SETS: &[NixSet] = &[
     NixSet {
         name: "network",
         packages: &[
-            // The routing stack a `devbox lab` substrate needs: without it
-            // `lab up` starts zebra and gets command-not-found for every
-            // routed topology.
+            // The routing stack. Anything that stands a routed topology up
+            // in this box starts zebra by name, and without the package it
+            // gets command-not-found.
             "frr",
-            // Role services and the DHCP client used by `ztp-blank` nodes.
-            // They are processes inside network namespaces, so a package set
-            // (rather than a system service) is exactly what the lab needs.
+            // DNS/DHCP, time, and a shell toolbox, for processes run inside
+            // network namespaces. A package set rather than a system service,
+            // because a namespace can use the first and not the second.
             "dnsmasq",
             "chrony",
             "busybox",
@@ -692,7 +692,8 @@ mod tests {
     /// Ubuntu provisioning does not read `NIX_SETS`; it uses a separate
     /// `nix_packages_for_set` mapping. A package added to one and not the
     /// other means an Ubuntu box is reported provisioned without a tool that
-    /// a later command shells out to — `nft` for a policy, `frr` for a lab.
+    /// a later command shells out to — `nft` for a policy, `frr` for a routed
+    /// topology.
     #[test]
     fn the_ubuntu_mapping_covers_every_catalogued_package() {
         for set in super::NIX_SETS {

@@ -231,10 +231,11 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
             let _ = writeln!(nft, "    # posture is open: nothing is blocked");
         }
         Posture::Isolated => {
-            // This lab's subnets stay reachable: the posture means "no
-            // egress", not "no networking". *This lab's* — the previous
-            // blanket RFC 1918 exemption let an isolated box reach the home or
-            // corporate LAN behind it, which is egress by any reading.
+            // The subnets this box itself hosts stay reachable: the posture
+            // means "no egress", not "no networking". *This box's* — the
+            // previous blanket RFC 1918 exemption let an isolated box reach
+            // the home or corporate LAN behind it, which is egress by any
+            // reading.
             for prefix in &ctx.lab_prefixes {
                 let family = if prefix.contains(':') { "ip6" } else { "ip" };
                 let _ = writeln!(nft, "    {family} daddr {prefix} accept");
@@ -327,7 +328,7 @@ pub const ALLOW_TTL_SECS: u64 = 3600;
 ///   an unlisted endpoint simply by using that port.
 /// * `isolated` accepted all of RFC 1918 and ULA, so a box with a route to a
 ///   home or corporate LAN could reach the LAN router while the posture
-///   promised lab-internal traffic only.
+///   promised loopback and box-internal traffic only.
 ///
 /// Both are now derived from the box. Empty means "none of these exist", which
 /// is the strict reading and the right default.
@@ -335,7 +336,9 @@ pub const ALLOW_TTL_SECS: u64 = 3600;
 pub struct Context {
     /// The resolvers this box is configured to use, from `/etc/resolv.conf`.
     pub resolvers: Vec<String>,
-    /// Prefixes belonging to a lab running on this box.
+    /// Prefixes a product running in this box has declared as its own, read
+    /// from `/etc/devbox/lab/*/prefixes` (ADR-0046). Kept under that name
+    /// because the on-guest path is the published contract.
     pub lab_prefixes: Vec<String>,
     /// Networks nested containers send from.
     ///
@@ -345,9 +348,9 @@ pub struct Context {
     /// Retained for compatibility; the forward chain no longer exempts
     /// interfaces at all.
     ///
-    /// Lab traffic between two namespaces does not traverse the root forward
-    /// hook — both veth ends live inside namespaces — so there was nothing for
-    /// this to legitimately name.
+    /// Traffic between two namespaces inside the box does not traverse the
+    /// root forward hook — both veth ends live inside namespaces — so there
+    /// was nothing for this to legitimately name.
     pub internal_ifaces: Vec<String>,
 }
 
@@ -477,11 +480,11 @@ pub fn ruleset_with(policy: &Policy, ctx: &Context) -> String {
     // Enumerating container bridges cannot work — `--opt
     // com.docker.network.bridge.name=foo` names a bridge anything at all — so
     // the previous version inverted the test and exempted `dvb*`, devbox's own
-    // veth names. That was worse than useless: lab wiring *moves* both veth
-    // ends into node namespaces and renames them, so no interface at the root
-    // keeps that name, while a Docker network created as `dvb0` would have
-    // bypassed the posture entirely. An exemption for something that does not
-    // exist is a bypass with no beneficiary.
+    // veth names. That was worse than useless: the wiring that builds such a
+    // subnet *moves* both veth ends into node namespaces and renames them, so
+    // no interface at the root keeps that name, while a Docker network created
+    // as `dvb0` would have bypassed the posture entirely. An exemption for
+    // something that does not exist is a bypass with no beneficiary.
     let _ = writeln!(nft, "    jump {FORWARD_EGRESS}");
     let _ = writeln!(nft, "  }}");
 
@@ -642,7 +645,7 @@ mod tests {
         // Filtering forward like output dropped inbound published ports.
         // Enumerating container bridges missed every custom-named one.
         // Exempting `dvb*` exempted a name no root interface ever has — a
-        // bypass with no beneficiary, since lab wiring moves both veth ends
+        // bypass with no beneficiary, since that wiring moves both veth ends
         // into namespaces.
         let ctx = Context {
             resolvers: vec!["192.0.2.53".into()],
@@ -998,7 +1001,7 @@ mod tests {
 
         // Not all of RFC 1918. A box with a route to a home or corporate LAN
         // could otherwise reach its router while the posture promised
-        // lab-internal traffic only — which is egress by any reading.
+        // box-internal traffic only — which is egress by any reading.
         assert!(!nft.contains("172.16.0.0/12"));
         assert!(!nft.contains("192.168.0.0/16"));
         assert!(!nft.contains("fc00::/7"));

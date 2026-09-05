@@ -2,8 +2,8 @@
 //!
 //! This is the single most repeated defect in this codebase's review history.
 //! Nine separate call sites have been found and fixed one at a time — start,
-//! attach, exec, `code`, the lab substrate, `reprovision`, both Sets paths, and
-//! the bare-`devbox` console — each discovered only after the previous fix
+//! attach, exec, `code`, `reprovision`, both Sets paths, and the
+//! bare-`devbox` console — each discovered only after the previous fix
 //! shipped. Two more (`use` and `upgrade`) were found by enumerating the call
 //! sites instead of waiting for the next round.
 //!

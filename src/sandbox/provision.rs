@@ -1319,7 +1319,12 @@ async fn install_obsd_binary(runtime: &dyn Runtime, name: &str) -> Result<()> {
 
 /// Materialize a release-pinned guest binary through the runtime's native
 /// copy path, then freeze and verify it before the privileged install.
-pub(crate) async fn install_embedded_binary(
+///
+/// `pub` on purpose: this is the supported entry point for anything outside
+/// this crate that needs its own binary inside a box devbox provisioned. The
+/// staging, digest check, and privileged install are the contract — a caller
+/// that copies bytes in by hand gets none of them.
+pub async fn install_embedded_binary(
     runtime: &dyn Runtime,
     name: &str,
     binary_name: &str,

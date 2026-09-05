@@ -1,9 +1,10 @@
 # Devbox — Network set (Networking tools)
 #
-# frr and conntrack-tools are here because `devbox lab` shells out to them on
-# the substrate box: `lab up` starts zebra/bgpd inside each router namespace,
-# and tightening an egress policy flushes conntrack. Without them those paths
-# fail with command-not-found after having already done half their work.
+# frr and conntrack-tools are here because things running on the box shell out
+# to them: standing a routed topology up starts zebra/bgpd inside each router
+# namespace, and tightening an egress policy flushes conntrack. Without them
+# those paths fail with command-not-found after having already done half their
+# work.
 { pkgs }:
 with pkgs;
 [
@@ -14,8 +15,8 @@ with pkgs;
   #
   # The package keeps them in `libexec/frr/`, and a NixOS system profile links
   # only bin, sbin, lib, etc and share — so installing `frr` gave the substrate
-  # `vtysh` and nothing to talk to. `lab up` invokes `zebra` and `bgpd` by
-  # name, and its preflight probes `command -v zebra`, so the whole reason this
+  # `vtysh` and nothing to talk to. Callers invoke `zebra` and `bgpd` by name
+  # and probe `command -v zebra` before they start, so the whole reason this
   # set carries frr was unreachable on the one image devbox builds by default.
   #
   # `mgmtd` is here for the same reason and is easy to miss: FRR 10 moved

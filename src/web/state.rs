@@ -11,16 +11,6 @@ use crate::sandbox::SandboxManager;
 /// browser starts losing them. Lag is reported, never silent (§7.3).
 pub const EVENT_BUFFER: usize = 512;
 
-/// How long a ZTP status read is reused before another is made.
-///
-/// Shorter than the page's poll interval, so a reader never sees a figure more
-/// than one interval stale, and long enough that the two elements refreshing
-/// together share one round trip into the substrate.
-pub const ZTP_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
-
-/// Lab/substrate pairs the ZTP cache will hold.
-pub const MAX_CACHED_ZTP_LABS: usize = 32;
-
 /// One message on the console's Server-Sent Events channel.
 ///
 /// `kind` becomes the SSE `event:` name that htmx matches with `sse-swap`;
@@ -74,20 +64,6 @@ pub struct AppState {
     pub events: broadcast::Sender<ConsoleEvent>,
     /// Binary version, shown in the header.
     pub version: &'static str,
-    /// The last ZTP status read, per (lab, substrate), with when it was taken.
-    ///
-    /// The lab page has two elements that want it — the topology, to colour
-    /// its nodes, and the provisioning panel — and each polls on its own
-    /// interval. Reading twice means two `ip netns exec` round trips into the
-    /// substrate every two seconds per open page, for one answer.
-    pub ztp_cache: Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<
-                String,
-                (std::time::Instant, crate::lab::ztp_status::FabricView),
-            >,
-        >,
-    >,
     /// The box statuses the watcher last probed, for readers that must not
     /// probe themselves.
     ///
@@ -168,7 +144,6 @@ impl AppState {
             rebuilds_idle: Arc::new(tokio::sync::Notify::new()),
             build_status: Arc::new(std::sync::Mutex::new(Default::default())),
             box_status: Arc::new(std::sync::Mutex::new(Default::default())),
-            ztp_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -188,7 +163,7 @@ impl AppState {
         })
     }
 
-    /// Whether an asynchronous create/rebuild/lab operation already owns the
+    /// Whether an asynchronous create or rebuild operation already owns the
     /// slot. Used to reconnect a refreshed page to the live status stream
     /// instead of replacing that stream with a conflict notice.
     pub fn is_rebuilding(&self, box_name: &str) -> bool {
@@ -284,25 +259,6 @@ impl AppState {
             .ok()
             .and_then(|known| known.get(name).cloned())
             .unwrap_or_default()
-    }
-
-    /// A ZTP status read within the last [`ZTP_CACHE_TTL`], if there is one.
-    pub fn cached_ztp(&self, key: &str) -> Option<crate::lab::ztp_status::FabricView> {
-        let cache = self.ztp_cache.lock().ok()?;
-        let (taken, view) = cache.get(key)?;
-        (taken.elapsed() < ZTP_CACHE_TTL).then(|| view.clone())
-    }
-
-    /// Remember a ZTP status read, for the other element that wants it.
-    pub fn cache_ztp(&self, key: &str, view: &crate::lab::ztp_status::FabricView) {
-        if let Ok(mut cache) = self.ztp_cache.lock() {
-            // Bounded: the key carries a request-supplied substrate name, and
-            // an unbounded map keyed on one is a way to spend memory.
-            if cache.len() >= MAX_CACHED_ZTP_LABS {
-                cache.clear();
-            }
-            cache.insert(key.to_string(), (std::time::Instant::now(), view.clone()));
-        }
     }
 
     /// The last build status for a box, if one finished without being seen.

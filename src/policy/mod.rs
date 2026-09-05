@@ -216,16 +216,18 @@ impl Policy {
             Posture::Isolated => {
                 // Only what the ruleset actually permits. This used to allow
                 // every RFC 1918 address, while the generated ruleset (since
-                // ADR-0046) permits only the prefixes of a lab that is
-                // *running* — so `policy test 192.168.1.1` answered "allowed"
-                // for traffic the box would drop.
+                // ADR-0046) permits only the prefixes a product *running* in
+                // the box has declared under `/etc/devbox/lab/*/prefixes` — so
+                // `policy test 192.168.1.1` answered "allowed" for traffic the
+                // box would drop.
                 //
-                // Whether a lab is up is a property of the box, and this runs
-                // offline against devbox.toml. Reporting the stricter of the
-                // two possible answers is the right way to be wrong: a tool
-                // that says "denied" about something permitted causes a second
-                // look, and one that says "allowed" about something dropped
-                // causes an outage nobody connects to the policy.
+                // Whether anything has declared them is a property of the box,
+                // and this runs offline against devbox.toml. Reporting the
+                // stricter of the two possible answers is the right way to
+                // be wrong: a tool that says "denied" about something
+                // permitted causes a second look, and one that says "allowed"
+                // about something dropped causes an outage nobody connects to
+                // the policy.
                 if is_lab_internal(&target.addr) {
                     Decision::deny(
                         self,
@@ -422,10 +424,12 @@ pub fn is_local(addr: &str) -> bool {
     }
 }
 
-/// Private ranges, which a lab uses for its own subnets (§9).
+/// Private ranges, which anything that stands its own subnets up inside a box
+/// uses for them (§9).
 ///
-/// `isolated` permits these so a lab node can still reach its peers — the
-/// posture means "no egress", not "no networking".
+/// `isolated` permits these so two nodes on such a subnet can still reach each
+/// other — the posture means "no egress", not "no networking". The name is
+/// part of the published surface (ADR-0046) and stays as it is.
 pub fn is_lab_internal(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(a)) => a.is_private(),
