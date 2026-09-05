@@ -1,0 +1,237 @@
+# Quickstart — devbox v5
+
+v4 made a box you could watch. v5 makes a **run** you can hand to someone: one
+command, one report, and a line at the bottom saying how much of it devbox
+actually saw.
+
+## Install and make a box
+
+```bash
+cargo build --release            # or: curl -fsSL …/install.sh | sh
+cd my-project
+devbox                           # ensure a box for this directory, open the console
+```
+
+`devbox` with no arguments creates a box for the current project if it does not
+have one, then opens the console on that box's page. The URL it prints carries
+a per-launch token; the console binds `127.0.0.1` only and refuses any request
+whose `Host` header is not a loopback name.
+
+Console without touching a box:
+
+```bash
+devbox web --port 8080 --no-open
+```
+
+## Record a run
+
+```bash
+devbox run -- claude
+```
+
+Everything about that command is recorded and rendered:
+
+```
+run 01M1S6K0XSDYN51E45Y3JS6NK7 · 1.9s · exit 0 · finished
+  files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
+  network  2 peers · 2 DNS · ↑3.7KB ↓98.3KB
+  process  24 in the tree
+  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
+  report   ~/.devbox/runs/devtest/01M1S6K0XSDYN51E45Y3JS6NK7/report.html
+```
+
+Useful flags:
+
+| Flag | Effect |
+|---|---|
+| `--label "…"` | A name for the run, shown in `devbox runs` and at the top of the report |
+| `--posture isolated` | Hold an egress posture for this run only, then restore the box's own |
+| `--cwd /workspace/sub` | Working directory inside the box (default `/workspace`) |
+| `--no-report` | Record the run, skip rendering |
+| `--open` | Open the HTML report when it finishes |
+
+Then:
+
+```bash
+devbox runs                          # every run on this box
+devbox report <RUN_ID>               # Markdown
+devbox report <RUN_ID> --format json # the model itself
+devbox report <RUN_ID> --open        # HTML, in a browser
+```
+
+The report lands at `~/.devbox/runs/<box>/<run>/report.{md,json,html}`, mode
+0600 — it names every host the command reached and every file it touched. The
+console renders the same model at `/boxes/<box>/runs/<run>`.
+
+`exec` and `shell` are recorded as runs too (`kind = exec`, `kind = shell`),
+but do not render a report. They have no wrapper, so only the time-window rule
+can attribute events to them — see [observability.md](observability.md#run-attribution).
+
+## What the report says, and what it admits
+
+| Section | Reads |
+|---|---|
+| Files | The diff of the checkpoint taken before the run against the one taken after. `scope: run` means exactly that; `scope: box` would mean the whole box's overlay. |
+| Network | One row per peer — connections, ports, TLS seen, bytes each way, duration. Plus TLS server names and DNS answers. |
+| Processes | The process tree, by pid, wrapper included. |
+| Credentials | Which brokered credential was used and how often. Not wired yet — the section prints an explicit "not recorded", and `devbox watch --type credential` is where the events are. |
+| Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. |
+
+Two numbers surprise people the first time:
+
+- **`unattributed in the window`** counts events from *other* activity in the
+  same box during the run. On a shared box it is large; on a box doing one
+  thing it is small. It is not a defect, it is the cost of sharing a box, shown.
+- **Byte counts are settled at connection close.** A connection still open when
+  the run ends reads `0B` — the kernel counters are read at `tcp_close` and
+  nowhere else, because that is the only place they are true.
+
+## Checkpoints
+
+A checkpoint is a copy of the overlay's upper layer. `devbox run` brackets each
+run with two, which is where the report's Files section comes from.
+
+```bash
+devbox layer checkpoint --label before-refactor
+devbox layer checkpoints
+devbox layer diff --from 01m1s3zz              # checkpoint vs the box now
+devbox layer diff --from 01m1s3zz --to 01m1s40 # checkpoint vs checkpoint
+devbox layer restore 01m1s3zz                  # put the overlay back
+devbox layer checkpoint-rm 01m1s3zz            # delete one
+```
+
+An id can be shortened to any unique prefix. The newest 20 are kept; the ones a
+run's report cites are never pruned, and `checkpoint-rm` refuses them without
+`--force`.
+
+`restore` refuses while a run is still going — rewriting the upper layer out
+from under a run would invalidate the evidence the report is about to cite.
+
+## Credentials that never enter the box
+
+```bash
+devbox secret set anthropic --from-env ANTHROPIC_API_KEY
+devbox secret ls                                # names and backends, never values
+devbox secret scope github --repo owner/name    # what this credential may reach
+devbox broker status
+devbox broker reach mybox                       # how this box gets to the broker
+```
+
+The value goes to the host keychain. A host-side broker proxies each request to
+the real upstream over TLS and injects the credential there; the box only ever
+holds a per-box token that is rotated at box start. Every brokered request is a
+`credential` event: provider, method, host, path (query stripped), upstream
+status, bytes, verdict.
+
+```bash
+devbox watch --type credential
+```
+
+Two things this does *not* do:
+
+- **No TLS interception.** There is no CA in the box. That is why `gh` cannot be
+  brokered — it forces HTTPS and `GH_HOST` rejects a scheme. `git` over smart
+  HTTP works, through `insteadOf` in the guest gitconfig.
+- **No credentials under `isolated`.** The posture blocks the broker along with
+  everything else. An isolated run has no credentials, deliberately.
+
+## MCP servers, in a box
+
+```bash
+devbox mcp add fetch --box mcp-tools -- uvx mcp-server-fetch
+devbox mcp add gitsrv --box mcp-tools --posture mirror-only -- mcp-server-git
+devbox mcp ls
+devbox mcp rm fetch
+```
+
+Then point the agent at it:
+
+```bash
+claude mcp add fetch -- devbox mcp run fetch
+codex mcp add fetch -- devbox mcp run fetch
+```
+
+`devbox mcp run` is a byte-exact stdio shim — no parsing, no line buffering, no
+re-framing. The server's stderr goes to `~/.devbox/mcp/<name>.log`, so a chatty
+server cannot corrupt the JSON-RPC stream. Registration edits `devbox.toml` as
+text so comments and ordering survive; `--global` writes `~/.devbox/mcp.toml`
+instead, which is what you want for a server you use from any directory.
+
+If the box has no `uvx` or `npx`, `mcp add` says so at registration time and
+names the set that provides it:
+
+```
+Warning: box 'devtest' has no 'uvx' on its PATH.
+  It comes with the 'python' set (uv, uvx and python3). Add it with:
+    devbox upgrade devtest --tools python
+```
+
+## Export
+
+```bash
+devbox export --run 01M1S6K0XSDYN51E45Y3JS6NK7 --format ocsf
+devbox export --from 2026-09-05T14:00:00Z --format otlp-json --out events.json
+devbox export --format jsonl
+```
+
+`--run` resolves the run to a row-id range first, so exporting one run out of a
+440k-event store is a scan of that run, not of the store. `ocsf` is OCSF 1.3,
+one JSON object per line; `otlp-json` is a single OTLP/JSON
+`ExportLogsServiceRequest`; `jsonl` is devbox's own event, unchanged.
+
+## The CLI, by task
+
+```bash
+# lifecycle
+devbox shell                     # a terminal, no browser needed
+devbox list / status / stop / destroy
+
+# what is in the box
+devbox sets list
+devbox sets apply --set system --set git --set lang-rust
+
+# what the box did
+devbox watch --type dns,tls --tree
+devbox behavior summary
+devbox behavior diff --from 2026-09-05T14:00:00Z --at 2026-09-05T15:00:00Z
+devbox behavior pcap --proto tcp --daddr 93.184.216.34 --dport 443 --seconds 5
+
+# what the box may reach
+devbox policy show
+devbox policy set mirror-only    # applied to a running box immediately
+devbox policy test pypi.org      # exits non-zero if denied
+
+# is any of this working
+devbox doctor
+```
+
+Every command that acts on a box takes the box name as an optional first
+positional. Leave it out and devbox uses the box registered for the current
+directory.
+
+## What changed from v4
+
+- **`devbox run`** — a run is a first-class object with an id, a report, two
+  checkpoints, and a coverage line. `devbox runs` and `devbox report` read it
+  back; the console has a **Runs** tab.
+- **Checkpoints** — `devbox layer checkpoint / checkpoints / restore /
+  checkpoint-rm`, and `devbox layer diff --from`.
+- **Credentials left the box** — `devbox secret` and `devbox broker`. The v4
+  provisioning code that copied `~/.claude/.credentials.json`,
+  `~/.codex/auth.json`, and a plaintext `~/.devbox-ai-env` into the guest is
+  gone, and re-provisioning an old box deletes those files from it.
+- **`devbox mcp`** — MCP servers run inside a box instead of on your host.
+- **`devbox export`** — OCSF 1.3 and OTLP/JSON, for anything downstream.
+- **File events have a scope** — the agent exports file events only under
+  declared prefixes (`/workspace` and the box user's home by default). The scope
+  rides in the handshake and `devbox doctor` prints it.
+- **Byte counts are real** — a `tcp_close` probe settles them; `connect` no
+  longer reports a zero that looked like a measurement.
+- **Network labs and the ZTP fabric were removed.** They will return as a
+  separate, container-based tool.
+
+Existing v4 boxes load unchanged. A v4 event store is migrated in place, column
+by column, checked against `PRAGMA table_info` rather than a recorded version
+number, so an interrupted migration is retried instead of being skipped.
+
+© 2026 Ethan H.B. Zhou

@@ -1,9 +1,10 @@
 # Devbox Quick Start
 
-> **Archived v3 guide.** v4 removed the Zellij/package-manager TUI and now
-> opens a local web console with observability and policy. Use the
-> current [v4 quickstart](quickstart-v4.md). The material below is retained for
-> users of the last v3 release.
+> **Archived v3 guide.** v4 removed the Zellij/package-manager TUI and opened a
+> local web console with observability and policy; v5 added recorded runs, a
+> credential broker, and sandboxed MCP servers. Use the current
+> [v5 quickstart](quickstart-v5.md). The material below is retained for users of
+> the last v3 release.
 
 This guide walks you through creating your first developer VM with devbox. It explains exactly what happens at each step so you can understand the system.
 

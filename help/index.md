@@ -17,4 +17,4 @@ Available cheat sheets:
   zellij        Terminal multiplexer (optional — not installed by default)
 
 Usage: `devbox guide <tool>`, or open the console (`devbox web`) and use the
-Help view, which renders the same sheets in the browser.
+Guides view, which renders the same sheets in the browser.

@@ -24,9 +24,23 @@ means "search every box for this run" rather than "use this directory's box".
   devbox                Ensure this project has a box, then open the console
   devbox web            Open the console without touching any box
   devbox shell          Attach a terminal (no browser needed)
+  devbox exec -- <cmd>  Run a one-off command in the box
+  devbox run -- <cmd>   Run a command and record what it did
   devbox stop           Stop sandbox (preserves state)
   devbox destroy        Remove sandbox (warns on uncommitted changes)
   devbox list           List all sandboxes
+
+## Runs (a command, and the receipt for it)
+  devbox run -- <cmd>              Record files, network, processes, credentials
+  devbox run --label "…" -- <cmd>  Name the run
+  devbox run --posture isolated -- <cmd>   Hold a posture for this run only
+  devbox runs                      List this box's recorded runs
+  devbox report <RUN_ID>           Print the report (--format md|json|html)
+  devbox report <RUN_ID> --open    Open the HTML report in a browser
+
+The summary's last line is the coverage line: which capture backends were live,
+how many events were attributed to the run, and how many were dropped. `exec`
+and `shell` are recorded as runs too, but do not render a report.
 
 ## Console
   devbox web                       Start the local web console
@@ -69,6 +83,41 @@ pass `--force`, because the run's report cites them for what it changed.
   devbox diff                      Show changes vs host files
   devbox commit                    Sync changes back to host
   devbox discard                   Throw away all changes
+
+## What the box did
+  devbox watch                     Recent activity
+  devbox watch --type dns,tls      Only these event kinds
+  devbox watch --tree              Grouped by process
+  devbox behavior summary          Domains, processes, files, traffic, policy
+  devbox behavior diff --from T --at T     Compare two windows
+  devbox export --run ID --format ocsf     OCSF 1.3, one object per line
+  devbox export --format otlp-json         One OTLP/JSON request
+
+## What the box may reach
+  devbox policy show               Posture and allowlist
+  devbox policy set mirror-only    open | allowlist | mirror-only | isolated
+  devbox policy allow github.com   Add to the allowlist
+  devbox policy test pypi.org      Exits non-zero if it would be denied
+  devbox policy rules              The nftables ruleset the posture generates
+
+## Credentials (they never enter the box)
+  devbox secret set anthropic --from-env ANTHROPIC_API_KEY
+  devbox secret ls                 Names and backends, never values
+  devbox secret scope github --repo owner/name
+  devbox secret rm <provider>
+  devbox broker status             The host-side broker
+  devbox broker reach              How this box reaches it
+
+A host-side broker proxies each request to the real upstream and injects the
+credential there. The box holds only a per-box token, rotated at box start, and
+every use is recorded as a `credential` event.
+
+## MCP servers, inside a box
+  devbox mcp add <name> -- <cmd>   Register a server
+  devbox mcp add <name> --global -- <cmd>   ...visible from every directory
+  devbox mcp ls                    List registered servers
+  devbox mcp run <name>            What the agent launches
+  devbox mcp rm <name>             Forget one (its log is kept)
 
 ## Configuration
   devbox init                      Generate devbox.toml

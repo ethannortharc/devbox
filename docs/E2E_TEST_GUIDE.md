@@ -22,11 +22,13 @@ These tests should be run manually after significant changes.
 | 7 | [Guide system (inside VM)](#7-guide-system-inside-vm) | Verified |
 | 8 | [Create sandbox (with tools)](#8-create-sandbox-with-language-tools) | Manual |
 | 8b | [Create Ubuntu sandbox](#8b-create-ubuntu-sandbox) | Manual |
-| 9 | [Layout commands](#9-layout-commands) | Verified |
+| 9 | [Recorded runs](#9-recorded-runs) | Manual |
 | 10 | [Config management](#10-config-management) | Verified |
 | 11 | [Stop and destroy](#11-stop-and-destroy) | Verified |
-| 12 | [Overlay operations](#12-overlay-operations) | Manual |
+| 12 | [Overlay operations and checkpoints](#12-overlay-operations-and-checkpoints) | Manual |
 | 13 | [Snapshots](#13-snapshot-operations) | Manual |
+| 14 | [Credential broker](#14-credential-broker) | Manual |
+| 15 | [MCP server in a box](#15-mcp-server-in-a-box) | Manual |
 
 ---
 
@@ -73,9 +75,26 @@ Runtime availability:
 Auto-detected runtime: lima (priority 20)
 
 Supporting tools:
-  Zellij: installed
   Nix: not found
     Install: curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh
+```
+
+`doctor` also reports the collector daemon, the credential broker, and — for
+every running box — its kernel, BTF, nftables, agent, agent-binary freshness,
+capture source and file scope. Those lines are what tell you whether capture is
+real or degraded:
+
+```
+Running box capabilities:
+  e2e-test (lima):
+    kernel: 6.19.0
+    btf: ready
+    nftables: ready
+    vsock: ready
+    agent: devbox-obsd 0.2.0 (<commit>)
+    agent binary: matches host embed
+    capture: ebpf+packet+netfilter
+    file scope: /workspace, /home
 ```
 
 ## 2. Project initialization
@@ -133,9 +152,9 @@ devbox status e2e-test
 
 **Expected for `list`:**
 ```
-NAME                 RUNTIME      LAYOUT     PROJECT DIR
+NAME                 RUNTIME      MOUNT      PROJECT DIR
 ------------------------------------------------------------------------
-e2e-test             lima         default    /tmp/devbox-e2e
+e2e-test             lima         overlay    /tmp/devbox-e2e
 
 1 sandbox(es)
 ```
@@ -145,9 +164,10 @@ e2e-test             lima         default    /tmp/devbox-e2e
 Sandbox:     e2e-test
 Status:      Running (green)
 Runtime:     lima
+Image:       nixos
 Project:     /tmp/devbox-e2e
 Mount mode:  overlay
-Layout:      default
+Created:     <RFC 3339 timestamp>
 Sets:        system, shell, tools, editor, git, container
 ```
 
@@ -191,7 +211,6 @@ curl --version           # HTTP client
 tree --version           # Directory tree
 
 # Verify shell tools (from shell set):
-zellij --version         # Terminal multiplexer
 starship --version       # Shell prompt
 fzf --version            # Fuzzy finder
 yazi --version           # File manager
@@ -218,7 +237,7 @@ gh --version             # GitHub CLI
 
 # Verify devbox binary works inside VM:
 devbox guide             # Should show help index
-devbox guide zellij      # Should show zellij keybindings
+devbox guide lazygit     # Should show the lazygit sheet
 
 exit
 ```
@@ -233,8 +252,8 @@ devbox exec e2e-test -- sudo nixos-rebuild switch
 ```bash
 # From host (uses embedded cheat sheets):
 devbox guide
-devbox guide zellij
 devbox guide lazygit
+devbox guide rg
 devbox guide nonexistent
 
 # From inside the VM (uses /etc/devbox/help/ files):
@@ -246,8 +265,8 @@ exit
 
 **Expected:**
 - `guide`: Shows index with all 13 available cheat sheets
-- `guide zellij`: Renders Zellij keybinding reference
-- `guide lazygit`: Renders lazygit workflow reference
+- `guide lazygit`: Renders the lazygit workflow reference
+- `guide rg`: Renders the ripgrep reference
 - `guide nonexistent`: Prints "No cheat sheet for 'nonexistent'" to stderr
 - Guide works both on the host and inside the VM
 
@@ -328,7 +347,6 @@ nix --version            # Nix package manager
 rg --version             # ripgrep
 fd --version             # fd
 bat --version            # bat
-zellij --version         # zellij
 lazygit --version        # lazygit
 
 # devbox guide should work
@@ -342,28 +360,38 @@ exit
 devbox destroy e2e-ubuntu --force
 ```
 
-## 9. Layout commands
+## 9. Recorded runs
+
+> v4 removed the Zellij layout subsystem; `devbox layout` no longer exists.
+> This slot now covers `devbox run`, the v5 replacement for "what did that
+> command actually do?"
 
 ```bash
-devbox layout list
-devbox layout preview default
-devbox layout preview ai-pair
-devbox layout preview tdd
+devbox run e2e-test --label smoke -- sh -c 'curl -sS -o /dev/null https://example.com; echo hi > /workspace/run-probe.txt; sleep 1'
+devbox runs e2e-test
+devbox report <RUN_ID> --format md
+devbox layer checkpoints e2e-test
 ```
 
-**Expected for `list`:**
+**Expected for `run`** — a five-line summary, then a report path:
 ```
-NAME             DESCRIPTION
-------------------------------------------------------------
-default          Clean workspace: editor + terminal + files
-ai-pair          AI assistant + editor + output
-...
-plain            No layout, just a shell
-
-9 layout(s) available
+run 01M1S6K0XSDYN51E45Y3JS6NK7 · 1.9s · exit 0 · finished
+  files    1 changed (1 added, 0 modified, 0 deleted) · scope: run
+  network  1 peers · 1 DNS · ↑1.9KB ↓6.3KB
+  process  24 in the tree
+  coverage full (ebpf+packet+netfilter) · 53 events · 0 dropped
+  report   ~/.devbox/runs/e2e-test/01M1S6K0XSDYN51E45Y3JS6NK7/report.html
 ```
 
-**Expected for `preview`:** ASCII diagram showing pane arrangement with percentages and tab names.
+**Check, in order:**
+- `files` names `run-probe.txt` and says `scope: run`, not `scope: box`.
+- `network` names `example.com` with non-zero bytes. Zero bytes with a
+  successful `curl` means the `close` probe did not attach — check
+  `devbox doctor` for `capture: ebpf…`.
+- `process` includes `curl` with a real pid (not `4294967295`).
+- `coverage` reads `full`, and `dropped` is 0.
+- `devbox layer checkpoints` shows a `run-start` and a `run-end` pair for the
+  run; `devbox layer checkpoint-rm <one of them>` refuses without `--force`.
 
 ## 10. Config management
 
@@ -375,7 +403,7 @@ devbox config set runtime auto
 ```
 
 **Expected:**
-- `show`: Displays current global config (runtime, layout, tools)
+- `show`: Displays the current global config (runtime, image, tools)
 - `set`/`get`: Round-trip works correctly
 - Values persist in `~/.devbox/config.toml`
 
@@ -394,13 +422,20 @@ devbox list                # Should show "No sandboxes found."
 - Destroy: "Sandbox '...' destroyed."
 - List after destroy: "No sandboxes found."
 
-## 12. Overlay operations
+## 12. Overlay operations and checkpoints
 
-> Requires a sandbox with files in the overlay upper layer.
+> Requires a sandbox with files in the overlay upper layer. `/workspace` is the
+> merged view; the upper layer lives at `/var/devbox/overlay/upper` and is not
+> something you write to directly.
 
 ```bash
 devbox create --name overlay-test --bare
-devbox exec overlay-test -- touch /workspace/upper/testfile.txt
+devbox exec overlay-test -- touch /workspace/testfile.txt
+devbox diff overlay-test
+devbox layer checkpoint overlay-test --label base   # note the id it prints
+devbox exec overlay-test -- sh -c 'echo more > /workspace/testfile.txt'
+devbox layer diff overlay-test --from <ID>          # any unique prefix works
+devbox layer restore <ID> overlay-test
 devbox diff overlay-test
 devbox discard overlay-test
 devbox diff overlay-test
@@ -409,8 +444,14 @@ devbox destroy overlay-test --force
 
 **Expected:**
 - First diff: shows `testfile.txt` as Added
-- After discard: diff shows no changes
-- Note: overlay behavior depends on NixOS image having the overlay mount configured
+- `layer checkpoint`: prints an id, a file count and a byte count
+- `layer diff --from <id>`: shows `~ testfile.txt` (modified), even though the
+  file is the same length — the comparison uses size *and* mtime
+- `layer restore`: prints `Restored checkpoint <id>` and refreshes the overlay,
+  so the next `cat` reads the restored content rather than a cached one
+- After `discard`: diff shows no changes
+- Note: overlay behavior depends on the NixOS image having the overlay mount
+  configured
 
 ## 13. Snapshot operations
 
@@ -418,9 +459,9 @@ devbox destroy overlay-test --force
 
 ```bash
 devbox create --name snap-test --bare
-devbox snapshot save snap-test
+devbox snapshot save nightly snap-test     # <SNAPSHOT> first, then the box
 devbox snapshot list snap-test
-devbox snapshot restore snap-test <snapshot-name>
+devbox snapshot restore nightly snap-test
 devbox destroy snap-test --force
 ```
 
@@ -428,6 +469,52 @@ devbox destroy snap-test --force
 - Save: Creates a snapshot without errors
 - List: Shows the saved snapshot with name and timestamp
 - Restore: Restores to the snapshot state
+
+## 14. Credential broker
+
+> Uses a dummy provider and a local echo upstream. Never point this test at a
+> real key.
+
+```bash
+printf 'not-a-real-value\n' | devbox secret set e2e-probe \
+  --url http://127.0.0.1:9 --header 'Authorization: Bearer' --stdin
+devbox secret ls
+devbox secret scope e2e-probe
+devbox broker status
+devbox broker reach e2e-test
+devbox exec e2e-test -- sh -c 'env | grep DEVBOX_BROKER'
+devbox secret rm e2e-probe
+```
+
+**Expected:**
+- `secret set`: "Stored 'e2e-probe' in the keychain store. It is never written
+  into a box."
+- `secret ls`: one row with the provider name, the backend and the upstream —
+  **never** the value
+- `broker reach`: an address and how it was verified, e.g.
+  `e2e-test: http://host.lima.internal:7879 (lima user-mode network)`
+- `exec … env`: `DEVBOX_BROKER_URL` and `DEVBOX_BROKER_TOKEN` are present, and
+  the secret's value appears nowhere
+- `secret rm`: removes it from the keychain (`security find-generic-password -s
+  devbox -a e2e-probe` finds nothing afterwards)
+
+## 15. MCP server in a box
+
+```bash
+devbox mcp add echo-test --box e2e-test -- sh -c 'cat'
+devbox mcp ls
+printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | devbox mcp run echo-test
+devbox mcp rm echo-test
+```
+
+**Expected:**
+- `mcp add`: prints the registration plus the `claude mcp add` / `codex mcp add`
+  lines to paste, and warns if the box lacks the interpreter the command needs
+- `mcp run`: echoes the JSON-RPC line back byte for byte and exits 0
+- stdout carries **only** JSON-RPC; anything the server writes to stderr lands
+  in `~/.devbox/mcp/echo-test.log`
+- `mcp rm`: leaves `devbox.toml` byte-identical to what it was before `mcp add`,
+  comments included; the log is kept
 
 ---
 
@@ -438,8 +525,13 @@ devbox destroy snap-test --force
 devbox destroy e2e-test --force 2>/dev/null
 devbox destroy e2e-lang --force 2>/dev/null
 devbox destroy e2e-explicit --force 2>/dev/null
+devbox destroy e2e-ubuntu --force 2>/dev/null
 devbox destroy overlay-test --force 2>/dev/null
 devbox destroy snap-test --force 2>/dev/null
+
+# Remove any test credential and MCP registration
+devbox secret rm e2e-probe 2>/dev/null
+devbox mcp rm echo-test 2>/dev/null
 
 # Remove test project
 rm -rf /tmp/devbox-e2e
@@ -502,3 +594,14 @@ devbox exec <sandbox> -- sudo nixos-rebuild switch 2>&1
 5. **Nix binary cache**: NixOS downloads pre-compiled packages from `cache.nixos.org`. If a package isn't cached (rare), Nix builds it from source, which takes longer.
 
 6. **Self-update**: `devbox self-update --check` will fail until GitHub Releases are published for the repository.
+
+7. **Agent replacement on first entry**: starting or entering a box built by an
+   older devbox prints `Box '<name>' has an out-of-date observability agent
+   (<sha> vs <sha>); replacing it.` and, on NixOS, runs one `nixos-rebuild
+   switch` to regenerate the unit. It happens once per stale box and is
+   idempotent afterwards.
+
+8. **Runs need the collector**: `devbox run`, `exec`, `shell`, `watch`,
+   `behavior`, `policy`, `web` and `mcp run` start the background collector if
+   it is not already up. `devbox runs` and `devbox report` do not — they only
+   read.
