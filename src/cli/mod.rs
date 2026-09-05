@@ -15,6 +15,7 @@ pub mod help;
 pub mod init;
 pub mod layer;
 pub mod list;
+pub mod mcp;
 pub mod nix_cmd;
 pub mod policy;
 pub mod prune;
@@ -175,11 +176,15 @@ pub enum Command {
     /// Read or change a box's egress policy
     Policy(policy::PolicyArgs),
 
+    /// Run MCP servers inside a box
+    Mcp(mcp::McpArgs),
+
     /// Start the local web console
     Web(web::WebArgs),
 
     /// Export a box's events as OCSF, OTLP/JSON, or JSON Lines
     Export(export::ExportArgs),
+
     /// Manage the credentials the broker holds for your boxes
     Secret(secret::SecretArgs),
 
@@ -195,6 +200,13 @@ impl Command {
     /// process. Lifecycle and observation commands do, so capture survives
     /// after the foreground command or web console exits.
     pub fn needs_collector(&self) -> bool {
+        // `mcp` decides for itself: `mcp run` starts a box and its events have
+        // to be collected, while `mcp add`, `ls` and `rm` only edit a file.
+        // Registering the whole subcommand here would launch a background
+        // process for `devbox mcp ls`.
+        if let Self::Mcp(args) = self {
+            return args.needs_collector();
+        }
         matches!(
             self,
             Self::Create(_)
@@ -256,6 +268,7 @@ impl Command {
             Command::Watch(args) => watch::run(args, manager).await,
             Command::Behavior(args) => behavior::run(args, manager).await,
             Command::Policy(args) => policy::run(args, manager).await,
+            Command::Mcp(args) => mcp::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
             Command::Export(args) => export::run(args, manager).await,
             Command::Secret(args) => secret::run(args, manager).await,
