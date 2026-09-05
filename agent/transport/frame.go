@@ -23,7 +23,10 @@ import (
 	"io"
 )
 
-// ProtocolVersion is bumped whenever the event schema or the framing changes.
+// ProtocolVersion is bumped when the framing or an existing record layout
+// changes incompatibly. Adding an event type is additive: an older collector
+// counts the unknown type as rejected and keeps the stream, so it does not
+// bump the version (see the close event, W0-5b).
 const ProtocolVersion = 1
 
 // MaxFrameSize bounds a single frame.

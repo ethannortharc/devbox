@@ -5,41 +5,202 @@ use crate::runtime::Runtime;
 /// OverlayFS paths inside the VM.
 #[allow(dead_code)]
 const WORKSPACE: &str = "/workspace";
-const UPPER: &str = "/var/devbox/overlay/upper";
+pub(crate) const UPPER: &str = "/var/devbox/overlay/upper";
 const LOWER: &str = "/mnt/host";
 #[allow(dead_code)]
 const WORK: &str = "/var/devbox/overlay/work";
 const STASH_DIR: &str = "/var/devbox/overlay/stash";
 
+/// What `find`'s `%y` reports for one entry.
+///
+/// Kept as a small enum rather than the raw letter so that the two callers
+/// that care — this module's add/modify/delete classification, and
+/// [`crate::sandbox::checkpoint`]'s tree-against-tree diff — cannot disagree
+/// about what "is a directory" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    /// A character device. In an overlay upper this is almost always a
+    /// whiteout, but see [`TreeEntry::is_whiteout`] for the real test.
+    Char,
+    /// Block device, fifo, socket, or anything else `find` reports.
+    Other,
+}
+
+impl EntryKind {
+    /// Map `find -printf '%y'` onto the enum.
+    pub fn from_find(letter: &str) -> Self {
+        match letter {
+            "f" => Self::File,
+            "d" => Self::Dir,
+            "l" => Self::Symlink,
+            "c" => Self::Char,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// One entry of a guest-side directory tree, as [`enumerate_tree`] sees it.
+///
+/// This is deliberately more than `overlay::diff` needs today: a checkpoint is
+/// diffed against another *tree*, not against the lower layer, so it has no
+/// `test -e` to fall back on and has to decide "changed?" from the metadata
+/// alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Path relative to the tree root, no leading slash.
+    pub path: String,
+    pub kind: EntryKind,
+    /// `find`'s `%s`: bytes for a regular file, target length for a symlink,
+    /// and the directory's own on-disk size for a directory — which is why the
+    /// tree diff ignores it there.
+    pub size: u64,
+    /// `find`'s `%T@` verbatim (`seconds.nanoseconds`). Only ever compared for
+    /// equality, so it is never parsed into a float and never loses precision.
+    /// `cp -a` preserves it exactly, which is what makes a copied checkpoint
+    /// compare equal to the upper it came from.
+    pub mtime: String,
+    /// A character device with rdev 0/0 — OverlayFS's "this name is deleted".
+    /// A genuine `/dev`-style character node in the upper is *not* a whiteout,
+    /// which is the case `kind == Char` alone gets wrong.
+    pub is_whiteout: bool,
+    /// A directory carrying `trusted.overlay.opaque=y` — OverlayFS's "ignore
+    /// whatever the lower layer has under this name".
+    pub is_opaque: bool,
+}
+
+/// The guest shell that lists one tree.
+///
+/// Three passes rather than one because GNU `find -printf` can report neither
+/// a device node's major/minor nor an xattr:
+///
+/// - `E` — every entry, with type, size, mtime and path;
+/// - `W` — the major/minor of each character device, so whiteouts (0/0) can be
+///   told apart from real device nodes;
+/// - `O` — the directories that carry `trusted.overlay.opaque`.
+///
+/// The path is the last field of every record, so a path containing spaces or
+/// tabs still parses. A path containing a newline does not — the same
+/// limitation `overlay::diff` has always had.
+fn tree_listing_command(root: &str) -> String {
+    let root = root.trim_end_matches('/');
+    format!(
+        "set -e; \
+         find '{root}' -mindepth 1 -printf 'E\\t%y\\t%s\\t%T@\\t%P\\n'; \
+         find '{root}' -mindepth 1 -type c -exec stat -c 'W %t %T %n' {{}} +; \
+         find '{root}' -mindepth 1 -type d -exec sh -c \
+         'for d in \"$@\"; do v=$(getfattr -n trusted.overlay.opaque --only-values \"$d\" 2>/dev/null || true); \
+         if [ \"$v\" = y ]; then printf \"O %s\\n\" \"$d\"; fi; done' _ {{}} +"
+    )
+}
+
+/// Parse [`tree_listing_command`]'s output into entries.
+///
+/// Split out from the guest call so the format — which is the part that breaks
+/// — can be tested without a VM.
+pub fn parse_tree_listing(stdout: &str, root: &str) -> Vec<TreeEntry> {
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let mut entries: Vec<TreeEntry> = vec![];
+    let mut whiteouts: Vec<String> = vec![];
+    let mut opaque: Vec<String> = vec![];
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((tag, rest)) = line.split_at_checked(1) else {
+            continue;
+        };
+        match tag {
+            "E" => {
+                // "\t<kind>\t<size>\t<mtime>\t<path>"
+                let mut fields = rest.trim_start_matches('\t').splitn(4, '\t');
+                let (Some(kind), Some(size), Some(mtime), Some(path)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                entries.push(TreeEntry {
+                    path: path.to_string(),
+                    kind: EntryKind::from_find(kind),
+                    size: size.parse().unwrap_or(0),
+                    mtime: mtime.to_string(),
+                    is_whiteout: false,
+                    is_opaque: false,
+                });
+            }
+            "W" => {
+                // " <major> <minor> <absolute path>"
+                let rest = rest.trim_start_matches(' ');
+                let mut fields = rest.splitn(3, ' ');
+                let (Some(major), Some(minor), Some(path)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                // `stat -c '%t %T'` prints hex with no padding; 0/0 is the
+                // whiteout rdev and every other value is a real device node.
+                if major.trim_start_matches('0').is_empty()
+                    && minor.trim_start_matches('0').is_empty()
+                {
+                    whiteouts.push(path.strip_prefix(&prefix).unwrap_or(path).to_string());
+                }
+            }
+            "O" => {
+                let path = rest.trim_start_matches(' ');
+                opaque.push(path.strip_prefix(&prefix).unwrap_or(path).to_string());
+            }
+            _ => {}
+        }
+    }
+
+    for entry in &mut entries {
+        entry.is_whiteout = whiteouts.contains(&entry.path);
+        entry.is_opaque = opaque.contains(&entry.path);
+    }
+    entries
+}
+
+/// List one guest directory tree, root excluded.
+///
+/// `overlay::diff` walks the live upper with it; `checkpoint` walks a saved
+/// upper with the same call, so the two can never drift apart on what an
+/// entry is.
+pub async fn enumerate_tree(
+    runtime: &dyn Runtime,
+    sandbox_name: &str,
+    root: &str,
+) -> Result<Vec<TreeEntry>> {
+    let result = runtime
+        .run_as_root(sandbox_name, &tree_listing_command(root), false)
+        .await?;
+
+    if result.exit_code != 0 {
+        bail!("Failed to scan {root}: {}", result.stderr.trim());
+    }
+
+    Ok(parse_tree_listing(&result.stdout, root))
+}
+
 /// List files changed in the overlay upper layer.
 /// Returns a list of (status, path) tuples.
 pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<OverlayChange>> {
     // List all files in the upper directory (needs root for overlay dirs)
-    let cmd = format!("find {UPPER} -not -path {UPPER} -printf '%y %P\\n'");
-    let result = runtime.run_as_root(sandbox_name, &cmd, false).await?;
-
-    if result.exit_code != 0 {
-        bail!("Failed to scan overlay changes: {}", result.stderr.trim());
-    }
+    let entries = enumerate_tree(runtime, sandbox_name, UPPER)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to scan overlay changes: {e:#}"))?;
 
     let mut changes = vec![];
-    for line in result.stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (kind, path) = match line.split_once(' ') {
-            Some((k, p)) => (k, p),
-            None => continue,
-        };
-
+    for entry in entries {
         // Check if the file exists in the lower layer to determine add vs modify
-        let lower_path = format!("{LOWER}/{path}");
+        let lower_path = format!("{LOWER}/{}", entry.path);
         let check = runtime
             .exec_cmd(sandbox_name, &["test", "-e", &lower_path], false)
             .await?;
 
-        let status = if kind == "c" {
+        let status = if entry.kind == EntryKind::Char {
             // OverlayFS whiteout — file was deleted
             ChangeStatus::Deleted
         } else if check.exit_code == 0 {
@@ -50,8 +211,8 @@ pub async fn diff(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Vec<Overl
 
         changes.push(OverlayChange {
             status,
-            path: path.to_string(),
-            is_dir: kind == "d",
+            path: entry.path,
+            is_dir: entry.kind == EntryKind::Dir,
         });
     }
 

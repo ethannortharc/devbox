@@ -9,12 +9,21 @@ CO-RE programs that feed the observability plane (§7.1).
 | `handle_tcp_v6_connect` | kprobe `tcp_v6_connect` | records the socket and process for completion |
 | `handle_tcp_finish_connect` | kprobe `tcp_finish_connect` | established outbound `connect` — 5-tuple |
 | `handle_accept` | kretprobe `inet_csk_accept` | `accept` — 5-tuple |
+| `handle_tcp_close` | kprobe `tcp_close` | `close` — 5-tuple, bytes sent/received, duration |
 | `handle_openat` | tracepoint `syscalls/sys_enter_openat` | `file` — path, flags, op |
 
 DNS and TLS SNI are **not** eBPF programs: they are parsed from the flow by
 `agent/decode` (see `wire.go`). A ClientHello is plaintext by design and a DNS
 message is a UDP payload, so neither needs a kernel probe — and keeping them in
-userspace keeps the verifier's job small.
+userspace keeps the verifier's job small. The two differ in one way that
+matters: a DNS message arrives whole in one datagram, while a ClientHello no
+longer does. TLS 1.3 now offers a post-quantum key share by default and that
+pushes the record past a 1448-byte MSS, so `decode.SNI` parses whatever a
+segment actually carries and answers `ErrNeedMore` when `server_name` is not in
+it yet, and `agent/capture` joins the flow's next segment — along the sequence
+number, capped at 4 segments and 8 KiB — and retries. Doing that in a kernel
+probe would mean a TCP reassembler inside the verifier's reach, which is exactly
+the trade this split avoids.
 
 ## Filtering
 
@@ -47,8 +56,10 @@ developer on macOS has neither. While the pair was untracked, `build.rs` had no
 object to embed and every build from source — which is every build outside a
 tagged release — silently shipped the portable proc+packet agent instead. The
 symptom was not an error. It was `devbox watch` reporting connections with pid
-`4294967295`, no file events at all, and a behaviour summary reading `↑0B ↓0B`:
-a capture that looked like a working one.
+`4294967295` and no file events at all: a capture that looked like a working
+one. (The `↑0B ↓0B` traffic line that accompanied it was a *different* bug —
+see "Why traffic is counted at close" below — and switching to the eBPF agent
+did not fix it, which is how the two came to be told apart.)
 
 `vmlinux.h` stays untracked. It is 5 MB of one kernel's types, it is an input
 rather than an artifact, and unlike the object it can be regenerated anywhere
@@ -153,7 +164,44 @@ therefore stashes process identity against the socket pointer. The
 fields, emits the event, and deletes that entry. Attempts which never complete
 produce no event; the bounded LRU map eventually evicts their stale entries.
 
-`fill_net` writes **every** field of the record, including `_pad`, the unused
-address bytes, and the byte/duration counters. `bpf_ringbuf_reserve` hands back
-reused memory, not zeroed memory, so a field left untouched carries whatever
-the previous record put there — and the Go decoder reports it as real traffic.
+`fill_net` writes **every** field of the record, including the flags byte, the
+unused address bytes, and the byte/duration counters. `bpf_ringbuf_reserve`
+hands back reused memory, not zeroed memory, so a field left untouched carries
+whatever the previous record put there — and the Go decoder reports it as real
+traffic.
+
+## Why traffic is counted at close and nowhere else
+
+Every probe above except `handle_tcp_close` fires while a connection is being
+*made*: at the connect syscall, on the SYN-ACK, on the listener's accept. At
+each of them no payload has crossed the socket, so there is no byte count to
+read — which is why a `connect` record's `bytes_tx`, `bytes_rx` and `dur_ns`
+are zero, and were zero for as long as those were the only network probes. The
+`Traffic: ↑0B ↓0B` in every behaviour summary was not a capture failure; it was
+the honest sum of a set of records none of which could have carried a number.
+
+`struct tcp_sock` keeps running totals (`bytes_sent`, `bytes_received`) that
+are final by the time the socket is closed, so `tcp_close` is where a
+connection is settled: it emits one more `net_event`, flagged `NET_FLAG_CLOSE`,
+carrying those totals and the time since establishment. Both fields are read
+through `bpf_core_field_exists`, so a kernel predating either still loads the
+program and reports zero for that direction instead of refusing to attach.
+
+`tcp_close` rather than `tcp_set_state` entering `TCP_CLOSE`: the latter fires
+on every state transition of every TCP socket, frequently from softirq where
+the current process has nothing to do with the socket, and also for sockets
+that never carried a byte. `tcp_close` fires once per socket, in the closing
+process's own context, which is what makes the cgroup filter meaningful there.
+A kprobe rather than a kretprobe, because `tcp_close` unhashes the socket on
+its way out and the local port — half of what joins this record to its connect
+— is gone by the time it returns.
+
+Attribution is by socket pointer, not by 5-tuple: `tcp_close` runs in whoever
+closes the fd, which after a fork or an SCM_RIGHTS pass is not the process that
+dialled. `tcp_finish_connect` and `inet_csk_accept` therefore park the opener's
+identity and the establishment timestamp in the `established` LRU map, and the
+close probe reads them back. A close with no entry — a connection older than
+the agent — is still reported, flagged `NET_FLAG_ORPHAN`, with the closer's
+identity and no direction. Consumers count `close` events and only `close`
+events, so the totals cannot be double-counted if a connect probe ever gains
+counters of its own.

@@ -77,7 +77,7 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         .iter()
         .map(|t| t.parse::<EventType>())
         .collect::<Result<Vec<_>>>()
-        .context("unknown --type; valid values: exec, exit, connect, accept, dns, tls, file, syscall, api, policy")?;
+        .context("unknown --type; valid values: exec, exit, connect, accept, close, dns, tls, file, syscall, api, policy")?;
 
     if !path.exists() {
         println!("No collected events are available for box '{name}'.");

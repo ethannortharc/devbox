@@ -171,7 +171,7 @@ pub async fn prune(rt: &dyn Runtime, box_name: &str, keep: usize) -> Result<Vec<
 devbox layer checkpoint [NAME] [--label L]
 devbox layer checkpoints [NAME]
 devbox layer diff [NAME] --from <id> [--to <id>]
-devbox layer restore [NAME] <id>
+devbox layer restore <id> [NAME]        # the id is required, so it comes first (clap), as in `snapshot restore`
 ```
 
 ## 6. Component B — Credential broker
