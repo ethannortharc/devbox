@@ -2203,3 +2203,44 @@ other; agent-replacing tasks get one box each from here on.
 **Next.** W2-2 (`mcp run` as a run, `mcp report`, `mcp self`), W2-3 (the
 sweep of small gaps each track left), then docs, README, screenshot,
 ADRs 0059+, version 0.2.0 and a release.
+
+## 2026-09-05T19:30Z — 0.2.0 release candidate: the code surface is frozen
+
+**Landed since the last entry.** `v5/sweep` (nine small gaps: discard now
+remounts, `layer checkpoint-rm`, the box-name guardrail walks the real command
+tree, the guest home comes from the login shell rather than `/etc/passwd`,
+the console terminal gets the broker variables, the NixOS unit gets a file
+scope), `v5/mcp` with its integration wave (`mcp run` is a run, `mcp report`,
+`devbox mcp self`, `uvx mcp-server-fetch` end to end from a dedicated box),
+`v5/report-polish` (wrappers fold to one row, writes outside the overlay get
+their own table, `destroy` removes the reports with the store, the
+Credentials section is fed by the broker's events — which until then never
+reached the run they were made for), `v5/docs` (README rewritten around the
+run report, a v5 quickstart, ADR-0059..0067, version 0.2.0, CI on `main`,
+`v4`, and `v5-main`), and two blockers the documentation pass found:
+`v5/redact` (a `*_TOKEN=`, `*_SECRET=`, `*_KEY=` or `Authorization:` value in
+an `exec` argv is `***` before the agent sends it, again when the collector
+stores it, and again when an old row is read; the runtime's login shell
+folds into the wrapper row) and `v5/export-credential` (a brokered call is
+OCSF API Activity 6003, validated allowed and denied against the schema
+server; `--run` now fills `metadata.correlation_uid`).
+
+**The screenshot in the README is one page of a real run**: files (scope:
+run), network with the broker hop, processes with the token shown as `***`,
+credentials, policy. The three strings that must not appear — the user
+name, the host path, the token — were checked against the DOM and appear
+zero times.
+
+**Gate on `v5-main`** — the final one before tagging: every test binary
+green, clippy clean, Go clean, release build `devbox 0.2.0`.
+
+**What remains is not code.** The release workflow has never run (this host
+has no `act`); `v0.2.0` will be its first run. `install.sh`, the README, and
+`Cargo.toml` name github.com while the origin is a private Gitea, so the
+release needs `v5-main` on GitHub and a tag pushed there — both outward
+actions for Ethan. Follow-ups that did not block 0.2.0 are listed in the
+wave-2 checklist and will become the first issues of the next cycle:
+`devbox code` broker injection, `detect_vm_username` asking the guest,
+`RunRecord.file_scope`, a migration for pre-redaction rows, the broker's
+per-process monotonic clock, the run-start attribution race that can start
+a process tree mid-wrapper, and the amd64 CO-RE object once CI produces it.
