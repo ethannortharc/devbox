@@ -156,50 +156,53 @@ jobs:
 
       - name: build eBPF objects
         run: |
-          # Keep whatever this checkout committed: `go generate` overwrites it,
-          # and the next step's whole job is to compare the two.
-          for tracked in agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.o; do
-            if [ -f "$tracked" ]; then cp "$tracked" "$tracked.committed"; fi
-          done
+          # Keep the committed bindings: `go generate` overwrites them, and the
+          # next step's whole job is to compare the two.
+          if [ -f agent/bpf/devbox_amd64_bpfel.go ]; then
+            cp agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed
+          fi
           go generate -tags bpf2go ./agent/bpf
 
-      # The object is tracked per architecture so a source build embeds the
-      # eBPF agent (agent/bpf/README.md). Tracked generated output goes stale
-      # silently, and the symptom is not a build failure: it is an agent whose
-      # probes disagree with `devbox.bpf.c` and decode into plausible garbage.
-      - name: check the committed amd64 object is current
-        id: core-object
+      # bpf2go writes a pair, and only one half of it can be gated here.
+      #
+      # The .go bindings name the loader's API surface — programs, maps, record
+      # types — so they move only when `devbox.bpf.c` moves. A difference is a
+      # real staleness signal and nothing else produces one.
+      #
+      # The .o cannot be byte-compared. It embeds BTF taken from this runner's
+      # own kernel, so a clang upgrade or a runner image bump rewrites its bytes
+      # while the source stands still; gating on that turns the build red for
+      # something no commit caused. It is uploaded instead, every run, for a
+      # maintainer to commit when the source behind it changed.
+      #
+      # What that leaves uncovered is named in agent/bpf/README.md: editing a
+      # probe body without touching a name changes the object and not the
+      # bindings, and no CI check can see it.
+      - name: check the committed amd64 bindings are current
         run: |
-          uncommitted=
-          for tracked in agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.o; do
-            if [ ! -f "$tracked.committed" ]; then
-              uncommitted="$uncommitted $tracked"
-              continue
-            fi
-            if ! cmp -s "$tracked" "$tracked.committed"; then
-              echo "::error file=$tracked::$tracked is not what this source generates."
-              echo "Regenerate on an amd64 Linux host with BTF and commit the result:"
-              echo "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h"
-              echo "  go generate -tags bpf2go ./agent/bpf"
-              echo "A clang or kernel-BTF change on this runner is a legitimate"
-              echo "cause, and the fix is the same: regenerate and commit."
-              exit 1
-            fi
-          done
-          rm -f agent/bpf/devbox_amd64_bpfel.go.committed agent/bpf/devbox_amd64_bpfel.o.committed
-          if [ -n "$uncommitted" ]; then
-            echo "::notice::no committed amd64 object yet ($uncommitted); uploading the generated pair to commit"
-            echo "upload=true" >> "$GITHUB_OUTPUT"
+          if [ ! -f agent/bpf/devbox_amd64_bpfel.go.committed ]; then
+            echo "::notice::no committed amd64 pair yet; download devbox-bpf-amd64 from this run and commit both files"
+            exit 0
           fi
+          if ! cmp -s agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed; then
+            echo "::error file=agent/bpf/devbox_amd64_bpfel.go::the committed amd64 bindings are not what this source generates."
+            echo "Download the devbox-bpf-amd64 artifact from this run and commit both files."
+            diff -u agent/bpf/devbox_amd64_bpfel.go.committed \
+                    agent/bpf/devbox_amd64_bpfel.go || true
+            exit 1
+          fi
+          rm -f agent/bpf/devbox_amd64_bpfel.go.committed
 
+      # Uploaded on failure too: a failing bindings check is exactly when the
+      # generated pair is the thing you came for.
       - uses: actions/upload-artifact@v4
-        if: steps.core-object.outputs.upload == 'true'
+        if: ${{ !cancelled() }}
         with:
           name: devbox-bpf-amd64
           path: |
             agent/bpf/devbox_amd64_bpfel.go
             agent/bpf/devbox_amd64_bpfel.o
-          retention-days: 7
+          retention-days: 14
 
       - name: load probes and capture a scripted workload
         run: |

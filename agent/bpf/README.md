@@ -82,19 +82,53 @@ target.
 
 ### When it must be regenerated
 
-- `devbox.bpf.c` changed at all — programs, maps, or record structs.
-- `agent/decode/record.go` changed its layout. The two are mirrors and
-  `agent/decode`'s size assertions are what catch a half-applied change.
-- The pinned `github.com/cilium/ebpf` version changed, which can change the
-  shape of the generated loader.
+Regenerate and commit the pair for **every** architecture when any of these
+changes:
 
-A stale object does not fail to build. It loads, attaches, and decodes into
-plausible-looking nonsense — which is why the `ebpf` CI job regenerates the
-amd64 pair on every run and fails if it differs from what is committed.
+- `devbox.bpf.c`, in any way at all — not only when a program, map, or record
+  struct is added or renamed. Editing the body of an existing probe changes the
+  object and leaves the bindings identical, and that case is the one nothing
+  else will catch (see below).
+- `agent/decode/record.go`'s layout. It and the record structs in
+  `devbox.bpf.c` are mirrors of one another, and `agent/decode`'s size
+  assertions are what turn a half-applied change into a test failure instead of
+  a misdecoded event.
+- The pinned `github.com/cilium/ebpf` version, which can change the shape of
+  the generated loader.
 
-The amd64 pair is produced by CI, not by hand: no arm64 developer machine can
-make a valid one. When the job finds none committed it uploads the generated
-pair as the `devbox-bpf-amd64` artifact to be downloaded and committed.
+A stale object does not fail to build. It loads, it attaches, and it decodes
+into plausible-looking nonsense — pids that are not pids, paths assembled from
+the wrong offsets. That is the failure mode this section exists to prevent.
+
+### What CI does and does not check
+
+The `ebpf` job regenerates the amd64 pair on every run, and gates the two
+halves differently:
+
+| file | gate |
+|---|---|
+| `devbox_amd64_bpfel.go` | byte-compared against what is committed; **differs → job fails** |
+| `devbox_amd64_bpfel.o` | not compared; uploaded as the `devbox-bpf-amd64` artifact |
+
+The bindings are comparable because they encode only the loader's API surface —
+program, map, and type names — which moves when and only when `devbox.bpf.c`
+moves.
+
+The object is not. It embeds BTF derived from the runner's own kernel, so a
+clang upgrade or a runner image bump rewrites its bytes with no commit behind
+the change. Gating on that would mean a red build that no diff explains and
+that regenerating "fixes" only until the next image bump, which is how a check
+gets ignored and then deleted.
+
+**So one case is on you, not on CI**: change a probe's body without touching a
+program, map, or type name, and the bindings come out identical while the
+object does not. CI stays green with a stale object committed. Treat the list
+above as the rule and regenerate on any `devbox.bpf.c` edit.
+
+The amd64 pair is produced by CI, not by hand — no arm64 developer machine can
+make a valid one. Every run uploads the freshly generated pair as
+`devbox-bpf-amd64` (kept 14 days), including runs where the bindings check
+failed, which is precisely when you want it: download it and commit both files.
 
 ## Testing
 
