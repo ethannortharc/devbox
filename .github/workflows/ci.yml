@@ -155,7 +155,51 @@ jobs:
         run: sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
 
       - name: build eBPF objects
-        run: go generate -tags bpf2go ./agent/bpf
+        run: |
+          # Keep whatever this checkout committed: `go generate` overwrites it,
+          # and the next step's whole job is to compare the two.
+          for tracked in agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.o; do
+            if [ -f "$tracked" ]; then cp "$tracked" "$tracked.committed"; fi
+          done
+          go generate -tags bpf2go ./agent/bpf
+
+      # The object is tracked per architecture so a source build embeds the
+      # eBPF agent (agent/bpf/README.md). Tracked generated output goes stale
+      # silently, and the symptom is not a build failure: it is an agent whose
+      # probes disagree with `devbox.bpf.c` and decode into plausible garbage.
+      - name: check the committed amd64 object is current
+        id: core-object
+        run: |
+          uncommitted=
+          for tracked in agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.o; do
+            if [ ! -f "$tracked.committed" ]; then
+              uncommitted="$uncommitted $tracked"
+              continue
+            fi
+            if ! cmp -s "$tracked" "$tracked.committed"; then
+              echo "::error file=$tracked::$tracked is not what this source generates."
+              echo "Regenerate on an amd64 Linux host with BTF and commit the result:"
+              echo "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h"
+              echo "  go generate -tags bpf2go ./agent/bpf"
+              echo "A clang or kernel-BTF change on this runner is a legitimate"
+              echo "cause, and the fix is the same: regenerate and commit."
+              exit 1
+            fi
+          done
+          rm -f agent/bpf/devbox_amd64_bpfel.go.committed agent/bpf/devbox_amd64_bpfel.o.committed
+          if [ -n "$uncommitted" ]; then
+            echo "::notice::no committed amd64 object yet ($uncommitted); uploading the generated pair to commit"
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: steps.core-object.outputs.upload == 'true'
+        with:
+          name: devbox-bpf-amd64
+          path: |
+            agent/bpf/devbox_amd64_bpfel.go
+            agent/bpf/devbox_amd64_bpfel.o
+          retention-days: 7
 
       - name: load probes and capture a scripted workload
         run: |
