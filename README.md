@@ -350,7 +350,7 @@ and NixOS generations for whole-system rollback.
 devbox diff                      # review the overlay
 devbox commit --path src/        # accept selectively
 devbox discard                   # throw it all away
-devbox snapshot restore <id>     # roll the whole VM back
+devbox snapshot restore <snapshot>   # roll the whole VM back
 ```
 
 ### Overlay layer lifecycle
@@ -488,7 +488,9 @@ overlay contract. Restricted runtimes must be selected explicitly.
 | Incus | Linux | Auto-detected; NixOS overlay or Ubuntu writable |
 | Lima | macOS | Auto-detected; NixOS overlay or Ubuntu writable |
 | Docker | Any | Explicit only: `--runtime docker --image ubuntu --writable --bare`. No protected OverlayFS, and no eBPF — it shares your kernel. |
-| Multipass | macOS/Linux | Existing boxes only; new creation disabled |
+
+A fourth backend, Multipass, is still carried for boxes registered under older
+versions; creating new ones is disabled and `devbox run` does not work on it.
 
 ---
 
