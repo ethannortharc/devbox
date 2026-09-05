@@ -1,3 +1,5 @@
+pub mod agent_sync;
+pub mod checkpoint;
 pub mod config;
 pub mod global_config;
 pub mod overlay;
@@ -706,11 +708,13 @@ impl SandboxManager {
         })?;
         let runtime = self.runtime_for_sandbox(&state)?;
 
+        let mut just_started = false;
         match runtime.status(name).await? {
             SandboxStatus::Running => {}
             SandboxStatus::Stopped => {
                 println!("Starting sandbox '{name}'...");
                 runtime.start(name).await?;
+                just_started = true;
             }
             SandboxStatus::NotFound => {
                 bail!(
@@ -743,7 +747,133 @@ impl SandboxManager {
                 ),
             }
         }
+
+        // The box may have been provisioned by an older devbox, or by a build
+        // of *this* version that embedded a different agent. Both hand back a
+        // box whose handshake passes and whose capture is quietly degraded,
+        // because the collector compares version strings and these agents
+        // share one. This is the point where the host holds the lifecycle
+        // claim, so it is the point that may also regenerate the service.
+        //
+        // Never fatal. A box that cannot have its agent refreshed is still a
+        // box the user asked to enter.
+        match crate::sandbox::agent_sync::ensure_current(
+            self,
+            runtime.as_ref(),
+            name,
+            &state.image,
+            crate::sandbox::agent_sync::Scope::Full,
+            &claim,
+        )
+        .await
+        {
+            Ok(refresh) => {
+                if refresh.changed() {
+                    println!(
+                        "Observability agent in box '{name}' is now the one this devbox ships."
+                    );
+                }
+            }
+            // One failure here is not like the others. Regenerating the unit
+            // rebuilds the box, and a rebuild removes its firewall; if the
+            // saved posture did not come back, the box is running open while
+            // every surface still says otherwise. Same fail-closed condition
+            // as the apply above, and the same answer.
+            Err(error) if crate::sandbox::agent_sync::lost_the_posture(&error) => {
+                match runtime.stop(name).await {
+                    Ok(()) => bail!(
+                        "sandbox '{name}' cannot be used: {error:#}. It was stopped for safety"
+                    ),
+                    Err(stop_error) => bail!(
+                        "sandbox '{name}' cannot be used: {error:#}. It could not be stopped and may still be running without that policy: {stop_error:#}. Run `devbox stop {name}` immediately"
+                    ),
+                }
+            }
+            Err(error) => eprintln!(
+                "Warning: could not bring box '{name}'s observability agent up to date: {error:#}"
+            ),
+        }
+
+        // The broker token is per box and rotated at box start (§6.3), so a
+        // token that leaked out of a box stops working the next time that box
+        // comes up. Rotating on every entry instead would cut off a shell that
+        // is still running in the same box, which is why this is keyed on an
+        // actual start.
+        if (just_started || crate::broker::tokens::current(&self.state_dir, name).is_none())
+            && let Err(error) = crate::broker::tokens::rotate(&self.state_dir, name)
+        {
+            tracing::warn!(box_id = %name, %error, "could not mint a broker token");
+        }
+        crate::broker::daemon::ensure_running(self);
+        if just_started {
+            self.refresh_guest_gitconfig(runtime.as_ref(), name).await;
+        }
+
         Ok((state, runtime, claim))
+    }
+
+    /// The environment a devbox-started session gets for the credential
+    /// broker — §6.3.
+    ///
+    /// This is the integration point: `run`, `exec`, `shell`, and `mcp run`
+    /// all wrap their command with these pairs, and no other path puts them
+    /// in a guest. Best effort throughout: a host with no secrets, a broker
+    /// that is not running, or a box with no verified route to the host all
+    /// mean "no variables", never "the command fails".
+    pub async fn broker_env(&self, runtime: &dyn Runtime, name: &str) -> Vec<(String, String)> {
+        crate::broker::guest_env(&self.state_dir, runtime, name).await
+    }
+
+    /// Rewrite the devbox-managed `insteadOf` stanza in the guest gitconfig.
+    ///
+    /// The broker's address is a function of the runtime's host-reach *and*
+    /// the port it bound, and both can change across a restart. An append
+    /// would leave the stale rewrite above the fresh one, and git honours the
+    /// last match — so the section is replaced, in the guest, from the guest's
+    /// own copy of the file.
+    async fn refresh_guest_gitconfig(&self, runtime: &dyn Runtime, name: &str) {
+        let wants_github = crate::broker::configured_providers(&self.state_dir)
+            .iter()
+            .any(|p| p == crate::broker::providers::GITHUB);
+        let base = if wants_github {
+            let Some(endpoint) = crate::broker::endpoint(&self.state_dir) else {
+                return;
+            };
+            match tokio::time::timeout(
+                crate::broker::reach::REACH_TIMEOUT,
+                runtime.host_reach(name, endpoint.port),
+            )
+            .await
+            {
+                Ok(Ok(reach)) => Some(reach.base_url()),
+                _ => return,
+            }
+        } else {
+            // Nothing to broker: strip any stanza an earlier configuration
+            // left behind, rather than leaving git pointed at a dead address.
+            None
+        };
+
+        let existing = runtime
+            .exec_cmd(name, &["sh", "-c", "cat ~/.gitconfig 2>/dev/null"], false)
+            .await
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout)
+            .unwrap_or_default();
+        if base.is_none() && !existing.contains(crate::broker::GITCONFIG_BEGIN) {
+            return;
+        }
+        let updated = crate::broker::apply_gitconfig_section(&existing, base.as_deref());
+        // Base64 through argv, the same way provisioning writes guest files:
+        // the content has newlines, tabs, and a URL in it, and none of that
+        // survives a naive shell interpolation.
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(updated.as_bytes());
+        let write = format!("printf %s '{encoded}' | base64 -d > ~/.gitconfig");
+        if let Err(error) = runtime.exec_cmd(name, &["sh", "-c", &write], false).await {
+            tracing::debug!(box_id = %name, %error, "could not refresh the guest gitconfig");
+        }
     }
 
     /// Attach to a sandbox: start it if stopped, then hand the user a shell.
@@ -789,7 +919,10 @@ impl SandboxManager {
 
         println!("Attaching to sandbox '{name}'...");
         let shell = crate::web::service::detect_shell(runtime.as_ref(), name).await;
-        runtime.exec_as_user(name, &[shell, "-l"]).await?;
+        let env = self.broker_env(runtime.as_ref(), name).await;
+        let cmd = crate::broker::with_env(&env, &[shell.to_string(), "-l".to_string()]);
+        let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        runtime.exec_as_user(name, &cmd_refs).await?;
         Ok(())
     }
 
@@ -1012,7 +1145,9 @@ impl SandboxManager {
     ) -> Result<i32> {
         let (_state, runtime, claim) = self.prepare_running_for_use(name).await?;
 
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let env = self.broker_env(runtime.as_ref(), name).await;
+        let wrapped = crate::broker::with_env(&env, cmd);
+        let cmd_refs: Vec<&str> = wrapped.iter().map(|s| s.as_str()).collect();
         // The command can be arbitrarily long-lived. The claim protects the
         // preparation boundary, not the process lifetime.
         drop(claim);
@@ -1103,6 +1238,9 @@ impl SandboxManager {
     /// and retryable. Reversing the order strands data under a name no command
     /// can list, and the next box with that name adopts it.
     fn remove_sandbox_records(&self, name: &str) -> Result<()> {
+        // A token outliving its box would authenticate the next box created
+        // under that name into the previous one's audit trail.
+        crate::broker::tokens::forget(&self.state_dir, name);
         crate::obs::collector::remove_box_data(&self.state_dir, name)?;
         SandboxState::remove(&self.state_dir, name)
     }

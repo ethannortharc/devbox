@@ -60,6 +60,15 @@ const MAX_STDERR_LINES: usize = 1_000;
 /// every box this supervisor is responsible for.
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long the agent-freshness check and any replacement it triggers may
+/// take before this box's collector is started anyway.
+///
+/// Long enough for the copy: the agent is a dozen megabytes and it crosses a
+/// runtime CLI twice, once to stage it and once for root to freeze it. Short
+/// enough that a box which will never answer does not hold up the rest — the
+/// stale agent still streams, and `devbox doctor` now says it is stale.
+const AGENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// How long a retiring collector is given to drain before it is aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -418,6 +427,81 @@ impl Supervisor {
         );
     }
 
+    /// Replace the box's agent when it is not the one this build carries,
+    /// before spawning anything that would talk to it.
+    ///
+    /// Attaching is the second place the question can be asked — the first is
+    /// the CLI's own lifecycle path — and the only one that covers a box
+    /// started from the console or left running across a devbox upgrade.
+    ///
+    /// Three deliberate limits:
+    ///
+    /// - It takes the per-box lifecycle claim, and skips when it cannot. A
+    ///   push during someone else's rebuild would install an agent the
+    ///   rebuild is about to replace, and the claim is how every other writer
+    ///   of guest files already announces itself.
+    /// - It is [`Scope::BinaryOnly`]. Regenerating a NixOS unit means
+    ///   `nixos-rebuild switch`; minutes of it inside a reconciliation tick
+    ///   would suspend capture for every other box.
+    /// - It is bounded. A wedged runtime CLI must delay one box's collector,
+    ///   not the loop.
+    ///
+    /// Never fatal: a box whose agent could not be replaced still gets a
+    /// collector, and the stale agent still streams — degraded, and now
+    /// visibly so through `devbox doctor`.
+    async fn refresh_agent(
+        &self,
+        name: &str,
+        state: &crate::sandbox::state::SandboxState,
+        runtime: &dyn crate::runtime::Runtime,
+    ) {
+        let claim = match crate::web::build::try_claim_box(&self.manager.state_dir, name) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                tracing::debug!(
+                    box_id = %name,
+                    "another devbox process holds this box; leaving its agent alone"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(box_id = %name, %error, "could not claim box to check its agent");
+                return;
+            }
+        };
+        let refresh = tokio::time::timeout(
+            AGENT_REFRESH_TIMEOUT,
+            crate::sandbox::agent_sync::ensure_current(
+                &self.manager,
+                runtime,
+                name,
+                &state.image,
+                crate::sandbox::agent_sync::Scope::BinaryOnly,
+                &claim,
+            ),
+        )
+        .await;
+        drop(claim);
+        match refresh {
+            Ok(Ok(refresh)) => {
+                if refresh.pushed {
+                    tracing::info!(box_id = %name, "replaced an out-of-date observability agent");
+                }
+                for note in refresh.notes {
+                    tracing::warn!(box_id = %name, "{note}");
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(box_id = %name, %error, "could not update the observability agent")
+            }
+            Err(_) => tracing::warn!(
+                box_id = %name,
+                seconds = AGENT_REFRESH_TIMEOUT.as_secs(),
+                "checking the observability agent timed out"
+            ),
+        }
+    }
+
     async fn start(
         &self,
         name: &str,
@@ -477,6 +561,8 @@ impl Supervisor {
                 return Ok(None);
             }
         }
+
+        self.refresh_agent(name, &state, runtime.as_ref()).await;
 
         let database = store_path(&self.manager.state_dir, name);
         if let Some(parent) = database.parent() {

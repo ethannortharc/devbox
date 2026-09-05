@@ -23,6 +23,15 @@ type DevboxConnOwner struct {
 	Comm     [16]int8
 }
 
+type DevboxConnState struct {
+	_         structs.HostLayout
+	Owner     DevboxConnOwner
+	OpenTsNs  uint64
+	Sport     uint16
+	Direction uint8
+	_         [5]byte
+}
+
 // LoadDevbox returns the embedded CollectionSpec for Devbox.
 func LoadDevbox() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_DevboxBytes)
@@ -68,6 +77,7 @@ type DevboxProgramSpecs struct {
 	HandleAccept           *ebpf.ProgramSpec `ebpf:"handle_accept"`
 	HandleExec             *ebpf.ProgramSpec `ebpf:"handle_exec"`
 	HandleOpenat           *ebpf.ProgramSpec `ebpf:"handle_openat"`
+	HandleTcpClose         *ebpf.ProgramSpec `ebpf:"handle_tcp_close"`
 	HandleTcpFinishConnect *ebpf.ProgramSpec `ebpf:"handle_tcp_finish_connect"`
 	HandleTcpV4Connect     *ebpf.ProgramSpec `ebpf:"handle_tcp_v4_connect"`
 	HandleTcpV6Connect     *ebpf.ProgramSpec `ebpf:"handle_tcp_v6_connect"`
@@ -78,6 +88,7 @@ type DevboxProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type DevboxMapSpecs struct {
 	Connecting    *ebpf.MapSpec `ebpf:"connecting"`
+	Established   *ebpf.MapSpec `ebpf:"established"`
 	ExecEvents    *ebpf.MapSpec `ebpf:"exec_events"`
 	FileEvents    *ebpf.MapSpec `ebpf:"file_events"`
 	NetEvents     *ebpf.MapSpec `ebpf:"net_events"`
@@ -111,6 +122,7 @@ func (o *DevboxObjects) Close() error {
 // It can be passed to LoadDevboxObjects or ebpf.CollectionSpec.LoadAndAssign.
 type DevboxMaps struct {
 	Connecting    *ebpf.Map `ebpf:"connecting"`
+	Established   *ebpf.Map `ebpf:"established"`
 	ExecEvents    *ebpf.Map `ebpf:"exec_events"`
 	FileEvents    *ebpf.Map `ebpf:"file_events"`
 	NetEvents     *ebpf.Map `ebpf:"net_events"`
@@ -120,6 +132,7 @@ type DevboxMaps struct {
 func (m *DevboxMaps) Close() error {
 	return _DevboxClose(
 		m.Connecting,
+		m.Established,
 		m.ExecEvents,
 		m.FileEvents,
 		m.NetEvents,
@@ -140,6 +153,7 @@ type DevboxPrograms struct {
 	HandleAccept           *ebpf.Program `ebpf:"handle_accept"`
 	HandleExec             *ebpf.Program `ebpf:"handle_exec"`
 	HandleOpenat           *ebpf.Program `ebpf:"handle_openat"`
+	HandleTcpClose         *ebpf.Program `ebpf:"handle_tcp_close"`
 	HandleTcpFinishConnect *ebpf.Program `ebpf:"handle_tcp_finish_connect"`
 	HandleTcpV4Connect     *ebpf.Program `ebpf:"handle_tcp_v4_connect"`
 	HandleTcpV6Connect     *ebpf.Program `ebpf:"handle_tcp_v6_connect"`
@@ -150,6 +164,7 @@ func (p *DevboxPrograms) Close() error {
 		p.HandleAccept,
 		p.HandleExec,
 		p.HandleOpenat,
+		p.HandleTcpClose,
 		p.HandleTcpFinishConnect,
 		p.HandleTcpV4Connect,
 		p.HandleTcpV6Connect,

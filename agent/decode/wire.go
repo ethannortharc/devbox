@@ -19,6 +19,16 @@ import (
 // ErrMalformed is returned for input that is not a well-formed message.
 var ErrMalformed = errors.New("decode: malformed message")
 
+// ErrNeedMore is returned for input that is a well-formed *prefix* — every byte
+// present is valid, the message simply stops early.
+//
+// It is deliberately not ErrMalformed. The two mean opposite things to a
+// caller holding a byte stream: ErrMalformed says no further byte will help and
+// the flow can be abandoned, ErrNeedMore says the next segment is worth joining
+// on and retrying. Only TLS returns it; a DNS message arrives whole in one
+// datagram.
+var ErrNeedMore = errors.New("decode: message is incomplete")
+
 // DNSMessage is the part of a DNS message the observability plane cares about.
 type DNSMessage struct {
 	// ID is the transaction id, used to pair a response with its query.
@@ -208,73 +218,136 @@ type ClientHello struct {
 // SNI parses a TLS ClientHello and extracts the server name and first ALPN
 // protocol.
 //
-// `record` is a complete TLS record: the 5-byte record header followed by the
-// handshake message. No decryption is involved — the ClientHello is plaintext
-// by design, which is exactly why it is the cheapest reliable way to learn who
-// a box is talking to.
+// `record` starts at the 5-byte TLS record header but need not be a *complete*
+// record. Requiring one is why this used to return nothing for real traffic: a
+// TLS 1.3 ClientHello offering a post-quantum key share is around 1.5 KB
+// (X25519MLKEM768 alone contributes 1216 bytes), so it does not fit inside one
+// 1448-byte segment, and every segment on its own looked truncated. Instead the
+// parse walks forward over the bytes actually in hand — every step still
+// bounds-checked against them, none of the range checks relaxed — and succeeds
+// as soon as server_name has been read in full.
+//
+// A prefix that ends before that yields ErrNeedMore, which tells the caller
+// another segment is worth waiting for. Anything no further byte can repair
+// stays ErrMalformed.
+//
+// No decryption is involved — the ClientHello is plaintext by design, which is
+// exactly why it is the cheapest reliable way to learn who a box is talking to.
 func SNI(record []byte) (*ClientHello, error) {
 	// TLS record header: type(1) version(2) length(2)
-	if len(record) < 5 {
-		return nil, fmt.Errorf("%w: TLS record shorter than its header", ErrMalformed)
+	if len(record) == 0 {
+		return nil, fmt.Errorf("%w: empty TLS record", ErrMalformed)
 	}
 	if record[0] != 0x16 {
 		return nil, fmt.Errorf("%w: not a TLS handshake record", ErrMalformed)
 	}
+	if len(record) < 5 {
+		return nil, fmt.Errorf("%w: TLS record header is incomplete", ErrNeedMore)
+	}
 	recLen := int(binary.BigEndian.Uint16(record[3:5]))
 	body := record[5:]
-	if len(body) < recLen {
-		return nil, fmt.Errorf("%w: TLS record is truncated", ErrMalformed)
+
+	// `final` says whether every byte the message in hand claims to have is
+	// present. It decides how a shortfall further in is reported: inside a
+	// message that is already complete, a field running past the end is
+	// malformed and no later segment can repair it.
+	final := len(body) >= recLen
+	if final {
+		body = body[:recLen]
 	}
-	body = body[:recLen]
+	short := func(what string) error {
+		if final {
+			return fmt.Errorf("%w: %s", ErrMalformed, what)
+		}
+		return fmt.Errorf("%w: %s", ErrNeedMore, what)
+	}
 
 	// Handshake header: type(1) length(3)
-	if len(body) < 4 || body[0] != 0x01 {
+	if len(body) < 1 {
+		return nil, short("TLS record carries no handshake message")
+	}
+	if body[0] != 0x01 {
 		return nil, fmt.Errorf("%w: not a ClientHello", ErrMalformed)
 	}
+	if len(body) < 4 {
+		return nil, short("ClientHello header is incomplete")
+	}
+	hsLen := int(body[1])<<16 | int(body[2])<<8 | int(body[3])
 	hs := body[4:]
+	if len(hs) >= hsLen {
+		// The ClientHello is all here even if the record claims more, so from
+		// here on a shortfall is the message's own fault.
+		hs = hs[:hsLen]
+		final = true
+	} else if final {
+		// The handshake message continues into a later TLS record. Joining
+		// record bodies is a different job from joining TCP segments, and no
+		// ClientHello in the wild needs it.
+		return nil, fmt.Errorf("%w: ClientHello spans more than one TLS record", ErrMalformed)
+	}
 
 	// client_version(2) random(32)
 	if len(hs) < 34 {
-		return nil, fmt.Errorf("%w: ClientHello is truncated", ErrMalformed)
+		return nil, short("ClientHello is truncated")
 	}
 	off := 34
 
 	// session_id
-	if off >= len(hs) {
-		return nil, fmt.Errorf("%w: ClientHello has no session id", ErrMalformed)
+	if off+1 > len(hs) {
+		return nil, short("ClientHello has no session id")
 	}
 	off += 1 + int(hs[off])
 
 	// cipher_suites
 	if off+2 > len(hs) {
-		return nil, fmt.Errorf("%w: ClientHello has no cipher suites", ErrMalformed)
+		return nil, short("ClientHello has no cipher suites")
 	}
 	off += 2 + int(binary.BigEndian.Uint16(hs[off:off+2]))
 
 	// compression_methods
-	if off >= len(hs) {
-		return nil, fmt.Errorf("%w: ClientHello has no compression methods", ErrMalformed)
+	if off+1 > len(hs) {
+		return nil, short("ClientHello has no compression methods")
 	}
 	off += 1 + int(hs[off])
 
 	// extensions
 	if off+2 > len(hs) {
-		// A ClientHello with no extensions is legal but tells us nothing.
-		return &ClientHello{}, nil
+		if final {
+			// A ClientHello with no extensions is legal but tells us nothing.
+			return &ClientHello{}, nil
+		}
+		return nil, short("ClientHello stops before its extensions")
 	}
 	extTotal := int(binary.BigEndian.Uint16(hs[off : off+2]))
 	off += 2
-	if off+extTotal > len(hs) {
+	ext := hs[off:]
+	extWhole := len(ext) >= extTotal
+	if extWhole {
+		ext = ext[:extTotal]
+	} else if final {
 		return nil, fmt.Errorf("%w: ClientHello extensions run past the record", ErrMalformed)
 	}
-	ext := hs[off : off+extTotal]
 
 	out := &ClientHello{}
+	// stop decides what a walk that ended early is worth. A server_name already
+	// read in full is the answer this function exists for and is returned
+	// whatever follows it; without one, a block that was cut short is worth
+	// another segment and a block that was all here is malformed.
+	stop := func(what string) (*ClientHello, error) {
+		if out.SNI != "" {
+			return out, nil
+		}
+		if extWhole {
+			return nil, fmt.Errorf("%w: %s", ErrMalformed, what)
+		}
+		return nil, fmt.Errorf("%w: %s", ErrNeedMore, what)
+	}
+
 	for len(ext) >= 4 {
 		extType := binary.BigEndian.Uint16(ext[0:2])
 		extLen := int(binary.BigEndian.Uint16(ext[2:4]))
 		if 4+extLen > len(ext) {
-			return nil, fmt.Errorf("%w: TLS extension runs past the block", ErrMalformed)
+			return stop("TLS extension runs past the block")
 		}
 		data := ext[4 : 4+extLen]
 
@@ -289,6 +362,9 @@ func SNI(record []byte) (*ClientHello, error) {
 			}
 		}
 		ext = ext[4+extLen:]
+	}
+	if len(ext) > 0 || !extWhole {
+		return stop("ClientHello ends before a server_name extension")
 	}
 	return out, nil
 }

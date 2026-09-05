@@ -204,6 +204,22 @@ impl Runtime for DockerRuntime {
         argv
     }
 
+    /// **Unverified on the machine this was built on** — no Docker daemon is
+    /// running here, so this follows §6.6 rather than a measurement.
+    ///
+    /// `host.docker.internal` is resolvable inside a container on Docker
+    /// Desktop but not on plain Linux Docker, where the bridge gateway is the
+    /// address that works; both are offered and the probe picks whichever
+    /// answers. §6.6 lists no fallback for Docker and none is invented here.
+    async fn host_reach(&self, name: &str, port: u16) -> Result<crate::broker::reach::HostReach> {
+        let mut candidates = vec!["host.docker.internal".to_string()];
+        if let Some(gateway) = crate::broker::reach::default_gateway(self, name).await
+            && !candidates.contains(&gateway)
+        {
+            candidates.push(gateway);
+        }
+        crate::broker::reach::probe(self, name, port, &candidates, "docker host gateway").await
+    }
     async fn destroy(&self, name: &str) -> Result<()> {
         let container = Self::container_name(name);
         // Force remove (stops if running)

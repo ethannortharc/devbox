@@ -1,0 +1,47 @@
+{
+  "attributes": [
+    {
+      "key": "event.name",
+      "value": {
+        "stringValue": "devbox.exit"
+      }
+    },
+    {
+      "key": "process.pid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "process.parent_pid",
+      "value": {
+        "intValue": "640"
+      }
+    },
+    {
+      "key": "process.executable.name",
+      "value": {
+        "stringValue": "pip"
+      }
+    },
+    {
+      "key": "devbox.tid",
+      "value": {
+        "intValue": "812"
+      }
+    },
+    {
+      "key": "devbox.uid",
+      "value": {
+        "intValue": "1000"
+      }
+    }
+  ],
+  "body": {
+    "stringValue": "exit"
+  },
+  "eventName": "devbox.exit",
+  "severityNumber": 9,
+  "severityText": "INFO",
+  "timeUnixNano": "1786054450000000000"
+}

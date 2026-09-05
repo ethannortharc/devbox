@@ -432,6 +432,27 @@ impl Runtime for LimaRuntime {
         argv
     }
 
+    /// Lima's user-mode network puts the host behind two addresses, and both
+    /// were measured to work with a listener bound to `127.0.0.1` only
+    /// (vmType `vz`, Lima 2.x, 2026-09-05): `host.lima.internal`, which Lima
+    /// writes into the guest's hosts file, and the default gateway, which is
+    /// the same address. The host sees the connection arrive from
+    /// `127.0.0.1` — the gateway is NATed onto host loopback — so no wider
+    /// bind is needed and none is done.
+    ///
+    /// The documented name is tried first so `doctor` reports something a
+    /// human recognises; the gateway is the fallback for an image whose hosts
+    /// file Lima did not manage to write.
+    async fn host_reach(&self, name: &str, port: u16) -> Result<crate::broker::reach::HostReach> {
+        let mut candidates = vec!["host.lima.internal".to_string()];
+        if let Some(gateway) = crate::broker::reach::default_gateway(self, name).await
+            && !candidates.contains(&gateway)
+        {
+            candidates.push(gateway);
+        }
+        crate::broker::reach::probe(self, name, port, &candidates, "lima user-mode network").await
+    }
+
     async fn destroy(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         // Stop first if running (ignore errors)

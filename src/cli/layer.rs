@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::cli::box_arg::BoxArg;
+use crate::cli::watch::human_bytes;
 use crate::sandbox::SandboxManager;
+use crate::sandbox::checkpoint::{self, CheckpointId, Target};
 use crate::sandbox::overlay;
 
 #[derive(Args, Debug)]
@@ -25,9 +27,19 @@ pub enum LayerAction {
         boxarg: BoxArg,
     },
     /// Show file diffs in overlay
+    ///
+    /// With no `--from` this is the live upper against the host. With
+    /// `--from <id>` it is that checkpoint against the box now, or against a
+    /// second checkpoint with `--to <id>`.
     Diff {
         #[command(flatten)]
         boxarg: BoxArg,
+        /// Compare from this checkpoint instead of from the host files
+        #[arg(long, value_name = "ID")]
+        from: Option<String>,
+        /// Compare against this checkpoint instead of against the box now
+        #[arg(long, value_name = "ID", requires = "from")]
+        to: Option<String>,
     },
     /// Sync overlay changes to host
     Commit {
@@ -69,21 +81,50 @@ pub enum LayerAction {
         #[command(flatten)]
         boxarg: BoxArg,
     },
+    /// Save the overlay upper layer as a checkpoint
+    Checkpoint {
+        #[command(flatten)]
+        boxarg: BoxArg,
+        /// A name to remember this checkpoint by
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// List saved checkpoints
+    Checkpoints {
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
+    /// Put the overlay back to a checkpoint
+    ///
+    /// The id comes first because clap cannot place a required positional
+    /// after an optional one — the same reason `devbox snapshot restore
+    /// <SNAPSHOT> [NAME]` reads the way it does.
+    Restore {
+        /// The checkpoint to restore; a unique prefix is enough
+        #[arg(value_name = "ID")]
+        id: String,
+
+        #[command(flatten)]
+        boxarg: BoxArg,
+    },
 }
 
 impl LayerAction {
     /// The box this action names. Every variant carries one, so the shared
     /// preamble below can resolve it before dispatching.
-    pub(crate) fn boxarg(&self) -> &BoxArg {
+    pub fn boxarg(&self) -> &BoxArg {
         match self {
             Self::Status { boxarg }
-            | Self::Diff { boxarg }
+            | Self::Diff { boxarg, .. }
             | Self::Commit { boxarg, .. }
             | Self::Discard { boxarg, .. }
             | Self::Refresh { boxarg }
             | Self::Conflicts { boxarg }
             | Self::Stash { boxarg }
-            | Self::StashPop { boxarg } => boxarg,
+            | Self::StashPop { boxarg }
+            | Self::Checkpoint { boxarg, .. }
+            | Self::Checkpoints { boxarg }
+            | Self::Restore { boxarg, .. } => boxarg,
         }
     }
 }
@@ -111,11 +152,31 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
         LayerAction::Status { .. } => {
             overlay::status(runtime.as_ref(), &name).await?;
         }
-        LayerAction::Diff { .. } => {
-            let changes = overlay::diff(runtime.as_ref(), &name).await?;
+        LayerAction::Diff { from, to, .. } => {
+            let (changes, empty_message) = match from {
+                None => (
+                    overlay::diff(runtime.as_ref(), &name).await?,
+                    "No changes (overlay is clean).".to_string(),
+                ),
+                Some(from) => {
+                    let from = CheckpointId::parse(&from)?;
+                    let target = match to {
+                        Some(to) => Target::Checkpoint(CheckpointId::parse(&to)?),
+                        None => Target::Live,
+                    };
+                    let against = match &target {
+                        Target::Live => "the box now".to_string(),
+                        Target::Checkpoint(id) => format!("checkpoint {id}"),
+                    };
+                    (
+                        checkpoint::diff(runtime.as_ref(), &name, &from, target).await?,
+                        format!("No changes between checkpoint {from} and {against}."),
+                    )
+                }
+            };
 
             if changes.is_empty() {
-                println!("No changes (overlay is clean).");
+                println!("{empty_message}");
                 return Ok(());
             }
 
@@ -178,6 +239,47 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
         }
         LayerAction::StashPop { .. } => {
             overlay::stash_pop(runtime.as_ref(), &name).await?;
+        }
+        LayerAction::Checkpoint { label, .. } => {
+            let saved = checkpoint::create(runtime.as_ref(), &name, label.as_deref()).await?;
+            println!(
+                "Checkpoint {} saved — {} file(s), {}{}",
+                saved.id,
+                saved.files,
+                human_bytes(saved.bytes),
+                saved
+                    .label
+                    .as_deref()
+                    .map(|l| format!(" ({l})"))
+                    .unwrap_or_default(),
+            );
+        }
+        LayerAction::Checkpoints { .. } => {
+            let saved = checkpoint::list(runtime.as_ref(), &name).await?;
+            if saved.is_empty() {
+                println!(
+                    "No checkpoints on '{name}'. Take one with `devbox layer checkpoint {name}`."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<16} {:<22} {:>6} {:>9}  LABEL",
+                "ID", "CREATED", "FILES", "BYTES"
+            );
+            for c in &saved {
+                println!(
+                    "{:<16} {:<22} {:>6} {:>9}  {}",
+                    c.id,
+                    c.created_at,
+                    c.files,
+                    human_bytes(c.bytes),
+                    c.label.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+        LayerAction::Restore { id, .. } => {
+            let id = CheckpointId::parse(&id)?;
+            checkpoint::restore(runtime.as_ref(), &name, &id).await?;
         }
     }
 

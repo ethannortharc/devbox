@@ -17,11 +17,16 @@ async fn main() -> Result<()> {
         Some(cmd) => {
             if cmd.needs_collector() {
                 devbox::obs::daemon::ensure_running(&manager);
+                // Same trigger as the collector, and for the same reason: the
+                // broker has to be up before a session that will use it
+                // starts, and both are no-ops when they are already running.
+                devbox::broker::daemon::ensure_running(&manager);
             }
             cmd.run(&manager).await
         }
         None => {
             devbox::obs::daemon::ensure_running(&manager);
+            devbox::broker::daemon::ensure_running(&manager);
             open_console_for_cwd(&manager, cli.tools.as_deref()).await
         }
     }
