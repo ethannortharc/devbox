@@ -1,5 +1,6 @@
 pub mod behavior;
 pub mod box_arg;
+pub mod broker;
 pub mod code;
 pub mod commit;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod nix_cmd;
 pub mod policy;
 pub mod prune;
 pub mod reprovision;
+pub mod secret;
 pub mod self_update;
 pub mod sets;
 pub mod shell;
@@ -72,6 +74,10 @@ pub enum Command {
     /// Internal entry point for the per-user collector process.
     #[command(name = "__collector", hide = true)]
     Collector,
+
+    /// Internal entry point for the per-user credential broker process.
+    #[command(name = "__broker", hide = true)]
+    Broker,
 
     /// Create a new sandbox
     Create(create::CreateArgs),
@@ -158,6 +164,13 @@ pub enum Command {
 
     /// Start the local web console
     Web(web::WebArgs),
+
+    /// Manage the credentials the broker holds for your boxes
+    Secret(secret::SecretArgs),
+
+    /// Inspect the host-side credential broker
+    #[command(name = "broker")]
+    BrokerCmd(broker::BrokerArgs),
 }
 
 impl Command {
@@ -191,6 +204,12 @@ impl Command {
                 });
                 crate::obs::daemon::run(manager).await
             }
+            Command::Broker => {
+                let manager = std::sync::Arc::new(SandboxManager {
+                    state_dir: manager.state_dir.clone(),
+                });
+                crate::broker::daemon::run(manager).await
+            }
             Command::Create(args) => create::run(args, manager).await,
             Command::Shell(args) => shell::run(args, manager).await,
             Command::Exec(args) => exec::run(args, manager).await,
@@ -219,6 +238,8 @@ impl Command {
             Command::Behavior(args) => behavior::run(args, manager).await,
             Command::Policy(args) => policy::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
+            Command::Secret(args) => secret::run(args, manager).await,
+            Command::BrokerCmd(args) => broker::run(args, manager).await,
         }
     }
 }

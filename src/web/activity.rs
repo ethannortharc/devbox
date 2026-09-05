@@ -1332,6 +1332,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         }
     }
 

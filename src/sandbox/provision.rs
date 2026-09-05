@@ -1193,7 +1193,13 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 // ── Git Config ─────────────────────────────────────────────
 
 /// Copy host ~/.gitconfig into the VM so git user.name, user.email,
-/// remote aliases, and other settings carry over automatically.
+/// remote aliases, and other settings carry over — and then rewrite the
+/// devbox-managed section that points github at the credential broker (§6.3).
+///
+/// The host gitconfig is copied for its identity settings, not its
+/// credentials: a `[credential]` helper naming a host binary or a host
+/// keychain is meaningless in the guest, and a helper that stores a token in
+/// plaintext must not be carried across. Those sections are dropped.
 async fn setup_git_config(
     runtime: &dyn Runtime,
     name: &str,
@@ -1203,14 +1209,19 @@ async fn setup_git_config(
     let home = dirs::home_dir().unwrap_or_default();
     let gitconfig_path = home.join(".gitconfig");
 
-    if !gitconfig_path.exists() {
+    let host = match std::fs::read_to_string(&gitconfig_path) {
+        Ok(content) => strip_credential_sections(&content),
+        Err(_) => String::new(),
+    };
+
+    // The broker's address changes whenever the box restarts onto a different
+    // port, so the section is rewritten rather than appended — git takes the
+    // last `insteadOf` that matches, and a stale one above a fresh one wins.
+    let broker = broker_base_url(runtime, name).await;
+    let content = crate::broker::apply_gitconfig_section(&host, broker.as_deref());
+    if content.trim().is_empty() {
         return Ok(());
     }
-
-    let content = match std::fs::read_to_string(&gitconfig_path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
 
     let vm_path = format!("{vm_home}/.gitconfig");
     write_file_to_vm(runtime, name, &vm_path, &content).await?;
@@ -1218,8 +1229,57 @@ async fn setup_git_config(
     let chown_cmd = format!("chown {vm_user}:users {vm_path}");
     run_in_vm(runtime, name, &chown_cmd, false).await?;
 
-    println!("Synced host git config to VM.");
+    if broker.is_some() {
+        println!("Synced host git config, and pointed github.com at the devbox broker.");
+    } else {
+        println!("Synced host git config to VM.");
+    }
     Ok(())
+}
+
+/// The broker URL this box should use, or `None` when there is nothing to
+/// broker or no verified way to reach the host.
+async fn broker_base_url(runtime: &dyn Runtime, name: &str) -> Option<String> {
+    let manager = crate::sandbox::SandboxManager::new().ok()?;
+    if !crate::broker::configured_providers(&manager.state_dir)
+        .iter()
+        .any(|p| p == crate::broker::providers::GITHUB)
+    {
+        return None;
+    }
+    let endpoint = crate::broker::endpoint(&manager.state_dir)?;
+    let reach = tokio::time::timeout(
+        crate::broker::reach::REACH_TIMEOUT,
+        runtime.host_reach(name, endpoint.port),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(reach.base_url())
+}
+
+/// Drop `[credential ...]` sections from a gitconfig.
+///
+/// A credential helper is a host-side thing — `osxkeychain`, a binary under
+/// `/opt/homebrew`, a `store` file in the host's home — and every one of those
+/// either fails in the guest or, worse, names a plaintext token file that the
+/// copy would be pointing at. The broker is how the guest gets git
+/// credentials now, so there is nothing here worth carrying across.
+fn strip_credential_sections(content: &str) -> String {
+    let mut out = String::new();
+    let mut in_credential = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            let header = trimmed.trim_start_matches('[').to_ascii_lowercase();
+            in_credential = header.starts_with("credential");
+        }
+        if !in_credential {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // ── Shared Helpers ──────────────────────────────────────────
@@ -1281,27 +1341,30 @@ fn generate_state_toml(
     toml
 }
 
-// ── AI Tool Config Detection & Copy ────────────────────────
+// ── AI Tool Settings (never credentials) ───────────────────
 
 /// Describes an AI coding tool's host configuration.
 struct AiToolConfig {
     name: &'static str,
-    /// Files to copy: (host_path_suffix, vm_path_suffix)
-    /// Paths are relative to home directory.
+    /// Settings files to copy: (host_path_suffix, vm_path_suffix), relative to
+    /// the home directory. **Credential files are not on this list, and adding
+    /// one would break the promise the whole broker exists to keep** (§6.2).
     config_files: &'static [(&'static str, &'static str)],
-    /// Environment variables that hold API keys.
-    env_vars: &'static [&'static str],
 }
 
-/// Known AI tool configurations.
+/// Known AI tool configurations — settings only.
+///
+/// v4 also copied `~/.claude/.credentials.json` and `~/.codex/auth.json` into
+/// the guest, wrote every `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` it could find
+/// into `~/.devbox-ai-env` and sourced it from `.zshrc`, and synthesised an
+/// `aichat` config with a key inlined. All four are gone: they contradicted
+/// the README's own "credential safety" line, and they are what the credential
+/// broker replaces. The agent now gets a per-box broker token and a URL; the
+/// credential stays on the host.
 static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
     AiToolConfig {
         name: "claude-code",
-        config_files: &[
-            (".claude/.credentials.json", ".claude/.credentials.json"),
-            (".claude/settings.json", ".claude/settings.json"),
-        ],
-        env_vars: &["ANTHROPIC_API_KEY"],
+        config_files: &[(".claude/settings.json", ".claude/settings.json")],
     },
     AiToolConfig {
         name: "opencode",
@@ -1309,26 +1372,26 @@ static AI_TOOL_CONFIGS: &[AiToolConfig] = &[
             ".config/opencode/config.json",
             ".config/opencode/config.json",
         )],
-        env_vars: &["OPENAI_API_KEY"],
     },
     AiToolConfig {
         name: "codex",
-        config_files: &[
-            (".codex/config.json", ".codex/config.json"),
-            (".codex/auth.json", ".codex/auth.json"),
-        ],
-        env_vars: &["OPENAI_API_KEY"],
+        config_files: &[(".codex/config.json", ".codex/config.json")],
     },
     AiToolConfig {
         name: "aichat",
         config_files: &[(".config/aichat/config.yaml", ".config/aichat/config.yaml")],
-        env_vars: &[],
     },
 ];
 
-/// Detect AI tool configurations on the host and copy them into the VM.
-/// Checks for config files and API key env vars in priority order:
-/// claude-code → opencode → codex → aichat.
+/// Copy the host's AI tool *settings* into the VM.
+///
+/// Every file is scanned first, and one that carries credential material is
+/// skipped with a message rather than copied. That check is not paranoia about
+/// files we happen to know: `~/.claude/settings.json` has an `env` block that
+/// can hold `ANTHROPIC_API_KEY`, `~/.config/aichat/config.yaml` normally has
+/// an `api_key:` line, and `~/.config/opencode/config.json` was the file v4's
+/// own key-scraper read `apiKey` out of. A settings file is only a settings
+/// file until someone puts a key in it.
 async fn setup_ai_tool_configs(
     runtime: &dyn Runtime,
     name: &str,
@@ -1339,38 +1402,7 @@ async fn setup_ai_tool_configs(
     let mut copied_any = false;
 
     for tool in AI_TOOL_CONFIGS {
-        let mut found_files = vec![];
-
-        // Check which config files exist on host
-        for (host_suffix, _vm_suffix) in tool.config_files {
-            let host_path = home.join(host_suffix);
-            if host_path.exists() {
-                found_files.push(host_suffix);
-            }
-        }
-
-        // Check env vars
-        let mut found_env_vars = vec![];
-        for var in tool.env_vars {
-            if std::env::var(var).is_ok() {
-                found_env_vars.push(*var);
-            }
-        }
-
-        if found_files.is_empty() && found_env_vars.is_empty() {
-            continue;
-        }
-
-        // Report what we found
-        println!("Found {} configuration on host:", tool.name);
-        for f in &found_files {
-            println!("  found: ~/{f}");
-        }
-        for v in &found_env_vars {
-            println!("  env:   {v}");
-        }
-
-        // Copy config files
+        let mut announced = false;
         for (host_suffix, vm_suffix) in tool.config_files {
             let host_path = home.join(host_suffix);
             if !host_path.exists() {
@@ -1384,133 +1416,108 @@ async fn setup_ai_tool_configs(
                 }
             };
 
-            let vm_path = format!("{vm_home}/{vm_suffix}");
+            if let Some(marker) = credential_material(&content) {
+                eprintln!(
+                    "  skipped: ~/{host_suffix} — it contains what looks like a credential \
+                     ({marker}). Credentials stay on the host; run `devbox secret set` instead."
+                );
+                continue;
+            }
 
-            // Ensure parent directory exists with correct ownership
+            if !announced {
+                println!("Found {} configuration on host:", tool.name);
+                announced = true;
+            }
+
+            let vm_path = format!("{vm_home}/{vm_suffix}");
             let vm_parent = vm_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(&vm_path);
             run_in_vm(runtime, name, &format!("mkdir -p {vm_parent}"), false).await?;
 
             write_file_to_vm(runtime, name, &vm_path, &content).await?;
             println!("  copied: ~/{host_suffix} → {vm_path}");
-
-            // Set restrictive permissions for credential/auth files
-            if vm_suffix.contains("credential") || vm_suffix.contains("auth") {
-                run_in_vm(runtime, name, &format!("chmod 600 {vm_path}"), false).await?;
-            }
             copied_any = true;
         }
-
-        // Write env vars to a sourced file
-        if !found_env_vars.is_empty() {
-            let env_file = format!("{vm_home}/.devbox-ai-env");
-            let mut env_content = String::from("# AI tool API keys (sourced by .zshrc)\n");
-            for var in &found_env_vars {
-                if let Ok(val) = std::env::var(var) {
-                    env_content.push_str(&format!("export {var}=\"{val}\"\n"));
-                }
-            }
-            write_file_to_vm(runtime, name, &env_file, &env_content).await?;
-
-            // Source it from .zshrc if not already
-            let source_line = "[ -f ~/.devbox-ai-env ] && source ~/.devbox-ai-env";
-            let add_source_cmd = format!(
-                "grep -qF 'devbox-ai-env' {vm_home}/.zshrc 2>/dev/null || echo '{source_line}' >> {vm_home}/.zshrc"
-            );
-            runtime
-                .exec_cmd(name, &["bash", "-c", &add_source_cmd], false)
-                .await?;
-            copied_any = true;
-        }
-
-        // Fix ownership for all copied files
-        let chown_cmd = format!(
-            "chown -R {vm_user}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex {vm_home}/.devbox-ai-env 2>/dev/null; true"
-        );
-        run_in_vm(runtime, name, &chown_cmd, false).await?;
     }
 
     if copied_any {
-        println!("AI tool configurations synced to devbox.");
+        let chown_cmd = format!(
+            "chown -R {vm_user}:users {vm_home}/.claude {vm_home}/.config {vm_home}/.codex 2>/dev/null; true"
+        );
+        run_in_vm(runtime, name, &chown_cmd, false).await?;
+        println!("AI tool settings synced to devbox. No credentials were copied.");
     }
 
-    // Auto-generate aichat config from detected credentials if no host config was copied.
-    let has_aichat_config = home.join(".config/aichat/config.yaml").exists();
-    if !has_aichat_config && let Some(config) = generate_aichat_config_from_credentials(&home) {
-        let config_dir = format!("{vm_home}/.config/aichat");
-        run_in_vm(runtime, name, &format!("mkdir -p {config_dir}"), false).await?;
-        let config_path = format!("{config_dir}/config.yaml");
-        write_file_to_vm(runtime, name, &config_path, &config).await?;
-        run_in_vm(
-            runtime,
-            name,
-            &format!("chown -R {vm_user}:users {config_dir}"),
-            false,
-        )
-        .await?;
-        println!("Generated aichat config from detected AI tool credentials.");
-    }
+    // v4 left `~/.devbox-ai-env` behind on every box it provisioned, with the
+    // host's API keys in it, sourced from `.zshrc`. Re-provisioning an
+    // existing box has to remove it, or the box keeps the keys the upgrade
+    // was supposed to take away.
+    let purge = format!(
+        "rm -f {vm_home}/.devbox-ai-env {vm_home}/.claude/.credentials.json \
+         {vm_home}/.codex/auth.json 2>/dev/null; \
+         if [ -f {vm_home}/.zshrc ]; then \
+           sed -i '/devbox-ai-env/d' {vm_home}/.zshrc 2>/dev/null || true; \
+         fi; true"
+    );
+    run_in_vm(runtime, name, &purge, false).await?;
 
     Ok(())
 }
 
-/// Try to generate an aichat config.yaml from existing AI tool credentials.
-/// Priority: Anthropic (claude-code) → OpenAI (opencode/codex).
-/// Returns None if no credentials found.
-fn generate_aichat_config_from_credentials(home: &std::path::Path) -> Option<String> {
-    // Check for Anthropic API key (env var or claude-code credentials)
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
-        // Try to extract from claude-code credentials
-        let creds_path = home.join(".claude/.credentials.json");
-        let content = std::fs::read_to_string(creds_path).ok()?;
-        // credentials.json may contain OAuth tokens, not API keys.
-        // Only extract if it looks like an API key.
-        if content.contains("sk-ant-") {
-            // Simple extraction — look for api_key field
-            let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-            parsed
-                .get("apiKey")
-                .or_else(|| parsed.get("api_key"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
+/// Whether a settings file carries something that looks like a credential.
+///
+/// Shape-based, and deliberately blunt. A false positive costs one skipped
+/// settings file and a printed reason; a false negative writes a live key into
+/// the guest, which is the exact failure this component exists to end.
+fn credential_material(content: &str) -> Option<&'static str> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("sk-ant-", "an Anthropic key"),
+        ("sk-proj-", "an OpenAI project key"),
+        ("sk-or-", "an OpenRouter key"),
+        ("ghp_", "a GitHub personal access token"),
+        ("gho_", "a GitHub OAuth token"),
+        ("github_pat_", "a GitHub fine-grained token"),
+        ("xoxb-", "a Slack token"),
+        ("AKIA", "an AWS access key id"),
+    ];
+    for (needle, label) in PREFIXES {
+        if content.contains(needle) {
+            return Some(label);
         }
-    });
-
-    if let Some(key) = anthropic_key {
-        return Some(format!(
-            "model: claude:claude-sonnet-4-20250514\n\
-             clients:\n\
-             - type: claude\n\
-               api_key: {key}\n"
-        ));
     }
-
-    // Check for OpenAI API key
-    let openai_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
-        // Try opencode config
-        let opencode_path = home.join(".config/opencode/config.json");
-        if let Ok(content) = std::fs::read_to_string(opencode_path) {
-            let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-            parsed
-                .get("apiKey")
-                .or_else(|| parsed.get("api_key"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
+    // A key-shaped field with a non-empty value. `"api_key": ""` and
+    // `apiKeyHelper` are common and harmless; `"api_key": "x"` is not.
+    const FIELDS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "auth_token",
+        "access_token",
+        "refresh_token",
+    ];
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(field) = FIELDS.iter().find(|f| lower.contains(*f)) else {
+            continue;
+        };
+        let Some((_, after)) = lower.split_once(field) else {
+            continue;
+        };
+        // Strip the punctuation on both sides so `"api_key": ""` and
+        // `api_key: ''` — the shape of a config skeleton — read as empty,
+        // while `"api_key": "x"` does not. The closing brace and bracket are
+        // in the set because a one-line JSON object ends `""}` and trimming
+        // only quotes would leave a `}` and call it a value.
+        let value = after
+            .trim_start_matches(['"', '\'', ' ', ':', '=', '\t'])
+            .trim_end_matches([',', '"', '\'', ' ', '\t', '}', ']', ';']);
+        if !value.is_empty() && value != "null" && value != "{}" && !value.starts_with("helper") {
+            return Some("a key-shaped field with a value");
         }
-    });
-
-    if let Some(key) = openai_key {
-        return Some(format!(
-            "model: openai:gpt-4o\n\
-             clients:\n\
-             - type: openai\n\
-               api_key: {key}\n"
-        ));
     }
-
+    // `sk-` alone is too common a substring to match on, but a quoted value
+    // that starts with it is not.
+    if content.contains("\"sk-") || content.contains("'sk-") {
+        return Some("a quoted sk- value");
+    }
     None
 }
 
@@ -2763,5 +2770,92 @@ mod resolved_packages_tests {
             pairs.is_empty(),
             "inherited the project's packages: {pairs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_hygiene_tests {
+    use super::{credential_material, strip_credential_sections};
+
+    /// The list of files provisioning copies is the promise. Two of them —
+    /// `~/.claude/.credentials.json` and `~/.codex/auth.json` — were on it in
+    /// v4, and this is the test that notices if they come back.
+    #[test]
+    fn no_credential_file_is_on_the_copy_list() {
+        let copied: Vec<&str> = super::AI_TOOL_CONFIGS
+            .iter()
+            .flat_map(|tool| tool.config_files.iter().map(|(host, _)| *host))
+            .collect();
+        for forbidden in [
+            ".claude/.credentials.json",
+            ".codex/auth.json",
+            ".aws/credentials",
+            ".netrc",
+        ] {
+            assert!(
+                !copied.contains(&forbidden),
+                "{forbidden} must never be copied into a box"
+            );
+        }
+        for suffix in &copied {
+            assert!(
+                !suffix.contains("credential") && !suffix.contains("auth"),
+                "{suffix} is named like a credential file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_file_carrying_a_key_is_recognised() {
+        // `~/.claude/settings.json` genuinely has an `env` block, and people
+        // put keys in it.
+        assert!(
+            credential_material(r#"{"env":{"ANTHROPIC_API_KEY":"sk-ant-api03-abc"}}"#).is_some()
+        );
+        assert!(credential_material("api_key: sk-ant-oat01-xyz\n").is_some());
+        assert!(credential_material(r#"{"apiKey": "anything"}"#).is_some());
+        assert!(credential_material("token: ghp_0123456789abcdef\n").is_some());
+        assert!(credential_material(r#"{"access_token":"x"}"#).is_some());
+        assert!(credential_material("aws_access_key_id = AKIAIOSFODNN7EXAMPLE").is_some());
+
+        // Settings that are only settings.
+        assert!(credential_material(r#"{"model":"claude-sonnet-4-5"}"#).is_none());
+        assert!(credential_material("model: claude:claude-sonnet-4-5\nclients: []\n").is_none());
+        assert!(
+            credential_material(r#"{"permissions":{"allow":["Bash(git:*)"]}}"#).is_none(),
+            "an allow-list is not a credential"
+        );
+        // An empty field is what a config skeleton looks like.
+        assert!(credential_material(r#"{"api_key": ""}"#).is_none());
+        // `apiKeyHelper` names a command, not a key.
+        assert!(credential_material(r#"{"apiKeyHelper": "helper.sh"}"#).is_none());
+    }
+
+    #[test]
+    fn credential_helpers_do_not_cross_into_the_guest() {
+        let host = "\
+[user]
+\tname = Ethan
+[credential]
+\thelper = osxkeychain
+[credential \"https://github.com\"]
+\thelper = store --file /Users/ethan/.git-token
+[core]
+\teditor = vim
+";
+        let out = strip_credential_sections(host);
+        assert!(out.contains("[user]"));
+        assert!(out.contains("name = Ethan"));
+        assert!(out.contains("[core]"));
+        assert!(out.contains("editor = vim"));
+        assert!(
+            !out.contains("osxkeychain") && !out.contains(".git-token"),
+            "a host credential helper is meaningless or dangerous in the guest: {out}"
+        );
+        assert!(!out.contains("[credential"));
+
+        // A config with nothing to strip comes back unchanged in substance.
+        let plain = "[user]\n\tname = Ethan\n";
+        assert_eq!(strip_credential_sections(plain), plain);
     }
 }

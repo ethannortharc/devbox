@@ -33,12 +33,16 @@ const (
 	TypeSyscall Type = "syscall"
 	TypeAPI     Type = "api"
 	TypePolicy  Type = "policy"
+	// TypeCredential is written by the host-side credential broker, not by
+	// this agent. It is in the shared contract because the collector stores
+	// it in the same table and the console renders it with the same code.
+	TypeCredential Type = "credential"
 )
 
 // AllTypes lists every valid event type, in schema order.
 var AllTypes = []Type{
 	TypeExec, TypeExit, TypeConnect, TypeAccept, TypeDNS,
-	TypeTLS, TypeFile, TypeSyscall, TypeAPI, TypePolicy,
+	TypeTLS, TypeFile, TypeSyscall, TypeAPI, TypePolicy, TypeCredential,
 }
 
 // Valid reports whether t is a known event type.
@@ -65,6 +69,8 @@ func (t Type) SubObject() string {
 		return "api"
 	case TypePolicy:
 		return "policy"
+	case TypeCredential:
+		return "credential"
 	default:
 		return ""
 	}
@@ -96,11 +102,12 @@ type Event struct {
 	// Exactly one sub-object is populated, chosen by Type. Absent rather than
 	// null on the wire (ADR-0015): at 10k events/s the five null fields cost
 	// more than they explain.
-	Net    *Net    `json:"net,omitempty"`
-	Exec   *Exec   `json:"exec,omitempty"`
-	File   *File   `json:"file,omitempty"`
-	API    *API    `json:"api,omitempty"`
-	Policy *Policy `json:"policy,omitempty"`
+	Net        *Net        `json:"net,omitempty"`
+	Exec       *Exec       `json:"exec,omitempty"`
+	File       *File       `json:"file,omitempty"`
+	API        *API        `json:"api,omitempty"`
+	Policy     *Policy     `json:"policy,omitempty"`
+	Credential *Credential `json:"credential,omitempty"`
 }
 
 // Net carries connection, DNS, and TLS detail.
@@ -164,6 +171,27 @@ type Policy struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// Credential carries one brokered credential use (§6.5 of the v5 design).
+//
+// There is deliberately no field for the credential, and none for any request
+// or response header: this row lands in the same store the console and the
+// export read, and an audit record that can leak the secret it audits is worse
+// than no record at all.
+type Credential struct {
+	Provider string `json:"provider"`
+	Method   string `json:"method,omitempty"`
+	// Host is the upstream the broker spoke to, or would have.
+	Host string `json:"host,omitempty"`
+	// Path is the upstream path with the query string stripped.
+	Path      string `json:"path,omitempty"`
+	Status    uint16 `json:"status,omitempty"`
+	ReqBytes  uint64 `json:"req_bytes,omitempty"`
+	RespBytes uint64 `json:"resp_bytes,omitempty"`
+	// Verdict is allowed, denied, or error.
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason,omitempty"`
+}
+
 // Now formats a time the way TSWall expects.
 //
 // Millisecond precision, UTC, `Z` suffix — matching the example in §11.1 and,
@@ -212,6 +240,10 @@ func (e *Event) Validate() error {
 	case "policy":
 		if e.Policy == nil {
 			return fmt.Errorf("policy event requires a policy sub-object")
+		}
+	case "credential":
+		if e.Credential == nil {
+			return fmt.Errorf("credential event requires a credential sub-object")
 		}
 	}
 	return nil

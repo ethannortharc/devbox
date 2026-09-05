@@ -245,7 +245,7 @@ Devbox prioritizes protecting your host filesystem and providing safe, reversibl
 | **Explicit commit** | Changes sync to host only when you run `devbox commit`. Review first with `devbox diff`. |
 | **Snapshot & rollback** | Auto-snapshots on shell attach. NixOS generations allow full system rollback. |
 | **VM boundary** | Full VM isolation (not containers). Your host OS is never modified. |
-| **Credential safety** | No credentials are stored in the sandbox state. API keys are passed via environment variables, never written to disk. |
+| **Credentials stay on the host** | No API key, OAuth token, or git credential is written into a box or its environment. `devbox secret set` keeps them in the host keychain; a host-side broker injects them per request, inside a declared scope, and records every use as a `credential` event. |
 | **Writable opt-in** | Direct host mount requires explicit `--writable` flag. Default is always safe overlay mode. |
 | **Behaviour audit** | A background collector persists process, network, DNS, TLS and workspace-file events per box. |
 | **Egress policy** | `allowlist`, `mirror-only`, and `isolated` postures compile to live nftables enforcement. |
