@@ -6,9 +6,8 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=DEVBOX_OBSD_BINARY");
     println!("cargo:rerun-if-env-changed=DEVBOX_OBSD_EBPF");
-    println!("cargo:rerun-if-env-changed=DEVBOX_ZTPD_BINARY");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-    for path in ["go.mod", "go.sum", "agent", "ztpd", "internal"] {
+    for path in ["go.mod", "go.sum", "agent", "internal"] {
         println!("cargo:rerun-if-changed={path}");
     }
 
@@ -39,20 +38,6 @@ fn main() {
     println!(
         "cargo:rustc-env=DEVBOX_EMBEDDED_OBSD_EBPF={}",
         if embedded_has_ebpf { "1" } else { "0" }
-    );
-
-    let ztpd_out = out_dir.join("devbox-ztpd");
-    if let Some(source) = env::var_os("DEVBOX_ZTPD_BINARY") {
-        let source = PathBuf::from(source);
-        fs::copy(&source, &ztpd_out).unwrap_or_else(|error| {
-            panic!("copy prebuilt ZTP server {}: {error}", source.display())
-        });
-    } else {
-        build_go_binary(&ztpd_out, "./ztpd/cmd/ztpd", "ZTP server", &[]);
-    }
-    println!(
-        "cargo:rustc-env=DEVBOX_EMBEDDED_ZTPD={}",
-        ztpd_out.display()
     );
 }
 

@@ -22,11 +22,9 @@ jobs:
           - goarch: amd64
             runner: ubuntu-latest
             artifact: devbox-obsd-linux-amd64
-            ztpd_artifact: devbox-ztpd-linux-amd64
           - goarch: arm64
             runner: ubuntu-24.04-arm
             artifact: devbox-obsd-linux-arm64
-            ztpd_artifact: devbox-ztpd-linux-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -60,20 +58,11 @@ jobs:
           go build -trimpath -tags ebpf \
             -ldflags "-s -w -X github.com/ethannortharc/devbox/internal/buildinfo.Version=$package_version -X github.com/ethannortharc/devbox/internal/buildinfo.Commit=${GITHUB_SHA::12}" \
             -o ${{ matrix.artifact }} ./agent/cmd/obsd
-          go build -trimpath \
-            -ldflags "-s -w -X github.com/ethannortharc/devbox/internal/buildinfo.Version=$package_version -X github.com/ethannortharc/devbox/internal/buildinfo.Commit=${GITHUB_SHA::12}" \
-            -o ${{ matrix.ztpd_artifact }} ./ztpd/cmd/ztpd
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
-          retention-days: 1
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.ztpd_artifact }}
-          path: ${{ matrix.ztpd_artifact }}
           retention-days: 1
 
   build:
@@ -88,12 +77,10 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: devbox-darwin-arm64
             agent_name: devbox-obsd-linux-arm64
-            ztpd_name: devbox-ztpd-linux-arm64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             binary_name: devbox-linux-amd64
             agent_name: devbox-obsd-linux-amd64
-            ztpd_name: devbox-ztpd-linux-amd64
 
     steps:
       - name: Checkout
@@ -109,11 +96,6 @@ jobs:
           name: ${{ matrix.agent_name }}
           path: embedded-agent
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ matrix.ztpd_name }}
-          path: embedded-ztpd
-
       - name: Install musl-tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -124,7 +106,6 @@ jobs:
         env:
           DEVBOX_OBSD_BINARY: ${{ github.workspace }}/embedded-agent/${{ matrix.agent_name }}
           DEVBOX_OBSD_EBPF: "1"
-          DEVBOX_ZTPD_BINARY: ${{ github.workspace }}/embedded-ztpd/${{ matrix.ztpd_name }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (macOS)

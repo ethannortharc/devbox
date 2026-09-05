@@ -607,7 +607,7 @@ async fn api_requires_a_token_too() {
 }
 
 #[tokio::test]
-async fn create_lab_and_pcap_routes_validate_real_http_requests() {
+async fn create_and_pcap_routes_validate_real_http_requests() {
     let (dir, app) = console_with_boxes(&["alpha"]);
 
     let create_page = app.clone().oneshot(get_authed("/boxes/new")).await.unwrap();
@@ -649,34 +649,13 @@ async fn create_lab_and_pcap_routes_validate_real_http_requests() {
         .unwrap();
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
 
+    // The network-lab console was removed in v5. An authenticated request for
+    // what it used to serve must be an honest 404 — not a 500 from a
+    // half-removed route, and not a blank 200 that reads as "there are none".
     for uri in ["/labs", "/labs/ztp-fabric", "/api/labs/ztp-fabric/view"] {
         let response = app.clone().oneshot(get_authed(uri)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{uri}");
-        if uri == "/labs/ztp-fabric" {
-            assert!(
-                body_string(response)
-                    .await
-                    .contains("data-build-status=\"lab-ztp-fabric\""),
-                "lab operation status must be protected from a stale replay GET"
-            );
-        }
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
     }
-    assert_eq!(
-        app.clone()
-            .oneshot(post_form("/api/labs/no-such-lab/up", ""))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        app.clone()
-            .oneshot(post_form("/api/labs/ztp-fabric/fault", ""))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::BAD_REQUEST
-    );
 
     let invalid_capture = app
         .oneshot(post_authed(
@@ -997,44 +976,6 @@ async fn activity_tab_says_why_it_is_empty_rather_than_only_that_it_is() {
     assert!(html.contains("capture-down"), "{html}");
     assert!(html.contains("Collector is not running"));
     assert!(html.contains("devbox doctor"));
-}
-
-#[tokio::test]
-async fn the_ztp_fragment_refuses_a_lab_name_that_is_a_file_path() {
-    // `scenarios::resolve` falls back to *reading a file* for a name it does
-    // not recognise, which the CLI wants (`devbox lab up ./my-topology.toml`)
-    // and a request must never get: a name pointing at a character device is a
-    // read that never returns.
-    let (_dir, app) = console_with_boxes(&["alpha"]);
-
-    // Percent-encoded, because an unencoded slash is a different route and
-    // never reaches this handler at all — testing that would prove nothing.
-    for name in ["%2Fdev%2Fzero", "..%2F..%2Fetc%2Fpasswd", "not-a-scenario"] {
-        let res = app
-            .clone()
-            .oneshot(get_authed(&format!("/api/labs/{name}/ztp")))
-            .await
-            .unwrap();
-        // Nothing to render, and nothing read: the panel is simply absent.
-        assert_eq!(res.status(), StatusCode::OK, "{name}");
-        assert!(body_string(res).await.trim().is_empty(), "{name}");
-    }
-}
-
-#[tokio::test]
-async fn the_ztp_fragment_renders_for_a_built_in_scenario_with_no_substrate() {
-    let (_dir, app) = console_with_boxes(&["alpha"]);
-    let html = body_string(
-        app.oneshot(get_authed("/api/labs/ztp-fabric/ztp"))
-            .await
-            .unwrap(),
-    )
-    .await;
-
-    // One registered box, so "auto" resolves to it — and with no lab running
-    // on it the panel invites rather than reporting a failure.
-    assert!(html.contains("Zero-touch provisioning"), "{html}");
-    assert!(html.contains("Not running"));
 }
 
 #[tokio::test]

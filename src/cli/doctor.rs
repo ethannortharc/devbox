@@ -233,26 +233,8 @@ if test -x /usr/local/bin/devbox-obsd; then
 else
   agent=missing
 fi
-missing=
-for tool in ip zebra bgpd dnsmasq chronyd busybox; do
-  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-# mgmtd, but only where its absence is a fault.
-#
-# FRR 10 moved interface configuration into it, so without mgmtd a router
-# loads its BGP config and none of its addresses -- silently, because zebra
-# logs "No such command" per line and carries on. Before FRR 9 there is no
-# such binary and zebra still owns that config, so demanding it there would
-# report a fault on a substrate that works.
-if command -v zebra >/dev/null 2>&1; then
-  frrmaj=$(zebra --version 2>/dev/null | sed -n 's/^zebra version \([0-9][0-9]*\).*/\1/p')
-  if [ -n "$frrmaj" ] && [ "$frrmaj" -ge 10 ] 2>/dev/null; then
-    command -v mgmtd >/dev/null 2>&1 || missing="$missing mgmtd"
-  fi
-fi
-test -z "$missing" && lab=ready || lab="missing:$missing"
-printf 'kernel=%s\nbtf=%s\nnftables=%s\nvsock=%s\nagent=%s\nlab=%s\n' \
-  "$kernel" "$btf" "$nft" "$vsock" "$agent" "$lab"
+printf 'kernel=%s\nbtf=%s\nnftables=%s\nvsock=%s\nagent=%s\n' \
+  "$kernel" "$btf" "$nft" "$vsock" "$agent"
 "#;
 
 fn print_guest_probe(stdout: &str, runtime: &str) {
@@ -455,7 +437,7 @@ mod tests {
 
     #[test]
     fn guest_probe_has_every_v4_capability() {
-        for field in ["kernel=", "btf=", "nftables=", "vsock=", "agent=", "lab="] {
+        for field in ["kernel=", "btf=", "nftables=", "vsock=", "agent="] {
             assert!(GUEST_PROBE.contains(field));
         }
         assert!(GUEST_PROBE.contains("/usr/local/bin/devbox-obsd -version"));

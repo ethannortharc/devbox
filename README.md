@@ -13,9 +13,8 @@ devbox
 That's it. Devbox detects your project type, provisions a NixOS VM with [120+ tools](docs/PACKAGES.md), and opens a local web console where you can watch and govern everything the box does.
 
 v4 keeps the proven sandbox core and replaces the terminal UI with a local web
-console, continuous eBPF/proc observability, live egress policy, real packet
-capture, multi-node network labs, and zero-touch fabric provisioning. Start at
-[the v4 quickstart](docs/quickstart-v4.md).
+console, continuous eBPF/proc observability, live egress policy, and real
+packet capture. Start at [the v4 quickstart](docs/quickstart-v4.md).
 
 ---
 
@@ -62,8 +61,8 @@ did this run do that the last one didn't?" the same way `devbox diff` answers
 ![devbox v4 console](docs/screenshot-console.png)
 
 The console manages box creation and lifecycle, streamed Nix rebuilds, Activity
-and flow pcaps, egress policy, overlay files, a browser terminal, and routed Lab
-topologies. It binds loopback only and gives every launch a random
+and flow pcaps, egress policy, overlay files, and a browser terminal. It binds
+loopback only and gives every launch a random
 `devbox-….localhost` browser origin. A one-time URL token installs a key in that
 origin's storage and requests send it explicitly as `x-devbox-key`; it is never
 a cookie or a navigable URL credential. Open as many tabs as you need: typing
@@ -170,7 +169,7 @@ curl -fsSL https://raw.githubusercontent.com/ethannortharc/devbox/main/install.s
 ```
 
 Or build from source (requires Rust 1.89+ and Go 1.26+; Go builds the embedded
-Linux observability agent and ZTP server):
+Linux observability agent):
 
 ```bash
 git clone https://github.com/ethannortharc/devbox.git
@@ -178,9 +177,8 @@ cd devbox
 cargo install --path .
 ```
 
-Release/packaging builds may supply matching binaries with
-`DEVBOX_OBSD_BINARY=/path/to/devbox-obsd` and
-`DEVBOX_ZTPD_BINARY=/path/to/devbox-ztpd` instead of invoking Go.
+Release/packaging builds may supply a matching binary with
+`DEVBOX_OBSD_BINARY=/path/to/devbox-obsd` instead of invoking Go.
 
 ### Verify your system
 
@@ -336,7 +334,6 @@ All layer operations are also available in the **DevBox Management Panel** insid
 | `devbox watch` | Query or stream captured activity |
 | `devbox behavior summary/diff/pcap` | Compare runs or capture a real flow pcap |
 | `devbox policy show/set/allow/test/rules` | Inspect and enforce egress posture |
-| `devbox lab list/up/down/status/config/fault/heal` | Operate routed network labs |
 | `devbox diff` | Show overlay changes vs host |
 | `devbox commit` | Sync overlay changes to host |
 | `devbox discard` | Throw away overlay changes |
@@ -356,6 +353,9 @@ All layer operations are also available in the **DevBox Management Panel** insid
 | `devbox nix add <pkg>` | Add a Nix package |
 | `devbox nix remove <pkg>` | Remove a Nix package |
 | `devbox prune` | Remove all stopped sandboxes |
+
+Network labs and the ZTP fabric were removed in v5; they will return as a
+separate, container-based tool.
 
 ---
 
@@ -497,7 +497,7 @@ mount_mode = "overlay"      # overlay (safe) | writable (direct)
 editor = true               # neovim, helix, nano
 git = true                  # git, lazygit, gh
 container = false           # docker, compose, lazydocker
-network = false             # FRR/lab services + network diagnostics
+network = false             # network diagnostics, FRR and role services
 ai_code = true              # claude-code (npm), codex, aider, aichat, ...
 ai_infra = false            # ollama, open-webui
 
@@ -557,7 +557,7 @@ overlay contract. Restricted runtimes must be selected explicitly.
 devbox (single binary)
   |
   |-- CLI + local web control plane
-  |     one lifecycle, policy, observability, terminal and Lab API
+  |     one lifecycle, policy, observability and terminal API
   |
   |-- Sandbox Manager
   |     Lifecycle: create -> start -> attach -> stop -> destroy
@@ -575,12 +575,8 @@ devbox (single binary)
   |     Declarative package management via nixos-rebuild
   |
   |-- Observability + control
-  |     embedded devbox-obsd, background collector, per-box SQLite
-  |     eBPF/proc capture, behavior diff, pcap, nftables policy
-  |
-  |-- Network Lab + ZTP
-        namespaces/veth/FRR/netem, DNS/NTP/DHCP role services
-        embedded devbox-ztpd, source of truth, config generation, SLOs
+        embedded devbox-obsd, background collector, per-box SQLite
+        eBPF/proc capture, behavior diff, pcap, nftables policy
 ```
 
 ### Provisioning flow
@@ -604,9 +600,8 @@ cargo build --release
 # Test all Rust units and integrations
 cargo test
 
-# Go agent/ZTP and Python lab toolkit
+# Go agent
 go test ./...
-(cd labkit && uv run pytest)
 
 # Lint
 cargo clippy -- -D warnings

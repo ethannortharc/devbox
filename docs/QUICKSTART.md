@@ -1,7 +1,7 @@
 # Devbox Quick Start
 
 > **Archived v3 guide.** v4 removed the Zellij/package-manager TUI and now
-> opens a local web console with observability, policy, Labs and ZTP. Use the
+> opens a local web console with observability and policy. Use the
 > current [v4 quickstart](quickstart-v4.md). The material below is retained for
 > users of the last v3 release.
 

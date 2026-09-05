@@ -143,8 +143,11 @@ fn a_lifecycle_command_replaces_an_outdated_collector_daemon() {
     std::fs::write(&identity, format!("pid={old_pid} version=0.0.0-old\n"))
         .expect("publish simulated old release");
 
+    // Any command that `needs_collector` will do; `watch` on a box that does
+    // not exist is the cheapest one that still succeeds, so a failure here is
+    // the replacement and not the trigger.
     let trigger = devbox()
-        .args(["lab", "list"])
+        .args(["watch", "no-such-box"])
         .env("HOME", home.path())
         .output()
         .expect("run lifecycle command");

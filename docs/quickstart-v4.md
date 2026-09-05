@@ -32,8 +32,10 @@ devbox web --port 8080 --no-open
 | **Policy** | Egress posture and allowlist, editable live. |
 | **Files** | Overlay changes — what the box wrote, before you commit it. |
 | **Terminal** | A real shell, over a real pty. |
-| **Labs** | Built-in scenarios, a live topology/traffic graph, bring-up/down, faults and healing. |
 | **Help** | The cheat sheets, rendered in the browser. |
+
+Network labs and the ZTP fabric were removed in v5; they will return as a
+separate, container-based tool.
 
 Open as many console tabs as you need. **New tab** in the header is a shortcut,
 but separately typing or bookmarking the bound loopback address printed by
@@ -69,13 +71,6 @@ devbox behavior pcap --proto tcp --daddr 93.184.216.34 --dport 443 --seconds 5
 devbox policy show
 devbox policy set mirror-only     # applied to the running box immediately
 devbox policy test pypi.org        # exits non-zero if denied
-
-# the lab
-devbox lab list
-devbox lab status clos-3node
-devbox lab up clos-3node --substrate mybox
-devbox lab fault clos-3node leaf1-spine1 --loss 5 --delay 20
-devbox lab heal clos-3node leaf1-spine1
 ```
 
 The Activity flow table has a **pcap** action too. It starts a bounded live

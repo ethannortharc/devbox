@@ -10,7 +10,6 @@ pub mod doctor;
 pub mod exec;
 pub mod help;
 pub mod init;
-pub mod lab;
 pub mod layer;
 pub mod list;
 pub mod nix_cmd;
@@ -156,9 +155,6 @@ pub enum Command {
     /// Read or change a box's egress policy
     Policy(policy::PolicyArgs),
 
-    /// Bring up and inspect multi-node lab topologies
-    Lab(lab::LabArgs),
-
     /// Start the local web console
     Web(web::WebArgs),
 }
@@ -182,7 +178,6 @@ impl Command {
                 | Self::Watch(_)
                 | Self::Behavior(_)
                 | Self::Policy(_)
-                | Self::Lab(_)
                 | Self::Web(_)
         )
     }
@@ -222,7 +217,6 @@ impl Command {
             Command::Watch(args) => watch::run(args, manager).await,
             Command::Behavior(args) => behavior::run(args, manager).await,
             Command::Policy(args) => policy::run(args, manager).await,
-            Command::Lab(args) => lab::run(args, manager).await,
             Command::Web(args) => web::run(args, manager).await,
         }
     }

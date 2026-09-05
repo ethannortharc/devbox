@@ -26,8 +26,6 @@ type Service string
 const (
 	// Obsd is the in-guest eBPF observability agent.
 	Obsd Service = "devbox-obsd"
-	// Ztpd is the zero-touch-provisioning server.
-	Ztpd Service = "devbox-ztpd"
 )
 
 // String renders a one-line identity banner, e.g.

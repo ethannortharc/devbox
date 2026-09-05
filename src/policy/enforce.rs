@@ -407,7 +407,7 @@ fn load_command(enforcing: bool) -> String {
     )
 }
 
-/// Read the box's resolvers and any lab prefixes it hosts.
+/// Read the box's resolvers and any hosted prefixes it declares.
 ///
 /// Best effort: a box that cannot be read yields an empty context, which
 /// generates the *strictest* ruleset rather than the most permissive one. The
@@ -447,15 +447,26 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
         resolvers.extend(upstream.into_iter().filter(|r| !is_loopback_resolver(r)));
     }
 
-    // Labs record their prefixes under /etc/devbox/lab/<name>/prefixes when
-    // they come up, and remove them on teardown. Reading the directory here is
-    // the handoff: the ruleset generator runs on the host and cannot otherwise
-    // know a lab exists. A box with no lab gets none, and `isolated` then
-    // means loopback only — which is what the posture says.
-    let lab_prefixes = runtime
+    // Declared prefixes: a service that stands subnets up inside a box writes
+    // them under /etc/devbox/prefixes/ on the way up — one file per owner, one
+    // CIDR per line — and removes its file on teardown. Reading that directory
+    // here is the whole handoff (ADR-0046): the ruleset generator runs on the
+    // host and has no other way to learn those subnets exist.
+    //
+    // The glob is the contract. With no directory, or an empty one, `sh` passes
+    // the pattern through unmatched and `cat` exits 1 (measured, not assumed —
+    // `2>/dev/null` hides the message, not the status). The `exit_code == 0`
+    // filter below turns that into an empty list, which is the answer we want:
+    // a box that declares nothing gets nothing, and `isolated` then means
+    // loopback only, which is what the posture says.
+    //
+    // Failing to empty is also the safe direction for a *partial* failure. An
+    // unreadable entry loses every prefix in the directory, not just its own,
+    // so the ruleset gets stricter rather than accidentally permissive.
+    let declared_prefixes = runtime
         .exec_cmd(
             sandbox_name,
-            &["sh", "-c", "cat /etc/devbox/lab/*/prefixes 2>/dev/null"],
+            &["sh", "-c", "cat /etc/devbox/prefixes/* 2>/dev/null"],
             false,
         )
         .await
@@ -493,13 +504,13 @@ async fn discover_context(runtime: &dyn Runtime, sandbox_name: &str) -> super::n
 
     super::nftables::Context {
         resolvers,
-        lab_prefixes,
+        declared_prefixes,
         container_prefixes,
         internal_ifaces,
     }
 }
 
-/// Parse lab prefixes, one per line.
+/// Parse hosted prefixes, one per line.
 ///
 /// Validated as CIDRs for the same reason resolvers are: the result is
 /// interpolated into a ruleset that runs as root.
@@ -660,8 +671,8 @@ pub async fn restore_after_rebuild(
 
 /// Apply the saved posture if this box is not already owned by someone.
 ///
-/// For the paths that merely *use* a box — `exec`, `attach`, `code`, the lab —
-/// rather than changing it. They want the posture to be true, and they have no
+/// For the paths that merely *use* a box — `exec`, `attach`, `code` — rather
+/// than changing it. They want the posture to be true, and they have no
 /// business queueing behind a rebuild to say so.
 ///
 /// A refused claim is not a failure here. The holder is a rebuild, and a
@@ -674,9 +685,9 @@ pub async fn restore_after_rebuild(
 /// to.
 /// Restore the saved posture after a rebuild this process does not own.
 ///
-/// Only for callers that rebuild *through another process* — the lab substrate
-/// path drives `nixos-rebuild` inside a box it does not hold a claim on. A
-/// caller that does its own rebuilding holds the claim and must use
+/// Only for callers that rebuild *through another process* — a caller that
+/// drives `nixos-rebuild` inside a box it does not hold a claim on. A caller
+/// that does its own rebuilding holds the claim and must use
 /// [`restore_after_rebuild`], which requires it.
 pub async fn restore_after_rebuild_or_step_aside(
     manager: &crate::sandbox::SandboxManager,
@@ -812,8 +823,8 @@ mod tests {
     /// A path that only *uses* a box must not fight a rebuild for it.
     ///
     /// This is the contention rule, and it is a behaviour rather than a
-    /// convention now: `exec`, `attach`, `code` and the lab want the posture to
-    /// be true, and when a rebuild owns the box the rebuild is already obliged
+    /// convention now: `exec`, `attach` and `code` want the posture to be
+    /// true, and when a rebuild owns the box the rebuild is already obliged
     /// to make it true before it returns. Applying on top would be redundant at
     /// best and a stale overwrite at worst.
     ///
@@ -860,7 +871,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lab_prefixes_are_parsed_and_validated() {
+    fn hosted_prefixes_are_parsed_and_validated() {
         assert_eq!(
             parse_prefixes("10.99.0.0/16\n\n2001:db8::/32\n"),
             vec!["10.99.0.0/16", "2001:db8::/32"]

@@ -30,7 +30,7 @@ pub enum Posture {
     Allowlist,
     /// Package mirrors and declared sources only — "build, don't phone home".
     MirrorOnly,
-    /// No egress. Loopback and lab-internal only.
+    /// No egress. Loopback, plus private prefixes the box itself declares.
     Isolated,
 }
 
@@ -63,7 +63,10 @@ impl Posture {
             Posture::MirrorOnly => {
                 "Package mirrors and git hosts only. Builds work; nothing phones home."
             }
-            Posture::Isolated => "No egress at all. Loopback and lab-internal traffic only.",
+            Posture::Isolated => {
+                "No egress at all. Loopback only, plus any private prefixes a \
+                 service hosted in the box declares."
+            }
         }
     }
 
@@ -216,21 +219,25 @@ impl Policy {
             Posture::Isolated => {
                 // Only what the ruleset actually permits. This used to allow
                 // every RFC 1918 address, while the generated ruleset (since
-                // ADR-0046) permits only the prefixes of a lab that is
-                // *running* — so `policy test 192.168.1.1` answered "allowed"
-                // for traffic the box would drop.
+                // ADR-0046) permits only the prefixes a service *running* in
+                // the box has declared under `/etc/devbox/prefixes/` — so
+                // `policy test 192.168.1.1` answered "allowed" for traffic the
+                // box would drop.
                 //
-                // Whether a lab is up is a property of the box, and this runs
-                // offline against devbox.toml. Reporting the stricter of the
-                // two possible answers is the right way to be wrong: a tool
-                // that says "denied" about something permitted causes a second
-                // look, and one that says "allowed" about something dropped
-                // causes an outage nobody connects to the policy.
-                if is_lab_internal(&target.addr) {
+                // Whether anything has declared them is a property of the box,
+                // and this runs offline against devbox.toml. Reporting the
+                // stricter of the two possible answers is the right way to
+                // be wrong: a tool that says "denied" about something
+                // permitted causes a second look, and one that says "allowed"
+                // about something dropped causes an outage nobody connects to
+                // the policy.
+                //
+                // The verdict line above already names the posture, so the
+                // reason does not repeat it.
+                if is_private_range(&target.addr) {
                     Decision::deny(
                         self,
-                        "posture is isolated: private addresses are reachable only \
-                         while a lab that owns them is running on this box",
+                        "private range; permitted only while a box-hosted service declares it",
                     )
                 } else {
                     Decision::deny(self, "posture is isolated: no egress")
@@ -422,11 +429,14 @@ pub fn is_local(addr: &str) -> bool {
     }
 }
 
-/// Private ranges, which a lab uses for its own subnets (§9).
+/// RFC 1918 and ULA — the ranges a service standing its own subnets up inside
+/// a box allocates from (§9).
 ///
-/// `isolated` permits these so a lab node can still reach its peers — the
-/// posture means "no egress", not "no networking".
-pub fn is_lab_internal(addr: &str) -> bool {
+/// `isolated` permits a declared prefix out of these so two endpoints on such
+/// a subnet can still reach each other — the posture means "no egress", not
+/// "no networking". Membership here is necessary, never sufficient: the
+/// ruleset accepts only what the box has actually declared (ADR-0046).
+pub fn is_private_range(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(a)) => a.is_private(),
         // fc00::/7, the v6 unique-local range.
@@ -730,14 +740,14 @@ mod tests {
             Verdict::Allow
         );
         // A private address is *not* unconditionally allowed. The ruleset
-        // permits only the prefixes of a lab that is running (ADR-0046), and
-        // this evaluation is offline — so it reports the stricter answer and
-        // says why, rather than promising reachability the box will refuse.
+        // permits only the prefixes the box has declared (ADR-0046), and this
+        // evaluation is offline — so it reports the stricter answer and says
+        // why, rather than promising reachability the box will refuse.
         let private = policy.evaluate(&target("", "192.168.5.5"));
         assert_eq!(private.verdict, Verdict::Block);
         assert!(
-            private.reason.contains("lab"),
-            "the reason must point at the lab condition: {}",
+            private.reason.contains("declares it"),
+            "the reason must point at the declaration condition: {}",
             private.reason
         );
     }
@@ -775,11 +785,11 @@ mod tests {
         // Broadcast likewise: DHCP is exempted by port, not by destination.
         assert!(!is_local("255.255.255.255"));
 
-        assert!(is_lab_internal("10.0.0.1"));
-        assert!(is_lab_internal("172.16.0.1"));
-        assert!(is_lab_internal("192.168.1.1"));
-        assert!(is_lab_internal("fd00::1"));
-        assert!(!is_lab_internal("8.8.8.8"));
+        assert!(is_private_range("10.0.0.1"));
+        assert!(is_private_range("172.16.0.1"));
+        assert!(is_private_range("192.168.1.1"));
+        assert!(is_private_range("fd00::1"));
+        assert!(!is_private_range("8.8.8.8"));
     }
 
     #[test]
