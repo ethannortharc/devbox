@@ -785,7 +785,7 @@ impl Store {
                 tracing::debug!(id, "skipping an oversized event in a live tail");
                 continue;
             };
-            match serde_json::from_str(&raw) {
+            match decode(&raw) {
                 Ok(event) => events.push(event),
                 Err(e) => undecodable.record(&e),
             }
@@ -885,7 +885,7 @@ impl Store {
             // back short, which is the honest answer: those events are in the
             // store and in every view that does not re-read itself on a timer.
             let Some(raw) = raw else { continue };
-            match serde_json::from_str(&raw) {
+            match decode(&raw) {
                 Ok(event) => out.push(event),
                 Err(e) => undecodable.record(&e),
             }
@@ -965,7 +965,7 @@ impl Store {
                     break;
                 }
             }
-            match serde_json::from_str(&raw) {
+            match decode(&raw) {
                 Ok(event) => out.push(event),
                 Err(e) => {
                     // The export is now missing an event it was asked for.
@@ -1080,7 +1080,7 @@ impl Store {
                     break;
                 }
             }
-            match serde_json::from_str(&raw) {
+            match decode(&raw) {
                 Ok(event) => out.push(event),
                 Err(e) => {
                     truncated = true;
@@ -1313,6 +1313,28 @@ const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, e
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
      ended_by";
 
+/// Decode a stored event, with credentials removed from its argv.
+///
+/// On the way *out*, because the rows already in a store were written before
+/// any redaction existed — the agent redacts at the source now and the
+/// collector redacts on arrival, but neither of those can reach an event that
+/// was recorded last week. Every read path goes through here, so a consumer
+/// cannot be added that forgets: `devbox watch`, the run report, the console's
+/// Activity tab and every export all decode through this one function.
+///
+/// The `raw` column keeps what the agent sent. That is the host's own disk,
+/// where the token already lives; what this protects is everything devbox
+/// *renders*, which is what leaves the machine.
+fn decode(raw: &str) -> Result<Event, serde_json::Error> {
+    let mut event: Event = serde_json::from_str(raw)?;
+    if let Some(exec) = event.exec.as_mut()
+        && exec.argv.iter().any(|a| super::redact::has_secret(a))
+    {
+        exec.argv = super::redact::argv(&exec.argv);
+    }
+    Ok(event)
+}
+
 /// Counts rows a read could not decode, and says so exactly once.
 ///
 /// Every one of these was a `warn!` per row. A store holding events from a
@@ -1372,7 +1394,12 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         kind: row.get(2)?,
         // A run whose argv no longer decodes is still a run that happened;
         // losing the command line is better than losing the row.
-        argv: serde_json::from_str(&argv).unwrap_or_default(),
+        //
+        // Redacted like an exec's. This one is the command the *user* typed,
+        // and `devbox run -- curl -H 'Authorization: Bearer …'` puts a
+        // credential in it just as surely as the broker's wrapper does — into
+        // the report header, `devbox runs`, and the console's Runs tab.
+        argv: super::redact::argv(&serde_json::from_str::<Vec<String>>(&argv).unwrap_or_default()),
         cwd: row.get(4)?,
         label: row.get(5)?,
         started_at: row.get(6)?,

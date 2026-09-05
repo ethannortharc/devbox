@@ -978,3 +978,246 @@ fn run_ids_sort_in_the_order_they_were_minted() {
     unique.dedup();
     assert_eq!(unique.len(), ids.len());
 }
+
+// ---------------------------------------------------------------------------
+// A credential must not reach any output
+// ---------------------------------------------------------------------------
+
+/// The token this test hunts for. Distinctive enough that a single `contains`
+/// is a real assertion rather than a coincidence.
+const SECRET: &str = "sk-w26-abc123-do-not-leak";
+
+/// An assignment that must survive, in a command the report actually shows.
+///
+/// A redactor that removed this would be worse than one that leaked: it would
+/// quietly empty the field that says which broker a box was talking to, and
+/// nothing would look wrong.
+const KEPT: &str = "DEVBOX_BROKER_URL=http://host.lima.internal:7879";
+
+/// Every shape the token reaches an argv in, on one box, in one run.
+fn leaky_events() -> Vec<Event> {
+    // 1. The runtime's own login shell, which carries the whole command as a
+    //    single quoted word. This is the one that shipped a live token.
+    let mut login = base(EventType::Exec, 900, 1, CGROUP, "2026-09-05T10:00:00.000Z");
+    login.comm = "bash".into();
+    login.exec = Some(Exec {
+        path: "/run/current-system/sw/bin/bash".into(),
+        argv: vec![
+            "bash".into(),
+            "-c".into(),
+            format!(
+                "cd /home || exit 1 ; exec /bin/bash -l -c 'env -- DEVBOX_BROKER_TOKEN={SECRET} DEVBOX_RUN_ID={RUN} sh -c curl'"
+            ),
+        ],
+        cwd: "/home".into(),
+    });
+
+    // 2. The environment shim as its own argv words.
+    let mut shim = base(
+        EventType::Exec,
+        901,
+        900,
+        CGROUP,
+        "2026-09-05T10:00:00.100Z",
+    );
+    shim.comm = "env".into();
+    shim.exec = Some(Exec {
+        path: "/usr/bin/env".into(),
+        argv: vec![
+            "env".into(),
+            "--".into(),
+            format!("DEVBOX_BROKER_TOKEN={SECRET}"),
+            format!("DEVBOX_RUN_ID={RUN}"),
+            "curl".into(),
+        ],
+        cwd: "/workspace".into(),
+    });
+
+    // 3. The user's own command, with the token in a header.
+    let mut user = base(
+        EventType::Exec,
+        902,
+        901,
+        CGROUP,
+        "2026-09-05T10:00:00.200Z",
+    );
+    user.comm = "curl".into();
+    user.exec = Some(Exec {
+        path: "/usr/bin/curl".into(),
+        argv: vec![
+            "curl".into(),
+            "-s".into(),
+            "-H".into(),
+            format!("Authorization: Bearer {SECRET}"),
+            KEPT.into(),
+            "https://api.example.com".into(),
+        ],
+        cwd: "/workspace".into(),
+    });
+
+    vec![login, shim, user]
+}
+
+fn leaky_run() -> RunRecord {
+    RunRecord {
+        // The run's own argv is the command the *user* typed, and it can carry
+        // a credential just as surely as the wrapper does.
+        argv: vec![
+            "curl".into(),
+            "-H".into(),
+            format!("Authorization: Bearer {SECRET}"),
+        ],
+        ..record()
+    }
+}
+
+#[test]
+fn no_output_devbox_renders_can_carry_a_broker_token() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut live = leaky_run();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+
+    // Written *unredacted*, the way a store filled by an older agent holds
+    // them. The read path is what has to clean them.
+    let events = leaky_events();
+    let mut attributor = Attributor::new();
+    attributor.set_active(store.active_runs().unwrap());
+    let tags: Vec<_> = events.iter().map(|e| attributor.attribute(e)).collect();
+    store.insert_batch_tagged(&events, &tags).unwrap();
+    store
+        .finish_run(
+            RUN,
+            "2026-09-05T10:00:01.500Z",
+            Some(0),
+            RunStatus::Finished,
+            "ebpf+packet",
+            "0.1.6",
+            0,
+            None,
+        )
+        .unwrap();
+
+    let record = store.get_run(RUN).unwrap().unwrap();
+    let read_back = store
+        .query(&Query {
+            run_id: Some(RUN.to_string()),
+            limit: Some(Query::MAX_LIMIT),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(read_back.len(), 3);
+
+    let report = RunReport::build(
+        record,
+        &read_back,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        store.attribution_counts(RUN).unwrap(),
+        0,
+    );
+
+    // 1. markdown, 2. json, 3. html — the three a report is written as.
+    // `renders_argv` says whether the output is expected to show a command at
+    // all: the terminal summary is counts and a verdict, so "no token in it"
+    // is true of it trivially and proves nothing about the redaction.
+    let mut outputs: Vec<(&str, String, bool)> = vec![
+        ("markdown", markdown::render(&report), true),
+        ("summary", markdown::render_summary(&report), false),
+        ("json", json::render(&report).unwrap(), true),
+        ("html", html::render(&report).unwrap(), true),
+    ];
+
+    // 4. every export format, which is what `devbox export` writes.
+    for format in [
+        devbox::export::Format::Jsonl,
+        devbox::export::Format::Ocsf,
+        devbox::export::Format::OtlpJson,
+    ] {
+        let mut out: Vec<u8> = Vec::new();
+        devbox::export::run_selection(
+            &store,
+            &devbox::export::Window::default(),
+            Some(RUN),
+            &devbox::export::Context::new(BOX),
+            format,
+            &mut out,
+        )
+        .unwrap();
+        outputs.push((format.as_str(), String::from_utf8(out).unwrap(), true));
+    }
+
+    // 5. what `devbox watch` renders, both shapes.
+    outputs.push((
+        "watch --json",
+        devbox::obs::behavior::render_jsonl(&read_back).unwrap(),
+        true,
+    ));
+    outputs.push((
+        "watch summary lines",
+        read_back
+            .iter()
+            .map(|e| e.summary())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        true,
+    ));
+    outputs.push((
+        "watch --tree",
+        devbox::obs::correlate::chains(&read_back)
+            .iter()
+            .map(|c| c.command.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        true,
+    ));
+
+    for (what, text, renders_argv) in &outputs {
+        assert!(
+            !text.contains(SECRET),
+            "{what} carries the broker token:\n{text}"
+        );
+        // Without this the test passes for an output that renders no command
+        // at all, which is how a redaction test stops testing anything.
+        if *renders_argv {
+            assert!(
+                text.contains("***"),
+                "{what} shows no redaction — is it rendering the argv?\n{text}"
+            );
+        }
+    }
+
+    // Two things survive every one of them: the run's own id, which ties the
+    // report to its events, and a benign assignment in the user's command —
+    // a redactor that swept those away would be worse than one that leaked,
+    // because nothing about the result would look wrong.
+    for what in ["markdown", "json", "html", "jsonl"] {
+        let text = &outputs.iter().find(|(k, _, _)| *k == what).unwrap().1;
+        assert!(text.contains(RUN), "{what} lost the run id:\n{text}");
+        assert!(
+            text.contains(KEPT),
+            "{what} redacted something that was not a secret:\n{text}"
+        );
+    }
+
+    // And the login shell is folded away rather than merely cleaned.
+    let tree: Vec<&str> = report
+        .processes
+        .iter()
+        .map(|p| p.command.as_str())
+        .collect();
+    assert!(
+        tree.contains(&"[devbox wrapper]"),
+        "the runtime's login shell is still its own line: {tree:#?}"
+    );
+    assert!(
+        !tree.iter().any(|c| c.contains("cd /home || exit 1")),
+        "the login shell's argv survived the fold: {tree:#?}"
+    );
+    assert_eq!(
+        report.processes.iter().find(|p| !p.wrapper).unwrap().depth,
+        0,
+        "the user's command must still be the tree root"
+    );
+}

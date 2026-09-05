@@ -244,3 +244,96 @@ pub trait Runtime: Send + Sync {
         }
     }
 }
+
+/// Whether an exec's argv is a runtime's own login-shell wrapper.
+///
+/// Nothing in devbox generates this line. `limactl shell --workdir /home <vm>
+/// -- <cmd>` reaches the guest over ssh, and limactl builds the remote side
+/// itself:
+///
+/// ```text
+/// bash -c "cd /home || exit 1 ; exec /bin/bash -l -c '<cmd>'"
+/// ```
+///
+/// Which is an `exec` event, arrives before anything devbox asked for, and
+/// carried the whole command — including the broker's environment — as one
+/// enormous quoted word at the top of every run report's process tree.
+///
+/// Recognised by shape rather than by an exact string, and deliberately
+/// tolerant: the format belongs to limactl, so a change there should cost a
+/// tidier tree and nothing else. The security half of that problem is
+/// [`crate::obs::redact`], which does not depend on this function at all —
+/// a line this fails to fold is still a line with no credential in it.
+pub fn is_login_wrapper(argv: &[String]) -> bool {
+    // `bash -c <script>` or `sh -c <script>`, and nothing else.
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let shell = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(shell, "bash" | "sh" | "zsh") || argv.get(1).map(String::as_str) != Some("-c") {
+        return false;
+    }
+    let Some(script) = argv.get(2) else {
+        return false;
+    };
+
+    // The prologue limactl writes: cd to the workdir devbox asked for, then
+    // exec a login shell for the real command. All three parts, because any
+    // one of them alone is an ordinary thing for a script to do.
+    script.starts_with(&format!("cd {} ", lima::SHELL_WORKDIR))
+        && script.contains(" exec ")
+        && script.contains("-l -c")
+}
+
+#[cfg(test)]
+mod login_wrapper_tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn limactls_own_login_shell_is_recognised() {
+        // Captured from devtest: this is the line that opened every run
+        // report, ahead of the command anyone actually ran.
+        assert!(is_login_wrapper(&argv(&[
+            "bash",
+            "-c",
+            "cd /home || exit 1 ; exec /bin/bash -l -c 'env -- DEVBOX_RUN_ID=01X sh -c true'",
+        ])));
+        // The absolute path the exec event usually carries.
+        assert!(is_login_wrapper(&argv(&[
+            "/run/current-system/sw/bin/bash",
+            "-c",
+            "cd /home || exit 1 ; exec /bin/bash -l -c 'true'",
+        ])));
+    }
+
+    #[test]
+    fn a_users_own_shell_script_is_not() {
+        // Every one of these does *some* of what the prologue does, which is
+        // why all three parts are required.
+        for words in [
+            vec!["sh", "-c", "cd /home && ls"],
+            vec![
+                "bash",
+                "-c",
+                "cd /workspace || exit 1 ; exec /bin/bash -l -c 'x'",
+            ],
+            vec!["bash", "-c", "exec /bin/bash -l -c 'x'"],
+            vec![
+                "bash",
+                "-lc",
+                "cd /home || exit 1 ; exec /bin/bash -l -c 'x'",
+            ],
+            vec!["curl", "https://example.com"],
+            vec![],
+        ] {
+            assert!(
+                !is_login_wrapper(&argv(&words)),
+                "wrongly folded: {words:?}"
+            );
+        }
+    }
+}
