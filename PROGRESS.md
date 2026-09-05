@@ -50,8 +50,10 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W2 | W2-1 wire A to E, B, G; newest-first summary; `export --run` | `v5/run` | **DONE** |
 | W2 | W2-2 `mcp run` as a run, `mcp report`, `mcp self` | `v5/mcp` | **DONE** |
 | W2 | W2-3 sweep: discard remount, `checkpoint-rm`, guest home, NixOS file scope | `v5/sweep` | **DONE** |
-| W2 | W2-4 README, docs, screenshot, ADR-0059…0067, version 0.2.0 | `v5/docs` | **DONE** |
+| W2 | W2-4 README, docs, screenshot, ADR-0059…0067, version 0.2.0 | `v5/docs` | **DONE** — 0.2.0's code surface is final at `db750b3` |
 | W2 | W2-5 run report polish: fold the wrapper, writes outside the overlay, wire Credentials | `v5/report-polish` | **DONE** |
+| W2 | W2-6 redact credentials out of every argv devbox records or renders | `v5/redact` | **DONE** |
+| W2 | W2-7 a brokered credential use is OCSF API Activity 6003 | `v5/redact` | **DONE** |
 
 ## Environment notes
 
