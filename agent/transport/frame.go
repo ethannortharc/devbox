@@ -61,6 +61,16 @@ type Hello struct {
 	// EBPF is false in the degraded `--no-ebpf` mode (§13), which the UI
 	// marks so nobody mistakes proc-polling coverage for kernel coverage.
 	EBPF bool `json:"ebpf"`
+	// FileScope lists the path prefixes a file event has to be under to be
+	// sent at all. `file` in Capture says the probe is attached; this says how
+	// much of the filesystem it reports, and without it an operator reading
+	// "no writes under /workspace" cannot tell a quiet box from a scope that
+	// excluded the directory they were watching.
+	//
+	// Empty from an agent that predates the flag, and from one told to report
+	// every path — the collector treats both as "not narrowed", which is what
+	// they are.
+	FileScope []string `json:"file_scope,omitempty"`
 }
 
 // HelloAck is the collector's reply.

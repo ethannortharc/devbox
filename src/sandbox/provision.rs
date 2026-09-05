@@ -1767,10 +1767,15 @@ pub(crate) async fn install_ubuntu_obsd_service(runtime: &dyn Runtime, name: &st
     } else {
         " -no-transport"
     };
+    // The same scope the console's exec agent gets, from the same probe: two
+    // agents watching one box must not disagree about which paths produce
+    // file events, or the feed changes shape depending on who attached.
+    let file_scope = crate::obs::supervisor::guest_file_scope(runtime, name).await;
     let unit = format!(
         "[Unit]\nDescription=devbox observability agent\nAfter=network.target\n\n\
          [Service]\nType=simple\nExecStart=/usr/local/bin/devbox-obsd -box-id {name}{transport} \
          -packet=true -status-file /run/devbox/obsd-status.json \
+         -file-scope {file_scope} \
          -policy /etc/devbox/policy.json{no_ebpf}\n\
          Restart=always\nRestartSec=2s\nRuntimeDirectory=devbox\n\
          CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYSLOG CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE\n\

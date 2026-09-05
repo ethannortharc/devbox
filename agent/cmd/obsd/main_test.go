@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -114,6 +115,71 @@ func TestFlagsParse(t *testing.T) {
 	}
 }
 
+func TestFileScopeDefaultsToTheWorkspaceAndRefusesRelativePrefixes(t *testing.T) {
+	t.Parallel()
+
+	// The default is the promise §7.1 makes. Without it the openat tracepoint
+	// exports every path every process in the box opens — 6750 events in 80
+	// seconds on an idle box, and a store that grew to 258 MB overnight.
+	cfg, err := parseFlags([]string{"-box-id", "b"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if cfg.fileScope != "/workspace" {
+		t.Fatalf("default file scope = %q", cfg.fileScope)
+	}
+
+	scoped, err := parseFlags([]string{"-box-id", "b", "-file-scope", "/workspace,/home/dev"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if scoped.fileScope != "/workspace,/home/dev" {
+		t.Fatalf("file scope = %q", scoped.fileScope)
+	}
+
+	// Refused at startup rather than ignored: a scope that parses to nothing
+	// admits every path, so a typo would silently restore the flood.
+	if _, err := parseFlags([]string{"-box-id", "b", "-file-scope", "workspace"}, io.Discard); err == nil {
+		t.Fatal("a relative file scope was accepted")
+	}
+}
+
+func TestCaptureStatusPublishesTheScopeAndWhatItSuppressed(t *testing.T) {
+	t.Parallel()
+
+	// A filter nobody can see is indistinguishable from a probe that stopped
+	// firing, so the numbers are published beside the capabilities.
+	const line = `{"ts_wall":"2026-09-05T00:00:00.000Z","ts_mono_ns":1,"box_id":"b",` +
+		`"pid":9,"tid":9,"comm":"sh","type":"file","file":{"path":%q,"op":"open"}}`
+	fixture := filepath.Join(t.TempDir(), "events.jsonl")
+	body := fmt.Sprintf(line, "/workspace/main.go") + "\n" + fmt.Sprintf(line, "/dev/null") + "\n"
+	if err := os.WriteFile(fixture, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scope := capture.NewScope(&capture.Fixture{Path: fixture, BoxID: "b"}, []string{"/workspace"})
+	events := make(chan *event.Event, 4)
+	if err := scope.Run(context.Background(), events); err != nil {
+		t.Fatalf("scope.Run: %v", err)
+	}
+	close(events)
+	var kept []string
+	for e := range events {
+		kept = append(kept, e.File.Path)
+	}
+	if len(kept) != 1 || kept[0] != "/workspace/main.go" {
+		t.Fatalf("kept %v, want only the workspace path", kept)
+	}
+
+	status := currentCaptureStatus(config{boxID: "b"}, scope)
+	if len(status.FileScope) != 1 || status.FileScope[0] != "/workspace" {
+		t.Fatalf("status.FileScope = %v", status.FileScope)
+	}
+	if status.FileOutOfScope != 1 {
+		t.Fatalf("status.FileOutOfScope = %d, want 1", status.FileOutOfScope)
+	}
+}
+
 func TestUnknownFlagIsAnError(t *testing.T) {
 	t.Parallel()
 
@@ -208,17 +274,17 @@ func TestCaptureStatusReportsEffectiveDomainsNotRequestedFlags(t *testing.T) {
 	t.Parallel()
 
 	cfg := config{boxID: "b", packet: true, policy: "/etc/devbox/policy.json"}
-	degraded := currentCaptureStatus(cfg, &capture.Proc{BoxID: "b"})
+	degraded := currentCaptureStatus(cfg, capture.NewScope(&capture.Proc{BoxID: "b"}, nil))
 	for _, domain := range degraded.Capture {
 		if domain == "dns" {
 			t.Fatalf("proc fallback falsely advertised DNS: %+v", degraded)
 		}
 	}
 
-	recovered := currentCaptureStatus(cfg, capture.NewMulti(
+	recovered := currentCaptureStatus(cfg, capture.NewScope(capture.NewMulti(
 		&capture.Proc{BoxID: "b"},
 		statusPacket{},
-	))
+	), nil))
 	if !contains(recovered.Capture, "dns") || !contains(recovered.Capture, "tls") {
 		t.Fatalf("live packet source was not published: %+v", recovered)
 	}

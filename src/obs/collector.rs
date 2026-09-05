@@ -88,6 +88,14 @@ pub struct Hello {
     pub source: String,
     #[serde(default)]
     pub ebpf: bool,
+    /// Path prefixes a file event has to be under to be sent at all.
+    ///
+    /// `file` in [`Hello::capture`] says the probe is attached; this says how
+    /// much of the filesystem it reports. Empty from an agent that predates
+    /// the field and from one told to report every path, which are the same
+    /// thing to every reader: not narrowed.
+    #[serde(default)]
+    pub file_scope: Vec<String>,
 }
 
 /// The collector's reply.
@@ -885,6 +893,7 @@ mod tests {
             box_id: "myapp".into(),
             capture: vec!["exec".into()],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: true,
         };
         let ack = evaluate_hello(&hello, None);
@@ -937,6 +946,7 @@ mod tests {
             box_id: "myapp".into(),
             capture: vec!["exec".into()],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: true,
         };
         assert!(evaluate_hello(&hello, None).accepted);
@@ -951,6 +961,7 @@ mod tests {
             box_id: "myapp".into(),
             capture: vec![],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: true,
         };
         let ack = evaluate_hello(&hello, None);
@@ -966,6 +977,7 @@ mod tests {
             box_id: String::new(),
             capture: vec![],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: false,
         };
         assert!(!evaluate_hello(&nameless, None).accepted);
@@ -1049,6 +1061,7 @@ mod tests {
             box_id: "alpha".into(),
             capture: vec![],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: false,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
@@ -1145,6 +1158,7 @@ mod tests {
             box_id: "alpha".into(),
             capture: vec!["ebpf".into(), "packet".into()],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: true,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
@@ -1197,6 +1211,7 @@ mod tests {
             box_id: "alpha".into(),
             capture: vec![],
             source: String::new(),
+            file_scope: Vec::new(),
             ebpf: false,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
