@@ -123,13 +123,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev linux-tools-common
           # On Ubuntu 24.04 `bpftool` is a virtual package: the binary ships in
-          # the kernel-specific linux-tools package, so ask for the running
-          # kernel's and fall back to the generic one.
+          # a kernel-specific linux-tools package, and the wrapper script in
+          # linux-tools-common refuses to run when the runner's kernel (an
+          # Azure build) has no matching package. `btf dump` only needs libbpf,
+          # not a matching kernel, so use whichever real binary got installed.
           sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
-          bpftool version
+          BPFTOOL=$(ls -d /usr/lib/linux-tools/*/bpftool 2>/dev/null | head -n 1)
+          if [ -z "$BPFTOOL" ]; then echo "::error::no bpftool binary under /usr/lib/linux-tools"; exit 1; fi
+          "$BPFTOOL" version
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
 
       - name: generate vmlinux types
-        run: sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
+        run: sudo "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
 
       - name: build eBPF objects
         run: |
