@@ -179,6 +179,7 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
                     ),
                     Err(error) => println!("    \x1b[31mprobe failed\x1b[0m — {error}"),
                 }
+                print_agent_freshness(runtime.as_ref(), &state.name).await;
                 print_capture_source(&manager.state_dir, &state.name);
             }
             Ok(SandboxStatus::Stopped | SandboxStatus::NotFound) => {}
@@ -373,6 +374,31 @@ async fn check_incus_network() {
 /// and told to the collector in the handshake, and the difference is the whole
 /// question a reader has when `devbox watch` shows connections with no process
 /// against them: proc polling reads /proc/net/tcp, which has no pid column.
+/// Whether the box's agent is the binary this devbox would install.
+///
+/// Next to `capture:`, and asked of the guest rather than of any host record:
+/// the whole reason this line exists is that the version string every other
+/// check reads says `0.1.6` for two different agents. Its answer is the digest
+/// or nothing.
+async fn print_agent_freshness(runtime: &dyn crate::runtime::Runtime, name: &str) {
+    use crate::sandbox::agent_sync::{Digest, doctor_line, host_digest, probe};
+
+    match probe(runtime, name).await {
+        Ok(guest) => {
+            let colour = if guest.digest == Digest::Hex(host_digest().to_string()) {
+                "32"
+            } else {
+                "33"
+            };
+            println!(
+                "    agent binary: \x1b[{colour}m{}\x1b[0m",
+                doctor_line(host_digest(), &guest.digest)
+            );
+        }
+        Err(error) => println!("    agent binary: \x1b[31munreadable\x1b[0m — {error}"),
+    }
+}
+
 fn print_capture_source(state_dir: &Path, name: &str) {
     use crate::obs::health::{CaptureState, capture_source, load};
 
