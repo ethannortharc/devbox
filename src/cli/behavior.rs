@@ -177,21 +177,29 @@ fn summary(args: SummaryArgs, manager: &SandboxManager) -> Result<()> {
         return Ok(());
     };
 
-    // `export` rather than `query`: it is bounded by bytes as well as rows,
-    // and it reports truncation from what the scan *reached* rather than from
-    // how many rows happened to decode. Counting decoded rows meant one row
-    // written by an older schema turned a cut-off window into a short one that
-    // claimed to be complete.
+    // Newest-first, which is what "what has this box been doing" means.
+    //
+    // This used to read from the beginning of the window like `export` does.
+    // On a box with two million events that answered the question with its
+    // *first* seven minutes — from weeks ago — and said only that the scan had
+    // been cut short. The bytes-and-rows bound is the same, and truncation is
+    // still reported from what the scan reached rather than from how many rows
+    // happened to decode.
     let (events, truncated) = store
-        .export(args.since.as_deref(), Query::MAX_LIMIT, MAX_SCAN_BYTES)
+        .recent(args.since.as_deref(), Query::MAX_LIMIT, MAX_SCAN_BYTES)
         .context("failed to query the event store")?;
 
     // A summary that silently covers only part of a window is worse than one
     // that says so: it reports "no violations" for a run that had them.
     if truncated {
+        let first = events
+            .first()
+            .map(|e| e.ts_wall.as_str())
+            .unwrap_or("the cut-off point");
         eprintln!(
-            "warning: the scan stopped before the end of this window. The summary \
-             below covers the oldest events it reached — narrow it with --since."
+            "warning: this window holds more than one scan can read. The summary \
+             below covers the most recent events, back to {first} — narrow it \
+             with --since to see further back."
         );
     }
 

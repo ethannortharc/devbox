@@ -20,9 +20,11 @@
 //! the nanosecond mtime — so a checkpoint is a faithful upper and restoring one
 //! puts the box back exactly where it was.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::obs::Store;
+use crate::obs::run::ActiveRun;
 use crate::runtime::Runtime;
 use crate::sandbox::overlay::{
     self, ChangeStatus, EntryKind, OverlayChange, TreeEntry, UPPER, enumerate_tree,
@@ -122,11 +124,11 @@ pub struct Checkpoint {
     /// RFC3339, UTC, second precision — the same spelling the rest of devbox
     /// writes timestamps in.
     pub created_at: String,
-    /// The run this checkpoint belongs to.
+    /// The run this checkpoint belongs to, set by [`create_for_run`].
     ///
-    /// Always `None` in wave 1: there is no runs table yet. Component A fills
-    /// it at integration, and [`prune_plan`] already refuses to delete a
-    /// checkpoint that has one, so retention does not have to change then.
+    /// [`prune_plan`] never deletes a checkpoint that has one: a run report
+    /// links to its start and end checkpoints, and a report whose evidence has
+    /// been garbage-collected is worse than a slightly larger directory.
     pub run_id: Option<String>,
     /// Non-directory entries in the saved upper — regular files, symlinks and
     /// whiteouts. Whiteouts count because a deletion is a change the
@@ -147,12 +149,42 @@ pub enum Target {
 
 /// Refuse to rewrite the upper out from under a run that is still going.
 ///
-/// Wave 1 has no runs table, so this is a hook that always succeeds. Component
-/// A owns the table; at integration this becomes "is there a row in `runs` for
-/// this box with no `ended_at`", and [`restore`] already calls it first, so
-/// nothing else has to move.
-fn active_run_guard(_box_name: &str) -> Result<()> {
-    Ok(())
+/// A restore replaces `/workspace` wholesale. Doing that under a live run
+/// destroys the very thing that run's report is about — its end checkpoint
+/// would describe a tree the command never produced — and it is invisible
+/// afterwards, because the report is assembled from whatever the upper holds
+/// at the end.
+///
+/// Sync rather than async: the answer is one indexed SQLite read on a store
+/// the caller already holds open, and marking it `async` would promise an
+/// await point it does not have. [`restore`] is the only caller and is async
+/// itself, so nothing about the call site changes.
+fn active_run_guard(store: &Store, box_name: &str) -> Result<()> {
+    let active = store
+        .active_runs()
+        .with_context(|| format!("could not check whether box '{box_name}' has a live run"))?;
+    refuse_while_running(box_name, &active)
+}
+
+/// The rule itself, over the runs rather than over a database.
+///
+/// Split out so it can be tested without a guest and without a store. The
+/// interesting part is the message: a refusal that says "a run is in progress"
+/// without saying *which* leaves the reader with nowhere to go.
+pub fn refuse_while_running(box_name: &str, active: &[ActiveRun]) -> Result<()> {
+    if active.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = active.iter().map(|r| r.run_id.as_str()).collect();
+    // Written as one literal rather than as a `\`-continued one. rustfmt joins
+    // a continued literal back onto a single line and the continuation's
+    // indentation survives into the message, which is how this refusal spent a
+    // round reading "would rewrite          /workspace".
+    bail!(
+        "Box '{box_name}' has {} run(s) in progress ({}); restoring would rewrite /workspace underneath them. Wait for them to finish, or run `devbox runs {box_name}` to see what is still going.",
+        active.len(),
+        ids.join(", ")
+    );
 }
 
 fn checkpoint_dir(id: &CheckpointId) -> String {
@@ -172,6 +204,31 @@ pub async fn create(
     runtime: &dyn Runtime,
     box_name: &str,
     label: Option<&str>,
+) -> Result<Checkpoint> {
+    create_inner(runtime, box_name, label, None).await
+}
+
+/// Take a checkpoint that belongs to a run (§4.1, §5.1).
+///
+/// The only difference from [`create`] is the `run_id` in the manifest, and
+/// that field is not decoration: [`prune_plan`] never drops a checkpoint that
+/// has one, so a report can still show its file diff months later. A run takes
+/// two — `run-start` and `run-end` — and the pair is what makes the report's
+/// Files section describe *the run* rather than the box's whole history.
+pub async fn create_for_run(
+    runtime: &dyn Runtime,
+    box_name: &str,
+    run_id: &str,
+    label: Option<&str>,
+) -> Result<Checkpoint> {
+    create_inner(runtime, box_name, label, Some(run_id)).await
+}
+
+async fn create_inner(
+    runtime: &dyn Runtime,
+    box_name: &str,
+    label: Option<&str>,
+    run_id: Option<&str>,
 ) -> Result<Checkpoint> {
     let id = CheckpointId::generate();
     let dir = checkpoint_dir(&id);
@@ -210,7 +267,7 @@ pub async fn create(
         id: id.clone(),
         label: label.map(str::to_string),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        run_id: None,
+        run_id: run_id.map(str::to_string),
         files: entries.iter().filter(|e| e.kind != EntryKind::Dir).count(),
         bytes: entries
             .iter()
@@ -456,8 +513,13 @@ pub fn diff_trees(from: &[TreeEntry], to: &[TreeEntry]) -> Vec<OverlayChange> {
 /// `/workspace` to be idle, so a failure is a warning rather than an error:
 /// the restore itself has already happened by then, and `devbox diff` (which
 /// reads the upper directly) will agree with it.
-pub async fn restore(runtime: &dyn Runtime, box_name: &str, id: &CheckpointId) -> Result<()> {
-    active_run_guard(box_name)?;
+pub async fn restore(
+    runtime: &dyn Runtime,
+    store: &Store,
+    box_name: &str,
+    id: &CheckpointId,
+) -> Result<()> {
+    active_run_guard(store, box_name)?;
 
     let known = list(runtime, box_name).await?;
     let id = resolve_id(&known, id)?;

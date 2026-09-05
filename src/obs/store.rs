@@ -11,6 +11,14 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
+use super::run::{ActiveRun, Attribution, RunRecord, RunStatus, RunTag};
+
+/// The schema this build writes, recorded in `meta` under `schema`.
+///
+/// 1. events + meta, as v4 shipped them. A store created before the key
+///    existed reports 1 by its absence, not by its content.
+/// 2. `runs`, and `events.run_id` / `events.attribution` (§4.1).
+const SCHEMA_VERSION: u32 = 2;
 
 /// Opens and owns a box's event database.
 pub struct Store {
@@ -40,6 +48,11 @@ pub struct Query {
     /// therefore delivered twice.
     pub before_id: Option<i64>,
     pub kinds: Vec<EventType>,
+    /// Only events attributed to this run (§4.2).
+    ///
+    /// Exact, not a prefix: a run report that quietly widened to a second run
+    /// because their ids shared a millisecond would be worse than no report.
+    pub run_id: Option<String>,
     /// Substring match against the peer (domain, SNI, or address).
     pub peer: Option<String>,
     /// Substring match against the path.
@@ -147,7 +160,9 @@ impl Store {
                 peer        TEXT,
                 dport       INTEGER,
                 path        TEXT,
-                raw         TEXT    NOT NULL
+                raw         TEXT    NOT NULL,
+                run_id      TEXT,
+                attribution TEXT
             );
 
             CREATE INDEX IF NOT EXISTS events_ts    ON events (ts_wall);
@@ -160,9 +175,53 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id           TEXT PRIMARY KEY,
+                box_id           TEXT    NOT NULL,
+                kind             TEXT    NOT NULL,
+                argv             TEXT    NOT NULL,
+                cwd              TEXT    NOT NULL DEFAULT '',
+                label            TEXT    NOT NULL DEFAULT '',
+                started_at       TEXT    NOT NULL,
+                ended_at         TEXT,
+                exit_code        INTEGER,
+                status           TEXT    NOT NULL,
+                posture_before   TEXT    NOT NULL DEFAULT '',
+                posture_during   TEXT    NOT NULL DEFAULT '',
+                cgroup_id        INTEGER NOT NULL DEFAULT 0,
+                root_pid         INTEGER NOT NULL DEFAULT 0,
+                checkpoint_start TEXT,
+                checkpoint_end   TEXT,
+                capture_sources  TEXT    NOT NULL DEFAULT '',
+                agent_version    TEXT    NOT NULL DEFAULT '',
+                dropped_events   INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
             "#,
         )
         .context("failed to create the event schema")?;
+
+        // A store created by v4 has the two `events` columns missing and no
+        // `schema` key. Both are additive: an old row simply reads back with a
+        // NULL `run_id`, which is the truth — it belongs to no run.
+        //
+        // Before the indexes below, not after: `events_run` names a column
+        // that only exists once the migration has added it, and creating it
+        // first made a v4 database fail to *open* — "no such column: run_id",
+        // from a binary whose whole job at that moment was to upgrade it.
+        Self::migrate(&conn)?;
+
+        // Both partial, and both on the hot read. `runs_running` is what the
+        // collector re-queries on every flush, so it costs one entry per
+        // running command rather than one per run the box has ever done;
+        // `events_run` bounds a run-scoped export to the run's own rows.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS runs_running ON runs (status) WHERE status = 'running';
+             CREATE INDEX IF NOT EXISTS events_run ON events (run_id) WHERE run_id IS NOT NULL;",
+        )
+        .context("failed to index the runs")?;
 
         // A generation, written once when the store is created.
         //
@@ -183,6 +242,74 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Bring an older database up to [`SCHEMA_VERSION`].
+    ///
+    /// Additive only, and driven by what the table actually has rather than by
+    /// the recorded version: `CREATE TABLE IF NOT EXISTS` above leaves a v4
+    /// `events` untouched, so the columns have to be added here, and a store
+    /// that was already migrated by a newer binary must not have them added
+    /// twice. `PRAGMA table_info` is the authority; the `meta` key is the
+    /// record, written last so an interrupted migration is retried rather than
+    /// declared done.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let mut existing: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(events)")
+                .context("failed to inspect the events table")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("failed to read the events columns")?;
+            for row in rows {
+                existing.push(row.context("failed to read an events column")?);
+            }
+        }
+
+        for column in ["run_id", "attribution"] {
+            if existing.iter().any(|c| c == column) {
+                continue;
+            }
+            conn.execute(&format!("ALTER TABLE events ADD COLUMN {column} TEXT"), [])
+                .with_context(|| format!("failed to add events.{column}"))?;
+        }
+
+        // Not `IF NOT EXISTS` on the row: an upgrade has to overwrite the
+        // version a previous release wrote, and a *downgrade* deliberately
+        // does not — a v4 binary reading a v5 store still only reads columns
+        // it knows about, and lowering the number would make the next v5 run
+        // re-attempt migrations that already happened.
+        let recorded: u32 = conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .context("failed to read the schema version")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        if recorded < SCHEMA_VERSION {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![SCHEMA_VERSION.to_string()],
+            )
+            .context("failed to stamp the schema version")?;
+        }
+        Ok(())
+    }
+
+    /// The schema version this database is at.
+    pub fn schema_version(&self) -> Result<u32> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .context("failed to read the schema version")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1))
+    }
+
     /// Append one event.
     pub fn insert(&self, event: &Event) -> Result<i64> {
         event.validate()?;
@@ -190,26 +317,8 @@ impl Store {
 
         self.conn
             .execute(
-                "INSERT INTO events
-                   (ts_wall, ts_mono_ns, box_id, cgroup_id, pid, tid, ppid, comm, uid,
-                    type, peer, dport, path, raw)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![
-                    event.ts_wall,
-                    event.ts_mono_ns,
-                    event.box_id,
-                    event.cgroup_id,
-                    event.pid,
-                    event.tid,
-                    event.ppid,
-                    event.comm,
-                    event.uid,
-                    event.kind.as_str(),
-                    event.peer(),
-                    event.net.as_ref().map(|n| n.dport),
-                    event.path(),
-                    raw,
-                ],
+                INSERT_EVENT,
+                params_from_iter(event_params(event, &raw, None).iter().map(|a| a.as_ref())),
             )
             .context("failed to insert an event")?;
 
@@ -221,39 +330,316 @@ impl Store {
     /// The collector batches: one transaction per burst is the difference
     /// between a few thousand and a few hundred thousand events per second.
     pub fn insert_batch(&mut self, events: &[Event]) -> Result<usize> {
+        self.insert_batch_tagged(events, &[])
+    }
+
+    /// Append many events, each with the run it was attributed to (§4.2).
+    ///
+    /// `tags` is parallel to `events` and may be shorter or empty — a missing
+    /// entry is "no run", which is what the collector produces whenever no run
+    /// is live. Kept beside the events rather than inside them because the
+    /// [`Event`] envelope is a cross-language contract with the Go agent, and
+    /// the attribution is a *host* conclusion the guest never sees.
+    pub fn insert_batch_tagged(
+        &mut self,
+        events: &[Event],
+        tags: &[Option<RunTag>],
+    ) -> Result<usize> {
         let tx = self.conn.transaction().context("failed to begin")?;
         let mut written = 0;
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
             if event.validate().is_err() {
                 continue;
             }
             let raw = serde_json::to_string(event)?;
+            let tag = tags.get(index).and_then(|t| t.as_ref());
+            let bound = event_params(event, &raw, tag);
             tx.execute(
-                "INSERT INTO events
-                   (ts_wall, ts_mono_ns, box_id, cgroup_id, pid, tid, ppid, comm, uid,
-                    type, peer, dport, path, raw)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![
-                    event.ts_wall,
-                    event.ts_mono_ns,
-                    event.box_id,
-                    event.cgroup_id,
-                    event.pid,
-                    event.tid,
-                    event.ppid,
-                    event.comm,
-                    event.uid,
-                    event.kind.as_str(),
-                    event.peer(),
-                    event.net.as_ref().map(|n| n.dport),
-                    event.path(),
-                    raw,
-                ],
+                INSERT_EVENT,
+                params_from_iter(bound.iter().map(|a| a.as_ref())),
             )?;
             written += 1;
         }
         tx.commit().context("failed to commit")?;
         Ok(written)
+    }
+
+    // -----------------------------------------------------------------------
+    // Runs (§4.1)
+    // -----------------------------------------------------------------------
+
+    /// Record a run at its start. The CLI writes this; the collector reads it.
+    pub fn insert_run(&self, run: &RunRecord) -> Result<()> {
+        let argv = serde_json::to_string(&run.argv).context("failed to encode a run's argv")?;
+        self.conn
+            .execute(
+                "INSERT INTO runs
+                   (run_id, box_id, kind, argv, cwd, label, started_at, ended_at, exit_code,
+                    status, posture_before, posture_during, cgroup_id, root_pid,
+                    checkpoint_start, checkpoint_end, capture_sources, agent_version,
+                    dropped_events)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                params![
+                    run.run_id,
+                    run.box_id,
+                    run.kind,
+                    argv,
+                    run.cwd,
+                    run.label,
+                    run.started_at,
+                    run.ended_at,
+                    run.exit_code,
+                    run.status,
+                    run.posture_before,
+                    run.posture_during,
+                    run.cgroup_id,
+                    run.root_pid,
+                    run.checkpoint_start,
+                    run.checkpoint_end,
+                    run.capture_sources,
+                    run.agent_version,
+                    run.dropped_events,
+                ],
+            )
+            .context("failed to record a run")?;
+        Ok(())
+    }
+
+    /// Publish the guest scope the wrapper reported, mid-run.
+    ///
+    /// Separate from [`Store::finish_run`] because it lands *while* events are
+    /// arriving: until it does, the collector has no cgroup to match on and
+    /// everything falls to the parent chain.
+    pub fn set_run_scope(&self, run_id: &str, cgroup_id: u64, root_pid: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET cgroup_id = ?2, root_pid = ?3 WHERE run_id = ?1",
+                params![run_id, cgroup_id, root_pid],
+            )
+            .context("failed to record a run's guest scope")?;
+        Ok(())
+    }
+
+    /// Claim the events a run's own cgroup produced before the host knew it.
+    ///
+    /// There is an unavoidable gap at the start of every run: the cgroup only
+    /// exists once the wrapper has entered it, the host only learns its id
+    /// when the wrapper publishes, and events are already arriving. Without
+    /// this, a report reliably lost its own first few hundred milliseconds —
+    /// which is where `exec` lives, so a run that fetched a URL showed the
+    /// connection and not the process that made it.
+    ///
+    /// Exact, not a widening: only rows whose `cgroup_id` *equals* this run's
+    /// are claimed, and only ones no other run already has. The kernel decided
+    /// that equality; nothing is being guessed to fill a hole.
+    ///
+    /// Returns how many rows were claimed.
+    pub fn backfill_run(&self, run_id: &str, cgroup_id: u64, since: &str) -> Result<u64> {
+        if cgroup_id == 0 {
+            return Ok(0);
+        }
+        let claimed = self
+            .conn
+            .execute(
+                "UPDATE events SET run_id = ?1, attribution = 'cgroup'
+                  WHERE run_id IS NULL AND cgroup_id = ?2 AND ts_wall >= ?3",
+                params![run_id, cgroup_id, normalize_ts(since)],
+            )
+            .context("failed to back-fill a run's early events")?;
+        Ok(claimed as u64)
+    }
+
+    /// Close a run out.
+    ///
+    /// Eight arguments rather than a struct: every one of them is a column of
+    /// the row this updates, and a `RunClosing` type would be a second shape
+    /// for the same record — one more thing to keep in step with `runs` for no
+    /// reader's benefit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_run(
+        &self,
+        run_id: &str,
+        ended_at: &str,
+        exit_code: Option<i32>,
+        status: RunStatus,
+        capture_sources: &str,
+        agent_version: &str,
+        dropped_events: u64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs
+                    SET ended_at = ?2, exit_code = ?3, status = ?4,
+                        capture_sources = ?5, agent_version = ?6, dropped_events = ?7
+                  WHERE run_id = ?1",
+                params![
+                    run_id,
+                    ended_at,
+                    exit_code,
+                    status.as_str(),
+                    capture_sources,
+                    agent_version,
+                    dropped_events,
+                ],
+            )
+            .context("failed to close a run")?;
+        Ok(())
+    }
+
+    /// Attach checkpoint ids to a run (component E, wired at integration).
+    pub fn set_run_checkpoints(
+        &self,
+        run_id: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET checkpoint_start = ?2, checkpoint_end = ?3 WHERE run_id = ?1",
+                params![run_id, start, end],
+            )
+            .context("failed to record a run's checkpoints")?;
+        Ok(())
+    }
+
+    /// One run by id.
+    pub fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1"),
+                params![run_id],
+                read_run,
+            )
+            .optional()
+            .context("failed to read a run")
+    }
+
+    /// Runs newest first.
+    pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {RUN_COLUMNS} FROM runs ORDER BY started_at DESC, run_id DESC LIMIT ?1"
+            ))
+            .context("failed to prepare the run list")?;
+        let rows = stmt
+            .query_map(params![limit as i64], read_run)
+            .context("failed to list runs")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("failed to read a run")?);
+        }
+        Ok(out)
+    }
+
+    /// The runs the collector should be attributing to right now.
+    ///
+    /// The hot read: once per flush batch. Answered from the same connection
+    /// and the same database as the events, so there is no second source of
+    /// truth to fall out of step with what `devbox run` wrote.
+    pub fn active_runs(&self) -> Result<Vec<ActiveRun>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, cgroup_id, root_pid, started_at, ended_at
+                   FROM runs WHERE status = 'running'",
+            )
+            .context("failed to prepare the active-run read")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ActiveRun {
+                    run_id: row.get(0)?,
+                    cgroup_id: row.get::<_, i64>(1)? as u64,
+                    root_pid: row.get::<_, i64>(2)? as u32,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                })
+            })
+            .context("failed to read the active runs")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("failed to read an active run")?);
+        }
+        Ok(out)
+    }
+
+    /// How many events of each attribution kind one run collected, and how
+    /// many of its window's events were attributed to nothing at all.
+    ///
+    /// The second number is the one that keeps a report honest: a run whose
+    /// coverage is mostly `window` and whose window also holds a thousand
+    /// unattributed events is not a report of that command.
+    pub fn attribution_counts(&self, run_id: &str) -> Result<Vec<(Attribution, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT attribution, COUNT(*) FROM events
+                  WHERE run_id = ?1 AND attribution IS NOT NULL
+                  GROUP BY attribution ORDER BY attribution",
+            )
+            .context("failed to prepare the attribution histogram")?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("failed to run the attribution histogram")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, n) = row.context("failed to read an attribution count")?;
+            if let Ok(kind) = kind.parse::<Attribution>() {
+                out.push((kind, n as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Policy refusals per run, for the console's Runs tab.
+    ///
+    /// One grouped query rather than one per row: the tab lists twenty runs,
+    /// and twenty round trips to answer a single column is how a list page
+    /// becomes slow enough that someone caches it wrongly. The verdict lives
+    /// inside the stored JSON — it is not a filter column, because until now
+    /// nothing filtered on it.
+    pub fn refusals_by_run(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, COUNT(*) FROM events
+                  WHERE type = 'policy' AND run_id IS NOT NULL
+                    AND json_extract(raw, '$.policy.verdict') != 'allow'
+                  GROUP BY run_id",
+            )
+            .context("failed to prepare the refusal histogram")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("failed to run the refusal histogram")?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (run_id, n) = row.context("failed to read a refusal count")?;
+            out.insert(run_id, n as u64);
+        }
+        Ok(out)
+    }
+
+    /// Events in a window that no run claimed.
+    pub fn unattributed_in_window(&self, since: &str, until: Option<&str>) -> Result<u64> {
+        let n: i64 = match until {
+            Some(until) => self.conn.query_row(
+                "SELECT COUNT(*) FROM events
+                  WHERE run_id IS NULL AND ts_wall >= ?1 AND ts_wall <= ?2",
+                params![normalize_ts(since), normalize_ts(until)],
+                |r| r.get(0),
+            ),
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id IS NULL AND ts_wall >= ?1",
+                params![normalize_ts(since)],
+                |r| r.get(0),
+            ),
+        }
+        .context("failed to count unattributed events")?;
+        Ok(n as u64)
     }
 
     /// Read the next page of a live tail, within `(after_id, up_to_id]`.
@@ -274,30 +660,63 @@ impl Store {
         limit: usize,
         max_bytes: usize,
     ) -> Result<(Vec<Event>, i64)> {
+        self.scan_window(after_id, up_to_id, limit, max_bytes, None)
+    }
+
+    /// [`Store::tail_scan`], optionally restricted to one run.
+    ///
+    /// The run filter is in SQL and not in the caller because a decoded
+    /// [`Event`] has no `run_id`: attribution is a host conclusion stored
+    /// beside the event, not a field the agent sends, so there is nothing to
+    /// test once the row has been turned back into an `Event`.
+    pub fn scan_window(
+        &self,
+        after_id: i64,
+        up_to_id: i64,
+        limit: usize,
+        max_bytes: usize,
+        run_id: Option<&str>,
+    ) -> Result<(Vec<Event>, i64)> {
         // The size test is in the projection, not the predicate: an oversized
         // row must still advance the scan, or it wedges the tail exactly the
         // way an undecodable one did.
+        // Not `LENGTH(raw)`. On a TEXT value SQLite's `LENGTH` counts
+        // *characters*, so a cap meant as sixty-four kilobytes admitted four
+        // times that for any event carrying multibyte content — which a
+        // command line or a domain name routinely does. The cast measures
+        // storage.
+        let sql = format!(
+            "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END
+               FROM events WHERE id > ? AND id <= ?{}
+              ORDER BY id ASC LIMIT ?",
+            if run_id.is_some() {
+                " AND run_id = ?"
+            } else {
+                ""
+            }
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                // Not `LENGTH(raw)`. On a TEXT value SQLite's `LENGTH` counts
-                // *characters*, so a cap meant as sixty-four kilobytes admitted
-                // four times that for any event carrying multibyte content —
-                // which a command line or a domain name routinely does. The
-                // cast measures storage.
-                "SELECT id, CASE WHEN LENGTH(CAST(raw AS BLOB)) <= ? THEN raw ELSE NULL END
-                   FROM events WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
-            )
+            .prepare(&sql)
             .context("failed to prepare the tail scan")?;
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(max_bytes as i64),
+            Box::new(after_id),
+            Box::new(up_to_id),
+        ];
+        if let Some(run_id) = run_id {
+            args.push(Box::new(run_id.to_string()));
+        }
+        args.push(Box::new(limit as i64));
         let rows = stmt
-            .query_map(
-                params![max_bytes as i64, after_id, up_to_id, limit as i64],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
+            .query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
             .context("failed to run the tail scan")?;
 
         let mut events = Vec::new();
         let mut scanned_to = after_id;
+        let mut undecodable = Undecodable::new("a live tail");
         for row in rows {
             let (id, raw) = row.context("failed to read a row")?;
             scanned_to = scanned_to.max(id);
@@ -307,7 +726,7 @@ impl Store {
             };
             match serde_json::from_str(&raw) {
                 Ok(event) => events.push(event),
-                Err(e) => tracing::warn!(error = %e, "stored event no longer decodes"),
+                Err(e) => undecodable.record(&e),
             }
         }
         Ok((events, scanned_to))
@@ -364,6 +783,10 @@ impl Store {
                 args.push(Box::new(k.as_str().to_string()));
             }
         }
+        if let Some(run_id) = &q.run_id {
+            sql.push_str(" AND run_id = ?");
+            args.push(Box::new(run_id.clone()));
+        }
         if let Some(peer) = &q.peer {
             sql.push_str(" AND peer LIKE ?");
             args.push(Box::new(format!("%{peer}%")));
@@ -392,6 +815,9 @@ impl Store {
             .context("failed to run query")?;
 
         let mut out = Vec::new();
+        // A row that no longer parses is schema drift, not a reason to fail
+        // the whole query — count it and keep the rest usable.
+        let mut undecodable = Undecodable::new("a query");
         for row in rows {
             let (_, raw) = row.context("failed to read a row")?;
             // Nulled by the size cap. A window that is mostly oversized comes
@@ -400,9 +826,7 @@ impl Store {
             let Some(raw) = raw else { continue };
             match serde_json::from_str(&raw) {
                 Ok(event) => out.push(event),
-                // A row that no longer parses is a schema drift, not a reason
-                // to fail the whole query — log it and keep the rest usable.
-                Err(e) => tracing::warn!(error = %e, "stored event no longer decodes"),
+                Err(e) => undecodable.record(&e),
             }
         }
         Ok(out)
@@ -461,6 +885,7 @@ impl Store {
         let mut budget = bytes;
         let mut truncated = false;
         let mut out = Vec::new();
+        let mut undecodable = Undecodable::new("an export");
         let mut cursor = stmt
             .query(params_from_iter(args.iter().map(|a| a.as_ref())))
             .context("failed to run export")?;
@@ -485,12 +910,126 @@ impl Store {
                     // The export is now missing an event it was asked for.
                     // Silence here let an incomplete audit present itself as a
                     // complete one, which is the one thing this flag exists to
-                    // prevent.
+                    // prevent — so the *flag* stays per row even though the
+                    // logging is now per read.
                     truncated = true;
-                    tracing::warn!(error = %e, "stored event no longer decodes");
+                    undecodable.record(&e);
                 }
             }
         }
+        Ok((out, truncated))
+    }
+
+    /// The inclusive row-id range a selection occupies, or `None` if it is empty.
+    ///
+    /// A scan bounded by ids costs the rows in the range; the same scan
+    /// bounded only by a predicate in the caller costs the whole table. On a
+    /// 442k-row store the difference was seven seconds of reading events for
+    /// an export that wanted a handful of them — the rows still had to be
+    /// decoded from JSON before anything could look at their timestamps.
+    ///
+    /// `MIN`/`MAX` over an indexed column, so this is two index probes rather
+    /// than a scan of its own.
+    pub fn id_bounds(
+        &self,
+        from: Option<&str>,
+        until: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        let mut sql = String::from("SELECT MIN(id), MAX(id) FROM events WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(from) = from {
+            sql.push_str(" AND ts_wall >= ?");
+            args.push(Box::new(normalize_ts(from)));
+        }
+        if let Some(until) = until {
+            sql.push_str(" AND ts_wall < ?");
+            args.push(Box::new(normalize_ts(until)));
+        }
+        if let Some(run_id) = run_id {
+            sql.push_str(" AND run_id = ?");
+            args.push(Box::new(run_id.to_string()));
+        }
+
+        let bounds: (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                &sql,
+                params_from_iter(args.iter().map(|a| a.as_ref())),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("failed to read a selection's row-id bounds")?;
+        Ok(match bounds {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None,
+        })
+    }
+
+    /// The *newest* events in a window, returned oldest-first.
+    ///
+    /// [`Store::export`] reads from the beginning, which is right for an audit
+    /// trail and wrong for a summary: a box with two million events answered
+    /// "what has this been doing" with its first seven minutes, from weeks
+    /// ago, and said only that the scan was cut short. A summary with no
+    /// `--since` means "lately".
+    ///
+    /// The `bool` is the same truncation flag `export` returns, and means the
+    /// same thing — there is more in this window than was read — except that
+    /// what was left out is *older* rather than newer.
+    pub fn recent(
+        &self,
+        since: Option<&str>,
+        rows: usize,
+        bytes: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let mut sql = String::from("SELECT raw FROM events WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = since {
+            sql.push_str(" AND ts_wall >= ?");
+            args.push(Box::new(normalize_ts(since)));
+        }
+        // One more than asked for, so "there is another row" is observed
+        // rather than inferred — the same reason `export` does it.
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        args.push(Box::new(rows as i64 + 1));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("failed to prepare the recent-events read")?;
+        let mut scanned = 0usize;
+        let mut budget = bytes;
+        let mut truncated = false;
+        let mut out = Vec::new();
+        let mut undecodable = Undecodable::new("a summary");
+        let mut cursor = stmt
+            .query(params_from_iter(args.iter().map(|a| a.as_ref())))
+            .context("failed to read recent events")?;
+        while let Some(row) = cursor.next().context("failed to read a row")? {
+            if scanned == rows {
+                truncated = true;
+                break;
+            }
+            scanned += 1;
+            let raw: String = row.get(0)?;
+            match budget.checked_sub(raw.len()) {
+                Some(left) => budget = left,
+                None => {
+                    truncated = true;
+                    break;
+                }
+            }
+            match serde_json::from_str(&raw) {
+                Ok(event) => out.push(event),
+                Err(e) => {
+                    truncated = true;
+                    undecodable.record(&e);
+                }
+            }
+        }
+        // Read newest-first so the limit keeps the recent events; returned
+        // oldest-first so every caller sees the same order `export` gives.
+        out.reverse();
         Ok((out, truncated))
     }
 
@@ -674,6 +1213,122 @@ impl Store {
 /// still over the limit is trimmed after the next one.
 const RETENTION_TRIM_PASSES: usize = 16;
 
+/// One statement for both insert paths, so a column added to one cannot be
+/// forgotten in the other — which is exactly how `run_id` would have gone
+/// missing from every batched event while the single-insert tests passed.
+const INSERT_EVENT: &str = "INSERT INTO events
+   (ts_wall, ts_mono_ns, box_id, cgroup_id, pid, tid, ppid, comm, uid,
+    type, peer, dport, path, raw, run_id, attribution)
+ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)";
+
+fn event_params<'a>(
+    event: &'a Event,
+    raw: &'a str,
+    tag: Option<&'a RunTag>,
+) -> Vec<Box<dyn rusqlite::ToSql + 'a>> {
+    vec![
+        Box::new(&event.ts_wall),
+        Box::new(event.ts_mono_ns),
+        Box::new(&event.box_id),
+        Box::new(event.cgroup_id),
+        Box::new(event.pid),
+        Box::new(event.tid),
+        Box::new(event.ppid),
+        Box::new(&event.comm),
+        Box::new(event.uid),
+        Box::new(event.kind.as_str()),
+        Box::new(event.peer()),
+        Box::new(event.net.as_ref().map(|n| n.dport)),
+        Box::new(event.path()),
+        Box::new(raw),
+        Box::new(tag.map(|t| t.run_id.as_str())),
+        Box::new(tag.map(|t| t.attribution.as_str())),
+    ]
+}
+
+/// The `runs` projection, in the order [`read_run`] expects.
+const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
+     exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
+     checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events";
+
+/// Counts rows a read could not decode, and says so exactly once.
+///
+/// Every one of these was a `warn!` per row. A store holding events from a
+/// newer schema — which is what happens the moment one binary on the box is
+/// ahead of another, and happened for real when the broker's `credential`
+/// events met a build that predated them — turned a single `devbox watch`
+/// into thousands of identical lines, with the useful output somewhere in the
+/// middle of them.
+///
+/// One line per read, on drop, so no caller has to remember to emit it. The
+/// count is the part that matters: one undecodable row is schema drift, ten
+/// thousand is a store this build should not be reading.
+#[derive(Debug)]
+struct Undecodable {
+    what: &'static str,
+    count: u64,
+    first: Option<String>,
+}
+
+impl Undecodable {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            count: 0,
+            first: None,
+        }
+    }
+
+    fn record(&mut self, error: &serde_json::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(error.to_string());
+        }
+    }
+}
+
+impl Drop for Undecodable {
+    fn drop(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        tracing::warn!(
+            skipped = self.count,
+            error = self.first.as_deref().unwrap_or(""),
+            "{} skipped stored events it could not decode; they were written by a \
+             newer schema than this build understands, or are damaged",
+            self.what,
+        );
+    }
+}
+
+fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    let argv: String = row.get(3)?;
+    Ok(RunRecord {
+        run_id: row.get(0)?,
+        box_id: row.get(1)?,
+        kind: row.get(2)?,
+        // A run whose argv no longer decodes is still a run that happened;
+        // losing the command line is better than losing the row.
+        argv: serde_json::from_str(&argv).unwrap_or_default(),
+        cwd: row.get(4)?,
+        label: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        exit_code: row.get(8)?,
+        status: row.get(9)?,
+        posture_before: row.get(10)?,
+        posture_during: row.get(11)?,
+        cgroup_id: row.get::<_, i64>(12)? as u64,
+        root_pid: row.get::<_, i64>(13)? as u32,
+        checkpoint_start: row.get(14)?,
+        checkpoint_end: row.get(15)?,
+        capture_sources: row.get(16)?,
+        agent_version: row.get(17)?,
+        dropped_events: row.get::<_, i64>(18)? as u64,
+    })
+}
+
 /// Put an RFC 3339 timestamp into the same normal form the store writes.
 ///
 /// Events are stored with a UTC `Z` suffix and compared as text, so a bound in
@@ -694,6 +1349,79 @@ fn normalize_ts(ts: &str) -> String {
 mod tests {
     use super::*;
     use crate::obs::event::{Exec, Net};
+
+    #[test]
+    fn a_summary_with_no_since_reads_the_newest_events_not_the_oldest() {
+        // The failure this fixes: a box with a long history answered "what has
+        // this been doing" with its *first* few minutes, from weeks ago, and
+        // said only that the scan had been cut short.
+        let mut store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..50)
+            .map(|i| {
+                event(
+                    EventType::Exec,
+                    1000 + i,
+                    &format!("2026-08-06T22:{:02}:00.000Z", i),
+                )
+            })
+            .collect();
+        store.insert_batch(&events).unwrap();
+
+        let (recent, truncated) = store.recent(None, 10, usize::MAX).unwrap();
+        assert!(truncated, "there is more than one scan can read");
+        assert_eq!(recent.len(), 10);
+        // Oldest-first in the result, newest-first in what it kept.
+        assert_eq!(recent.first().unwrap().pid, 1040);
+        assert_eq!(recent.last().unwrap().pid, 1049);
+
+        // `export` still reads from the beginning, which is what an audit
+        // trail wants; the two are deliberately different.
+        let (oldest, _) = store.export(None, 10, usize::MAX).unwrap();
+        assert_eq!(oldest.first().unwrap().pid, 1000);
+
+        // A window that fits is not reported as truncated by either.
+        let (all, truncated) = store.recent(None, 500, usize::MAX).unwrap();
+        assert_eq!(all.len(), 50);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn id_bounds_narrow_a_scan_to_the_rows_a_selection_occupies() {
+        let mut store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..20)
+            .map(|i| {
+                event(
+                    EventType::Exec,
+                    1000 + i,
+                    &format!("2026-08-06T22:{:02}:00.000Z", i),
+                )
+            })
+            .collect();
+        store.insert_batch(&events).unwrap();
+
+        let (first, last) = store
+            .id_bounds(
+                Some("2026-08-06T22:05:00.000Z"),
+                Some("2026-08-06T22:08:00.000Z"),
+                None,
+            )
+            .unwrap()
+            .expect("the window holds rows");
+        // 22:05, 22:06 and 22:07 — rows 6, 7 and 8 of twenty. The lower bound
+        // is inclusive and the upper is not, which is what `Query::until` and
+        // `Window::contains` both mean, so the ids agree with the filter that
+        // still runs over them.
+        assert_eq!((first, last), (6, 8));
+
+        // A window with nothing in it is `None`, not an empty range that a
+        // caller could mistake for "scan from 0".
+        assert!(
+            store
+                .id_bounds(Some("2099-01-01T00:00:00Z"), None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn writers_wait_for_a_short_sqlite_handoff_instead_of_dropping_immediately() {

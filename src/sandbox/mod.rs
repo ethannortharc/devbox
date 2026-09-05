@@ -883,6 +883,15 @@ impl SandboxManager {
     /// `devbox shell` is a plain, predictable login shell. Anyone who wants a
     /// multiplexer can still install and run one inside the box.
     pub async fn attach(&self, name: &str) -> Result<()> {
+        self.attach_with_env(name, &[]).await
+    }
+
+    /// Attach, with extra environment on the shell's command line.
+    ///
+    /// `extra` is how `devbox shell` gets `DEVBOX_RUN_ID` into the session: a
+    /// shell is recorded as a run like anything else, and it has no wrapper to
+    /// export it from.
+    pub async fn attach_with_env(&self, name: &str, extra: &[(String, String)]) -> Result<()> {
         let (state, runtime, claim) = self.prepare_running_for_use(name).await?;
 
         // Auto-snapshot on entry (best-effort, ignore failures)
@@ -919,7 +928,8 @@ impl SandboxManager {
 
         println!("Attaching to sandbox '{name}'...");
         let shell = crate::web::service::detect_shell(runtime.as_ref(), name).await;
-        let env = self.broker_env(runtime.as_ref(), name).await;
+        let mut env = self.broker_env(runtime.as_ref(), name).await;
+        env.extend_from_slice(extra);
         let cmd = crate::broker::with_env(&env, &[shell.to_string(), "-l".to_string()]);
         let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
         runtime.exec_as_user(name, &cmd_refs).await?;

@@ -18,7 +18,10 @@ pub mod list;
 pub mod nix_cmd;
 pub mod policy;
 pub mod prune;
+pub mod report;
 pub mod reprovision;
+pub mod run;
+pub mod runs;
 pub mod secret;
 pub mod self_update;
 pub mod sets;
@@ -88,6 +91,15 @@ pub enum Command {
 
     /// Run a one-off command in the sandbox
     Exec(exec::ExecArgs),
+
+    /// Run a command and record what it did (§4)
+    Run(run::RunArgs),
+
+    /// List a box's recorded runs
+    Runs(runs::RunsArgs),
+
+    /// Print a run's report
+    Report(report::ReportArgs),
 
     /// Stop a sandbox (preserves state)
     Stop(stop::StopArgs),
@@ -188,6 +200,7 @@ impl Command {
             Self::Create(_)
                 | Self::Shell(_)
                 | Self::Exec(_)
+                | Self::Run(_)
                 | Self::Reprovision(_)
                 | Self::Code(_)
                 | Self::Use(_)
@@ -216,6 +229,9 @@ impl Command {
             Command::Create(args) => create::run(args, manager).await,
             Command::Shell(args) => shell::run(args, manager).await,
             Command::Exec(args) => exec::run(args, manager).await,
+            Command::Run(args) => run::run(args, manager).await,
+            Command::Runs(args) => runs::run(args, manager).await,
+            Command::Report(args) => report::run(args, manager).await,
             Command::Stop(args) => stop::run(args, manager).await,
             Command::Destroy(args) => destroy::run(args, manager).await,
             Command::List(args) => list::run(args, manager).await,

@@ -10,6 +10,7 @@
 //! - [`health`] — per-box capture health, so an empty view can say why.
 //! - [`supervisor`] — one live collector per registered box.
 //! - [`correlate`] — the join that turns a wall of events into a story (§7.2).
+//! - [`run`] — a bounded execution with an identity, and its attribution (§4).
 
 pub mod behavior;
 pub mod collector;
@@ -18,10 +19,12 @@ pub mod daemon;
 pub mod event;
 pub mod health;
 pub mod pcap;
+pub mod run;
 pub mod store;
 pub mod supervisor;
 
 pub use event::{Event, EventType};
+pub use run::{Attribution, RunKind, RunRecord, RunStatus};
 pub use store::{Query, Retention, Store};
 
 /// Whether a box can connect to a host-owned Unix-domain socket through a

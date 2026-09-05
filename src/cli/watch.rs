@@ -131,6 +131,8 @@ pub async fn run(args: WatchArgs, manager: &SandboxManager) -> Result<()> {
         } else {
             kinds.clone()
         },
+        // `devbox watch` is the whole box; a run-scoped view is `devbox report`.
+        run_id: None,
         peer: None,
         path: if filtering_late {
             None

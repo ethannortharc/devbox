@@ -295,10 +295,20 @@ fn the_window_selects_on_ts_wall_with_an_exclusive_upper_bound() {
     .unwrap();
     let (text, stats) = export_to_string(&store, &window, Format::Jsonl);
 
-    assert_eq!(
+    // The scan is bounded by the window's row-id range, not by the store.
+    // Reading everything and discarding most of it after decoding it from JSON
+    // is what made a 442k-row export take about seven seconds; the assertion
+    // is here so a regression to that shows up as a test failure rather than
+    // as a slow command.
+    assert!(
+        stats.scanned < events.len() as u64,
+        "the scan read {} of {} rows — it should stop at the window's bounds",
         stats.scanned,
-        events.len() as u64,
-        "the cursor still reads the store"
+        events.len()
+    );
+    assert!(
+        stats.scanned >= stats.matched,
+        "the scan cannot match more rows than it read"
     );
     let kept: Vec<Event> = text
         .lines()
@@ -311,6 +321,77 @@ fn the_window_selects_on_ts_wall_with_an_exclusive_upper_bound() {
         "the lower bound is inclusive and the upper bound excludes the 09.310 policy event"
     );
     assert_eq!(stats.matched, 5);
+}
+
+#[test]
+fn a_run_selects_its_own_events_and_nothing_else() {
+    // `--run` is a SQL predicate, not a filter in the caller: a decoded event
+    // carries no `run_id`, so there would be nothing left to test by the time
+    // it reached Rust.
+    use devbox::obs::run::{Attribution, RunTag};
+
+    let events = events();
+    let mut store = Store::open_in_memory().unwrap();
+    // Half the fixture belongs to a run; the rest is the box getting on with
+    // its life around it.
+    let run = "01K4SZ0000000000000000ABCD";
+    let tags: Vec<Option<RunTag>> = events
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            (i % 2 == 0).then(|| RunTag {
+                run_id: run.to_string(),
+                attribution: Attribution::Cgroup,
+            })
+        })
+        .collect();
+    store.insert_batch_tagged(&events, &tags).unwrap();
+    let mine = tags.iter().filter(|t| t.is_some()).count() as u64;
+
+    let mut out: Vec<u8> = Vec::new();
+    let stats = export::run_selection(
+        &store,
+        &Window::default(),
+        Some(run),
+        &ctx(),
+        Format::Jsonl,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(stats.written, mine);
+    assert_eq!(stats.matched, mine);
+    assert_eq!(
+        String::from_utf8(out).unwrap().lines().count() as u64,
+        mine,
+        "the export holds exactly the run's events"
+    );
+
+    // A run nobody recorded exports an empty document, not the whole store.
+    let mut out: Vec<u8> = Vec::new();
+    let stats = export::run_selection(
+        &store,
+        &Window::default(),
+        Some("01K4SZ0000000000000000ZZZZ"),
+        &ctx(),
+        Format::Jsonl,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(stats.written, 0);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn an_empty_selection_still_produces_a_valid_otlp_document() {
+    // Zero bytes is not a valid OTLP request, and a collector fed one reports
+    // a parse error rather than "nothing matched" — which sends whoever ran
+    // the export looking for a bug in the wrong place.
+    let store = store_with(&events());
+    let window = Window::parse(Some("2099-01-01T00:00:00Z"), None).unwrap();
+    let (text, stats) = export_to_string(&store, &window, Format::OtlpJson);
+    assert_eq!(stats.written, 0);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+    assert!(parsed["resourceLogs"].is_array());
 }
 
 #[test]

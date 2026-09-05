@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::correlate;
 use super::event::{Event, EventType};
@@ -46,7 +46,11 @@ pub struct Summary {
 }
 
 /// A connection policy did not allow.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`: a run report is written to disk as
+/// JSON and re-rendered from that file after its events have aged out of the
+/// store (`report::load`), so every type inside the report has to round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Violation {
     pub target: String,
     pub verdict: String,

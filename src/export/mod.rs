@@ -203,14 +203,57 @@ pub fn run<W: Write>(
     format: Format,
     out: &mut W,
 ) -> Result<Stats> {
+    run_selection(store, window, None, ctx, format, out)
+}
+
+/// [`run`], optionally restricted to one run's events (§4.1).
+///
+/// The run is a SQL predicate rather than a filter here, because a decoded
+/// [`crate::obs::Event`] carries no `run_id` — attribution is a host
+/// conclusion stored beside the event, not something the agent sends.
+pub fn run_selection<W: Write>(
+    store: &Store,
+    window: &Window,
+    run_id: Option<&str>,
+    ctx: &Context,
+    format: Format,
+    out: &mut W,
+) -> Result<Stats> {
     let mut stats = Stats::default();
 
     // Pin the high-water mark before the first page. Without it, rows written
     // while the export runs land inside a later page but outside the window
     // the export claims to cover.
-    let up_to = store
+    let max_id = store
         .max_id()
         .context("failed to read the store's high-water mark")?;
+
+    // Then narrow to the ids the selection actually occupies.
+    //
+    // Without this the scan read every row in the store and threw most of them
+    // away *after* decoding them from JSON, which on a 442k-row box cost about
+    // seven seconds to export a handful of events. The bounds come from two
+    // index probes; the timestamp filter below stays, because the id range is
+    // a superset — `ts_wall` is written by the guest and a clock step can put
+    // an out-of-window event inside the range.
+    let bounds = store
+        .id_bounds(window.from.as_deref(), window.until.as_deref(), run_id)
+        .context("failed to bound the export")?;
+    let Some((first, last)) = bounds else {
+        // Nothing matches. Still emit the format's envelope, so a consumer
+        // gets a valid empty document rather than zero bytes.
+        if format == Format::OtlpJson {
+            out.write_all(otlp::request_prefix(ctx)?.as_bytes())
+                .context("failed to write the OTLP request header")?;
+            out.write_all(otlp::REQUEST_SUFFIX.as_bytes())
+                .context("failed to close the OTLP request")?;
+            out.write_all(b"\n")
+                .context("failed to close the OTLP request")?;
+        }
+        out.flush().context("failed to flush the export")?;
+        return Ok(stats);
+    };
+    let up_to = max_id.min(last);
 
     if format == Format::OtlpJson {
         out.write_all(otlp::request_prefix(ctx)?.as_bytes())
@@ -218,10 +261,10 @@ pub fn run<W: Write>(
     }
     let mut first_record = true;
 
-    let mut cursor = 0i64;
+    let mut cursor = first - 1;
     while cursor < up_to {
         let (events, scanned_to) = store
-            .tail_scan(cursor, up_to, PAGE, NO_BYTE_CAP)
+            .scan_window(cursor, up_to, PAGE, NO_BYTE_CAP, run_id)
             .context("failed to read a page of events")?;
         stats.scanned += events.len() as u64;
 
