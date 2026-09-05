@@ -48,9 +48,10 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W1 | W1-G export as OCSF 1.3 and OTLP/JSON | `v5/export` | **DONE** |
 | W2 | W2-0 file events get a scope | `v5/file-scope` | **DONE** |
 | W2 | W2-1 wire A to E, B, G; newest-first summary; `export --run` | `v5/run` | **DONE** |
-| W2 | W2-2 `mcp run` as a run, `mcp report`, `mcp self` | `v5/mcp` | in flight |
+| W2 | W2-2 `mcp run` as a run, `mcp report`, `mcp self` | `v5/mcp` | **DONE** |
 | W2 | W2-3 sweep: discard remount, `checkpoint-rm`, guest home, NixOS file scope | `v5/sweep` | **DONE** |
 | W2 | W2-4 README, docs, screenshot, ADR-0059…0067, version 0.2.0 | `v5/docs` | **DONE** |
+| W2 | W2-5 run report polish: fold the wrapper out of Processes, wire Credentials | — | in flight |
 
 ## Environment notes
 
