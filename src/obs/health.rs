@@ -64,6 +64,12 @@ pub struct CaptureHealth {
     /// Capture backends the agent reported in its hello.
     #[serde(default)]
     pub capture: Vec<String>,
+    /// The composed capture sources the agent's preflight actually kept —
+    /// `ebpf+packet+netfilter`, `proc+packet`. Empty for a record written
+    /// before this field existed, or by an agent that predates it; readers
+    /// go through [`capture_source`], which falls back to `ebpf`.
+    #[serde(default)]
+    pub source: String,
     #[serde(default)]
     pub agent_version: String,
     /// Why the last attempt ended, empty while it has not.
@@ -89,6 +95,7 @@ impl CaptureHealth {
             transport: String::new(),
             ebpf: false,
             capture: Vec::new(),
+            source: String::new(),
             agent_version: String::new(),
             detail: String::new(),
             attempts: 0,
@@ -108,6 +115,48 @@ impl CaptureHealth {
     pub fn with_attempts(mut self, attempts: u32) -> Self {
         self.attempts = attempts;
         self
+    }
+}
+
+/// What a degraded capture cannot see.
+///
+/// Named rather than implied. `proc + packet` was previously reported as a
+/// bare backend list, which reads like a different implementation of the same
+/// coverage — and the difference is not cosmetic: /proc/net/tcp has no pid
+/// column, so every connection arrives unattributed, and nothing polls file
+/// access at all.
+pub const DEGRADED_LOSS: &str = "no process attribution, no file events";
+
+/// The capture source of one box, as a line a human can act on.
+///
+/// One function so `devbox doctor` and the console's capture bar cannot drift
+/// apart — they answer the same question from the same record, and a reader
+/// who checks both should not have to reconcile two phrasings.
+///
+/// The record's own `source` when the agent sent one; otherwise reconstructed
+/// from `ebpf`, because an agent from before the field existed still knows
+/// whether it attached the probes.
+pub fn capture_source(health: &CaptureHealth) -> String {
+    let composition = capture_composition(health);
+    if health.ebpf {
+        composition
+    } else {
+        format!("{composition} (degraded: {DEGRADED_LOSS})")
+    }
+}
+
+/// Just the composition — `ebpf+packet`, `proc+packet` — with no verdict.
+///
+/// For callers with somewhere else to put the verdict: the console's status bar
+/// names the composition in its headline and spends a whole sentence on what a
+/// degraded one costs, where `doctor` has one line for both.
+pub fn capture_composition(health: &CaptureHealth) -> String {
+    if health.source.is_empty() {
+        // An agent from before the field. It still knows whether it attached
+        // the probes, so this is a reconstruction, not a guess.
+        if health.ebpf { "ebpf" } else { "proc" }.to_string()
+    } else {
+        health.source.clone()
     }
 }
 
@@ -234,6 +283,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let health = CaptureHealth::new("../../escape", CaptureState::Failed);
         assert!(publish(dir.path(), &health).is_err());
+    }
+
+    #[test]
+    fn a_kernel_capture_names_its_composition_and_nothing_else() {
+        let mut health = CaptureHealth::new("alpha", CaptureState::Streaming);
+        health.ebpf = true;
+        health.source = "ebpf+packet+netfilter".into();
+        assert_eq!(capture_source(&health), "ebpf+packet+netfilter");
+    }
+
+    #[test]
+    fn a_degraded_capture_says_what_it_costs() {
+        let mut health = CaptureHealth::new("alpha", CaptureState::Streaming);
+        health.source = "proc+packet".into();
+        assert_eq!(
+            capture_source(&health),
+            "proc+packet (degraded: no process attribution, no file events)"
+        );
+    }
+
+    #[test]
+    fn an_agent_from_before_the_source_field_still_reports_a_source() {
+        // The field is new; the agent that omits it is not broken, and
+        // reporting nothing would be worse than reporting what `ebpf` implies.
+        let mut kernel = CaptureHealth::new("alpha", CaptureState::Streaming);
+        kernel.ebpf = true;
+        assert_eq!(capture_source(&kernel), "ebpf");
+
+        let polling = CaptureHealth::new("alpha", CaptureState::Streaming);
+        assert!(capture_source(&polling).starts_with("proc (degraded:"));
     }
 
     #[test]

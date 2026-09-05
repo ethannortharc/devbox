@@ -22,8 +22,17 @@ task_plan.md
 /ztpd/bin/
 *.o
 /agent/bpf/vmlinux.h
-/agent/bpf/devbox_*_bpfel.go
 /agent/bpf/devbox_*_bpfeb.go
+
+# bpf2go output is tracked, one pair per architecture.
+#
+# A CO-RE object can only be produced on a Linux host of the target
+# architecture with BTF, so leaving it untracked meant a source build on macOS
+# had no way to embed the eBPF agent and silently fell back to proc polling.
+# Committing the generated pair is the cilium/ebpf convention. These negations
+# must come after `*.o` above, which would otherwise swallow the objects.
+!/agent/bpf/devbox_*_bpfel.go
+!/agent/bpf/devbox_*_bpfel.o
 
 # Python
 __pycache__/

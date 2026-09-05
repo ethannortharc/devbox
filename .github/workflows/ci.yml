@@ -155,7 +155,54 @@ jobs:
         run: sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
 
       - name: build eBPF objects
-        run: go generate -tags bpf2go ./agent/bpf
+        run: |
+          # Keep the committed bindings: `go generate` overwrites them, and the
+          # next step's whole job is to compare the two.
+          if [ -f agent/bpf/devbox_amd64_bpfel.go ]; then
+            cp agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed
+          fi
+          go generate -tags bpf2go ./agent/bpf
+
+      # bpf2go writes a pair, and only one half of it can be gated here.
+      #
+      # The .go bindings name the loader's API surface — programs, maps, record
+      # types — so they move only when `devbox.bpf.c` moves. A difference is a
+      # real staleness signal and nothing else produces one.
+      #
+      # The .o cannot be byte-compared. It embeds BTF taken from this runner's
+      # own kernel, so a clang upgrade or a runner image bump rewrites its bytes
+      # while the source stands still; gating on that turns the build red for
+      # something no commit caused. It is uploaded instead, every run, for a
+      # maintainer to commit when the source behind it changed.
+      #
+      # What that leaves uncovered is named in agent/bpf/README.md: editing a
+      # probe body without touching a name changes the object and not the
+      # bindings, and no CI check can see it.
+      - name: check the committed amd64 bindings are current
+        run: |
+          if [ ! -f agent/bpf/devbox_amd64_bpfel.go.committed ]; then
+            echo "::notice::no committed amd64 pair yet; download devbox-bpf-amd64 from this run and commit both files"
+            exit 0
+          fi
+          if ! cmp -s agent/bpf/devbox_amd64_bpfel.go agent/bpf/devbox_amd64_bpfel.go.committed; then
+            echo "::error file=agent/bpf/devbox_amd64_bpfel.go::the committed amd64 bindings are not what this source generates."
+            echo "Download the devbox-bpf-amd64 artifact from this run and commit both files."
+            diff -u agent/bpf/devbox_amd64_bpfel.go.committed \
+                    agent/bpf/devbox_amd64_bpfel.go || true
+            exit 1
+          fi
+          rm -f agent/bpf/devbox_amd64_bpfel.go.committed
+
+      # Uploaded on failure too: a failing bindings check is exactly when the
+      # generated pair is the thing you came for.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: devbox-bpf-amd64
+          path: |
+            agent/bpf/devbox_amd64_bpfel.go
+            agent/bpf/devbox_amd64_bpfel.o
+          retention-days: 14
 
       - name: load probes and capture a scripted workload
         run: |

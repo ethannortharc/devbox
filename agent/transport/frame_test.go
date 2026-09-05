@@ -133,7 +133,8 @@ func TestHandshakeSucceeds(t *testing.T) {
 	conn := pipe{in: &toAgent, out: &fromAgent}
 	err := Handshake(conn, Hello{
 		Version: "0.1.3", BoxID: "myapp",
-		Capture: []string{"exec", "connect"}, EBPF: true,
+		Capture: []string{"exec", "connect"},
+		Source:  "ebpf+packet", EBPF: true,
 	})
 	if err != nil {
 		t.Fatalf("Handshake: %v", err)
@@ -146,7 +147,7 @@ func TestHandshakeSucceeds(t *testing.T) {
 	if hello.Protocol != ProtocolVersion {
 		t.Errorf("Hello.Protocol = %d, want %d", hello.Protocol, ProtocolVersion)
 	}
-	if hello.BoxID != "myapp" || !hello.EBPF {
+	if hello.BoxID != "myapp" || !hello.EBPF || hello.Source != "ebpf+packet" {
 		t.Errorf("Hello lost fields: %+v", hello)
 	}
 }

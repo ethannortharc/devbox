@@ -38,14 +38,97 @@ the two together, and let the size assertions catch you if you forget.
 Generation is behind the `bpf2go` build tag so a plain `go build` works on any
 host, including macOS where eBPF cannot exist at all.
 
-On a Linux host with `clang`, libbpf headers, and `bpftool`:
+`devbox_<arch>_bpfel.go` and `devbox_<arch>_bpfel.o` are **tracked**, one pair
+per guest architecture. They are generated output, and committing generated
+output is a cost — but the alternative was worse. bpf2go compiles kprobe
+register access against the build host's own BTF, so the object can only be
+produced on a Linux machine of the target architecture with a BTF kernel; a
+developer on macOS has neither. While the pair was untracked, `build.rs` had no
+object to embed and every build from source — which is every build outside a
+tagged release — silently shipped the portable proc+packet agent instead. The
+symptom was not an error. It was `devbox watch` reporting connections with pid
+`4294967295`, no file events at all, and a behaviour summary reading `↑0B ↓0B`:
+a capture that looked like a working one.
+
+`vmlinux.h` stays untracked. It is 5 MB of one kernel's types, it is an input
+rather than an artifact, and unlike the object it can be regenerated anywhere
+the object can.
+
+### Regenerating
+
+On a Linux host of the target architecture with `clang`, libbpf headers, and
+`bpftool`:
 
 ```bash
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > agent/bpf/vmlinux.h
-go generate -tags bpf2go ./agent/bpf/...
+go generate -tags bpf2go ./agent/bpf
 ```
 
-`vmlinux.h` is generated, kernel-specific, and deliberately untracked.
+`go generate` passes `-target $GOARCH`, so the pair it writes is named for the
+architecture of the host doing the generating. Commit both files.
+
+Inside a devbox NixOS guest, which is the usual way to reach an arm64 kernel
+from a macOS host:
+
+```bash
+nix-shell -p go clang llvm libbpf --run '
+  export NIX_HARDENING_ENABLE=""
+  go generate -tags bpf2go ./agent/bpf'
+```
+
+`NIX_HARDENING_ENABLE=""` is required: nixpkgs' cc-wrapper injects
+`-fzero-call-used-regs=used-gpr`, which clang rejects outright for the `bpfel`
+target.
+
+### When it must be regenerated
+
+Regenerate and commit the pair for **every** architecture when any of these
+changes:
+
+- `devbox.bpf.c`, in any way at all — not only when a program, map, or record
+  struct is added or renamed. Editing the body of an existing probe changes the
+  object and leaves the bindings identical, and that case is the one nothing
+  else will catch (see below).
+- `agent/decode/record.go`'s layout. It and the record structs in
+  `devbox.bpf.c` are mirrors of one another, and `agent/decode`'s size
+  assertions are what turn a half-applied change into a test failure instead of
+  a misdecoded event.
+- The pinned `github.com/cilium/ebpf` version, which can change the shape of
+  the generated loader.
+
+A stale object does not fail to build. It loads, it attaches, and it decodes
+into plausible-looking nonsense — pids that are not pids, paths assembled from
+the wrong offsets. That is the failure mode this section exists to prevent.
+
+### What CI does and does not check
+
+The `ebpf` job regenerates the amd64 pair on every run, and gates the two
+halves differently:
+
+| file | gate |
+|---|---|
+| `devbox_amd64_bpfel.go` | byte-compared against what is committed; **differs → job fails** |
+| `devbox_amd64_bpfel.o` | not compared; uploaded as the `devbox-bpf-amd64` artifact |
+
+The bindings are comparable because they encode only the loader's API surface —
+program, map, and type names — which moves when and only when `devbox.bpf.c`
+moves.
+
+The object is not. It embeds BTF derived from the runner's own kernel, so a
+clang upgrade or a runner image bump rewrites its bytes with no commit behind
+the change. Gating on that would mean a red build that no diff explains and
+that regenerating "fixes" only until the next image bump, which is how a check
+gets ignored and then deleted.
+
+**So one case is on you, not on CI**: change a probe's body without touching a
+program, map, or type name, and the bindings come out identical while the
+object does not. CI stays green with a stale object committed. Treat the list
+above as the rule and regenerate on any `devbox.bpf.c` edit.
+
+The amd64 pair is produced by CI, not by hand — no arm64 developer machine can
+make a valid one. Every run uploads the freshly generated pair as
+`devbox-bpf-amd64` (kept 14 days), including runs where the bindings check
+failed, which is precisely when you want it: download it and commit both files.
 
 ## Testing
 
@@ -54,8 +137,10 @@ go generate -tags bpf2go ./agent/bpf/...
 - **Loading and attaching** — the `ebpf` job in `.github/workflows/ci.yml`, on
   a privileged Linux runner with BTF.
 
-Release artifacts embed the generated CO-RE agent, which runs inside the Lima
-guest on macOS. A plain source build embeds the portable proc+packet agent.
+A source build embeds the CO-RE agent whenever this checkout has the object for
+the guest architecture — `build.rs` looks for `devbox_<arch>_bpfel.o` and adds
+`-tags ebpf` when it finds one. Without it the build still succeeds, embedding
+the portable proc+packet agent and warning that it did.
 
 ## Why connect needs both entry and handshake-completion probes
 

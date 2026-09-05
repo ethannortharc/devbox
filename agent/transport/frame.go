@@ -45,6 +45,16 @@ type Hello struct {
 	// Capture lists the domains this agent is capturing, so the console can
 	// show what is and is not being watched rather than guessing.
 	Capture []string `json:"capture"`
+	// Source names the composed capture backends that survived preflight —
+	// "ebpf+packet+netfilter", "proc+packet". Domains say what is watched;
+	// this says what is doing the watching, and the two answer different
+	// questions: proc polling reports `connect` without any process to
+	// attribute it to, so a Capture list alone cannot distinguish full
+	// coverage from a plausible-looking degraded one.
+	//
+	// Added after Capture and EBPF, and read with a default on the collector
+	// side: an agent predating this field is still a valid agent.
+	Source string `json:"source,omitempty"`
 	// EBPF is false in the degraded `--no-ebpf` mode (§13), which the UI
 	// marks so nobody mistakes proc-polling coverage for kernel coverage.
 	EBPF bool `json:"ebpf"`

@@ -493,6 +493,7 @@ func stream(ctx context.Context, cfg config, source capture.Source, out io.Write
 		Version: buildinfo.Version,
 		BoxID:   cfg.boxID,
 		Capture: domains,
+		Source:  source.Name(),
 		EBPF:    sourceIncludes(source, "ebpf"),
 	}
 

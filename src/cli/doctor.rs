@@ -168,6 +168,9 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
                     Ok(result) if result.exit_code == 0 => {
                         print_guest_probe(&result.stdout, &state.runtime)
                     }
+                    // Keep going: which capture source is live is host-side
+                    // knowledge and stays answerable when the guest shell does
+                    // not.
                     Ok(result) => println!(
                         "    \x1b[31mprobe failed\x1b[0m (exit {}): {}{}",
                         result.exit_code,
@@ -176,6 +179,7 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
                     ),
                     Err(error) => println!("    \x1b[31mprobe failed\x1b[0m — {error}"),
                 }
+                print_capture_source(&manager.state_dir, &state.name);
             }
             Ok(SandboxStatus::Stopped | SandboxStatus::NotFound) => {}
             Ok(SandboxStatus::Unreachable(reason)) => println!(
@@ -377,6 +381,42 @@ async fn check_incus_network() {
                 }
             }
         }
+    }
+}
+
+/// Name what is actually collecting events inside one running box.
+///
+/// The guest probe above can only report that the agent *binary* is present.
+/// Whether it attached the kernel probes is decided at the agent's preflight
+/// and told to the collector in the handshake, and the difference is the whole
+/// question a reader has when `devbox watch` shows connections with no process
+/// against them: proc polling reads /proc/net/tcp, which has no pid column.
+fn print_capture_source(state_dir: &Path, name: &str) {
+    use crate::obs::health::{CaptureState, capture_source, load};
+
+    match load(state_dir, name) {
+        Ok(Some(health)) if health.state == CaptureState::Streaming => {
+            let colour = if health.ebpf { "32" } else { "33" };
+            println!(
+                "    capture: \x1b[{colour}m{}\x1b[0m",
+                capture_source(&health)
+            );
+        }
+        Ok(Some(health)) => {
+            let detail = if health.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", health.detail.trim())
+            };
+            println!(
+                "    capture: \x1b[33m{}\x1b[0m{detail}",
+                health.state.as_str()
+            );
+        }
+        // No record at all is the ordinary state of a box whose collector has
+        // not reached it yet, not a fault.
+        Ok(None) => println!("    capture: \x1b[33mno agent has connected yet\x1b[0m"),
+        Err(error) => println!("    capture: \x1b[31munreadable\x1b[0m — {error}"),
     }
 }
 
