@@ -1,5 +1,5 @@
 {
-  "activity_id": 1,
+  "activity_id": 2,
   "actor": {
     "process": {
       "name": "pip",
@@ -27,7 +27,8 @@
     "ip": "151.101.0.223",
     "port": 443
   },
-  "message": "connect pypi.org:443",
+  "duration": 690,
+  "message": "close pypi.org:443 ↑4.0KB ↓812.2KB 690ms",
   "metadata": {
     "product": {
       "name": "devbox",
@@ -44,6 +45,11 @@
     "ip": "10.0.0.5",
     "port": 51234
   },
-  "time": 1786054447612,
-  "type_uid": 400101
+  "time": 1786054448302,
+  "traffic": {
+    "bytes": 835822,
+    "bytes_in": 831720,
+    "bytes_out": 4102
+  },
+  "type_uid": 400102
 }

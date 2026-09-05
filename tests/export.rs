@@ -61,6 +61,16 @@ fn export_to_string(store: &Store, window: &Window, format: Format) -> (String, 
     (String::from_utf8(out).unwrap(), stats)
 }
 
+/// An OTLP record's attributes, by key.
+fn attributes(record: &Value) -> std::collections::BTreeMap<&str, &Value> {
+    record["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["key"].as_str().unwrap(), &a["value"]))
+        .collect()
+}
+
 /// Compare against a golden, or rewrite it under `UPDATE_GOLDEN=1`.
 fn golden(rel: &str, actual: &Value) {
     let path = fixture_dir().join(rel);
@@ -99,7 +109,10 @@ fn every_mapped_event_type_renders_its_golden_ocsf() {
             ),
         }
     }
-    assert_eq!(rendered, 9, "nine of the ten fixture types map to a class");
+    assert_eq!(
+        rendered, 10,
+        "ten of the eleven fixture types map to a class"
+    );
 }
 
 #[test]
@@ -140,7 +153,7 @@ fn type_uid_is_class_uid_times_a_hundred_plus_activity_id() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 9);
+    assert_eq!(checked, 10);
 }
 
 /// The §8 table, asserted as a table.
@@ -181,6 +194,11 @@ fn the_mapping_table_is_the_one_in_the_design() {
         by_kind[&EventType::Tls],
         (4001, 1),
         "Network Activity / Open"
+    );
+    assert_eq!(
+        by_kind[&EventType::Close],
+        (4001, 2),
+        "Network Activity / Close"
     );
     assert_eq!(
         by_kind[&EventType::Dns],
@@ -232,12 +250,12 @@ fn ocsf_drops_only_the_types_it_has_no_class_for_and_says_which() {
     let store = store_with(&events);
     let (text, stats) = export_to_string(&store, &Window::default(), Format::Ocsf);
 
-    assert_eq!(stats.written, 9);
+    assert_eq!(stats.written, 10);
     assert_eq!(stats.unmapped, 1);
     assert_eq!(stats.unmapped_summary(), "syscall=1");
     assert_eq!(
         text.lines().count(),
-        9,
+        10,
         "one line per written record, and no blank tail"
     );
     for line in text.lines() {
@@ -289,10 +307,10 @@ fn the_window_selects_on_ts_wall_with_an_exclusive_upper_bound() {
     let kinds: Vec<&str> = kept.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["accept", "file", "syscall", "api"],
+        vec!["accept", "file", "syscall", "close", "api"],
         "the lower bound is inclusive and the upper bound excludes the 09.310 policy event"
     );
-    assert_eq!(stats.matched, 4);
+    assert_eq!(stats.matched, 5);
 }
 
 #[test]
@@ -420,6 +438,75 @@ fn an_empty_store_exports_cleanly_in_every_format() {
             _ => assert!(text.is_empty(), "{}: {text:?}", format.as_str()),
         }
     }
+}
+
+/// A `close` is the only event that has settled byte counts, and both formats
+/// have somewhere to put them. Asserted directly rather than left to the
+/// goldens, because these three numbers are the reason the event exists.
+#[test]
+fn a_close_carries_its_settled_bytes_into_both_formats() {
+    let ctx = ctx();
+    let close = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Close)
+        .expect("the fixture has a close");
+    let net = close.net.clone().unwrap();
+    assert!(net.bytes_tx > 0 && net.bytes_rx > 0 && net.dur_ms > 0);
+
+    let ocsf = devbox::export::ocsf::render(&close, &ctx).expect("close maps");
+    assert_eq!(ocsf["class_uid"], 4001);
+    assert_eq!(ocsf["activity_id"], 2, "Close");
+    assert_eq!(ocsf["type_uid"], 400102);
+    assert_eq!(ocsf["traffic"]["bytes_out"], net.bytes_tx);
+    assert_eq!(ocsf["traffic"]["bytes_in"], net.bytes_rx);
+    assert_eq!(ocsf["traffic"]["bytes"], net.bytes_tx + net.bytes_rx);
+    assert_eq!(ocsf["duration"], net.dur_ms);
+    // `dir` decides the direction; the event type no longer can.
+    assert_eq!(ocsf["connection_info"]["direction_id"], 2, "dir=out");
+
+    let record = devbox::export::otlp::log_record(&close, &ctx);
+    let by_key = attributes(&record);
+    assert_eq!(record["eventName"], "devbox.close");
+    assert_eq!(
+        by_key["devbox.net.bytes_tx"]["intValue"],
+        net.bytes_tx.to_string()
+    );
+    assert_eq!(
+        by_key["devbox.net.bytes_rx"]["intValue"],
+        net.bytes_rx.to_string()
+    );
+    assert_eq!(
+        by_key["devbox.net.duration_ms"]["intValue"],
+        net.dur_ms.to_string()
+    );
+    assert_eq!(by_key["devbox.net.direction"]["stringValue"], "out");
+}
+
+/// A connection older than the agent: the bytes are real, the direction was
+/// never seen, and the process is whoever closed the socket. The record has to
+/// say all three rather than let a reader assume the usual case.
+#[test]
+fn an_orphan_close_is_unknown_direction_and_says_so() {
+    let ctx = ctx();
+    let mut close = events()
+        .into_iter()
+        .find(|e| e.kind == EventType::Close)
+        .unwrap();
+    let net = close.net.as_mut().unwrap();
+    net.dir = String::new();
+    net.orphan = true;
+
+    let ocsf = devbox::export::ocsf::render(&close, &ctx).unwrap();
+    assert_eq!(
+        ocsf["connection_info"]["direction_id"], 0,
+        "Unknown, not a guess at Outbound"
+    );
+    assert_eq!(ocsf["unmapped"]["orphan"], true);
+
+    let record = devbox::export::otlp::log_record(&close, &ctx);
+    let by_key = attributes(&record);
+    assert_eq!(by_key["devbox.net.orphan"]["boolValue"], true);
+    assert!(!by_key.contains_key("devbox.net.direction"));
 }
 
 // --------------------------------------------------------------- contract

@@ -60,7 +60,8 @@ const DEVICE_TYPE_VIRTUAL: i64 = 6;
 const FILE_TYPE_UNKNOWN: i64 = 0;
 const FILE_TYPE_REGULAR: i64 = 1;
 
-/// `connection_info.direction_id` — 1 Inbound, 2 Outbound.
+/// `connection_info.direction_id` — 0 Unknown, 1 Inbound, 2 Outbound.
+const DIRECTION_UNKNOWN: i64 = 0;
 const DIRECTION_INBOUND: i64 = 1;
 const DIRECTION_OUTBOUND: i64 = 2;
 
@@ -70,10 +71,9 @@ const DIRECTION_OUTBOUND: i64 = 2;
 /// The catch-all arm is load-bearing, not defensive: `EventType` is a shared
 /// contract that other tracks extend, and an export that panicked on a type it
 /// had not been taught would take down the one command an operator runs when
-/// something has already gone wrong. The two types known to be arriving:
+/// something has already gone wrong. `Close` arrived that way and cost one
+/// line. The type still to come:
 ///
-/// * `Close` (connection settlement, with byte counts) →
-///   `(CLASS_NETWORK_ACTIVITY, 2)` — Network Activity, activity "Close".
 /// * `Credential` (broker use) → `(CLASS_API_ACTIVITY, from the method)` —
 ///   API Activity, with `actor.session.uid = run_id`. Note that
 ///   `api_activity` has no `device` attribute, so [`base`] must drop it for
@@ -86,6 +86,7 @@ pub fn classify(event: &Event) -> Option<(i64, i64)> {
         EventType::Exit => (CLASS_PROCESS_ACTIVITY, 2), // Terminate
         EventType::File => (CLASS_FILE_ACTIVITY, file_activity_id(event)),
         EventType::Connect | EventType::Accept | EventType::Tls => (CLASS_NETWORK_ACTIVITY, 1), // Open
+        EventType::Close => (CLASS_NETWORK_ACTIVITY, 2), // Close
         EventType::Dns => (
             CLASS_DNS_ACTIVITY,
             match event.net.as_ref().is_some_and(|n| n.response) {
@@ -345,16 +346,25 @@ fn src_endpoint(net: &Net) -> Option<Map<String, Value>> {
     (!src.is_empty()).then_some(src)
 }
 
-/// Direction and protocol. `accept` is the only inbound thing a box records.
+/// Direction and protocol.
+///
+/// A `close` does not say which way it went in its type, so it carries `dir`
+/// instead — and carries it empty exactly when the connection was opened
+/// before the agent was watching. That case is `Unknown`, not a guess at
+/// `Outbound`: the whole point of the orphan flag is that this connection's
+/// origin was never observed.
 fn connection_info(event: &Event, net: &Net) -> Map<String, Value> {
-    let mut conn = Map::new();
-    conn.insert(
-        "direction_id".into(),
-        json!(match event.kind {
+    let direction = match net.dir.as_str() {
+        "in" => DIRECTION_INBOUND,
+        "out" => DIRECTION_OUTBOUND,
+        _ => match event.kind {
             EventType::Accept => DIRECTION_INBOUND,
+            EventType::Close => DIRECTION_UNKNOWN,
             _ => DIRECTION_OUTBOUND,
-        }),
-    );
+        },
+    };
+    let mut conn = Map::new();
+    conn.insert("direction_id".into(), json!(direction));
     if !net.proto.is_empty() {
         conn.insert("protocol_name".into(), json!(net.proto));
     }
@@ -374,6 +384,8 @@ fn network_activity(event: &Event, out: &mut Map<String, Value>) {
         Value::Object(connection_info(event, net)),
     );
 
+    // Settled on `close` and nowhere else — a `connect` carrying a byte count
+    // would be carrying a guess.
     if net.bytes_tx != 0 || net.bytes_rx != 0 {
         out.insert(
             "traffic".into(),
@@ -386,6 +398,13 @@ fn network_activity(event: &Event, out: &mut Map<String, Value>) {
     }
     if net.dur_ms != 0 {
         out.insert("duration".into(), json!(net.dur_ms));
+    }
+    if net.orphan {
+        // The bytes are real; the process on this record is whoever closed the
+        // socket, not whoever opened it. A reader adding them to that process's
+        // total would be wrong, so the record says so rather than leaving it to
+        // be inferred from an empty direction.
+        unmapped(out).insert("orphan".into(), json!(true));
     }
 
     if event.kind == EventType::Tls {

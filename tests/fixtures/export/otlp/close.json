@@ -3,7 +3,7 @@
     {
       "key": "event.name",
       "value": {
-        "stringValue": "devbox.connect"
+        "stringValue": "devbox.close"
       }
     },
     {
@@ -59,13 +59,37 @@
       "value": {
         "stringValue": "pypi.org"
       }
+    },
+    {
+      "key": "devbox.net.direction",
+      "value": {
+        "stringValue": "out"
+      }
+    },
+    {
+      "key": "devbox.net.bytes_tx",
+      "value": {
+        "intValue": "4102"
+      }
+    },
+    {
+      "key": "devbox.net.bytes_rx",
+      "value": {
+        "intValue": "831720"
+      }
+    },
+    {
+      "key": "devbox.net.duration_ms",
+      "value": {
+        "intValue": "690"
+      }
     }
   ],
   "body": {
-    "stringValue": "connect pypi.org:443"
+    "stringValue": "close pypi.org:443 ↑4.0KB ↓812.2KB 690ms"
   },
-  "eventName": "devbox.connect",
+  "eventName": "devbox.close",
   "severityNumber": 9,
   "severityText": "INFO",
-  "timeUnixNano": "1786054447612000000"
+  "timeUnixNano": "1786054448302000000"
 }

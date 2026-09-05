@@ -168,6 +168,14 @@ fn record_attributes(event: &Event, _ctx: &Context, event_name: &str) -> Vec<Val
         if !net.alpn.is_empty() {
             attrs.push(string_attr("devbox.tls.alpn", &net.alpn));
         }
+        // `close` says which way the connection went, since its type no longer
+        // does, and says when it never saw the connection opened at all.
+        if !net.dir.is_empty() {
+            attrs.push(string_attr("devbox.net.direction", &net.dir));
+        }
+        if net.orphan {
+            attrs.push(bool_attr("devbox.net.orphan", true));
+        }
         // Zero-valued on an open; the connection-settlement event carries the
         // totals.
         if net.bytes_tx != 0 {
