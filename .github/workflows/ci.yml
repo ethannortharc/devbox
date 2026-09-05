@@ -95,13 +95,12 @@ jobs:
         run: go test ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v6 of the action predates golangci-lint v2 and cannot install one
+        # (its goinstall path uses the v1 module path); v8 can. Pin the linter
+        # version so the config schema and the lint set do not move under us.
+        uses: golangci/golangci-lint-action@v8
         with:
-          # `latest` resolves to the v1 line in goinstall mode, and v1 rejects
-          # a version-2 config; pin the v2 release and build it with the job's
-          # own Go, since prebuilt binaries lag the Go release the module targets.
           version: v2.13.2
-          install-mode: goinstall
 
   ebpf:
     name: eBPF (privileged Linux)
