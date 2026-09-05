@@ -1618,3 +1618,333 @@ detected guest user. Version becomes 0.1.6.
 this host and are marked unverified until CI or an Incus machine runs them.
 The browser terminal still starts as root on Incus (`interactive_argv` has no
 `--user`), a pre-existing gap recorded as its own work item.
+
+## ADR-0059 — a run owns its events by cgroup, then by process tree, then by time
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** A run report is only worth reading if "these events belong to this
+run" is a claim someone can check. The v5 design named three rules but left
+their precedence and their failure modes open, and a first implementation
+showed why that matters: `bpf_get_current_cgroup_id()` returns the cgroup
+directory's inode — verified on a real box, `stat -c %i` and the agent both
+reported `17557` for the same scope, and the caller's shell stayed at `5632` —
+so cgroup identity is exact. But the cgroup does not exist until the run's
+wrapper enters it, and the host does not learn its id until the wrapper
+publishes it. In the first live run, `curl`'s `connect` was in the report and
+its `exec` was not: 45 events, one `exec`, a process tree of two.
+
+**Decision.** Attribute in a fixed order: **cgroup** (`pid != u32::MAX` and a
+non-zero `cgroup_id` equal to an active run's), then **pidtree** (pid or ppid in
+the run's learned descendant set), then **window** — and window *only* for the
+`u32::MAX` sentinel the packet tap uses, and only when exactly one run's window
+contains the timestamp. A real pid belonging to no run's tree returns `None`
+rather than falling through to window; two overlapping windows refuse to
+choose. A wrapper that could not obtain an exclusive cgroup publishes `0`, never
+a shared id. To close the startup race, `Store::backfill_run` runs once when the
+host learns the cgroup id and claims only rows where `cgroup_id` is exactly
+equal — the kernel's equality, not a widened one.
+
+**Consequences.** The same run went from 2 processes and 45 events to 6 and 256.
+Every report states its attribution counts per rule, so the reader can see how
+much rested on the weakest one. `exec` and `shell` are recorded as runs but have
+no wrapper — `exec` must capture its output, `shell`'s attach path takes no
+interactive flag — so only window can reach them, and an open `devbox shell`
+overlapping a `devbox run` makes window refuse for both. That cost shows up as
+`unattributed in the window` rather than as a wrong answer.
+
+**Revisit.** If `Runtime` ever grows an interactive `exec_as_user`, `exec` and
+`shell` can take the wrapper and drop out of the window contest entirely. If
+window competition proves noisy before then, give `ActiveRun` a kind and let
+step 3 skip `shell` runs.
+
+## ADR-0060 — a checkpoint is a copy of the upper layer, and restoring one remounts
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** A run report's Files section has to mean "what this run changed",
+not "what this box has ever changed". The obvious implementation — a new overlay
+layer per run — runs into a hard kernel limit on stacked layers and would make a
+long-lived box unmountable. The alternative is copying the upper directory, and
+the question was whether that is affordable and faithful. Measured on a real
+box: the live upper was 12 KB across 3 entries; `cp -a --reflink=auto` moved
+102 MB / 2000 files in 0.164 s (~620 MB/s), and 17 consecutive checkpoints took
+3 seconds. `cp -a` preserved mtime to the nanosecond, character-device whiteout
+nodes, and `trusted.overlay.opaque`. `--reflink=auto` is the correct spelling:
+`/var/devbox` is ext4, which has no reflink, and `--reflink=always` fails
+outright there while `auto` falls back silently and still wins on btrfs or XFS.
+
+**Decision.** `sandbox::checkpoint` copies `/var/devbox/overlay/upper` to
+`/var/devbox/checkpoints/<id>/upper` with a JSON manifest beside it. Diffing two
+checkpoints compares size **and** mtime, not size alone — a same-length rewrite
+is a real change and mtime is the only field that sees it. Restoring clears the
+upper the way `discard` does and then calls `overlay::refresh()`.
+
+**Consequences.** Copying without the remount leaves stale reads: on a live box,
+after clearing an entry straight out of the upper, `ls` updated immediately
+while `cat` went on returning the old content until the overlay was remounted.
+Kernel 6.19 refuses `mount -o remount` on an overlay
+(`fsconfig() failed: overlay: No changes allowed in reconfigure`), so refresh
+falls back to umount + mount; a failure there warns rather than failing the
+restore, since the upper is already correct and `devbox diff` reads it directly.
+The same missing remount was then found in `devbox layer discard` and fixed
+inside `overlay::discard`, so both callers get it. Checkpoints keep the newest
+20; ones a run's report cites are never pruned and `checkpoint-rm` refuses them
+without `--force`. `layer restore` is `<ID> [NAME]`, not the design's
+`[NAME] <ID>` — clap cannot put a required positional after an optional one, and
+`snapshot restore` already sets the precedent.
+
+**Revisit.** If a checkpoint ever needs to survive the box, this becomes a host
+copy and the cost model changes; measure again before assuming 0.16 s.
+
+## ADR-0061 — the broker is a per-service reverse proxy, so `gh` is out
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** Getting a credential to an agent inside a box without putting the
+credential inside the box means terminating the request on the host. Two shapes
+were available: a forward proxy with TLS interception (a CA in the box, every
+client trusting it), or a per-service reverse proxy the client is pointed at.
+The first reaches every client and costs a trust anchor in a sandbox whose whole
+point is that you do not trust what runs in it.
+
+**Decision.** A per-service reverse proxy. The box speaks plain HTTP to the
+broker; the broker opens TLS to the real upstream and injects the credential
+there. No CA, no MITM, no CONNECT tunnelling. Clients are pointed at it through
+their own configuration: `ANTHROPIC_BASE_URL` (which Claude Code honours
+*including the path prefix* — verified against the real CLI with a dummy token,
+correcting a documentation answer that said otherwise), `OPENAI_BASE_URL`, and
+for git a `url.<broker>.insteadOf` entry in the guest gitconfig.
+
+**Consequences.** `gh` cannot be brokered. It forces HTTPS
+(`tls: first record does not look like a TLS handshake`) and `GH_HOST` rejects a
+scheme, treating `http://127.0.0.1:18082` as a hostname. Rather than half-break
+it, `session_env` sets no `GH_HOST` at all and offers only an informational
+`DEVBOX_BROKER_GITHUB_URL`; the `/api/v3/*` and `/api/graphql` routes are kept so
+a future TLS listener would not need a rewrite. Claude Code's unauthenticated
+`HEAD <base>/api/hello` probe is answered locally, before auth, so it does not
+become a 401 and an audit row. Response bodies stream
+(`reqwest::Body::wrap_stream` in, `Body::from_stream` out) because a buffered
+proxy breaks SSE; `content-type` survives header stripping for the same reason.
+
+**Revisit.** Supporting `gh` means a TLS listener and a trust anchor in the box.
+That reverses this decision's premise and should be its own ADR, not a patch.
+
+## ADR-0062 — the secret lives in the OS keychain; the box gets a token that rotates
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** v4 copied `~/.claude/.credentials.json`, `~/.codex/auth.json`, and a
+plaintext `~/.devbox-ai-env` sourced by `.zshrc` into every box it provisioned —
+while the README promised credentials stayed on the host. The promise was the
+thing that was false.
+
+**Decision.** Values go to the OS keychain (macOS
+`security add-generic-password -s devbox -a <provider>`; Linux
+`~/.devbox/secrets/<provider>` at 0600, `secret-tool` where available), never to
+`state.json`, `devbox.toml`, or a log. The box receives a **per-box token**, 32
+random bytes, rotated at box start, delivered only in the argv of sessions
+devbox itself starts (`env -- K=V … cmd`, which is uniform across all three
+runtimes because `DevboxConfig.env` is honoured only by Docker). Holding the
+token grants brokered, scoped, logged access and nothing else. Every brokered
+request writes a `credential` event when the response body finishes streaming,
+so its byte count is real.
+
+**Consequences.** The four copy sites are deleted, the four settings files that
+remain get a content check that skips anything shaped like a credential, and
+provisioning purges the v4 leftovers from existing boxes. `[credential]` sections
+are stripped from the pushed gitconfig, since a host helper is either meaningless
+or a path to a host secret. Lima's user-mode network NATs the guest to the host's
+loopback, so the broker binds `127.0.0.1` only and the token is the *sole*
+identity — the broker cannot tell boxes apart by source address. The token is
+briefly visible in the host's `ps` output as part of `limactl shell`'s command
+line; the alternative is writing it to guest disk, which is worse. Incus and
+Docker reachability is implemented per the design but unverified on this host.
+
+**Revisit.** If per-box source addresses ever become distinguishable, the token
+can become a second factor rather than the only one.
+
+## ADR-0063 — export writes its own JSON, and a profile must be declared
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** OCSF and OTLP both have generated SDKs. Taking either would add a
+large dependency and a version treadmill to a binary whose entire event model is
+eleven small structs. The risk of hand-writing is getting the schema wrong
+quietly, so the question was whether the output could be *checked* instead.
+
+**Decision.** Hand-write both encoders and validate against the authorities:
+every OCSF class against `POST https://schema.ocsf.io/1.3.0/api/v2/validate`,
+and the OTLP payload by POSTing it to a real OpenTelemetry Collector. Required
+fields come from `?profiles=` (the core set), not from the default view that
+folds every profile in. Where OCSF requires a field devbox has not observed, say
+so rather than invent: `tls.version = "Unknown"` because the agent reads only
+the ClientHello, `http_response.code = 0` for "no status", `file.type_id = 0` for
+a path the probe merely saw opened.
+
+**Consequences.** The validator caught a real error the tests could not:
+`actor` and `device` on Network, DNS, HTTP and Detection Finding come from
+OCSF's `host` **profile**, and a record must declare
+`metadata.profiles: ["host"]` or they are rejected as unknown attributes. API
+Activity 6003 has no `device` at all, so `base()` skips it there. Ten golden
+records and eight `type_uid`s drawn from a real 442k-event store validate with
+zero errors and zero warnings; 147,998 records (109 MB) were accepted by
+otelcol-contrib 0.160.0 in one POST. An event kind with no honest class —
+`syscall` today — is counted as unmapped and skipped, and the invariant
+`matched == written + unmapped` fails the export rather than printing a partial
+one. Not covered by real data: HTTP Activity 4002, Detection Finding 2004 and
+the unmapped branch, which have golden coverage only.
+
+**Revisit.** If a third format arrives, or if OCSF 2.x reshapes the objects,
+reconsider a generated SDK — but keep the validator step either way, since it
+is what found the profile bug.
+
+## ADR-0064 — an MCP server's posture belongs to its box, and the registry can be global
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** An MCP server is third-party code the agent launches on the host
+with the user's full rights. Moving it into a box raises two scoping questions:
+what egress it gets, and where its registration lives.
+
+**Decision.** Posture is **per box**, applied for the duration of the run and
+only when it differs from what the box already has; on exit it is restored via
+`enforce::apply_saved`, following ADR-0047's rule that only a switch that
+actually happened is rolled back. A failure to apply refuses to start the server
+rather than silently falling back to the box's posture. Registration is written
+into the project's `devbox.toml` as **text surgery** — appending or excising
+exactly one `[mcp.<name>]` block, then re-parsing and asserting nothing else
+changed — because `DevboxConfig::save` regenerates the document from parsed
+values and destroys the comments `devbox init` itself wrote. A `--global` flag
+writes `~/.devbox/mcp.toml` instead, and lookup falls back to it, so a server
+registered once is reachable from any directory.
+
+**Consequences.** Verified on a real box: during the run the guest carried a
+default-drop `mirror-only` ruleset; after it, no devbox table and the box back at
+`open`. `devbox mcp rm` leaves `devbox.toml` byte-identical to the original,
+comments and trailing comments included. A registration written in inline form
+(`mcp.inline = { … }`) is readable but `rm` refuses it rather than rewriting the
+whole file. Because the posture is box-wide for the duration, two MCP servers
+that want different postures need different boxes; `mcp add` warns when a
+posture is attached to a box that is a project box rather than a dedicated one.
+
+**Revisit.** Per-server egress inside one box would need per-cgroup nftables
+rules. That is a real design, not a tweak, and should wait for a user who needs
+it.
+
+## ADR-0065 — bytes are settled at `tcp_close`, and a new event kind does not bump the protocol
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** `fill_net()` wrote zeros into every connection's byte counters, and
+the console, the behaviour summary and the run report all faithfully displayed
+`↑0B ↓0B`. That was not laziness: every existing probe
+(`tcp_v4_connect`, `tcp_v6_connect`, `tcp_finish_connect`, `inet_csk_accept`)
+fires while the connection is being *established*, when nothing has crossed it.
+
+**Decision.** Add `kprobe/tcp_close`, read `tcp_sock->bytes_sent` and
+`bytes_received` (both guarded by `bpf_core_field_exists`), and emit a new
+`close` event carrying them, the duration, and the direction. Pair the close
+with its open **inside the kernel**, keyed by the socket pointer in an LRU map —
+not by five-tuple in user space, because `tcp_close` runs in whichever process
+closed the fd, which after a fork or an `SCM_RIGHTS` pass is not the process that
+dialled. Every consumer counts bytes from `close` and only from `close`.
+`ProtocolVersion` is **not** bumped: an old agent simply never sends `close`, and
+an old collector counts it as rejected without dropping the connection, which is
+the same treatment the `Hello.Source` field already received.
+
+**Decisive evidence.** Traffic on a real box went from `↑0B ↓0B` to
+`↑1.9KB ↓6.3KB`. Live testing also found a genuine bug: an accepted connection
+whose handshake completed before the fd was closed had already been unhashed
+(`inet_num = 0`), so its close reported source port 0 and split the flow into two
+rows — fixed by remembering the published port in the pairing map. The record
+layout did not grow: the existing `__u8 _pad` became `__u8 flags`, and
+`NetRecordSize` is still 112.
+
+**Consequences.** UDP is not settled — its events come from the packet tap, not a
+probe — so "traffic covers all traffic" is still false and is documented as
+such. A connection still open reads 0, which is the honest reading of the model.
+A close whose open was never seen is marked `orphan`: the bytes are real but the
+process on the record closed the socket rather than opening it, so the record
+says so instead of adding them to that process's total. Bumping the protocol
+would have cut off every agent not upgraded in the same instant, for an addition
+no old reader needs to understand.
+
+**Revisit.** If a future change alters an existing record's layout rather than
+adding a kind, bump the version — that is the case the field exists for.
+
+## ADR-0066 — file events are filtered in the agent, and the scope rides in the handshake
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** With eBPF attached, the `openat` probe reports every path the box
+opens. On a real box that was 1,446 file events in sixty seconds and 651,564 in
+an eight-hour session — `/nix/store`, `/etc`, journald — against a design that
+says "under the workspace". The store grew 43.6 MiB/hour and `behavior summary`
+hit its 50,000-row scan limit inside the first eight minutes of an eight-hour
+window.
+
+**Decision.** Filter in the **agent**, at the Source boundary, by absolute path
+prefix, before the event reaches the pending queue — so a dropped-by-scope event
+is not a dropped event. The default scope is `/workspace` plus the box user's
+home. The host passes it (`-file-scope`) on every path that starts an agent —
+the collector's stdio agent, the Ubuntu systemd unit, and the NixOS module — so
+two agents on one box cannot disagree about what a file event is. The chosen
+scope is carried in the agent's `Hello`, stored in the box's capture health, and
+printed by `devbox doctor` and the console's capture bar.
+
+**Consequences.** Measured: 1,446 file events in that same minute became 90, and
+`exec` counts were identical (50 = 50), so the two agents saw the same syscalls
+and differed only in the filter. An empty scope captures everything and warns
+once; a relative prefix is rejected at startup rather than ignored, because
+ignoring it would empty the list and let the flood back in. **Relative paths are
+dropped**: `handle_openat` records `openat`'s pathname but not its `dirfd`, so
+user space cannot resolve one — 16.5% of file events in a sample. Fixing that
+means adding a field to the BPF record and regenerating the objects. Filtering
+in the agent rather than in the summary means the events are gone, not hidden;
+that is the point, and it is why the scope is stated everywhere the data is.
+
+**Revisit.** Add `dfd` to the file record and resolve relative paths in user
+space; then the scope becomes complete rather than best-effort.
+
+## ADR-0067 — an agent is replaced by content hash, not by version number
+
+**Status.** Accepted (2026-09-05).
+
+**Context.** The embedded agent was reinstalled only at provisioning time, and
+the only staleness test anywhere was a version string. Both halves failed
+together on a real box: the agent inside reported `devbox-obsd 0.1.6 (portable)`
+and the new host binary was also `0.1.6`, so `evaluate_hello` waved it through
+and the box kept capturing `proc+packet+netfilter (degraded: no process
+attribution, no file events)` indefinitely. The same version equality let an
+older collector daemon of the same version keep ownership for a whole login
+session — and the daemon is what spawns each box's stdio agent, so it went on
+passing `-no-ebpf` to an agent that no longer needed it.
+
+**Decision.** Compare **sha256 of the bytes**. `agent_sync::host_digest()` hashes
+the embedded agent once per process; the guest's digest is computed fresh on
+every probe (`sha256sum` → `shasum -a 256` → `openssl dgst -sha256 -r`, with the
+result validated as 64 hex characters on the host rather than trusted). Mismatch
+means replace, at box start/entry (full, including the systemd unit) and at
+collector attach (binary only, under a non-blocking per-box claim and a 180 s
+timeout). The collector daemon's identity sidecar records version, commit **and**
+the sha256 of the host binary, and a differing build takes over.
+
+**Decisive evidence.** Two builds made minutes apart carried the identical commit
+tag `11cc51fb0ab1-dirty` and differed only in sha256. `doctor` said the same
+sentence about both on its `agent:` line; only `agent binary:` could separate
+them.
+
+**Consequences.** `doctor` gains `agent binary: matches host embed / stale (sha …
+vs …) / missing / unverifiable`. Rewriting a NixOS unit costs one
+`nixos-rebuild switch` (~6 s on a warm store), which happens only when the unit
+is genuinely stale and is idempotent afterwards — and it must restore the egress
+posture, because a rebuild tears down devbox's nftables table; the source-level
+guard in `tests/policy_lifecycle.rs` caught that omission in the first
+implementation. No per-box digest cache was added: the host digest belongs in a
+`OnceLock`, the guest digest must be live to be true, and one merged probe answers
+both the digest and the unit question in a single exec. Docker is reasoned
+through but not exercised; Incus is unverified.
+
+**Revisit.** If the probe's cost ever shows up in `exec` latency, cache the
+*unit* answer only — never the digest.
