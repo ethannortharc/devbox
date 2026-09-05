@@ -127,6 +127,19 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
         Err(error) => println!("  Process:  \x1b[31munknown\x1b[0m — {error}"),
     }
 
+    println!("\nCredential broker:");
+    println!("  Process:  {}", crate::cli::broker::status_line(manager));
+    println!("  Secrets:  {}", crate::cli::secret::backend_label(manager));
+    let providers = crate::broker::configured_providers(&manager.state_dir);
+    println!(
+        "  Providers: {}",
+        if providers.is_empty() {
+            "(none — no credential is brokered, and none is copied into a box)".to_string()
+        } else {
+            providers.join(", ")
+        }
+    );
+
     println!("\nHost kernel capabilities:");
     if os == "linux" {
         print_file_capability(
@@ -181,6 +194,7 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
                 }
                 print_agent_freshness(runtime.as_ref(), &state.name).await;
                 print_capture_source(&manager.state_dir, &state.name);
+                print_host_reach(manager, runtime.as_ref(), &state.name).await;
             }
             Ok(SandboxStatus::Stopped | SandboxStatus::NotFound) => {}
             Ok(SandboxStatus::Unreachable(reason)) => println!(
@@ -371,6 +385,32 @@ async fn check_incus_network() {
 ///
 /// The guest probe above can only report that the agent *binary* is present.
 /// Whether it attached the kernel probes is decided at the agent's preflight
+/// One line per running box saying how it reaches the broker — §6.6.
+///
+/// Printed even when the answer is "it cannot": a box with no route to the
+/// host gets no broker variables at all, and the symptom inside the agent is a
+/// missing API key rather than anything that points here.
+async fn print_host_reach(
+    manager: &SandboxManager,
+    runtime: &dyn crate::runtime::Runtime,
+    name: &str,
+) {
+    if crate::broker::configured_providers(&manager.state_dir).is_empty() {
+        return;
+    }
+    let port = crate::broker::endpoint(&manager.state_dir)
+        .map(|endpoint| endpoint.port)
+        .unwrap_or(crate::broker::DEFAULT_PORT);
+    match runtime.host_reach(name, port).await {
+        Ok(reach) => println!(
+            "    broker:  \x1b[32m{}\x1b[0m ({})",
+            reach.base_url(),
+            reach.how
+        ),
+        Err(error) => println!("    broker:  \x1b[31munreachable\x1b[0m — {error}"),
+    }
+}
+
 /// and told to the collector in the handshake, and the difference is the whole
 /// question a reader has when `devbox watch` shows connections with no process
 /// against them: proc polling reads /proc/net/tcp, which has no pid column.

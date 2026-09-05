@@ -8,6 +8,7 @@
 //! Layers, outermost first:
 //!
 //! - [`cli`] — command surface (clap), one module per command.
+//! - [`broker`] — the credential broker: secrets stay on the host (§6).
 //! - [`web`] — the v4 web console: axum server, askama templates, SSE.
 //! - [`sandbox`] — box lifecycle, state, config, OverlayFS diff/commit.
 //! - [`nix`] — Nix set composition and rebuilds inside a box.
@@ -18,6 +19,7 @@
 //! - [`policy`] — egress postures, the allowlist, and the nftables driver.
 //! - [`tools`] — language/tool detection and the tool registry.
 
+pub mod broker;
 pub mod cli;
 pub mod embedded;
 pub mod export;

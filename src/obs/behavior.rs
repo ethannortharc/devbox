@@ -172,7 +172,12 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
                     entry.1 = entry.1.saturating_add(call.tokens);
                 }
             }
-            EventType::Exit | EventType::Syscall => {}
+            // A brokered credential use is not something the *box* did on
+            // the network — the host made that request on its behalf, and
+            // folding `api.anthropic.com` into `domains` would claim the box
+            // reached it directly. The run report reads `credential` events
+            // separately (§4.4), which is where they belong.
+            EventType::Credential | EventType::Exit | EventType::Syscall => {}
         }
     }
 
@@ -483,6 +488,7 @@ mod tests {
             file: None,
             api: None,
             policy: None,
+            credential: None,
         }
     }
 

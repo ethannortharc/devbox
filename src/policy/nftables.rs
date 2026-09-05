@@ -210,6 +210,20 @@ fn emit_policy_rules(nft: &mut String, policy: &Policy, ctx: &Context) {
         }
     }
 
+    // The broker, under every posture that still has egress. `isolated` is
+    // excluded by construction: `discover_context` does not look it up, and
+    // this guard means a caller that fills the field in anyway still gets the
+    // posture it asked for.
+    if policy.egress != Posture::Isolated
+        && let Some((address, port)) = &ctx.broker
+    {
+        let family = if address.contains(':') { "ip6" } else { "ip" };
+        let _ = writeln!(
+            nft,
+            "    {family} daddr {address} tcp dport {port} accept comment \"devbox credential broker\""
+        );
+    }
+
     match policy.egress {
         Posture::Open if audits(policy) => {
             // Observe and warn — the step before enforcing, which the Policy
@@ -348,6 +362,19 @@ pub struct Context {
     /// Retained for the allow-set seeding; the forward chain no longer keys on
     /// them, because a snapshot cannot cover a network created later.
     pub container_prefixes: Vec<String>,
+    /// The credential broker's address as seen from inside this box, and the
+    /// port it listens on — §6.7.
+    ///
+    /// Exempted for the same reason DNS is (ADR-0020): under `allowlist` or
+    /// `mirror-only` the broker is the *only* credentialled path out, and a
+    /// posture that blocks it makes every brokered request fail in a way that
+    /// looks like a network fault rather than a policy decision. Narrow on
+    /// purpose — one address, one port, TCP — because it is an exemption in a
+    /// default-deny firewall and the blanket versions of those were holes.
+    ///
+    /// `None` under `isolated`, always: an isolated run has no credentials,
+    /// which is the point.
+    pub broker: Option<(String, u16)>,
     /// Retained for compatibility; the forward chain no longer exempts
     /// interfaces at all.
     ///
@@ -613,6 +640,47 @@ mod tests {
             );
             assert!(nft.contains("ip daddr 127.0.0.0/8 accept"));
         }
+    }
+
+    /// §6.7: the broker is the only credentialled path out, so `allowlist`
+    /// and `mirror-only` let it through and `isolated` does not.
+    #[test]
+    fn the_credential_broker_is_reachable_under_every_posture_but_isolated() {
+        let ctx = Context {
+            broker: Some(("192.168.5.2".into(), 7879)),
+            ..Default::default()
+        };
+        let rule = "ip daddr 192.168.5.2 tcp dport 7879 accept";
+        for posture in [Posture::Open, Posture::Allowlist, Posture::MirrorOnly] {
+            let nft = ruleset_with(&policy(posture, &[]), &ctx);
+            assert!(
+                nft.contains(rule),
+                "{posture} must not block the broker; a posture that does makes every \
+                 brokered request look like a network fault"
+            );
+        }
+        let isolated = ruleset_with(&policy(Posture::Isolated, &[]), &ctx);
+        assert!(
+            !isolated.contains(rule),
+            "an isolated run has no credentials — that is the point"
+        );
+
+        // The exemption is one address on one port, not the host, not the
+        // port, and not UDP.
+        let nft = ruleset_with(&policy(Posture::Allowlist, &[]), &ctx);
+        assert!(
+            !nft.contains("tcp dport 7879 accept\n"),
+            "port-only exemption"
+        );
+        assert!(
+            !nft.contains("ip daddr 192.168.5.2 accept"),
+            "address-only exemption"
+        );
+        assert!(!nft.contains("udp dport 7879"));
+
+        // With no broker configured, nothing is exempted at all.
+        let none = ruleset_with(&policy(Posture::Allowlist, &[]), &Context::default());
+        assert!(!none.contains("7879"));
     }
 
     #[test]

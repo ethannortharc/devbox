@@ -467,6 +467,27 @@ impl Runtime for IncusRuntime {
         run_interactive("incus", &arg_refs).await
     }
 
+    /// **Unverified on the machine this was built on** — no Incus is
+    /// installed here, so unlike the Lima implementation this one was written
+    /// from §6.6 and not measured.
+    ///
+    /// Incus containers sit on a managed bridge (`incusbr0` by default) whose
+    /// host end holds the address the guest sees as its default gateway, so
+    /// the gateway is the first and only candidate. It is still *probed*
+    /// rather than assumed: if the bridge is configured without a host
+    /// address, or egress policy blocks it, the probe fails and the broker
+    /// simply injects nothing rather than handing the box a dead address.
+    ///
+    /// The §6.6 fallback — a reverse tunnel over `incus exec` and socat — is
+    /// not implemented; a box that cannot reach the gateway gets no broker
+    /// variables and `doctor` says so.
+    async fn host_reach(&self, name: &str, port: u16) -> Result<crate::broker::reach::HostReach> {
+        let mut candidates = Vec::new();
+        if let Some(gateway) = crate::broker::reach::default_gateway(self, name).await {
+            candidates.push(gateway);
+        }
+        crate::broker::reach::probe(self, name, port, &candidates, "incus host bridge").await
+    }
     async fn destroy(&self, name: &str) -> Result<()> {
         let vm = Self::vm_name(name);
         // Stop first (ignore errors if already stopped)
