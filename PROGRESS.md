@@ -51,7 +51,7 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W2 | W2-2 `mcp run` as a run, `mcp report`, `mcp self` | `v5/mcp` | **DONE** |
 | W2 | W2-3 sweep: discard remount, `checkpoint-rm`, guest home, NixOS file scope | `v5/sweep` | **DONE** |
 | W2 | W2-4 README, docs, screenshot, ADR-0059…0067, version 0.2.0 | `v5/docs` | **DONE** |
-| W2 | W2-5 run report polish: fold the wrapper out of Processes, wire Credentials | — | in flight |
+| W2 | W2-5 run report polish: fold the wrapper, writes outside the overlay, wire Credentials | `v5/report-polish` | **DONE** |
 
 ## Environment notes
 
