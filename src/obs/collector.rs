@@ -674,7 +674,7 @@ impl Collector {
             }
             self.stats.received.fetch_add(1, Ordering::Relaxed);
 
-            let event: Event = match serde_json::from_slice(&frame) {
+            let mut event: Event = match serde_json::from_slice(&frame) {
                 Ok(e) => e,
                 Err(e) => {
                     self.stats.rejected.fetch_add(1, Ordering::Relaxed);
@@ -685,6 +685,18 @@ impl Collector {
             if event.validate().is_err() {
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 continue;
+            }
+            // On arrival, before this event is stored *or* published live.
+            //
+            // The agent redacts at the source, so on a current box this finds
+            // nothing. It is here for the box that is one release behind —
+            // which is the ordinary state between upgrades — and because the
+            // live channel hands events straight to the console without
+            // passing through the store's read path.
+            if let Some(exec) = event.exec.as_mut()
+                && exec.argv.iter().any(|a| super::redact::has_secret(a))
+            {
+                exec.argv = super::redact::argv(&exec.argv);
             }
             // The handshake decided which box this connection speaks for.
             // Accepting an event that names a different one would let a

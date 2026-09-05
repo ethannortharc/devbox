@@ -729,6 +729,10 @@ fn is_wrapper(chain: &correlate::Chain) -> bool {
         .any(|exec| {
             crate::obs::run::is_wrapper_command(&exec.argv)
                 || crate::mcp::shim::is_wrapper_command(&exec.argv)
+                // The runtime's own login shell, which nothing in devbox
+                // writes: `limactl shell` builds it on the guest side, and it
+                // arrives before anything devbox asked for.
+                || crate::runtime::is_login_wrapper(&exec.argv)
         })
 }
 

@@ -11,6 +11,7 @@
 //! - [`supervisor`] — one live collector per registered box.
 //! - [`correlate`] — the join that turns a wall of events into a story (§7.2).
 //! - [`run`] — a bounded execution with an identity, and its attribution (§4).
+//! - [`redact`] — credentials out of an argv, on the way out.
 
 pub mod behavior;
 pub mod collector;
@@ -19,6 +20,7 @@ pub mod daemon;
 pub mod event;
 pub mod health;
 pub mod pcap;
+pub mod redact;
 pub mod run;
 pub mod store;
 pub mod supervisor;

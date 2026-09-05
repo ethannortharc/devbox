@@ -12,6 +12,16 @@ use super::{
 pub struct LimaRuntime;
 
 /// NixOS Lima image version — from https://github.com/nixos-lima/nixos-lima
+/// The working directory `limactl shell` is asked for.
+///
+/// `--workdir` avoids the "cd: No such file or directory" warning Lima prints
+/// when it tries to match the host's cwd inside the VM. It is public because
+/// `limactl` turns it into a login-shell prologue on the guest side —
+/// `bash -c 'cd /home || exit 1 ; exec /bin/bash -l -c …'` — which is an exec
+/// event, and [`super::is_login_wrapper`] has to recognise it to keep it out
+/// of a run report's process tree.
+pub const SHELL_WORKDIR: &str = "/home";
+
 const NIXOS_LIMA_VERSION: &str = "v0.0.4";
 
 /// Ubuntu version for cloud images
@@ -160,7 +170,7 @@ containerd:
                     GUEST_PROBE_TIMEOUT,
                     run_cmd(
                         "limactl",
-                        &["shell", "--workdir", "/home", vm, "--", "true"],
+                        &["shell", "--workdir", SHELL_WORKDIR, vm, "--", "true"],
                     ),
                 )
                 .await;
@@ -407,7 +417,7 @@ impl Runtime for LimaRuntime {
         let vm = Self::vm_name(name);
         // Use --workdir to avoid "cd: No such file or directory" warnings
         // from Lima trying to match the host CWD inside the VM.
-        let mut args = vec!["shell", "--workdir", "/home", &vm, "--"];
+        let mut args = vec!["shell", "--workdir", SHELL_WORKDIR, &vm, "--"];
         args.extend_from_slice(cmd);
 
         if interactive {
@@ -424,7 +434,7 @@ impl Runtime for LimaRuntime {
             "limactl".to_string(),
             "shell".to_string(),
             "--workdir".to_string(),
-            "/home".to_string(),
+            SHELL_WORKDIR.to_string(),
             Self::vm_name(name),
             "--".to_string(),
         ];

@@ -338,6 +338,10 @@ type captureStatus struct {
 	// question these numbers answer.
 	FileOutOfScope  uint64 `json:"file_out_of_scope"`
 	ExecKernelNoise uint64 `json:"exec_kernel_noise"`
+	// ArgvRedacted counts execs whose argv carried a credential. Non-zero is
+	// normal on a box with a broker: it says the redaction ran, which is what
+	// somebody about to forward a run report wants to know.
+	ArgvRedacted uint64 `json:"argv_redacted"`
 }
 
 func currentCaptureStatus(cfg config, source *capture.Scope) captureStatus {
@@ -356,6 +360,7 @@ func currentCaptureStatus(cfg config, source *capture.Scope) captureStatus {
 		FileScope:        source.Prefixes(),
 		FileOutOfScope:   source.FileOutOfScope(),
 		ExecKernelNoise:  source.KernelNoise(),
+		ArgvRedacted:     source.ArgvRedacted(),
 	}
 }
 
