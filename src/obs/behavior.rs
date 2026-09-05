@@ -121,6 +121,19 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
                 if let Some(peer) = event.peer() {
                     summary.domains.insert(peer);
                 }
+            }
+            EventType::Close => {
+                // Traffic is counted here and only here.
+                //
+                // A `connect` is emitted from a probe that runs before any
+                // payload has crossed the socket, so its counters are zero by
+                // construction; adding them in bought nothing and would start
+                // double-counting the day a source began filling both ends.
+                // The peer still goes in, because an orphan close can be the
+                // only record of a connection this window saw at all.
+                if let Some(peer) = event.peer() {
+                    summary.domains.insert(peer);
+                }
                 if let Some(net) = &event.net {
                     // Saturating: an agent supplies these and nothing
                     // validates them, so two events claiming most of a `u64`
@@ -494,8 +507,20 @@ mod tests {
             proto: "tcp".into(),
             daddr: "151.101.0.223".into(),
             dport: 443,
+            ..Default::default()
+        });
+
+        // The same connection, settled. The counters live here and nowhere
+        // else, which is what makes them countable exactly once.
+        let mut close = base(812, 6_000_000_000, EventType::Close);
+        close.net = Some(Net {
+            proto: "tcp".into(),
+            daddr: "151.101.0.223".into(),
+            dport: 443,
             bytes_tx: 4102,
             bytes_rx: 831_720,
+            dur_ms: 690,
+            dir: "out".into(),
             ..Default::default()
         });
 
@@ -513,7 +538,7 @@ mod tests {
             flags: 0,
         });
 
-        vec![exec, dns, connect, write, read]
+        vec![exec, dns, connect, write, read, close]
     }
 
     #[test]
@@ -521,9 +546,9 @@ mod tests {
         let s = summarize("myapp", &run());
 
         assert_eq!(s.box_id, "myapp");
-        assert_eq!(s.events, 5);
+        assert_eq!(s.events, 6);
         assert_eq!(s.started, "2026-08-06T22:00:01.000Z");
-        assert_eq!(s.ended, "2026-08-06T22:00:05.000Z");
+        assert_eq!(s.ended, "2026-08-06T22:00:06.000Z");
 
         // The connection carried only an address; the DNS answer names it.
         assert!(s.domains.contains("pypi.org"), "domains: {:?}", s.domains);
@@ -535,6 +560,48 @@ mod tests {
         assert_eq!(s.dns_queries.len(), 1);
         assert_eq!(s.bytes_tx, 4102);
         assert_eq!(s.bytes_rx, 831_720);
+    }
+
+    #[test]
+    fn traffic_is_counted_at_the_close_and_only_there() {
+        // A connect that claims bytes is a connect from a probe that could not
+        // have known them — every network probe that fires while a connection
+        // is being made runs before a byte has crossed it. Counting both ends
+        // would double every settled connection the day one of them was
+        // filled in, so this pins the rule rather than leaving it to a comment.
+        let mut events = run();
+        let connect = events
+            .iter_mut()
+            .find(|e| e.kind == EventType::Connect)
+            .expect("the run dials something");
+        let net = connect.net.as_mut().unwrap();
+        net.bytes_tx = 999_999;
+        net.bytes_rx = 999_999;
+
+        let s = summarize("myapp", &events);
+        assert_eq!(s.bytes_tx, 4102, "only the close settles the traffic");
+        assert_eq!(s.bytes_rx, 831_720);
+    }
+
+    #[test]
+    fn an_orphan_close_still_counts_and_still_names_its_peer() {
+        // A connection older than the agent: no connect, no accept, no name
+        // from DNS. Dropping it would under-report the box's traffic, which is
+        // the failure this whole event type exists to fix.
+        let mut orphan = base(4242, 3_000_000_000, EventType::Close);
+        orphan.net = Some(Net {
+            proto: "tcp".into(),
+            daddr: "203.0.113.7".into(),
+            dport: 443,
+            bytes_tx: 10,
+            bytes_rx: 20,
+            orphan: true,
+            ..Default::default()
+        });
+
+        let s = summarize("myapp", &[orphan]);
+        assert_eq!((s.bytes_tx, s.bytes_rx), (10, 20));
+        assert!(s.domains.contains("203.0.113.7"), "{:?}", s.domains);
     }
 
     #[test]
@@ -623,12 +690,20 @@ mod tests {
         extra_connect.net = Some(Net {
             daddr: "10.0.0.9".into(),
             dport: 443,
+            ..Default::default()
+        });
+        let mut extra_close = base(900, 11_000_000_000, EventType::Close);
+        extra_close.net = Some(Net {
+            daddr: "10.0.0.9".into(),
+            dport: 443,
             bytes_tx: 100,
             bytes_rx: 200,
+            dir: "out".into(),
             ..Default::default()
         });
         later.push(extra_dns);
         later.push(extra_connect);
+        later.push(extra_close);
 
         let after = summarize("myapp", &later);
         let d = diff(&before, &after);

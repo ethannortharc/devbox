@@ -20,5 +20,11 @@ func (e *EBPF) Name() string { return "ebpf" }
 // Domains implements Source. DNS and TLS need packet payload capture; the
 // current probes truthfully advertise only what their ring buffers produce.
 func (e *EBPF) Domains() []event.Type {
-	return []event.Type{event.TypeExec, event.TypeConnect, event.TypeAccept, event.TypeFile}
+	return []event.Type{
+		event.TypeExec, event.TypeConnect, event.TypeAccept,
+		// `tcp_close` settles a connection: the connect and accept records
+		// say a connection happened, this one says what crossed it.
+		event.TypeClose,
+		event.TypeFile,
+	}
 }

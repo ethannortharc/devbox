@@ -67,6 +67,12 @@ func Load() (_ *Runtime, err error) {
 		{"inet_csk_accept", func() (link.Link, error) {
 			return link.Kretprobe("inet_csk_accept", runtime.Objects.HandleAccept, nil)
 		}},
+		// A kprobe, not a kretprobe: `tcp_close` unhashes the socket, and
+		// after it returns the local port and the byte counters this probe
+		// exists to read are gone.
+		{"tcp_close", func() (link.Link, error) {
+			return link.Kprobe("tcp_close", runtime.Objects.HandleTcpClose, nil)
+		}},
 		{"syscalls/sys_enter_openat", func() (link.Link, error) {
 			return link.Tracepoint("syscalls", "sys_enter_openat", runtime.Objects.HandleOpenat, nil)
 		}},

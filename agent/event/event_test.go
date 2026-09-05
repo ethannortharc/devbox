@@ -33,6 +33,7 @@ func TestSubObjectMapping(t *testing.T) {
 		TypeExec:    "exec",
 		TypeConnect: "net",
 		TypeAccept:  "net",
+		TypeClose:   "net",
 		TypeDNS:     "net",
 		TypeTLS:     "net",
 		TypeFile:    "file",
@@ -197,7 +198,7 @@ func TestValidateChecksEachSubObject(t *testing.T) {
 			TSWall: "2026-08-06T22:14:07.412Z", BoxID: "b", PID: 1, Type: ty,
 		}
 	}
-	for _, ty := range []Type{TypeExec, TypeFile, TypeAPI, TypePolicy, TypeDNS} {
+	for _, ty := range []Type{TypeExec, TypeFile, TypeAPI, TypePolicy, TypeDNS, TypeClose} {
 		if err := base(ty).Validate(); err == nil {
 			t.Errorf("%s without its sub-object should not validate", ty)
 		}
