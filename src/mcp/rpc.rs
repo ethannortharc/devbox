@@ -67,6 +67,21 @@ mod code {
     pub const INVALID_PARAMS: i64 = -32602;
 }
 
+/// The answer to a JSON-RPC batch.
+///
+/// Batching is the one thing `2025-03-26` requires that this server does not
+/// do, and it is deliberate: the framing here is one message per line, the
+/// four tools are independent reads that a client gains nothing by grouping,
+/// and the revision that followed — `2025-06-18` — removed batching from the
+/// protocol altogether. Implementing a feature on its way out, for a benefit
+/// none of these tools have, is not worth the second response path.
+///
+/// What is worth doing is saying so. A client that batches gets the shape it
+/// sent named and the remedy spelled out, in one place, rather than the
+/// generic "no `method`" it used to get — which described its requests, all of
+/// them valid, as malformed.
+pub const BATCH_UNSUPPORTED: &str = "batch requests are not supported; send one request per line";
+
 /// Serve until stdin closes.
 pub async fn serve(manager: &SandboxManager) -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin());
@@ -163,6 +178,21 @@ pub async fn handle(manager: &SandboxManager, line: &str) -> Option<String> {
             ));
         }
     };
+
+    // A batch is a JSON array of messages. It parses, and every message in it
+    // is well formed, so the generic "no `method`" answer below would tell a
+    // client that its perfectly correct requests were malformed and leave it
+    // no way to recover. Naming the shape and the remedy is what lets a client
+    // fall back to sending them one at a time.
+    //
+    // Not implemented rather than not noticed: see [`BATCH_UNSUPPORTED`].
+    if message.is_array() {
+        return Some(error_response(
+            Value::Null,
+            code::INVALID_REQUEST,
+            BATCH_UNSUPPORTED,
+        ));
+    }
 
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -642,6 +672,48 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["protocolVersion"], LATEST_PROTOCOL);
+    }
+
+    /// A batch is well-formed JSON full of well-formed requests, so the
+    /// generic "no `method`" answer told a client its correct messages were
+    /// malformed and left it nowhere to go. Naming the shape and the remedy is
+    /// the whole value of not implementing the feature.
+    #[tokio::test]
+    async fn a_batch_is_refused_in_a_way_a_client_can_act_on() {
+        let (_dir, manager) = manager();
+        let response = ask(
+            &manager,
+            json!([
+                {"jsonrpc":"2.0","id":1,"method":"ping"},
+                {"jsonrpc":"2.0","id":2,"method":"tools/list"},
+            ]),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["error"]["message"], BATCH_UNSUPPORTED);
+        // No `id` to answer under: the ids live inside the array, and picking
+        // one of them would be answering a request we did not run.
+        assert_eq!(response["id"], Value::Null);
+        assert!(response.get("result").is_none(), "{response}");
+    }
+
+    /// An empty array is a batch too, and the same answer is the useful one.
+    #[tokio::test]
+    async fn an_empty_batch_gets_the_same_explanation() {
+        let (_dir, manager) = manager();
+        let response = ask(&manager, json!([])).await;
+        assert_eq!(response["error"]["message"], BATCH_UNSUPPORTED);
+    }
+
+    /// The session survives it: a client that batches once and then falls back
+    /// to one request per line must find the server still there.
+    #[tokio::test]
+    async fn a_batch_does_not_end_the_session() {
+        let (_dir, manager) = manager();
+        let _ = ask(&manager, json!([{"jsonrpc":"2.0","id":1,"method":"ping"}])).await;
+        let after = ask(&manager, json!({"jsonrpc":"2.0","id":2,"method":"ping"})).await;
+        assert_eq!(after["result"], json!({}));
+        assert_eq!(after["id"], 2);
     }
 
     #[tokio::test]
