@@ -2377,3 +2377,32 @@ against the unfixed code proves nothing — checking that caught one test in
 W3-9 that would have passed either way. And restoring a working tree with `git
 checkout --` after building a variant binary silently reverted the change under
 test, twice, in two different tasks; back the file up with `cp` instead.
+
+## 2026-09-06T16:20Z — 0.2.1 shipped; `main` is 0.2.1
+
+**Released.** `v0.2.1` at `1ffdeed`:
+https://github.com/ethannortharc/devbox/releases/tag/v0.2.1 — the release
+workflow went green on its first run this time (both agents, both builds,
+the release), `devbox-darwin-arm64` and `devbox-linux-amd64` published, the
+macOS binary verified on this host, and the release notes posted (0.2.0's
+were posted alongside; they had been sitting in a scratchpad). `main` was
+fast-forwarded from March's `0474a45` to `1ffdeed` on GitHub and Gitea, so
+the default branch is the release.
+
+**What 0.2.1 is**, for the record: the cidata mount fix that lets a stopped
+Lima box boot again (W3-6, W3-10), the collector read loop that a keepalive
+could no longer cancel (W3-9), handovers and agent pushes that wait for the
+run they would interrupt and a report that says when one did not (W3-7,
+W3-8, W3-11), the guest's single home (W3-5, W3-3), `[mounts]` defaults
+(W3-10), broker takeover by hash and daemon leaks closed (W3-1, W2-9),
+`devbox code` over ssh environment (W3-4), run start gate and schema v3–v5
+(W3-2, W3-7, W3-11), `layer prune`, `store redact`, the x86 CO-RE pair.
+Every one of the six defects that were already in 0.2.0 is in the notes with
+its cause.
+
+**Next cycle** opened the same morning: W4-1 (the capture verdict as a pure
+function, and `interrupted` produced on a real box), W4-2 (`/workspace`'s
+`nofail` at provision time only, and a command that clears the stale
+`/home/<user>` older boxes carry), W4-3 (one `StubRuntime` instead of five
+test doubles). Still needing a machine devbox does not have here: the Incus,
+Docker, and Ubuntu-image paths.
