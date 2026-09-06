@@ -18,6 +18,9 @@ let
   sets = devboxConfig.sets or {};
   langs = devboxConfig.languages or {};
   username = devboxConfig.user.name or "dev";
+  # The home the box's login shell actually uses, when devbox was able to ask
+  # the box for it. Absent on a box provisioned before devbox recorded it.
+  userHome = devboxConfig.user.home or null;
   sandbox = devboxConfig.sandbox or {};
   mountMode = sandbox.mount_mode or "overlay";
   isOverlay = mountMode == "overlay";
@@ -143,11 +146,27 @@ in {
   # ── User configuration ────────────────────────────
   # Lima creates the user automatically; we declare it here so NixOS
   # manages the shell and group memberships properly.
+  #
+  # `home` is declared too, and that is not cosmetic. `isNormalUser` defaults
+  # it to `/home/${username}`, so a box whose user Lima created somewhere else
+  # had its passwd entry silently re-homed by the first `nixos-rebuild`. On a
+  # Mac, Lima's cloud-init uses `/home/<name>.guest` — the host's own home is
+  # mounted into the guest and the two names would collide — and it writes the
+  # box's `authorized_keys` there. Re-homing left sshd resolving the home to a
+  # directory with no keys in it: every ssh connection opened after the first
+  # rebuild was refused, and the box stayed reachable only through the shared
+  # connection `limactl` had already authenticated, whose cached passwd entry
+  # still named the old home. That is also why the two disagreed about `$HOME`.
+  #
+  # devbox asks the box where its login shell lives and records the answer in
+  # `devbox-state.toml`; this keeps NixOS from overruling it. Absent on a box
+  # provisioned before that was recorded, and then the old default applies —
+  # `agent_sync` is what brings those boxes back.
   users.users.${username} = {
     isNormalUser = true;
     shell = lib.mkForce (if hasShell then pkgs.zsh else pkgs.bashInteractive);
     extraGroups = lib.mkAfter ([ "wheel" ] ++ lib.optionals (sets.container or false) [ "docker" ]);
-  };
+  } // lib.optionalAttrs (userHome != null) { home = userHome; };
 
   # ── OverlayFS Workspace Mount ─────────────────────────
   # In overlay mode, /mnt/host is the read-only host mount from Lima.

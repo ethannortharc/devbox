@@ -63,12 +63,20 @@ pub async fn write_set_modules(
     selection: &compose::Selection,
 ) -> Result<()> {
     // Read back what the box already declares, so regenerating the state file
-    // does not reset the guest username or the mount mode (both of which the
-    // NixOS module reads from it).
+    // does not reset the guest username, the guest home, or the mount mode
+    // (all three of which the NixOS module reads from it).
     let existing = read_state_toml(runtime, sandbox_name).await?;
     let username = existing
         .as_ref()
         .and_then(|t| toml_string(t, "user", "name"));
+    // Dropping this one is not cosmetic: without it the module falls back to
+    // `isNormalUser`'s `/home/<name>` and the next rebuild re-homes the passwd
+    // entry away from the directory holding the box's `authorized_keys` —
+    // which is the failure this key exists to prevent. A `devbox sets apply`
+    // would otherwise undo it during an unrelated change.
+    let home = existing
+        .as_ref()
+        .and_then(|t| toml_string(t, "user", "home"));
     let mount_mode = existing
         .as_ref()
         .and_then(|t| toml_string(t, "sandbox", "mount_mode"));
@@ -113,6 +121,7 @@ pub async fn write_set_modules(
         &languages_map(&config),
         &extra,
         username.as_deref(),
+        home.as_deref(),
         mount_mode.as_deref(),
     );
     write_state_toml(runtime, sandbox_name, &state_toml).await
