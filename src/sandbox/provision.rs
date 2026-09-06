@@ -1347,6 +1347,18 @@ fn strip_credential_sections(content: &str) -> String {
 // ── Shared Helpers ──────────────────────────────────────────
 
 /// Generate devbox-state.toml content from active sets and languages.
+/// Which user a box runs as, and the home that user's login shell actually
+/// uses.
+///
+/// The pair the rest of devbox derives everything else from, exposed because
+/// `devbox repair stale-home` has to know which of a box's two home
+/// directories is the real one before it offers to delete the other.
+pub(crate) async fn guest_identity(runtime: &dyn Runtime, name: &str) -> Result<(String, String)> {
+    let username = detect_vm_username(runtime, name).await;
+    let home = detect_vm_home(runtime, name, &username).await;
+    Ok((username, home))
+}
+
 /// Whether this box's `/workspace` may carry `nofail`.
 ///
 /// Decided once, at the box's birth, and never revisited. `nofail` is what

@@ -181,6 +181,7 @@ mod tests {
             case(&["store", "redact"], &[], &["--name"]),
             case(&["export"], &["--format", "jsonl"], &["--name"]),
             case(&["broker", "reach"], &[], &["--name"]),
+            case(&["repair", "stale-home"], &[], &["--name"]),
             case(&["sets", "list"], &[], &["--name"]),
             case(&["sets", "apply"], &["--set", "system"], &["--name"]),
             case(&["behavior", "summary"], &[], &["--name"]),
@@ -242,7 +243,7 @@ mod tests {
     /// wrong slot, such as `snapshot save nightly devtest` binding `nightly`
     /// as the box.
     fn selected_box(argv: &[String]) -> Option<String> {
-        use crate::cli::{behavior, broker, nix_cmd, policy, sets, snapshot, store};
+        use crate::cli::{behavior, broker, nix_cmd, policy, repair, sets, snapshot, store};
 
         let cli = Cli::try_parse_from(argv).expect("argv should parse");
         match cli.command.expect("a subcommand") {
@@ -259,6 +260,9 @@ mod tests {
             Command::Run(a) => a.boxarg.name().map(str::to_string),
             Command::Runs(a) => a.boxarg.name().map(str::to_string),
             Command::Export(a) => a.boxarg.name().map(str::to_string),
+            Command::Repair(a) => match a.command {
+                repair::RepairCommand::StaleHome(a) => a.boxarg.name().map(str::to_string),
+            },
             Command::BrokerCmd(a) => match a.command {
                 broker::BrokerCommand::Reach(a) => a.boxarg.name().map(str::to_string),
                 other => panic!("devbox broker {other:?} does not select a box"),
