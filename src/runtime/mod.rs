@@ -7,7 +7,7 @@ pub mod multipass;
 pub mod stub;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -182,6 +182,24 @@ pub trait Runtime: Send + Sync {
     /// Roll back an update whose corresponding sandbox state could not be
     /// persisted. Implementations must leave the next start on the old mounts.
     async fn rollback_mounts(&self, name: &str, update: &MountUpdate) -> Result<()>;
+
+    /// Copy one file out of a box onto the host.
+    ///
+    /// The trait had no way to move a file out at all, and the alternative —
+    /// `cat` through `exec_cmd` — reads the whole thing into a `String` on the
+    /// way past. That is fine for a probe's worth of text and wrong for the
+    /// thing this exists for: an archive of a home directory, which on the box
+    /// it was written for is 193 MB. It would also corrupt it, because
+    /// `ExecResult::stdout` is UTF-8 and a tarball is not.
+    ///
+    /// Every runtime's own CLI already does this properly, so each one calls
+    /// it. The default refuses rather than pretending, because a runtime that
+    /// silently cannot move files would be discovered as an archive that never
+    /// arrived.
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        let _ = (name, guest_path, host_path);
+        anyhow::bail!("runtime '{}' cannot copy a file out of a box", self.name())
+    }
 
     /// Execute an interactive command as the non-root user.
     /// Used for shell attach — defaults to exec_cmd with interactive=true.

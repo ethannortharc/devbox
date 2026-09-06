@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use super::cmd::{run_cmd, run_interactive, run_ok};
@@ -18,6 +20,22 @@ impl MultipassRuntime {
 
 #[async_trait]
 impl Runtime for MultipassRuntime {
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        // `multipass transfer <instance>:<path> <destination>` — the Multipass
+        // CLI reference for `transfer`, whose example is
+        // `multipass transfer ample-pigeon:remote_file.txt .`.
+        //
+        // Not verified on a live Multipass host: this machine has none.
+        let source = format!("{}:{guest_path}", Self::vm_name(name));
+        run_ok(
+            "multipass",
+            &["transfer", &source, &host_path.to_string_lossy()],
+        )
+        .await
+        .with_context(|| format!("copy {guest_path} out of box '{name}'"))?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "multipass"
     }

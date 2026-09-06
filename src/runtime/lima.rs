@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -246,6 +247,19 @@ containerd:
 
 #[async_trait]
 impl Runtime for LimaRuntime {
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        // `limactl copy SOURCE ... TARGET`, guest side prefixed with the
+        // instance name and a colon — `limactl copy --help`, Lima 2.2.0:
+        // "Prefix guest filenames with the instance name and a colon."
+        // It picks rsync when both ends have it and falls back to scp, so a
+        // large file does not go through a pipe this process owns.
+        let source = format!("{}:{guest_path}", Self::vm_name(name));
+        run_ok("limactl", &["copy", &source, &host_path.to_string_lossy()])
+            .await
+            .with_context(|| format!("copy {guest_path} out of box '{name}'"))?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "lima"
     }

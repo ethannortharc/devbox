@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use super::cmd::{run_cmd, run_interactive, run_ok};
@@ -47,6 +49,15 @@ impl DockerRuntime {
 
 #[async_trait]
 impl Runtime for DockerRuntime {
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        // `docker cp CONTAINER:SRC_PATH DEST_PATH` — `docker cp --help`.
+        let source = format!("{}:{guest_path}", Self::container_name(name));
+        run_ok("docker", &["cp", &source, &host_path.to_string_lossy()])
+            .await
+            .with_context(|| format!("copy {guest_path} out of box '{name}'"))?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "docker"
     }

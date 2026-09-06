@@ -39,6 +39,7 @@
 //! # let _ = guest.called("exec_cmd");
 //! ```
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -66,6 +67,11 @@ pub enum Call {
         cmd: Vec<String>,
         interactive: bool,
     },
+    CopyFrom {
+        name: String,
+        guest_path: String,
+        host_path: PathBuf,
+    },
 }
 
 impl Call {
@@ -80,6 +86,7 @@ impl Call {
             Self::Status(_) => "status",
             Self::Exec { .. } => "exec_cmd",
             Self::Argv { .. } => "argv",
+            Self::CopyFrom { .. } => "copy_from",
         }
     }
 }
@@ -87,7 +94,14 @@ impl Call {
 /// Every method [`StubRuntime`] records, and the only names
 /// [`StubRuntime::called`] accepts.
 const RECORDED: &[&str] = &[
-    "create", "start", "stop", "destroy", "status", "exec_cmd", "argv",
+    "create",
+    "start",
+    "stop",
+    "destroy",
+    "status",
+    "exec_cmd",
+    "argv",
+    "copy_from",
 ];
 
 type CreateFn = Box<dyn Fn(&CreateOpts) -> Result<SandboxInfo> + Send + Sync>;
@@ -95,6 +109,7 @@ type BoxNameFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 type StatusFn = Box<dyn Fn(&str) -> Result<SandboxStatus> + Send + Sync>;
 type ExecCmdFn = Box<dyn Fn(&str, &[&str], bool) -> Result<ExecResult> + Send + Sync>;
 type ArgvFn = Box<dyn Fn(&str, &[&str], bool) -> Vec<String> + Send + Sync>;
+type CopyFromFn = Box<dyn Fn(&str, &str, &Path) -> Result<()> + Send + Sync>;
 
 /// How an unscripted method fails: by name, so a test that reaches a call it
 /// did not think about is told which one.
@@ -126,6 +141,7 @@ pub struct StubRuntime {
     status: Option<StatusFn>,
     exec_cmd: Option<ExecCmdFn>,
     argv: Option<ArgvFn>,
+    copy_from: Option<CopyFromFn>,
 }
 
 impl Default for StubRuntime {
@@ -141,6 +157,7 @@ impl Default for StubRuntime {
             status: None,
             exec_cmd: None,
             argv: None,
+            copy_from: None,
         }
     }
 }
@@ -227,6 +244,17 @@ impl StubRuntime {
         F: Fn(&str, &[&str], bool) -> Vec<String> + Send + Sync + 'static,
     {
         self.argv = Some(Box::new(f));
+        self
+    }
+
+    /// What [`Runtime::copy_from`] does. The host path is passed through, so a
+    /// script that wants to stand in for a real transfer can write the file
+    /// the caller is about to check.
+    pub fn with_copy_from<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &str, &Path) -> Result<()> + Send + Sync + 'static,
+    {
+        self.copy_from = Some(Box::new(f));
         self
     }
 
@@ -348,6 +376,18 @@ impl Runtime for StubRuntime {
         }
     }
 
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        self.record(Call::CopyFrom {
+            name: name.to_string(),
+            guest_path: guest_path.to_string(),
+            host_path: host_path.to_path_buf(),
+        });
+        match &self.copy_from {
+            Some(f) => f(name, guest_path, host_path),
+            None => unscripted("copy_from"),
+        }
+    }
+
     // No test double has ever scripted anything below, so none of these has a
     // builder. They keep the `unimplemented!()` semantics the five doubles had,
     // and add the method's name to the message.
@@ -393,6 +433,43 @@ mod tests {
     #[should_panic(expected = "StubRuntime: stop not scripted")]
     async fn an_unscripted_method_names_itself() {
         let _ = StubRuntime::new().stop("box").await;
+    }
+
+    /// The transfer primitive records what it was asked to move, so a test can
+    /// assert on the guest path and the destination without the script having
+    /// to remember them itself.
+    #[tokio::test]
+    async fn copy_from_records_both_ends() {
+        let stub = StubRuntime::new().with_copy_from(|_, _, _| Ok(()));
+        stub.copy_from(
+            "devtest",
+            "/tmp/archive.tar.gz",
+            Path::new("/host/out.tar.gz"),
+        )
+        .await
+        .expect("scripted");
+        assert!(stub.called("copy_from"));
+        assert_eq!(
+            stub.calls(),
+            vec![Call::CopyFrom {
+                name: "devtest".into(),
+                guest_path: "/tmp/archive.tar.gz".into(),
+                host_path: PathBuf::from("/host/out.tar.gz"),
+            }]
+        );
+    }
+
+    /// And a refused transfer is still recorded: "it was asked and failed" and
+    /// "it was never asked" are the two outcomes this whole change turns on.
+    #[tokio::test]
+    async fn a_refused_copy_is_still_recorded() {
+        let stub = StubRuntime::new().with_copy_from(|_, _, _| bail!("no route to the box"));
+        assert!(
+            stub.copy_from("devtest", "/tmp/a", Path::new("/host/a"))
+                .await
+                .is_err()
+        );
+        assert!(stub.called("copy_from"));
     }
 
     /// Including the tail with no builder at all, which is where the five
