@@ -30,11 +30,20 @@ use crate::sandbox::SandboxManager;
 
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnerIdentity {
     pid: i32,
     version: String,
+    /// The daemon's own process group, or `0` when it has none recorded.
+    ///
+    /// Same reason as the collector's (see [`crate::obs::daemon`]): a daemon's
+    /// children inherit its group, and stopping the pid alone leaves them.
+    /// Written only after the daemon has proved it *leads* the group.
+    pgid: i32,
 }
+
+/// How long an unaccounted broker is given to go quietly.
+const ORPHAN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join("locks").join("broker-daemon.lock")
@@ -105,6 +114,14 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
         Ok(()) => File::unlock(&probe).context("release broker daemon ownership probe")?,
     }
 
+    // Clear anything already serving this state directory that the record does
+    // not account for, before adding one more.
+    let recorded = read_owner_identity(&manager.state_dir).ok();
+    let reaped = reap_orphans(&manager.state_dir, recorded.as_ref());
+    if reaped > 0 {
+        tracing::info!(reaped, "reclaimed unaccounted broker daemons");
+    }
+
     let path = log_path(&manager.state_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -131,6 +148,65 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
         .process_group(0);
     command.spawn().context("start the credential broker")?;
     Ok(())
+}
+
+/// Brokers serving this state directory that no ownership record accounts for.
+///
+/// The collector's reaper, for the other daemon, and scoped the same way: a
+/// `__broker` whose working directory is some other state directory belongs to
+/// somebody else's devbox, not to this one's litter.
+fn orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> Vec<crate::procgroup::Process> {
+    let Ok(processes) = crate::procgroup::snapshot() else {
+        return Vec::new();
+    };
+    let mut spare = Vec::new();
+    if let Some(owner) = owner {
+        spare.push(owner.pid);
+        if owner.pgid != 0 {
+            spare.extend(
+                processes
+                    .iter()
+                    .filter(|process| process.pgid == owner.pgid)
+                    .map(|process| process.pid),
+            );
+        }
+    }
+    crate::procgroup::orphans(&processes, "__broker", state_dir, &spare)
+}
+
+/// Broker daemons serving this state directory that nothing accounts for, for
+/// `devbox doctor`.
+pub fn unaccounted(manager: &SandboxManager) -> Vec<String> {
+    let owner = read_owner_identity(&manager.state_dir).ok();
+    orphans(&manager.state_dir, owner.as_ref())
+        .into_iter()
+        .map(|process| format!("pid {} — {}", process.pid, process.command))
+        .collect()
+}
+
+fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
+    let mut reaped = 0;
+    for orphan in orphans(state_dir, owner) {
+        match crate::procgroup::stop_group(orphan.pgid, "__broker", ORPHAN_TIMEOUT) {
+            Ok(stopped) if stopped.survivors == 0 => {
+                tracing::info!(
+                    pid = orphan.pid,
+                    pgid = orphan.pgid,
+                    "stopped an unaccounted broker serving this state directory"
+                );
+                reaped += 1;
+            }
+            Ok(stopped) => tracing::warn!(
+                pid = orphan.pid,
+                survivors = stopped.survivors,
+                "an unaccounted broker would not stop"
+            ),
+            Err(error) => {
+                tracing::warn!(pid = orphan.pid, %error, "could not stop an unaccounted broker")
+            }
+        }
+    }
+    reaped
 }
 
 fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
@@ -165,8 +241,12 @@ fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()>
             .mode(0o600)
             .open(&temporary)
             .with_context(|| format!("create broker identity {}", temporary.display()))?;
-        writeln!(file, "pid={} version={}", owner.pid, owner.version)
-            .context("write broker daemon identity")?;
+        writeln!(
+            file,
+            "pid={} version={} pgid={}",
+            owner.pid, owner.version, owner.pgid
+        )
+        .context("write broker daemon identity")?;
         file.sync_all().context("flush broker daemon identity")?;
         drop(file);
         std::fs::rename(&temporary, &path)
@@ -182,6 +262,10 @@ fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()>
 fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
     let mut pid = None;
     let mut version = None;
+    // Absent for a record written before this field existed, and a malformed
+    // one is no group: nothing here may turn an unparseable number into a
+    // signal.
+    let mut pgid = 0;
     for field in text.split_whitespace() {
         if let Some(value) = field.strip_prefix("pid=") {
             pid = Some(
@@ -191,6 +275,8 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
             );
         } else if let Some(value) = field.strip_prefix("version=") {
             version = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("pgid=") {
+            pgid = value.parse::<i32>().unwrap_or(0);
         }
     }
     let pid = pid.context("broker identity has no pid")?;
@@ -200,7 +286,11 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
     let version = version
         .filter(|value| !value.is_empty())
         .context("broker identity has no version")?;
-    Ok(OwnerIdentity { pid, version })
+    // A group id that is not the owner's own pid is not the owner's group.
+    if pgid != pid {
+        pgid = 0;
+    }
+    Ok(OwnerIdentity { pid, version, pgid })
 }
 
 /// Ask an older binary to release the lock, then prove it did.
@@ -209,6 +299,31 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
 /// checked against the process's own command line before any signal is sent,
 /// so a stale record cannot be turned into a way to kill an unrelated process.
 fn replace_outdated_owner(probe: &File, state_dir: &Path, owner: &OwnerIdentity) -> Result<bool> {
+    // The whole group where the owner recorded one, for the reason the
+    // collector's takeover does it: a daemon's children share its group, and
+    // signalling the pid alone leaves them behind.
+    if owner.pgid != 0 {
+        let stopped = crate::procgroup::stop_group(owner.pgid, "__broker", REPLACEMENT_TIMEOUT)
+            .with_context(|| format!("stop the outdated broker group {}", owner.pgid))?;
+        if stopped.survivors > 0 {
+            bail!(
+                "broker group {} still has {} process(es) after SIGTERM and SIGKILL",
+                owner.pgid,
+                stopped.survivors
+            );
+        }
+        return match probe.try_lock() {
+            Ok(()) => {
+                File::unlock(probe).context("release broker replacement probe")?;
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(anyhow::Error::new(error))
+                .context("claim ownership after stopping the outdated broker"),
+        };
+    }
+
+    // No group recorded: an owner from a build before this existed.
     let process = Command::new("ps")
         .args(["-ww", "-p", &owner.pid.to_string(), "-o", "command="])
         .stdin(Stdio::null())
@@ -285,13 +400,15 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     let listener = bind().await?;
     let port = listener.local_addr()?.port();
 
-    publish_owner_identity(
-        &manager.state_dir,
-        &OwnerIdentity {
-            pid: i32::try_from(std::process::id()).context("broker pid exceeds i32")?,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )?;
+    // A group of our own before anything is published about us, so the id we
+    // record can only ever name this daemon and its descendants.
+    let me = OwnerIdentity {
+        pid: i32::try_from(std::process::id()).context("broker pid exceeds i32")?,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pgid: crate::procgroup::lead_own_group()
+            .context("give the broker daemon a process group of its own")?,
+    };
+    publish_owner_identity(&manager.state_dir, &me)?;
     super::publish_endpoint(
         &manager.state_dir,
         &super::Endpoint {
@@ -407,10 +524,11 @@ mod tests {
     #[test]
     fn broker_owner_identity_round_trips_and_rejects_unsafe_pids() {
         assert_eq!(
-            parse_owner_identity("pid=4242 version=1.2.3\n").unwrap(),
+            parse_owner_identity("pid=4242 version=1.2.3 pgid=4242\n").unwrap(),
             OwnerIdentity {
                 pid: 4242,
                 version: "1.2.3".to_string(),
+                pgid: 4242,
             }
         );
         for invalid in ["", "pid=1 version=old", "pid=nope version=old", "pid=42"] {
@@ -424,6 +542,7 @@ mod tests {
         let owner = OwnerIdentity {
             pid: 4242,
             version: "1.2.3".to_string(),
+            pgid: 4242,
         };
         publish_owner_identity(dir.path(), &owner).unwrap();
         assert_eq!(read_owner_identity(dir.path()).unwrap(), owner);

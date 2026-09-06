@@ -126,9 +126,11 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
         ),
         Err(error) => println!("  Process:  \x1b[31munknown\x1b[0m — {error}"),
     }
+    print_unaccounted("  Orphans: ", crate::obs::daemon::unaccounted(manager));
 
     println!("\nCredential broker:");
     println!("  Process:  {}", crate::cli::broker::status_line(manager));
+    print_unaccounted("  Orphans: ", crate::broker::daemon::unaccounted(manager));
     println!("  Secrets:  {}", crate::cli::secret::backend_label(manager));
     let providers = crate::broker::configured_providers(&manager.state_dir);
     println!(
@@ -414,6 +416,26 @@ async fn print_host_reach(
 /// and told to the collector in the handshake, and the difference is the whole
 /// question a reader has when `devbox watch` shows connections with no process
 /// against them: proc polling reads /proc/net/tcp, which has no pid column.
+/// Daemons serving this state directory that no ownership record accounts for.
+///
+/// Printed rather than reaped, because `doctor` diagnoses. The number is the
+/// one that mattered: this host reached 147 of them, 1.9 GB, with nothing on
+/// any surface saying so — every one held no lock, so nothing ever contended
+/// with it and nothing ever looked.
+fn print_unaccounted(label: &str, orphans: Vec<String>) {
+    if orphans.is_empty() {
+        println!("{label} \x1b[32mnone\x1b[0m");
+        return;
+    }
+    println!(
+        "{label} \x1b[33m{}\x1b[0m — reclaimed by the next command that starts a daemon",
+        orphans.len()
+    );
+    for orphan in orphans {
+        println!("    {orphan}");
+    }
+}
+
 /// Whether the box's agent is the binary this devbox would install.
 ///
 /// Next to `capture:`, and asked of the guest rather than of any host record:

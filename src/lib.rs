@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod nix;
 pub mod obs;
 pub mod policy;
+pub mod procgroup;
 pub mod report;
 pub mod runtime;
 pub mod sandbox;

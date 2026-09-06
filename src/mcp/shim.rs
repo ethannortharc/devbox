@@ -434,83 +434,13 @@ async fn settle(
     (child.wait().await.ok(), true)
 }
 
-/// This process's own group id.
-pub fn own_process_group() -> i32 {
-    // SAFETY: `getpgrp` takes no arguments, touches no memory, and cannot fail.
-    unsafe { libc::getpgrp() }
-}
-
-/// The process group of whoever started us, when it can be read.
-///
-/// `getppid` is exact; turning a ppid into its group needs `getpgid`, which
-/// returns `ESRCH` if the parent has already gone — a `None` this treats as
-/// "nothing to protect", because a parent that has exited cannot be killed.
-fn parent_process_group() -> Option<i32> {
-    // SAFETY: neither call takes a pointer, and `getpgid` reports failure
-    // through its return value rather than through memory.
-    let parent = unsafe { libc::getppid() };
-    if parent <= 0 {
-        return None;
-    }
-    let group = unsafe { libc::getpgid(parent) };
-    (group > 0).then_some(group)
-}
-
-/// Signal a process group, refusing the ones that are not safe to name.
-///
-/// Three refusals, and each of them has a way of being reached:
-///
-/// - **`0`** means "the sender's own group" to `kill(2)`. A zero that reached
-///   here would take out the shim, its parent, and everything sharing their
-///   group, and it would do it while looking like an ordinary cleanup.
-/// - **`1`** is `init`'s group, and `kill(-1, …)` is "every process this user
-///   may signal".
-/// - **our own group**, which is the same disaster as `0` reached the long way
-///   round. It is not hypothetical: on a Linux CI runner this function's
-///   predecessor sent SIGTERM to a group that turned out to contain
-///   `cargo test`, and the whole step died with 143.
-///
-/// Through `killpg(2)` rather than `kill(1)`: the shell tool differs between
-/// procps, util-linux and BSD, needs a PATH lookup on the shutdown path, and
-/// puts a whole subprocess spawn between deciding to signal and signalling —
-/// which is exactly the window a reaped-and-recycled pid needs to become
-/// somebody else's.
-fn signal_group(pgid: i32, signal: i32) -> std::result::Result<(), String> {
-    if pgid <= 1 {
-        return Err(format!(
-            "refusing to signal process group {pgid}: it names this process's own \
-             group or every process on the host"
-        ));
-    }
-    let ours = own_process_group();
-    if pgid == ours {
-        return Err(format!(
-            "refusing to signal process group {pgid}: it is the group this shim is \
-             in, so the signal would come back to us"
-        ));
-    }
-    // And our parent's, for the case our own group is not the caller's: a shim
-    // that someone launched into a group of its own would pass the check above
-    // while still being able to signal the process that launched it.
-    if let Some(parent) = parent_process_group()
-        && pgid == parent
-    {
-        return Err(format!(
-            "refusing to signal process group {pgid}: it is the group of the process \
-             that started this shim"
-        ));
-    }
-    // SAFETY: `killpg` takes two integers and cannot write through a pointer.
-    // A group that has already gone is `ESRCH`, which is the normal outcome of
-    // cleaning up after something that cleaned up after itself.
-    if unsafe { libc::killpg(pgid, signal) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("could not signal process group {pgid}: {error}"));
-        }
-    }
-    Ok(())
-}
+#[cfg(test)]
+use crate::procgroup::parent_process_group;
+/// Signalling a whole process tree is not this module's invention any more:
+/// the collector and broker daemons replace an older build of themselves the
+/// same way, and the guards that stop a reaper reaching its own caller were
+/// paid for once already. They live in [`crate::procgroup`].
+pub use crate::procgroup::{own_process_group, signal_group};
 
 /// The code the agent sees.
 ///

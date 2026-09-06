@@ -23,6 +23,19 @@ use crate::sandbox::SandboxManager;
 const DISABLE_ENV: &str = "DEVBOX_NO_COLLECTOR_DAEMON";
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often the owning daemon looks for rivals on its own state directory.
+///
+/// Slow on purpose. Nothing is waiting on the answer, and the usual answer is
+/// "none" — the cost that matters is the one a user's command would pay, and
+/// this moves it off that path entirely.
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long an unaccounted daemon is given to go quietly.
+///
+/// Shorter than a replacement's: nothing is waiting on this one's shutdown to
+/// hand over, and it runs on the path of an ordinary command.
+const ORPHAN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// What a build publishes when it cannot identify itself.
 ///
 /// Its own executable can be gone — a worktree deleted while its daemon still
@@ -53,6 +66,16 @@ struct OwnerIdentity {
     /// the case this exists for. Empty for an owner from before this field
     /// existed, which is itself proof it is not this binary.
     build: String,
+    /// The daemon's own process group, or `0` when it has none recorded.
+    ///
+    /// A daemon's children — the exec transports that carry a guest agent's
+    /// stdio — inherit this group, and `kill_on_drop` does not run when the
+    /// daemon is killed rather than dropped. Signalling the pid alone
+    /// therefore stops the daemon and leaves its `limactl`/`ssh` pair holding
+    /// a guest. The daemon writes this only after proving it *leads* the group
+    /// (see [`crate::procgroup::lead_own_group`]); zero means an older build
+    /// that never did, and the takeover falls back to the single pid.
+    pgid: i32,
 }
 
 impl OwnerIdentity {
@@ -63,6 +86,10 @@ impl OwnerIdentity {
             version: env!("CARGO_PKG_VERSION").to_string(),
             commit: build_commit().to_string(),
             build: host_build_digest().to_string(),
+            // Filled in by `run` once it has made a group of its own. A
+            // process that has not done that must not claim a group: the one
+            // it is in belongs to whoever started it.
+            pgid: 0,
         })
     }
 
@@ -229,6 +256,20 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
         Ok(()) => File::unlock(&probe).context("release collector daemon ownership probe")?,
     }
 
+    // Before starting another one, clear anything already serving this state
+    // directory that the ownership record does not account for. Without this,
+    // a leak has no way of healing: the leaked daemon holds no lock, so
+    // nothing ever contends with it and nothing ever looks.
+    // Spare whoever the record names. On this path the old owner is normally
+    // dead — the lock was free, or the replacement above proved it stopped —
+    // but two lifecycle commands can reach here together, and the loser must
+    // not reap the winner's fresh daemon.
+    let recorded = read_owner_identity(&manager.state_dir).ok();
+    let reaped = reap_orphans(&manager.state_dir, recorded.as_ref());
+    if reaped > 0 {
+        tracing::info!(reaped, "reclaimed unaccounted collector daemons");
+    }
+
     let path = log_path(&manager.state_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -261,6 +302,85 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
         .spawn()
         .context("start the background observability collector")?;
     Ok(())
+}
+
+/// Daemons serving this state directory that no owner record accounts for.
+///
+/// The backstop for everything the ownership protocol cannot see. A daemon
+/// started outside it, or one whose predecessor's group was signalled while it
+/// was between `fork` and its own claim, holds no lock, appears in no sidecar,
+/// and supervises the same boxes as the daemon that does — forever, because
+/// nothing was ever going to look for it.
+///
+/// Scoped to *this* state directory, and that scoping is the safety argument,
+/// not an optimisation. A `__collector` serving another directory is somebody
+/// else's working setup — an isolated `HOME`, a second checkout — and "every
+/// daemon that is not the one I know about" would kill it. A daemon is started
+/// with its state directory as its working directory, so the process itself
+/// says which state it belongs to; that is the only claim made here.
+fn orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> Vec<crate::procgroup::Process> {
+    let Ok(processes) = crate::procgroup::snapshot() else {
+        return Vec::new();
+    };
+    // Everything the live owner accounts for: itself and its whole group.
+    let mut spare = Vec::new();
+    if let Some(owner) = owner {
+        spare.push(owner.pid);
+        if owner.pgid != 0 {
+            spare.extend(
+                processes
+                    .iter()
+                    .filter(|process| process.pgid == owner.pgid)
+                    .map(|process| process.pid),
+            );
+        }
+    }
+    crate::procgroup::orphans(&processes, "__collector", state_dir, &spare)
+}
+
+/// Collector daemons serving this state directory that nothing accounts for.
+///
+/// For `devbox doctor`, which reports them rather than reaping them: the
+/// number is the symptom a reader needs to see, and the next lifecycle command
+/// is what clears it.
+pub fn unaccounted(manager: &SandboxManager) -> Vec<String> {
+    let owner = read_owner_identity(&manager.state_dir).ok();
+    orphans(&manager.state_dir, owner.as_ref())
+        .into_iter()
+        .map(|process| format!("pid {} — {}", process.pid, process.command))
+        .collect()
+}
+
+/// Stop the orphans and say how many were stopped.
+///
+/// Best effort and never fatal: a lifecycle command that cannot tidy up is
+/// still a lifecycle command. Each is stopped by its own group, so its exec
+/// transports go with it.
+fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
+    let mut reaped = 0;
+    for orphan in orphans(state_dir, owner) {
+        // Its own group, because a daemon leads one; where it does not, the
+        // pid is all there is and `stop_group` refuses, which is correct.
+        match crate::procgroup::stop_group(orphan.pgid, "__collector", ORPHAN_TIMEOUT) {
+            Ok(stopped) if stopped.survivors == 0 => {
+                tracing::info!(
+                    pid = orphan.pid,
+                    pgid = orphan.pgid,
+                    "stopped an unaccounted collector serving this state directory"
+                );
+                reaped += 1;
+            }
+            Ok(stopped) => tracing::warn!(
+                pid = orphan.pid,
+                survivors = stopped.survivors,
+                "an unaccounted collector would not stop"
+            ),
+            Err(error) => {
+                tracing::warn!(pid = orphan.pid, %error, "could not stop an unaccounted collector")
+            }
+        }
+    }
+    reaped
 }
 
 fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
@@ -300,8 +420,8 @@ fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()>
             .with_context(|| format!("create collector identity {}", temporary.display()))?;
         writeln!(
             file,
-            "pid={} version={} commit={} build={}",
-            owner.pid, owner.version, owner.commit, owner.build
+            "pid={} version={} commit={} build={} pgid={}",
+            owner.pid, owner.version, owner.commit, owner.build, owner.pgid
         )
         .context("write collector daemon identity")?;
         file.sync_all().context("flush collector daemon identity")?;
@@ -324,6 +444,7 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
     // replacing it is exactly what the missing build identity is evidence for.
     let mut commit = String::new();
     let mut build = String::new();
+    let mut pgid = 0;
     for field in text.split_whitespace() {
         if let Some(value) = field.strip_prefix("pid=") {
             pid = Some(
@@ -337,6 +458,10 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
             commit = value.to_string();
         } else if let Some(value) = field.strip_prefix("build=") {
             build = value.to_string();
+        } else if let Some(value) = field.strip_prefix("pgid=") {
+            // A malformed group is no group. Nothing here may turn an
+            // unparseable number into a signal.
+            pgid = value.parse::<i32>().unwrap_or(0);
         }
     }
     let pid = pid.context("collector identity has no pid")?;
@@ -346,11 +471,18 @@ fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
     let version = version
         .filter(|value| !value.is_empty())
         .context("collector identity has no version")?;
+    // A group id that is not the owner's own pid is not the owner's group.
+    // The daemon only ever writes one it leads, so anything else came from a
+    // corrupted record — and signalling it would reach a stranger.
+    if pgid != pid {
+        pgid = 0;
+    }
     Ok(OwnerIdentity {
         pid,
         version,
         commit,
         build,
+        pgid,
     })
 }
 
@@ -365,6 +497,44 @@ fn replace_outdated_owner(
     owner: &OwnerIdentity,
     mine: &OwnerIdentity,
 ) -> Result<bool> {
+    // The whole group where the owner recorded one. A daemon's exec transports
+    // are its children and share its group, and `kill_on_drop` cannot run for
+    // a process that was signalled rather than dropped — so the pid alone
+    // stops the daemon and leaves a `limactl`/`ssh` pair attached to a guest.
+    // The group is only signalled if it is still *led* by a live
+    // `__collector`, which is what proves the recorded id was not recycled.
+    if owner.pgid != 0 {
+        let stopped = crate::procgroup::stop_group(owner.pgid, "__collector", REPLACEMENT_TIMEOUT)
+            .with_context(|| format!("stop the outdated collector group {}", owner.pgid))?;
+        if stopped.survivors > 0 {
+            bail!(
+                "collector group {} still has {} process(es) after SIGTERM and SIGKILL",
+                owner.pgid,
+                stopped.survivors
+            );
+        }
+        if stopped.escalated {
+            tracing::warn!(
+                pgid = owner.pgid,
+                "the outdated collector ignored SIGTERM and was killed"
+            );
+        }
+        // The lock is released when the last holder exits, which the check
+        // above has just established.
+        return match probe.try_lock() {
+            Ok(()) => {
+                File::unlock(probe).context("release collector replacement probe")?;
+                Ok(true)
+            }
+            // Somebody else won the free lock in between. Theirs to serve.
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(anyhow::Error::new(error))
+                .context("claim ownership after stopping the outdated collector"),
+        };
+    }
+
+    // No group recorded: an owner from a build before this existed. Signal the
+    // pid, exactly as before, and leave whatever it started to `kill_on_drop`.
     let process = Command::new("ps")
         .args(["-ww", "-p", &owner.pid.to_string(), "-o", "command="])
         .stdin(Stdio::null())
@@ -445,7 +615,14 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
         }
     }
 
-    publish_owner_identity(&manager.state_dir, &OwnerIdentity::mine()?)?;
+    // Before anything is published about this process: make a process group
+    // of our own, so the id we are about to record can only ever name us and
+    // our descendants. Fatal if it fails — a daemon that cannot be stopped
+    // cleanly is how this host collected a hundred and forty-seven of them.
+    let mut me = OwnerIdentity::mine()?;
+    me.pgid = crate::procgroup::lead_own_group()
+        .context("give the collector daemon a process group of its own")?;
+    publish_owner_identity(&manager.state_dir, &me)?;
 
     let stats = Arc::new(Stats::default());
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
@@ -457,6 +634,13 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
         },
     ));
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    // The owner is the one process that can look for rivals cheaply and
+    // safely: it knows exactly what to spare, and the scan costs a `ps` that
+    // no user is waiting on. Doing it only before a spawn — which is where a
+    // CLI command can afford it — leaves a rival that appears afterwards
+    // running until the next time a daemon happens to start.
+    let mut sweep = tokio::time::interval(ORPHAN_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -465,6 +649,20 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
             _ = interval.tick() => {
                 if let Err(error) = publish_stats(&manager.state_dir, stats.snapshot()) {
                     tracing::warn!(%error, "publish collector metrics snapshot");
+                }
+            }
+            _ = sweep.tick() => {
+                let state_dir = manager.state_dir.clone();
+                let me = me.clone();
+                // Off the runtime's worker: the scan shells out to `ps`, and
+                // blocking a worker stalls every collector this daemon runs.
+                let swept = tokio::task::spawn_blocking(move || {
+                    reap_orphans(&state_dir, Some(&me))
+                })
+                .await
+                .unwrap_or(0);
+                if swept > 0 {
+                    tracing::warn!(swept, "reclaimed collector daemons that were serving this state directory unaccounted");
                 }
             }
         }
@@ -601,18 +799,21 @@ mod tests {
             version: version.to_string(),
             commit: String::new(),
             build: build.to_string(),
+            pgid: 4242,
         }
     }
 
     #[test]
     fn collector_owner_identity_round_trips_and_rejects_unsafe_pids() {
         assert_eq!(
-            parse_owner_identity("pid=4242 version=1.2.3 commit=abc123 build=ff00\n").unwrap(),
+            parse_owner_identity("pid=4242 version=1.2.3 commit=abc123 build=ff00 pgid=4242\n")
+                .unwrap(),
             OwnerIdentity {
                 pid: 4242,
                 version: "1.2.3".to_string(),
                 commit: "abc123".to_string(),
                 build: "ff00".to_string(),
+                pgid: 4242,
             }
         );
         for invalid in ["", "pid=1 version=old", "pid=nope version=old", "pid=42"] {
@@ -682,6 +883,7 @@ mod tests {
             version: "0.1.6".into(),
             commit: "11cc51fbf1d3".into(),
             build: "c7d70a0857d42e7fbf0062fec377477658ff76cc8412b3210e60023a1736cca0".into(),
+            pgid: 7,
         }
         .describe();
         assert_eq!(
@@ -714,6 +916,7 @@ mod tests {
             version: "1.2.3".to_string(),
             commit: "abc123def456".to_string(),
             build: "c7d70a08".to_string(),
+            pgid: 4242,
         };
         publish_owner_identity(dir.path(), &owner).unwrap();
         assert_eq!(read_owner_identity(dir.path()).unwrap(), owner);
