@@ -274,13 +274,13 @@ pub fn generate_state_toml(
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
 ) -> String {
-    generate_state_toml_with(sets, languages, custom_packages, None, None, None)
+    generate_state_toml_with(sets, languages, custom_packages, None, None, None, None)
 }
 
 /// Generate `devbox-state.toml`, preserving the guest identity and mount mode.
 ///
-/// `devbox-module.nix` reads `[user].name`, `[user].home` and
-/// `[sandbox].mount_mode` from this file. Regenerating it from sets alone
+/// `devbox-module.nix` reads `[user].name`, `[user].home`,
+/// `[sandbox].runtime` and `[sandbox].mount_mode` from this file. Regenerating it from sets alone
 /// silently resets the guest username to `dev` and the mount mode to
 /// `overlay` — which breaks a box whose guest user differs, or whose workspace
 /// is writable, on the very next rebuild — and drops the guest home, which
@@ -291,6 +291,7 @@ pub fn generate_state_toml_with(
     custom_packages: &HashMap<String, String>,
     username: Option<&str>,
     home: Option<&str>,
+    runtime: Option<&str>,
     mount_mode: Option<&str>,
 ) -> String {
     let mut toml = String::new();
@@ -302,8 +303,18 @@ pub fn generate_state_toml_with(
         }
         toml.push('\n');
     }
-    if let Some(mode) = mount_mode {
-        toml.push_str(&format!("[sandbox]\nmount_mode = \"{mode}\"\n\n"));
+    if mount_mode.is_some() || runtime.is_some() {
+        toml.push_str("[sandbox]\n");
+        if let Some(mode) = mount_mode {
+            toml.push_str(&format!("mount_mode = \"{mode}\"\n"));
+        }
+        // Dropping this re-enables the Incus guest agent on a Lima box, where
+        // it fails and is restarted every five seconds for the life of the
+        // box — the same shape of loss as dropping the username or the home.
+        if let Some(runtime) = runtime {
+            toml.push_str(&format!("runtime = \"{runtime}\"\n"));
+        }
+        toml.push('\n');
     }
 
     toml.push_str("[sets]\n");
@@ -857,6 +868,7 @@ mod tests {
             &HashMap::new(),
             Some("ethan.linux"),
             Some("/home/ethan.linux.guest"),
+            Some("lima"),
             Some("writable"),
         );
         assert!(toml.contains("[user]"));
@@ -864,6 +876,7 @@ mod tests {
         assert!(toml.contains("home = \"/home/ethan.linux.guest\""));
         assert!(toml.contains("[sandbox]"));
         assert!(toml.contains("mount_mode = \"writable\""));
+        assert!(toml.contains("runtime = \"lima\""));
         let parsed: toml::Value = toml.parse().expect("valid TOML");
         assert_eq!(
             parsed["user"]["home"].as_str(),
