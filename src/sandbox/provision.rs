@@ -1373,6 +1373,16 @@ pub(crate) struct BirthProbe {
     pub state_says_nofail: bool,
     /// `/etc/fstab` already declares a `/workspace` mount.
     pub fstab_has_workspace: bool,
+    /// That declaration carries `nofail`.
+    ///
+    /// From `/etc/fstab`, deliberately, and not from the running mount.
+    /// `nofail` is an fstab and systemd option: it never reaches the kernel,
+    /// so `findmnt -no OPTIONS /workspace` does not report it on a box that
+    /// has it — measured on a box built with it, which lists only
+    /// `rw,relatime,lowerdir=…,upperdir=…,workdir=…,uuid=on`. Comparing the
+    /// recorded key against the *mount* would therefore call every such box a
+    /// mismatch and refuse every rebuild it ever needed.
+    pub fstab_has_nofail: bool,
     /// `/workspace` is mounted right now.
     pub workspace_mounted: bool,
 }
@@ -1392,8 +1402,13 @@ if [ -e /etc/devbox/devbox-state.toml ]; then
 else
   printf 'state=absent\n'
 fi
-if grep -qE '[[:space:]]/workspace[[:space:]]' /etc/fstab 2>/dev/null; then
+workspace_line=$(awk '$2 == "/workspace" { print; exit }' /etc/fstab 2>/dev/null)
+if [ -n "$workspace_line" ]; then
   printf 'fstab=yes\n'
+  case ",$(printf '%s' "$workspace_line" | awk '{print $4}')," in
+    *,nofail,*) printf 'fstabnofail=yes\n' ;;
+    *) printf 'fstabnofail=no\n' ;;
+  esac
 else
   printf 'fstab=no\n'
 fi
@@ -1414,6 +1429,7 @@ pub(crate) fn parse_birth_probe(stdout: &str) -> BirthProbe {
             "state=present" => probe.has_state = true,
             "nofail=true" => probe.state_says_nofail = true,
             "fstab=yes" => probe.fstab_has_workspace = true,
+            "fstabnofail=yes" => probe.fstab_has_nofail = true,
             "mounted=yes" => probe.workspace_mounted = true,
             _ => {}
         }
@@ -1469,32 +1485,6 @@ async fn workspace_nofail_for(runtime: &dyn Runtime, name: &str) -> bool {
     grant_workspace_nofail(&parse_birth_probe(&stdout))
 }
 
-/// What `/workspace` is mounted with right now, or `None` if it is not
-/// mounted.
-pub(crate) async fn workspace_mount_has_nofail(runtime: &dyn Runtime, name: &str) -> Option<bool> {
-    let result = runtime
-        .exec_cmd(
-            name,
-            &[
-                "sh",
-                "-c",
-                "findmnt -no OPTIONS /workspace 2>/dev/null && echo __DEVBOX_MOUNTED__",
-            ],
-            false,
-        )
-        .await
-        .ok()?;
-    if !result.stdout.contains("__DEVBOX_MOUNTED__") {
-        return None;
-    }
-    Some(
-        result
-            .stdout
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .any(|option| option == "nofail"),
-    )
-}
-
 /// Refuse to rebuild a box whose recorded workspace options are not the ones
 /// it is actually mounted with.
 ///
@@ -1504,20 +1494,22 @@ pub(crate) async fn workspace_mount_has_nofail(runtime: &dyn Runtime, name: &str
 /// remount, the switch exits 4, and the box can never be rebuilt again. Worth
 /// stopping in front of, because there is no stopping after.
 ///
-/// `None` for the mount means `/workspace` is not mounted: nothing to disagree
-/// with, which is the state every box being provisioned is in.
-pub(crate) fn refuse_on_workspace_mismatch(
-    box_name: &str,
-    state_says_nofail: bool,
-    mount_has_nofail: Option<bool>,
-) -> Result<()> {
-    let Some(mount_has_nofail) = mount_has_nofail else {
-        return Ok(());
-    };
-    if state_says_nofail == mount_has_nofail {
+/// The comparison is against `/etc/fstab`, not against the running mount:
+/// `nofail` never reaches the kernel, so a box that has it reports mount
+/// options without it and would look like a mismatch forever. fstab is also
+/// the right thing to compare — it is what `switch-to-configuration` diffs to
+/// decide whether the unit needs the reload that cannot succeed.
+///
+/// A box with no `/workspace` line has nothing to disagree with, which is the
+/// state every box being provisioned is in.
+pub(crate) fn refuse_on_workspace_mismatch(box_name: &str, probe: &BirthProbe) -> Result<()> {
+    if !probe.answered || !probe.fstab_has_workspace {
         return Ok(());
     }
-    let (says, has) = if state_says_nofail {
+    if probe.state_says_nofail == probe.fstab_has_nofail {
+        return Ok(());
+    }
+    let (says, has) = if probe.state_says_nofail {
         ("nofail", "without it")
     } else {
         ("no nofail", "with it")
@@ -1527,7 +1519,7 @@ pub(crate) fn refuse_on_workspace_mismatch(
     bail!(
         concat!(
             "box '{}' was not rebuilt. Its devbox-state.toml records the workspace mount as ",
-            "'{}' while /workspace is actually mounted {}, and overlayfs refuses to remount ",
+            "'{}' while /etc/fstab declares it {}, and overlayfs refuses to remount ",
             "with different options — so a rebuild from here would fail to activate and roll ",
             "back, permanently. That key records how the mount was built; it is not a setting. ",
             "If it was edited by hand, put it back.",
@@ -3030,14 +3022,20 @@ mod tests {
     /// they disagree the box is one rebuild from being unrebuildable, so the
     /// rebuild does not happen.
     #[test]
-    fn a_state_file_that_disagrees_with_the_mount_stops_the_rebuild() {
-        let says_yes = refuse_on_workspace_mismatch("devtest", true, Some(false))
-            .expect_err("a record that disagrees with the mount is refused");
+    fn a_state_file_that_disagrees_with_fstab_stops_the_rebuild() {
+        let says_yes = refuse_on_workspace_mismatch(
+            "devtest",
+            &probe("state=present\nnofail=true\nfstab=yes\nfstabnofail=no\nprobe=ok\n"),
+        )
+        .expect_err("a record that disagrees with fstab is refused");
         assert!(says_yes.to_string().contains("'nofail'"), "{says_yes}");
         assert!(says_yes.to_string().contains("without it"), "{says_yes}");
 
-        let says_no = refuse_on_workspace_mismatch("devtest", false, Some(true))
-            .expect_err("and so is the other direction");
+        let says_no = refuse_on_workspace_mismatch(
+            "devtest",
+            &probe("state=present\nnofail=\nfstab=yes\nfstabnofail=yes\nprobe=ok\n"),
+        )
+        .expect_err("and so is the other direction");
         assert!(says_no.to_string().contains("'no nofail'"), "{says_no}");
         assert!(says_no.to_string().contains("with it"), "{says_no}");
 
@@ -3050,14 +3048,29 @@ mod tests {
         }
     }
 
+    /// The comparison is against `/etc/fstab`, never the running mount.
+    /// `nofail` is an fstab option and never reaches the kernel, so a box
+    /// built *with* it reports mount options *without* it — measured on a
+    /// fresh box:
+    /// `rw,relatime,lowerdir=…,upperdir=…,workdir=…,uuid=on`. Comparing the
+    /// key against that would call every such box a mismatch and refuse every
+    /// rebuild it ever needed.
     #[test]
-    fn agreement_and_an_unmounted_workspace_both_pass() {
-        assert!(refuse_on_workspace_mismatch("devtest", true, Some(true)).is_ok());
-        assert!(refuse_on_workspace_mismatch("devtest", false, Some(false)).is_ok());
-        // Nothing mounted: nothing to disagree with, which is every box being
-        // provisioned.
-        assert!(refuse_on_workspace_mismatch("devtest", true, None).is_ok());
-        assert!(refuse_on_workspace_mismatch("devtest", false, None).is_ok());
+    fn agreement_and_a_box_with_no_workspace_line_both_pass() {
+        for stdout in [
+            // key and fstab agree, both ways
+            "state=present\nnofail=true\nfstab=yes\nfstabnofail=yes\nprobe=ok\n",
+            "state=present\nnofail=\nfstab=yes\nfstabnofail=no\nprobe=ok\n",
+            // no /workspace declared at all: every box being provisioned
+            "state=absent\nfstab=no\nmounted=no\nprobe=ok\n",
+            // and a probe that did not answer must not refuse anything either
+            "",
+        ] {
+            assert!(
+                refuse_on_workspace_mismatch("devtest", &probe(stdout)).is_ok(),
+                "{stdout:?}"
+            );
+        }
     }
 
     /// The Lima case, and the whole reason for the change: the guest user

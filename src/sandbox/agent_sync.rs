@@ -878,13 +878,7 @@ async fn reconfigure(
                 .map(|result| result.stdout)
                 .unwrap_or_default(),
         );
-        if probe.answered {
-            super::provision::refuse_on_workspace_mismatch(
-                name,
-                probe.state_says_nofail,
-                super::provision::workspace_mount_has_nofail(runtime, name).await,
-            )?;
-        }
+        super::provision::refuse_on_workspace_mismatch(name, &probe)?;
         println!("Regenerating {} for box '{name}'...", what.join(", "));
         // The module needs to know which hypervisor this is before it can
         // stop enabling the Incus guest agent on a Lima box. A box provisioned
