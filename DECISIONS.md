@@ -1948,3 +1948,178 @@ through but not exercised; Incus is unverified.
 
 **Revisit.** If the probe's cost ever shows up in `exec` latency, cache the
 *unit* answer only — never the digest.
+
+## ADR-0068 — the guest's boot mounts are named by label, and a box is repaired before it is stopped
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** Every NixOS box devbox has created on Lima since v3 (`dfba8cc`,
+2026-03-07) has been unable to boot a second time. `nixos-generate-config`
+records whatever is mounted at provisioning time into
+`hardware-configuration.nix` **by UUID**, and Lima's `cidata` volume is an
+iso9660 image whose UUID *is* its creation timestamp — regenerated on every
+`limactl start`. Measured on one box across a restart:
+`2026-09-05-00-33-2246` → `2026-09-05-22-01-3862`. Lima itself is immune
+because it names the volume by label and rewrites `/etc/fstab` at every boot;
+`nixos-rebuild switch` removes both protections at once by turning `/etc/fstab`
+into a read-only store symlink. The result, read out of the stranded box's own
+journal: `Timed out waiting for device /dev/disk/by-uuid/…` → `Dependency
+failed for /mnt/lima-cidata` → `local-fs.target` fails → emergency mode, which
+has no sshd. A control box built from the same image without devbox stopped and
+started cleanly.
+
+**Decision.** Generated `configuration.nix` overrides the mount with
+`lib.mkForce { device = "/dev/disk/by-label/cidata"; options = [ "ro" "nofail"
+"x-systemd.device-timeout=5s" ]; }`. A box that is still running repairs itself:
+the guest probe reads the `/mnt/lima-cidata` line out of `/etc/fstab`, a device
+under `/dev/disk/by-uuid/` means the box is one stop away from being lost, and
+the repair rides the same `nixos-rebuild` as any other drift (about nine
+seconds). Because a stopped box cannot be reached at all, `devbox stop` performs
+that repair first and **refuses to stop** if it fails — it lets the stop through
+for a box that is not running, for one whose probe cannot answer, and for
+`--force`, each of which would otherwise make an already-unreachable box
+impossible to stop.
+
+**Consequences.** A box that is already stopped and stranded cannot be
+recovered by any means we would ask a user to perform: no sshd, and the one
+line to change lives in the guest's ext4. `devbox destroy` and recreate;
+uncommitted overlay changes are lost. Refusing a stop is a real cost — the user
+asked for something and did not get it — but it is the only step in this bug
+that cannot be undone. One attempt to generalise `nofail` went badly
+wrong and is worth recording: applying it to `/workspace`
+broke every subsequent repair, because overlayfs rejects a remount that changes
+options (`overlay: No changes allowed in reconfigure`) and
+`switch-to-configuration` reloads a mount unit whose options moved, so
+`nixos-rebuild switch` exited 4 and the generation rolled back — and it
+self-locked, since `/etc` had already been switched. That was reverted before
+release; no published version carries it. The original motivation stands
+unaddressed: an overlay that cannot mount still takes the box to emergency mode.
+
+**Revisit.** If `/workspace` is ever to gain `nofail`, it has to be set at
+provisioning time, before the mount exists, never as a change to a box that
+already has it.
+
+## ADR-0069 — the guest's passwd home follows its login shell
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** On Lima the guest account has two homes. Lima's cloud-init creates
+the user with `homedir: /home/<user>.guest` — the suffix avoids a collision with
+the host home it mounts — and puts `authorized_keys` there. Devbox then created
+`/home/<user>` itself and, through `users.users.<name> = { isNormalUser = true;
+… }` with no `home` set, let nixpkgs default the passwd entry to it. sshd
+resolves keys from passwd, so it looked in the empty directory: any ssh
+connection that did not ride Lima's already-authenticated master was refused.
+That is exactly the connection `devbox code` needs in order to pass environment,
+since ssh does not carry `SetEnv` over a shared connection. Measured: the
+identical probe command returned `exit=0` on a repaired box and
+`exit=255 Permission denied` on an unrepaired one. Separately,
+`detect_vm_username` scanned `/etc/passwd` for the first account with a uid in
+1000..65534 — and Lima gives the guest user the *host's* uid, 501 on macOS, so
+the scan matched nobody on every Lima box and fell back to the host's `$USER`.
+It was right only by the coincidence of the two names matching.
+
+**Decision.** Ask the box who its user is rather than scanning for a plausible
+one, and take the home from what the login shell reports rather than from
+passwd. The NixOS module declares the home explicitly, so the passwd entry
+follows the account Lima actually made. Boxes that already have it wrong repair
+themselves on the next lifecycle command, sharing one `nixos-rebuild` with the
+other drift repairs.
+
+**Consequences.** Verified end to end on a box provisioned from scratch: `id
+-un`, `$HOME` and `getent passwd` agree, `/home/<user>` is no longer created at
+all, gitconfig and the AI tool settings land where the shell will read them, and
+a direct ssh authenticates. Every write path that stamps the state file had to
+carry the home with it — the Sets rebuild path kept only `[user].name`, so one
+unrelated `devbox sets apply` would have undone the repair on the next rebuild.
+That class of bug has now been hit three times (`name`, `mount_mode`, `home`,
+and again with `runtime`); the state file is written through one
+read-modify-write helper for that reason.
+
+**Revisit.** If a runtime ever reports a user devbox cannot enter, the probe
+should say so rather than fall back to the host's `$USER` — the fallback is the
+part that made this silent for so long.
+
+## ADR-0070 — the read loop is the only thing that ends a collector connection
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** One test in the suite failed about one run in ten with
+`received: 597, expected: 600`. Three explanations were possible; two were
+eliminated by experiment rather than by argument. A `tokio::io::duplex` probe
+delivered all 600,000 buffered bytes after the write half was dropped, ruling
+out lost buffering; `received` increments immediately after a successful
+`read_frame` and before every `continue`, ruling out an uncounted read. The
+cause was `serve_agent` running the read loop and the keepalive writer in one
+`tokio::select!`, which **cancels the branch that did not finish**. The first
+keepalive tick lands at 5 s and the test ran 5.44–5.54 s, so on a loaded machine
+the tick fell after the agent closed and before the read loop had drained: the
+write failed, the select cancelled the read, and frames the agent had already
+delivered were discarded.
+
+**Decision.** A failed keepalive means the *write* half is gone, which is no
+reason to stop reading what the agent already wrote. `keepalive` logs one debug
+line and then never resolves, so the read loop is the only branch that can end
+the connection. `received` thereby means what it always claimed: frames that
+arrived, regardless of queueing or of the write half's health.
+
+**Consequences.** Proved deterministically instead of by waiting for a flake:
+a regression test with `start_paused = true` pins keepalive failure at 5 s and
+three frames arriving at 6 s. Against the old code `received` is **0**, not 597
+— the cancellation discards everything still buffered, and the intermittent 597
+was only the fraction that happened to be read first. Against the new code it is
+3. The first version of that test used a `Cursor` reader and passed against the
+old code too, because `Cursor` hits EOF before the keepalive can fire; a
+regression test that does not fail against the unfixed code proves nothing, and
+checking that is not an optional step. Five consecutive full runs are green.
+`tokio`'s `test-util` feature became a dev-dependency, since `full` does not
+carry `start_paused`. The general shape is worth remembering: in a `select!`,
+the branch that represents the data stream must be the only one allowed to end
+the loop.
+
+**Revisit.** If a future branch legitimately needs to end a connection, it
+should do so by closing the reader, not by winning a `select!`.
+
+## ADR-0071 — a handover, and an agent push, wait for the run they would interrupt
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** A run came back with zero events about one time in ten, and only
+under load. The first suspect — a new agent binary being pushed mid-run — was
+wrong: the agent bytes were identical across a reproduction. The cause was the
+collector **handover** itself. A box's events all travel over the stdio agent,
+which is a *child process* of the collector daemon; replacing the daemon killed
+that child, and the new daemon started another. Measured: agent pid
+`127130 → 131453`, the box's `capture.json` `since` jumping from
+`05:12:13.731Z` to `05:13:08.049Z`, roughly two seconds with no capture — and
+not one line in `collector.log`, because the log level was `warn` and every
+handover message was `info`. Reproduction rate: 0 in 50 quiet runs, 2 in 20 with
+another build issuing commands. `agent_sync` had the same hole and a longer one,
+since its restart waits for systemd and, on NixOS, for a rebuild.
+
+**Decision.** Both defer. A handover is host-wide (it ends every box's stdio
+agent at once), so it asks whether *any* box has a run in flight; an agent push
+affects one box, so it asks about that box only. "In flight" requires
+`status='running'` **and** `ended_at IS NULL`, written by one statement, because
+a half-written row read as a live run would defer that box's updates forever. A
+deferred agent push writes `~/.devbox/boxes/<name>/agent-update-pending`
+recording the digest it wanted and the time of the **first** deferral, and
+`devbox run` finishes the job on its way out. Deferral is all-or-nothing: pushing
+bytes now and restarting later would leave a box reporting an agent it is not
+running.
+
+**Consequences.** The remaining gap is stated rather than closed: interruption
+rate went 2/20 → 1/20 under load, and the last case is a handover landing
+*between* two runs, which needs the two daemons to overlap rather than the run
+to wait. What made this cost two rounds to find was the silence, so a handover
+now leaves a note beside the lock that both daemons read and log — identified by
+build, never by pid, since the pid in that note belongs to the CLI that made the
+decision. The daemons' own default log level moved to `info` for the same
+reason; without that the two new lines would have been discarded exactly as
+their predecessors were. A run whose capture really was interrupted now says so
+in its report, and a run whose capture was merely re-published does not: both
+conditions — an event already attributed, and a changed agent pid — must hold
+before it is called an interruption.
+
+**Revisit.** Overlapping the two daemons across a handover would close the last
+case; it changes the ownership protocol, so it belongs in its own decision.
