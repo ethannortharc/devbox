@@ -2123,3 +2123,140 @@ before it is called an interruption.
 
 **Revisit.** Overlapping the two daemons across a handover would close the last
 case; it changes the ownership protocol, so it belongs in its own decision.
+
+## ADR-0072 — `/workspace` gets `nofail` at birth, or never
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** An overlay that cannot assemble fails `workspace.mount`, which
+fails `local-fs.target`, which drops the box into emergency mode with no sshd —
+the same ending as ADR-0068's cidata mount. `nofail` is the fix, and it was
+applied unconditionally in 0.2.1's development line. That had to be reverted,
+because overlayfs rejects **any** remount that changes options
+(`overlay: No changes allowed in reconfigure`) and `switch-to-configuration`
+reloads a mount unit whose options moved: `nixos-rebuild switch` exits 4, the
+generation rolls back, and — because `/etc` has already been switched — every
+later rebuild sees the same difference and fails the same way. A box that
+received the grant could no longer accept any devbox repair at all. The
+mechanism has now been hit three separate times, the third while deliberately
+testing that an old box does *not* get the grant.
+
+**Decision.** The option set is decided once, at provisioning, when
+`/workspace` does not yet exist and therefore no unit can be reloaded and no
+overlay can refuse. The answer is written to `devbox-state.toml` as
+`workspace_nofail` and **never recomputed**: no state file means the box is
+being born, so grant; a state file that says `true` keeps it; a state file
+without the key means the box was born without it, so never. That last case is
+the one a naive "new boxes get it" rule gets wrong, because `reprovision` runs
+the same code.
+
+Granting requires **two independent facts and a probe that says it finished**.
+A single probe line ends in `probe=ok`; without that marker the answer is no,
+because `limactl shell` failing to connect exits non-zero rather than erroring,
+and "the box has no state file" and "ssh hiccuped" were previously
+indistinguishable — a narrow window with an irreversible outcome. Beyond the
+absent state file, the box must also demonstrably have no `/workspace`: no line
+for it in `/etc/fstab`, and nothing mounted there.
+
+**Consequences.** The consistency check compares the record against
+`/etc/fstab`, not against the kernel's mount options — `nofail` is an
+fstab/systemd option and never reaches the kernel. Comparing against
+`findmnt -no OPTIONS /workspace` was written first and was wrong in exactly the
+way that matters: on a freshly built box the state key says `true`, fstab
+carries `nofail`, and the mount options do not, so every new box would have been
+judged inconsistent and refused every later rebuild — a check against lock-up
+becoming the way to lock up. Unit tests did not catch it because the test and
+the code shared the assumption. `/etc/fstab` is also what
+`switch-to-configuration` itself compares. A state file that disagrees with
+fstab now stops the rebuild with an explanation rather than attempting it. The
+key is a record of what the mount already is; editing it by hand is a way to
+lock a box.
+
+**Revisit.** Only if overlayfs ever accepts an option-changing remount. Until
+then, an existing box's mount options are not a thing devbox may change.
+
+## ADR-0073 — the repair happens before the run is recorded
+
+**Status.** Accepted (2026-09-06).
+
+**Context.** 0.2.1 told users to run any command that enters a box to pick up
+its guest-side repairs, and named `devbox exec <box> -- true`. That was false
+from the day it was written, and false for the two commands most likely to be
+used. Two changes landed the same day in 0.2.0/0.2.1: `exec` and `shell` began
+recording themselves as runs (`d8c7b83`), and a pending repair began deferring
+while a run is in flight (`9faf26a`, ADR-0071). Together, each of those commands
+opened a run and then deferred to it — waiting for itself. Every repair shares
+one gate, so this covered all of them: agent version, the NixOS module, the
+cidata mount, `AcceptEnv`, the unit, and the passwd home. Only `devbox run`
+(which finishes the job after its own run ends) and commands that open no run —
+`devbox code`, `reprovision`, the pre-check in `stop` — ever applied one.
+
+**Decision.** Reorder rather than relax. `exec` and `shell` now prepare the box
+first — which is where the repair happens — and record the run afterwards. The
+alternative, teaching the deferral to ignore the caller's own run, would let a
+repair run *during* the user's command, and every repair ends by restarting the
+agent: that is precisely the capture gap of ADR-0071, manufactured by devbox
+inside the window it was supposed to be recording.
+
+**Consequences.** The ordering is a type, not a convention.
+`prepare_running_for_use` returns a `Prepared`, and `SimpleRun::start` requires
+one; it never reads it. Writing the old order no longer compiles. Both
+regression tests fail against the previous code with the message
+`recorded 1 run(s) before preparing the box`. Measured on a real box: with the
+old binary the pending marker was byte-identical before and after
+`devbox exec … -- true`; with the new one the repair ran and the exec's run row
+was stamped nine seconds after the command began, with `ended_at` 33 ms later —
+so the user's command really did start after the repair finished. The unit tests
+pin the cause (preparation strictly precedes recording); the live runs pin the
+effect (the marker is cleared). There is still no unit test that watches a
+pending update be cleared, because the preparation path resolves a real runtime
+and has no injection point; adding one means a test-only runtime factory on
+`SandboxManager`.
+
+**Revisit.** If a command ever needs its run recorded before the box is
+prepared, that is a new decision and this type will say so.
+
+## ADR-0074 — a stale home is merged, archived to the host, and its credentials are deleted
+
+**Status.** Accepted (2026-09-06, with Ethan).
+
+**Context.** ADR-0069 left every box built before 0.2.1 with a `/home/<user>`
+full of things nothing reads, because the login shell used `/home/<user>.guest`.
+On the box used to develop this, that directory held `.claude/.credentials.json`
+and `.codex/auth.json` — the two files v4 copied in and v5 stopped copying. A
+cleanup that tarred the directory up and left the tarball in the box would have
+re-created, in one archive, exactly the leak the broker exists to prevent. The
+first implementation did that.
+
+**Decision.** Three separate dispositions, not one.
+
+- **Credentials are deleted and named, never merged and never archived.** The
+  list is by file, not by directory: `.config` as a whole is settings, but
+  `.config/gh/hosts.yml` is an OAuth token and `.config/gcloud` is a credential
+  database. `.claude/.credentials.json`, `.codex/auth.json`, `.netrc`,
+  `.npmrc`, `.docker/config.json` and `.aws/credentials` complete it. This holds
+  under `--keep` too, and the confirmation prompt says so before anything runs.
+- **Settings are merged** into the real home without overwriting anything
+  already there, and a merged `.gitconfig` loses its `[credential]` sections
+  through the same helper provisioning uses.
+- **Everything else is archived to the host**, at
+  `<state_dir>/archives/<box>-stale-home-<UTC>.tar.gz`, 0600 inside a 0700
+  directory. The order is pack in the guest, copy out, compare both sides by
+  byte count and sha256, and only then delete. Any failure leaves the guest
+  directory untouched and removes both the temporary and the half-written host
+  file.
+
+**Consequences.** The archive outlives the box, which is the point: an archive
+inside a box is lost with `devbox destroy`, and this directory is most likely to
+be cleaned up by someone who is about to recreate the box. `Runtime` gained
+`copy_from`, the first primitive for pulling a file out of a box; the Lima and
+Docker command lines were checked against `--help` on this host, and the Incus
+and Multipass ones against their documentation only, marked unverified in the
+code. Incus joins instance and path with `/` rather than `:` — a colon there is
+parsed as a remote name. `--keep` does the merge, the archive and the credential
+deletion but not the removal, for anyone who wants to look before the directory
+goes.
+
+**Revisit.** The credential list is a list, and lists go stale. If it grows a
+third time, the decision to enumerate rather than pattern-match is the one to
+re-examine.
