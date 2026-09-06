@@ -755,7 +755,16 @@ pub struct SimpleRun {
 impl SimpleRun {
     /// Open a run row, or `None` if the store cannot be written — recording a
     /// run is never a reason for the command itself to fail.
+    ///
+    /// `_ready` is never read. It is required because a run row is what makes
+    /// a box look busy, and a repair waiting for a quiet moment defers while a
+    /// box looks busy — so this must not happen until the box has been
+    /// prepared, which is where that repair is carried out. Taking the proof
+    /// as an argument is what stops the two being written in the order that
+    /// left `devbox exec` unable to ever repair anything. See
+    /// [`crate::sandbox::Prepared`].
     pub fn start(
+        _ready: &crate::sandbox::Prepared,
         manager: &SandboxManager,
         name: &str,
         kind: RunKind,

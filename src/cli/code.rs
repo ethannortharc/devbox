@@ -22,7 +22,11 @@ pub struct CodeArgs {
 
 pub async fn run(args: CodeArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.boxarg.name())?;
-    let (state, runtime, claim) = manager.prepare_running_for_use(&name).await?;
+    let crate::sandbox::Prepared {
+        state,
+        runtime,
+        claim,
+    } = manager.prepare_running_for_use(&name).await?;
 
     // Refresh overlay before opening editor to avoid stale file handles.
     // If a Zellij session is still attached, /workspace will be busy — that's

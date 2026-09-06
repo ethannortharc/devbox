@@ -168,7 +168,11 @@ pub fn describe(stale: &str, survey: &Survey, real_home: &str) -> String {
 
 async fn stale_home(args: StaleHomeArgs, manager: &SandboxManager) -> Result<()> {
     let name = manager.resolve_name(args.boxarg.name())?;
-    let (state, runtime, claim) = manager.prepare_running_for_use(&name).await?;
+    let crate::sandbox::Prepared {
+        state,
+        runtime,
+        claim,
+    } = manager.prepare_running_for_use(&name).await?;
     let _ = state;
 
     let (username, real_home) = crate::sandbox::provision::guest_identity(runtime.as_ref(), &name)

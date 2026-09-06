@@ -230,6 +230,37 @@ pub struct SandboxManager {
     pub state_dir: PathBuf,
 }
 
+/// A box that is ready for a command: claimed, running, its saved posture
+/// applied, and any repair that was waiting for a quiet moment carried out.
+///
+/// It is also a token, and that is the part worth knowing. Recording a run is
+/// how a box says "I am busy", and a repair defers while a box is busy —
+/// because every repair ends in restarting the agent, and doing that under a
+/// run drops whatever that run had not yet delivered. So a command that
+/// recorded its run *before* preparing the box hid the pending repair from
+/// itself, and did so every single time: `devbox exec` could never be the
+/// command that fixed a box, however often it was run, and said so in a line
+/// promising the repair would happen "after the run ends" — about a run that
+/// was its own.
+///
+/// Hence [`crate::cli::run::SimpleRun::start`] asks for one of these. Not
+/// because it needs anything in it, but because the only way to get one is to
+/// have already prepared the box, which puts the two steps in the one order
+/// that works and makes the other one impossible to write.
+pub struct Prepared {
+    pub(crate) state: SandboxState,
+    pub(crate) runtime: Box<dyn Runtime>,
+    pub(crate) claim: crate::web::build::BoxClaim,
+}
+
+impl Prepared {
+    /// The runtime this box was resolved to, for the callers that need to ask
+    /// the guest something between preparing and launching.
+    pub(crate) fn runtime(&self) -> &dyn Runtime {
+        self.runtime.as_ref()
+    }
+}
+
 impl SandboxManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
@@ -754,15 +785,13 @@ impl SandboxManager {
 
     /// Claim a box, make it ready for use, and enforce its saved posture.
     ///
-    /// The returned claim deliberately stays alive until the caller is ready
-    /// to launch the user's command. That closes the race where `devbox use`
-    /// could stop the VM and rewrite its mounts between our state read and our
-    /// start. Callers must drop it immediately before the interactive process
-    /// so a long-lived shell does not block legitimate lifecycle operations.
-    pub(crate) async fn prepare_running_for_use(
-        &self,
-        name: &str,
-    ) -> Result<(SandboxState, Box<dyn Runtime>, crate::web::build::BoxClaim)> {
+    /// The claim inside the returned [`Prepared`] deliberately stays alive
+    /// until the caller is ready to launch the user's command. That closes the
+    /// race where `devbox use` could stop the VM and rewrite its mounts
+    /// between our state read and our start. Callers must drop it immediately
+    /// before the interactive process so a long-lived shell does not block
+    /// legitimate lifecycle operations.
+    pub(crate) async fn prepare_running_for_use(&self, name: &str) -> Result<Prepared> {
         let (claim, state) = self.claim_and_read(name).with_context(|| {
             format!("cannot use box '{name}' while another lifecycle operation is in progress")
         })?;
@@ -873,7 +902,11 @@ impl SandboxManager {
             self.refresh_code_ssh_env(runtime.as_ref(), name).await;
         }
 
-        Ok((state, runtime, claim))
+        Ok(Prepared {
+            state,
+            runtime,
+            claim,
+        })
     }
 
     /// The environment a devbox-started session gets for the credential
@@ -984,7 +1017,26 @@ impl SandboxManager {
     /// shell is recorded as a run like anything else, and it has no wrapper to
     /// export it from.
     pub async fn attach_with_env(&self, name: &str, extra: &[(String, String)]) -> Result<()> {
-        let (state, runtime, claim) = self.prepare_running_for_use(name).await?;
+        let prepared = self.prepare_running_for_use(name).await?;
+        self.attach_prepared(prepared, name, extra).await
+    }
+
+    /// Attach to a box that has already been prepared.
+    ///
+    /// Split out for the same reason as [`Self::exec_prepared`]: `devbox
+    /// shell` records a run, and recording one before the box is prepared is
+    /// what taught a pending repair to keep waiting. See [`Prepared`].
+    pub(crate) async fn attach_prepared(
+        &self,
+        prepared: Prepared,
+        name: &str,
+        extra: &[(String, String)],
+    ) -> Result<()> {
+        let Prepared {
+            state,
+            runtime,
+            claim,
+        } = prepared;
 
         // Auto-snapshot on entry (best-effort, ignore failures)
         let snap_name = format!(
@@ -1320,7 +1372,28 @@ impl SandboxManager {
         cmd: &[String],
         interactive: bool,
     ) -> Result<i32> {
-        let (_state, runtime, claim) = self.prepare_running_for_use(name).await?;
+        let prepared = self.prepare_running_for_use(name).await?;
+        self.exec_prepared(prepared, name, cmd, interactive).await
+    }
+
+    /// Run a command in a box that has already been prepared.
+    ///
+    /// For callers that record a run: preparing has to come first, and having
+    /// it as a separate step is what lets them do it in that order. See
+    /// [`Prepared`] for why the order decides whether a pending repair ever
+    /// happens.
+    pub(crate) async fn exec_prepared(
+        &self,
+        prepared: Prepared,
+        name: &str,
+        cmd: &[String],
+        interactive: bool,
+    ) -> Result<i32> {
+        let Prepared {
+            state: _,
+            runtime,
+            claim,
+        } = prepared;
 
         let env = self.broker_env(runtime.as_ref(), name).await;
         let wrapped = crate::broker::with_env(&env, cmd);
