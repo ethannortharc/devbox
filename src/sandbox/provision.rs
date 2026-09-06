@@ -2255,26 +2255,92 @@ fn whoami() -> String {
         .unwrap_or_else(|_| "dev".to_string())
 }
 
-/// Detect the actual non-root username inside the VM.
-/// On Incus, exec_cmd runs as root so we can't use `whoami` — instead we
-/// find the first user with UID >= 1000 from /etc/passwd.
-/// On Lima, exec_cmd runs as the Lima user, so `whoami` works.
-/// Falls back to the host username if detection fails.
+/// The name of the ordinary user inside the box.
 ///
-/// Filters: UID 1000-65533, home under /home/ (excludes NixOS nixbld* users
-/// which have UID 30001+ but home /var/empty).
+/// Asked of the box rather than deduced from its `/etc/passwd`. The scan this
+/// used to be — the first account with a UID in 1000..65534 whose home is
+/// under `/home` — never matched on Lima, which gives its guest user the
+/// *host's* uid (501 on a Mac). Every Lima box therefore fell through to the
+/// host's own `$USER` and was right only by coincidence: a box whose account
+/// is not named after the person running devbox (Lima's `<user>.linux`, an
+/// image that ships its own account) got the wrong name, and with it the wrong
+/// home, the wrong `chown` target, and a [`pick_vm_home`] identity check that
+/// could no longer match — which is the failure W2-3 fixed the *home* half of
+/// and left this half of.
+///
+/// `id -un` only answers the right question where `exec_cmd` runs as the box
+/// user, which is what [`Runtime::exec_runs_as_root`] reports. Where it runs
+/// as root the answer is `root`, which is not the account devbox provisions —
+/// so there, and wherever a box says `root` anyway because a runtime can be
+/// wrong about itself, the passwd scan is still the best guess available.
 async fn detect_vm_username(runtime: &dyn Runtime, name: &str) -> String {
-    let result = runtime
+    if !runtime.exec_runs_as_root() {
+        let probe = "printf 'devbox-user=%s\\n' \"$(id -un 2>/dev/null)\"";
+        if let Ok(result) = runtime.exec_cmd(name, &["sh", "-lc", probe], false).await
+            && result.exit_code == 0
+            && let Some(user) = usable_username(&marker_field(&result.stdout, "devbox-user="))
+        {
+            return user;
+        }
+    }
+
+    // Filters: UID 1000-65533, home under /home/ (excludes NixOS nixbld* users
+    // which have UID 30001+ but home /var/empty).
+    let scan = runtime
         .exec_cmd(
             name,
             &["bash", "-lc", "awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\\/home\\// { print $1; exit }' /etc/passwd"],
             false,
         )
         .await;
-    match result {
-        Ok(r) if !r.stdout.trim().is_empty() => r.stdout.trim().to_string(),
-        _ => whoami(),
+    if let Ok(result) = scan
+        && let Some(user) = usable_username(result.stdout.trim())
+    {
+        return user;
     }
+
+    usable_username(&whoami()).unwrap_or_else(|| "dev".to_string())
+}
+
+/// One `devbox-<key>=<value>` line out of a guest probe's stdout.
+///
+/// The probes run under a login shell, so a profile that prints a banner would
+/// otherwise be parsed as the answer. Shared by the username and home probes
+/// because they are the same trick and drifted apart once already.
+fn marker_field(stdout: &str, key: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(key))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// A guest username devbox is willing to act on, or `None`.
+///
+/// Two jobs. The first is rejecting answers that are not the account we mean:
+/// nothing at all, or `root` — devbox provisions an ordinary user, and writing
+/// its gitconfig and AI tool settings into `/root` (or `chown root:users`-ing
+/// them) is not a degraded result, it is a wrong one.
+///
+/// The second is that this name is interpolated straight into guest shell
+/// commands — `chown {user}:users {path}`, `getent passwd {user}` — and it now
+/// comes from *inside* the box rather than from the host environment. The
+/// character set is the portable one plus `.`, which Lima needs for
+/// `<user>.linux`; anything else cannot be a username and must not become
+/// shell syntax.
+fn usable_username(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate == "root" || candidate.len() > 64 {
+        return None;
+    }
+    if !candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 /// Detect the home directory for a given username inside the VM.
@@ -2299,19 +2365,11 @@ async fn detect_vm_home(runtime: &dyn Runtime, name: &str, username: &str) -> St
         Ok(r) => r.stdout,
         Err(_) => String::new(),
     };
-    let field = |key: &str| -> String {
-        stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(key))
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    };
     pick_vm_home(
         username,
-        &field("devbox-user="),
-        &field("devbox-home="),
-        &field("devbox-passwd="),
+        &marker_field(&stdout, "devbox-user="),
+        &marker_field(&stdout, "devbox-home="),
+        &marker_field(&stdout, "devbox-passwd="),
     )
 }
 
@@ -2361,6 +2419,178 @@ fn pick_vm_home(username: &str, shell_user: &str, shell_home: &str, passwd_home:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::runtime::SandboxStatus;
+
+    /// A box that answers the username probe however the test says.
+    struct StubGuest {
+        /// What `Runtime::exec_runs_as_root` reports.
+        root_exec: bool,
+        /// stdout for the `id -un` probe.
+        id_un: &'static str,
+        /// stdout for the /etc/passwd scan.
+        passwd_scan: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for StubGuest {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn priority(&self) -> u32 {
+            0
+        }
+        fn exec_runs_as_root(&self) -> bool {
+            self.root_exec
+        }
+        async fn exec_cmd(&self, _: &str, cmd: &[&str], _: bool) -> Result<ExecResult> {
+            let joined = cmd.join(" ");
+            let stdout = if joined.contains("id -un") {
+                self.id_un.to_string()
+            } else if joined.contains("/etc/passwd") {
+                self.passwd_scan.to_string()
+            } else {
+                String::new()
+            };
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        async fn create(
+            &self,
+            _: &crate::runtime::CreateOpts,
+        ) -> Result<crate::runtime::SandboxInfo> {
+            unimplemented!()
+        }
+        async fn start(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stop(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn status(&self, _: &str) -> Result<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
+            unimplemented!()
+        }
+        async fn list(&self) -> Result<Vec<crate::runtime::SandboxInfo>> {
+            unimplemented!()
+        }
+        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn snapshot_list(&self, _: &str) -> Result<Vec<crate::runtime::SnapshotInfo>> {
+            unimplemented!()
+        }
+        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
+            unimplemented!()
+        }
+        async fn update_mounts(
+            &self,
+            _: &str,
+            _: &[crate::runtime::Mount],
+        ) -> Result<crate::runtime::MountUpdate> {
+            unimplemented!()
+        }
+        async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// The Lima case, and the whole reason for the change: the guest user
+    /// carries the host's uid, so the passwd scan finds nobody, and the name
+    /// devbox needs is the one the box itself reports.
+    #[tokio::test]
+    async fn the_box_is_asked_who_it_is_rather_than_scanned_for() {
+        let guest = StubGuest {
+            root_exec: false,
+            id_un: "devbox-user=ethan.linux\n",
+            // Empty, the way every Lima box answers it.
+            passwd_scan: "",
+        };
+        assert_eq!(detect_vm_username(&guest, "devtest").await, "ethan.linux");
+    }
+
+    /// Incus execs as root. Asking `id -un` there would name the exec, not the
+    /// account devbox provisions, so the scan is what it uses.
+    #[tokio::test]
+    async fn a_root_exec_runtime_is_not_asked_id_un_at_all() {
+        let guest = StubGuest {
+            root_exec: true,
+            // Would win if it were consulted. It must not be.
+            id_un: "devbox-user=root\n",
+            passwd_scan: "dev\n",
+        };
+        assert_eq!(detect_vm_username(&guest, "devtest").await, "dev");
+    }
+
+    /// A runtime can be wrong about itself — Docker says its exec runs as the
+    /// user and the image's default account is commonly root.
+    #[tokio::test]
+    async fn a_box_that_answers_root_falls_through_to_the_scan() {
+        let guest = StubGuest {
+            root_exec: false,
+            id_un: "devbox-user=root\n",
+            passwd_scan: "dev\n",
+        };
+        assert_eq!(detect_vm_username(&guest, "devtest").await, "dev");
+    }
+
+    /// A login shell that greets the user must not have its banner mistaken
+    /// for the answer — which is what the marker is for.
+    #[tokio::test]
+    async fn a_chatty_login_shell_does_not_rename_the_user() {
+        let guest = StubGuest {
+            root_exec: false,
+            id_un: "Welcome to NixOS!\nLast login: Fri\ndevbox-user=ethan\n",
+            passwd_scan: "dev\n",
+        };
+        assert_eq!(detect_vm_username(&guest, "devtest").await, "ethan");
+    }
+
+    #[test]
+    fn a_username_is_something_that_can_be_a_username() {
+        for good in ["ethan", "ethan.linux", "dev", "user-1", "_svc", "ubuntu"] {
+            assert_eq!(usable_username(good).as_deref(), Some(good), "{good}");
+        }
+        // `root` is not a degraded answer, it is the wrong account.
+        for bad in ["", "   ", "root", "root\n"] {
+            assert_eq!(usable_username(bad), None, "{bad:?}");
+        }
+        // This name is interpolated into `chown {user}:users {path}` in the
+        // guest, and it now comes from inside the box.
+        for hostile in [
+            "dev; rm -rf /",
+            "dev users",
+            "../root",
+            "a:b",
+            "$(id -un)",
+            "dev\ttab",
+        ] {
+            assert_eq!(usable_username(hostile), None, "{hostile:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_is_read_off_whatever_line_it_lands_on() {
+        let stdout = "motd\ndevbox-user=ethan\ndevbox-home=/home/ethan.guest\n";
+        assert_eq!(marker_field(stdout, "devbox-user="), "ethan");
+        assert_eq!(marker_field(stdout, "devbox-home="), "/home/ethan.guest");
+        assert_eq!(marker_field(stdout, "devbox-passwd="), "");
+        assert_eq!(marker_field("", "devbox-user="), "");
+    }
 
     /// Captured from devtest (Lima 2.x, vmType vz, NixOS): the guest user has
     /// the host's uid 501, so passwd and the shell disagree about home and the

@@ -31,15 +31,28 @@ use crate::sandbox::SandboxManager;
 
 /// Protocol revisions this server implements.
 ///
-/// Both are the same wire protocol for what these four tools do; the newer one
-/// adds capabilities (audio content, completions, tool annotations) that a
-/// read-only evidence server does not use. Listing both means a client pinned
-/// to either gets its own version echoed rather than a downgrade it has to
-/// decide about.
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-03-26", "2024-11-05"];
+/// All three are the same wire protocol for what these four tools do; the
+/// newer ones add capabilities (audio content, completions, tool annotations,
+/// structured output, elicitation, resource links) that a read-only evidence
+/// server does not use, and authorization rules that apply to HTTP transports
+/// rather than to stdio. Listing all three means a client pinned to any of
+/// them gets its own version echoed rather than a downgrade it has to decide
+/// about.
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// What we answer with when the client asks for something we do not know.
-pub const LATEST_PROTOCOL: &str = "2025-03-26";
+///
+/// `2025-06-18` rather than `2025-03-26`, because it is the newest revision
+/// this server actually conforms to. Batching is required by `2025-03-26` and
+/// is the one thing here that does not do it (see [`BATCH_UNSUPPORTED`]);
+/// `2025-06-18` removed batching from the protocol, so naming it is the
+/// honest answer to "what do you speak" rather than a claim walked back by an
+/// error later in the session.
+///
+/// A client that asks for `2025-03-26` still gets `2025-03-26` echoed: the gap
+/// is one message shape it probably never sends, and telling it we are older
+/// than it asked for would cost it the features it does use.
+pub const LATEST_PROTOCOL: &str = "2025-06-18";
 
 /// The most events one `watch` call will return.
 const WATCH_MAX: usize = 200;
@@ -66,6 +79,21 @@ mod code {
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
 }
+
+/// The answer to a JSON-RPC batch.
+///
+/// Batching is the one thing `2025-03-26` requires that this server does not
+/// do, and it is deliberate: the framing here is one message per line, the
+/// four tools are independent reads that a client gains nothing by grouping,
+/// and the revision that followed — `2025-06-18` — removed batching from the
+/// protocol altogether. Implementing a feature on its way out, for a benefit
+/// none of these tools have, is not worth the second response path.
+///
+/// What is worth doing is saying so. A client that batches gets the shape it
+/// sent named and the remedy spelled out, in one place, rather than the
+/// generic "no `method`" it used to get — which described its requests, all of
+/// them valid, as malformed.
+pub const BATCH_UNSUPPORTED: &str = "batch requests are not supported; send one request per line";
 
 /// Serve until stdin closes.
 pub async fn serve(manager: &SandboxManager) -> Result<()> {
@@ -163,6 +191,21 @@ pub async fn handle(manager: &SandboxManager, line: &str) -> Option<String> {
             ));
         }
     };
+
+    // A batch is a JSON array of messages. It parses, and every message in it
+    // is well formed, so the generic "no `method`" answer below would tell a
+    // client that its perfectly correct requests were malformed and leave it
+    // no way to recover. Naming the shape and the remedy is what lets a client
+    // fall back to sending them one at a time.
+    //
+    // Not implemented rather than not noticed: see [`BATCH_UNSUPPORTED`].
+    if message.is_array() {
+        return Some(error_response(
+            Value::Null,
+            code::INVALID_REQUEST,
+            BATCH_UNSUPPORTED,
+        ));
+    }
 
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -642,6 +685,76 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["protocolVersion"], LATEST_PROTOCOL);
+    }
+
+    /// The version this server volunteers has to be one whose contract it
+    /// keeps. `2025-03-26` and everything before it inherit JSON-RPC batching,
+    /// which this server answers with `-32600`; `2025-06-18` removed it. So
+    /// the default must not be one of the older two — while a client that asks
+    /// for one still gets its own version back, because the gap is a single
+    /// message shape it probably never sends and a downgrade would cost it
+    /// features it does use.
+    #[tokio::test]
+    async fn the_version_we_volunteer_is_one_we_do_not_have_to_walk_back() {
+        const REQUIRE_BATCHING: &[&str] = &["2025-03-26", "2024-11-05"];
+        assert!(
+            !REQUIRE_BATCHING.contains(&LATEST_PROTOCOL),
+            "{LATEST_PROTOCOL} mandates batching, which this server refuses",
+        );
+
+        let (_dir, manager) = manager();
+        for asked in REQUIRE_BATCHING {
+            assert!(SUPPORTED_PROTOCOLS.contains(asked), "{asked} was dropped");
+            let response = ask(
+                &manager,
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                       "params":{"protocolVersion":asked}}),
+            )
+            .await;
+            assert_eq!(response["result"]["protocolVersion"], *asked);
+        }
+    }
+
+    /// A batch is well-formed JSON full of well-formed requests, so the
+    /// generic "no `method`" answer told a client its correct messages were
+    /// malformed and left it nowhere to go. Naming the shape and the remedy is
+    /// the whole value of not implementing the feature.
+    #[tokio::test]
+    async fn a_batch_is_refused_in_a_way_a_client_can_act_on() {
+        let (_dir, manager) = manager();
+        let response = ask(
+            &manager,
+            json!([
+                {"jsonrpc":"2.0","id":1,"method":"ping"},
+                {"jsonrpc":"2.0","id":2,"method":"tools/list"},
+            ]),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["error"]["message"], BATCH_UNSUPPORTED);
+        // No `id` to answer under: the ids live inside the array, and picking
+        // one of them would be answering a request we did not run.
+        assert_eq!(response["id"], Value::Null);
+        assert!(response.get("result").is_none(), "{response}");
+    }
+
+    /// An empty array is a batch too, and the same answer is the useful one.
+    #[tokio::test]
+    async fn an_empty_batch_gets_the_same_explanation() {
+        let (_dir, manager) = manager();
+        let response = ask(&manager, json!([])).await;
+        assert_eq!(response["error"]["message"], BATCH_UNSUPPORTED);
+    }
+
+    /// The session survives it: a client that batches once and then falls back
+    /// to one request per line must find the server still there.
+    #[tokio::test]
+    async fn a_batch_does_not_end_the_session() {
+        let (_dir, manager) = manager();
+        let _ = ask(&manager, json!([{"jsonrpc":"2.0","id":1,"method":"ping"}])).await;
+        let after = ask(&manager, json!({"jsonrpc":"2.0","id":2,"method":"ping"})).await;
+        assert_eq!(after["result"], json!({}));
+        assert_eq!(after["id"], 2);
     }
 
     #[tokio::test]
