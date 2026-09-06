@@ -147,7 +147,9 @@ agent as a child process, so replacing it mid-run cuts the only channel that
 run's events travel on. For the same reason, pushing a new agent into a box
 waits for that box's own runs, leaving
 `~/.devbox/boxes/<name>/agent-update-pending` behind until it can be done;
-`devbox doctor` prints it, and `devbox run` finishes the job on its way out.
+`devbox doctor` prints it, `devbox run` finishes the job on its way out, and
+`devbox exec` and `devbox shell` do it on the way in — before they open a run
+of their own, which is what they used to defer to.
 
 ## Secrets that reach an argv
 
