@@ -360,6 +360,23 @@ mod tests {
 
     /// `exec` is the one command whose box name shares a line with a trailing
     /// command, so the `--` boundary is what makes it unambiguous.
+    /// `devbox stop` repairs a box that could not start again, and refuses if
+    /// that repair fails. `--force` is the only way past it, so it has to be
+    /// spelled out and it has to default to off.
+    #[test]
+    fn stop_needs_force_spelled_out() {
+        let parse = |argv: &[&str]| {
+            let full: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let cli = Cli::try_parse_from(&full).expect("argv should parse");
+            let Some(Command::Stop(args)) = cli.command else {
+                panic!("not a stop");
+            };
+            args.force
+        };
+        assert!(!parse(&["devbox", "stop", "devtest"]));
+        assert!(parse(&["devbox", "stop", "devtest", "--force"]));
+    }
+
     #[test]
     fn exec_keeps_its_bare_form() {
         let argv: Vec<String> = ["devbox", "exec", "--", "ls", "-la"]

@@ -165,6 +165,31 @@ pub(crate) fn resolve_project_mounts(
     mounts
 }
 
+/// Why a box was not stopped, and what to do instead.
+///
+/// Three things the reader needs and one they do not: what is wrong, that the
+/// box is *still running* and so still fixable, how to get their work out, and
+/// only then the escape hatch. `--force` last on purpose — it is the answer to
+/// "I have my data and I accept losing the box", not the first suggestion.
+///
+/// `concat!` with positional arguments rather than a `\`-continued literal:
+/// rustfmt rejoins a continued string and leaves the continuation's
+/// indentation inside it, which has reached users before as a run of spaces in
+/// the middle of a sentence.
+pub(crate) fn refuse_stop_message(name: &str) -> String {
+    format!(
+        concat!(
+            "box '{}' was not stopped, and is still running. Its /etc/fstab names a ",
+            "boot-time device that will not exist after the next start, so stopping it now ",
+            "would leave a box that cannot boot and has no sshd to fix it through. The ",
+            "repair for that did not work here. Get anything you need out of it first with ",
+            "`devbox layer commit {}`, then stop it with `devbox stop {} --force` if you ",
+            "still want to.",
+        ),
+        name, name, name
+    )
+}
+
 /// What the box will be able to see, said out loud before it is created.
 ///
 /// A box's mounts used to be invisible until someone looked inside it and
@@ -1118,7 +1143,7 @@ impl SandboxManager {
     }
 
     /// Stop a sandbox.
-    pub async fn stop_sandbox(&self, name: &str) -> Result<()> {
+    pub async fn stop_sandbox(&self, name: &str, force: bool) -> Result<()> {
         // The same claim the console's stop takes, here because the CLI does
         // not go through it.
         //
@@ -1133,8 +1158,83 @@ impl SandboxManager {
 
         let state = self.get_sandbox(name)?;
         let runtime = self.runtime_for_sandbox(&state)?;
+        self.repair_before_stop(runtime.as_ref(), name, &state, &_lock, force)
+            .await?;
         runtime.stop(name).await?;
         println!("Sandbox '{}' stopped.", name);
+        Ok(())
+    }
+
+    /// Put right anything that would make this box unable to start again.
+    ///
+    /// Stopping is the one operation that can turn a working box into an
+    /// unreachable one. A box provisioned by devbox 0.2.0 pins Lima's cidata
+    /// ISO in `/etc/fstab` by a UUID that Lima regenerates on every start; the
+    /// next boot waits for a device that will never appear, fails
+    /// `local-fs.target`, and lands in emergency mode where there is no sshd.
+    /// There is then no way in to fix the one line responsible — the box is
+    /// gone, and any overlay changes that were never committed go with it.
+    ///
+    /// So the repair happens here, while the box is still running and can
+    /// still be repaired. It is the same rebuild `agent_sync` already performs
+    /// on entry, under the claim this function is given; a box that is already
+    /// healthy costs one guest command and nothing else.
+    ///
+    /// Refusing rather than warning, when the repair does not work. A warning
+    /// on the way out is read after the damage, and the damage here is not
+    /// recoverable.
+    async fn repair_before_stop(
+        &self,
+        runtime: &dyn Runtime,
+        name: &str,
+        state: &crate::sandbox::state::SandboxState,
+        claim: &crate::web::build::BoxClaim,
+        force: bool,
+    ) -> Result<()> {
+        // Nothing to protect on a box that is not up: its next start is the
+        // one that would have failed either way, and the repair needs a
+        // running guest to talk to.
+        if !matches!(
+            runtime.status(name).await,
+            Ok(crate::runtime::SandboxStatus::Running)
+        ) {
+            return Ok(());
+        }
+
+        let doomed = match crate::sandbox::agent_sync::probe(runtime, name).await {
+            Ok(guest) => state.image == "nixos" && guest.boot_mount_is_doomed(),
+            // A box that cannot be probed cannot be judged. Stopping is what
+            // the user asked for, and refusing on an unanswered question would
+            // make an unreachable box impossible to stop at all.
+            Err(error) => {
+                tracing::debug!(box_id = %name, %error, "could not check the box's boot mounts");
+                return Ok(());
+            }
+        };
+        if !doomed {
+            return Ok(());
+        }
+
+        if force {
+            eprintln!(
+                "Warning: box '{name}' pins a boot-time mount by a device id that will not \
+                 exist after the next start, and --force was given. It will very likely not \
+                 come back."
+            );
+            return Ok(());
+        }
+
+        println!("Box '{name}' would not be able to start again; repairing it before stopping...");
+        crate::sandbox::agent_sync::ensure_current(
+            self,
+            runtime,
+            name,
+            &state.image,
+            crate::sandbox::agent_sync::Scope::Full,
+            claim,
+        )
+        .await
+        .map_err(|error| error.context(refuse_stop_message(name)))?;
         Ok(())
     }
 
@@ -1669,6 +1769,26 @@ mod tests {
             "{summary}"
         );
         assert!(!summary.contains("→ /mnt/host"), "{summary}");
+    }
+
+    /// The refusal has to leave the reader somewhere to go: the box is still
+    /// running, here is how to get your work out, and only then the override.
+    #[test]
+    fn refusing_to_stop_says_what_to_do_instead() {
+        let message = refuse_stop_message("devtest");
+        assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("devbox layer commit devtest"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+        // The reason, not just the verdict.
+        assert!(message.contains("cannot boot"), "{message}");
+        // rustfmt rejoins a `\`-continued literal and leaves its indentation
+        // inside the text; this is what notices.
+        assert!(!message.contains("  "), "{message}");
+        // `--force` is the last resort, not the first suggestion.
+        assert!(
+            message.find("layer commit").unwrap() < message.find("--force").unwrap(),
+            "{message}"
+        );
     }
 
     /// A box with nothing mounted is legal — an explicit empty `[mounts]`
