@@ -34,6 +34,10 @@ pub(crate) const GUEST_CWD: &str = "/workspace";
 /// in repeated round trips, and because it runs concurrently with the command
 /// itself — a run that beats this deadline has simply had its first second of
 /// events attributed by the parent chain instead of by cgroup.
+/// Shorter than the guest's own wait (`obs::run::GATE_SECONDS`), and it has to
+/// be: this budget is spent *reading* the wrapper's record, and opening the
+/// gate afterwards costs another round trip. Equal deadlines meant a readback
+/// that only just made it had already lost the wrapper.
 const SCOPE_READBACK_MS: u64 = 5_000;
 
 /// How long to let the collector settle before reading the run's events.
@@ -560,13 +564,24 @@ pub(crate) fn spawn_scope_readback(
     let run_id = run_id.to_string();
     let started = started_at.to_string();
     tokio::spawn(async move {
+        let store = Store::open(&store_path(&manager_dir, &name)).ok();
+        // Every exit from here writes an outcome, including the ones that
+        // learn nothing: a blank `start_gate` has to keep meaning "this run
+        // predates the gate" rather than doubling as "we gave up".
         let argv = readback_argv(&run_id, SCOPE_READBACK_MS);
         let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let result = runtime.exec_cmd(&name, &refs, false).await.ok()?;
-        let scope: GuestScope = serde_json::from_str(result.stdout.trim()).ok()?;
+        let read = runtime.exec_cmd(&name, &refs, false).await;
+        let scope = read
+            .ok()
+            .and_then(|result| serde_json::from_str::<GuestScope>(result.stdout.trim()).ok());
+        let Some(scope) = scope else {
+            if let Some(store) = &store {
+                let _ = store.set_run_start_gate(&run_id, StartGate::Timeout);
+            }
+            return None;
+        };
         let cgroup = scope.exclusive_cgroup_id();
 
-        let store = Store::open(&store_path(&manager_dir, &name)).ok();
         if let Some(store) = &store {
             let _ = store.set_run_scope(&run_id, cgroup, scope.root_pid);
             // Claim whatever the run's cgroup already produced. With the gate

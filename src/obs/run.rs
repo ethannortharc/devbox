@@ -706,9 +706,15 @@ pub const RUN_ID_ENV: &str = "DEVBOX_RUN_ID";
 ///
 /// The gate exists so the host has registered the run's cgroup *before* the
 /// command produces its first event; it must never be the reason a command
-/// does not run. Five seconds is a long time for one local SQLite write and a
-/// round trip, and a short time to notice that something is wrong.
-pub const GATE_SECONDS: u32 = 5;
+/// does not run.
+///
+/// Deliberately longer than the host's own readback deadline
+/// (`cli::run::SCOPE_READBACK_MS`), and it has to be: the host spends that
+/// budget *reading* the wrapper's record, and then needs another round trip to
+/// open the gate. Equal deadlines meant a readback that only just made it had
+/// already lost the wrapper — observed on a loaded box, as a run with no scope
+/// recorded at all.
+pub const GATE_SECONDS: u32 = 12;
 
 /// `$0` for the shell that waits at the gate, so `ps` says what it is.
 pub const GATE_ARGV0: &str = "devbox-run-gate";
@@ -798,9 +804,13 @@ unit=@UNIT@$rid
 home=${HOME-}; who=${USER-$(id -un 2>/dev/null || echo "")}
 method=
 if [ -d /run/systemd/system ]; then
-    if systemd-run --user --scope --quiet -- true >/dev/null 2>&1; then
+    # The probes run in the run's own cgroup, so they are in the run's own
+    # report. Both halves carry a marker the fold recognises — the unit name
+    # and the wrapper's own path. An unnamed probe running a bare no-op showed
+    # up as an unexplained process at the root of the tree.
+    if systemd-run --user --scope --quiet --unit="$unit-probe" -- test -f "$self" >/dev/null 2>&1; then
         method=systemd-user
-    elif sudo -n systemd-run --scope --quiet --uid="$(id -u)" --gid="$(id -g)" -- true >/dev/null 2>&1; then
+    elif sudo -n systemd-run --scope --quiet --unit="$unit-probe" --uid="$(id -u)" --gid="$(id -g)" -- test -f "$self" >/dev/null 2>&1; then
         method=systemd-system
     fi
 fi
@@ -840,7 +850,7 @@ pub fn bootstrap(run_id: &str, cwd: &str) -> Vec<String> {
 {{ mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; }} || sudo -n sh -c 'mkdir -p {primary} && chmod 1777 {primary}' 2>/dev/null
 [ -w "$d" ] || {{ d={fallback}; mkdir -p "$d" 2>/dev/null; }}
 w={prefix}{run_id}.sh
-cat > "$w" <<'{tag}'
+tee "$w" >/dev/null <<'{tag}'
 {wrapper}
 {tag}
 exec sh "$w" {run_id} "$d/{run_id}.json" '{cwd}' "$@"
@@ -1334,6 +1344,61 @@ mod tests {
         assert!(
             !script.contains("@GATE"),
             "a placeholder survived: {script}"
+        );
+    }
+
+    #[test]
+    fn every_process_the_wrapper_spawns_is_recognised() {
+        // Each of these ran in the run's own cgroup and therefore appeared in
+        // the run's own report. The bare ones — `cat`, `true` — had no marker
+        // at all and became the root of the tree, which is the bug the start
+        // gate was supposed to have fixed.
+        for words in [
+            // The bootstrap writing the wrapper: `tee` names the file, `cat`
+            // named nothing.
+            vec!["tee", "/tmp/.devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.sh"],
+            // The scope probe and its payload.
+            vec![
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--unit=devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00-probe",
+                "--",
+                "test",
+                "-f",
+                "/tmp/.devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.sh",
+            ],
+            vec![
+                "test",
+                "-f",
+                "/tmp/.devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00.sh",
+            ],
+            // The real scope, and the helpers stage 2 spawns.
+            vec![
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--unit=devbox-run-01ABCDEFGHJKMNPQRSTVWXYZ00",
+            ],
+            vec!["mkdir", "-p", "/run/devbox/runs"],
+            vec![
+                "rm",
+                "-f",
+                "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json.go",
+            ],
+        ] {
+            let argv: Vec<String> = words.iter().map(|s| s.to_string()).collect();
+            assert!(is_wrapper_command(&argv), "not folded: {argv:?}");
+        }
+
+        // And the script really does spawn only marked processes: a bare
+        // `cat` or `-- true` in it is the shape that leaked.
+        let script = wrapper_script();
+        assert!(!script.contains("-- true"), "an unmarked probe payload");
+        assert!(
+            !bootstrap("01ABCDEFGHJKMNPQRSTVWXYZ00", "/workspace")[2].contains("cat > "),
+            "an unmarked heredoc writer"
         );
     }
 
