@@ -1327,7 +1327,7 @@ async fn broker_base_url(runtime: &dyn Runtime, name: &str) -> Option<String> {
 /// either fails in the guest or, worse, names a plaintext token file that the
 /// copy would be pointing at. The broker is how the guest gets git
 /// credentials now, so there is nothing here worth carrying across.
-fn strip_credential_sections(content: &str) -> String {
+pub(crate) fn strip_credential_sections(content: &str) -> String {
     let mut out = String::new();
     let mut in_credential = false;
     for line in content.lines() {
