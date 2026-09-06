@@ -54,6 +54,18 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W2 | W2-5 run report polish: fold the wrapper, writes outside the overlay, wire Credentials | `v5/report-polish` | **DONE** |
 | W2 | W2-6 redact credentials out of every argv devbox records or renders | `v5/redact` | **DONE** |
 | W2 | W2-7 a brokered credential use is OCSF API Activity 6003 | `v5/redact` | **DONE** |
+| W3 | W3-1 one judgement of daemon ownership, and a way out of an unreadable one | `v5/takeover` | **DONE** |
+| W3 | W3-2 register the run before the command runs; `devbox store redact`; broker clock | `v5/run-hardening` | **DONE** |
+| W3 | W3-3 ask the box who its user is; an unrecordable MCP session still runs | `v5/guest-user` | **DONE** |
+| W3 | W3-4 `devbox code` carries the broker over ssh | `v5/code-broker` | **DONE** |
+| W3 | W3-5 the passwd home follows the login shell | `v5/home-align` | **DONE** |
+| W3 | W3-6 Lima's cidata mount by label, not by a UUID that changes every start | `v5/lima-stop` | **DONE** |
+| W3 | W3-7 a run cannot come back empty without saying why; defer the handover | `v5/capture-gap` | **DONE** |
+| W3 | W3-8 an agent push waits for its run; handovers are logged; `layer prune` | `v5/daemon-polish` | **DONE** |
+| W3 | W3-9 a failed keepalive no longer stops the collector reading | `v5/flaky-queue` | **DONE** |
+| W3 | W3-10 `[mounts]` default, repair-before-stop, incus-agent per runtime | `v5/mounts-stop` | **DONE** |
+| W3 | W3-11 an attach at the start of a run is not an interruption | `v5/restart-threshold` | **DONE** |
+| W3 | W3-12 README, docs, ADR-0068…0071, release notes, version 0.2.1 | `v5/docs-021` | **DONE** |
 
 ## Environment notes
 
@@ -2323,3 +2335,45 @@ serial log stays empty. Reproduced twice on clean throwaway boxes; the
 morning's `devtest` restart failure was very likely the same thing. Whether
 this is Lima, devbox's stop sequence, or a regression between v3 and v5 is
 W3-6's question, and no 0.2.1 goes out before it is answered.
+
+## 2026-09-06 — 0.2.1: the boxes come back, and the collector keeps every frame
+
+**Landed on `v5-main`**, `v0.2.0..4c641ec`, 36 non-merge commits across eleven
+task branches. What a user gets:
+
+- **Lima boxes boot again after a stop.** The cidata mount was pinned by a UUID
+  Lima regenerates on every start; it is named by label now, a running box
+  repairs itself on the next command that enters it, and `devbox stop` does
+  that repair before stopping — refusing to stop if it fails, because that is
+  the step that cannot be undone (ADR-0068). Present since v3; a box already
+  stopped and stranded is unrecoverable.
+- **The collector keeps every frame an agent sent.** A failed keepalive was
+  cancelling the read loop through a `select!` (ADR-0070).
+- **A run cannot come back empty without saying why.** The handover killed the
+  stdio agent it owns; handovers and agent pushes now wait for a run in flight,
+  a real interruption is reported and a plain re-attach is not (ADR-0071).
+- **One guest home, not two** (ADR-0069), which is also what makes `devbox
+  code` able to carry the broker variables over ssh.
+- `devbox.toml` with no `[mounts]` mounted nothing and said nothing;
+  `incus-agent` no longer fails every five seconds on a Lima box; run ids no
+  longer spin forever when two threads mint one in the same millisecond;
+  daemons are replaced by process group and no longer leak from the test suite
+  (147 of them, 1.9 GB, were found on this host).
+- New: `devbox layer prune`, `devbox store redact`, and an x86 CO-RE pair so an
+  amd64 source build embeds the eBPF agent instead of falling back.
+
+**Gate on `v5/docs-021`** — `cargo fmt --check`, `cargo +1.98.1 clippy -j 3
+--all-targets -- -D warnings`, `cargo test -j 3` (log at `/tmp/w312-test.log`).
+
+**Not released.** Version is 0.2.1 and the release notes are final, but no tag
+is cut and nothing is pushed. Before `v0.2.1` goes out: the release workflow
+has never run in its v5 shape (there is no `act` on this host, so it has only
+been checked with `actionlint`, a YAML parse and `bash -n install.sh`), and
+`install.sh`, the README's install line and `Cargo.toml`'s `repository` all
+point at `github.com/ethannortharc/devbox` while `origin` is `git.giomni.com`.
+
+**Two things this cycle keeps proving.** A regression test that does not fail
+against the unfixed code proves nothing — checking that caught one test in
+W3-9 that would have passed either way. And restoring a working tree with `git
+checkout --` after building a variant binary silently reverted the change under
+test, twice, in two different tasks; back the file up with `cp` instead.
