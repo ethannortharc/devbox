@@ -351,6 +351,23 @@ async fn a_deaf_server_and_the_children_it_spawned_are_both_stopped() {
 fn devbox(project: &std::path::Path, state: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_devbox"));
     command.current_dir(project).env("HOME", state);
+    // No background daemons for a throwaway `HOME`.
+    //
+    // Every `needs_collector` command starts a collector and a broker before
+    // it runs — before it even decides it is going to fail — and they are
+    // real daemons that supervise the state directory they were given for as
+    // long as the machine is up. Here that directory is a `tempfile::tempdir`
+    // that is deleted moments later, so the daemon can never be found again:
+    // it holds no lock anyone else contends for, its ownership sidecar goes
+    // with the directory, and nothing is left that names it.
+    //
+    // Three of the tests below run `mcp run`, so three of these were left
+    // behind by every `cargo test` in every worktree. Measured on this host
+    // before the fix: 147 of them, 1.9 GB resident, 54 still running — 54
+    // distinct temporary state directories, one daemon each.
+    command
+        .env("DEVBOX_NO_COLLECTOR_DAEMON", "1")
+        .env("DEVBOX_NO_BROKER", "1");
     command
 }
 
