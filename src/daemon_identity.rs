@@ -27,6 +27,18 @@ use anyhow::{Context, Result, bail};
 /// read as "unknown", never as "the same as yours".
 pub const UNKNOWN_BUILD: &str = "unknown";
 
+/// How often an owning daemon looks for rivals on its own state directory.
+///
+/// Slow on purpose. Nothing is waiting on the answer, and the usual answer is
+/// "none" — the cost that matters is the one a user's command would pay, and a
+/// periodic sweep is what moves it off that path entirely.
+///
+/// Shared, because the two daemons had drifted here before: the collector
+/// swept and the broker only looked before starting one, so a rival broker
+/// that appeared afterwards ran until the next broker start — which on a host
+/// with no secrets is never.
+pub const ORPHAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Lifecycle commands that must find the record unreadable before the daemon
 /// holding the lock is treated as broken.
 ///
@@ -1043,6 +1055,27 @@ mod tests {
             assert_ne!(mine.build, "", "a live test binary has an executable");
             assert_ne!(mine.build, UNKNOWN_BUILD);
             assert!(!should_replace(&mine, &mine));
+        }
+    }
+
+    /// The two daemons sweep on the same schedule. They had drifted here
+    /// before — the collector swept, the broker only looked before starting
+    /// one — and a rival broker on a host whose secrets were later removed
+    /// therefore ran until the machine was rebooted.
+    #[test]
+    fn both_daemons_sweep_on_one_schedule() {
+        assert_eq!(ORPHAN_SWEEP_INTERVAL, std::time::Duration::from_secs(300));
+        let collector = std::fs::read_to_string("src/obs/daemon.rs").expect("collector source");
+        let broker = std::fs::read_to_string("src/broker/daemon.rs").expect("broker source");
+        for (name, source) in [("collector", &collector), ("broker", &broker)] {
+            assert!(
+                source.contains("identity::ORPHAN_SWEEP_INTERVAL"),
+                "the {name} does not sweep on the shared schedule"
+            );
+            assert!(
+                source.contains("reap_orphans"),
+                "the {name} does not reap orphans at all"
+            );
         }
     }
 

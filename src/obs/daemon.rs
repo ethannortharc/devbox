@@ -22,13 +22,6 @@ use crate::sandbox::SandboxManager;
 const DISABLE_ENV: &str = "DEVBOX_NO_COLLECTOR_DAEMON";
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often the owning daemon looks for rivals on its own state directory.
-///
-/// Slow on purpose. Nothing is waiting on the answer, and the usual answer is
-/// "none" — the cost that matters is the one a user's command would pay, and
-/// this moves it off that path entirely.
-const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
 /// How long an unaccounted daemon is given to go quietly.
 ///
 /// Shorter than a replacement's: nothing is waiting on this one's shutdown to
@@ -439,7 +432,7 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     // no user is waiting on. Doing it only before a spawn — which is where a
     // CLI command can afford it — leaves a rival that appears afterwards
     // running until the next time a daemon happens to start.
-    let mut sweep = tokio::time::interval(ORPHAN_SWEEP_INTERVAL);
+    let mut sweep = tokio::time::interval(identity::ORPHAN_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
