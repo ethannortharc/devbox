@@ -84,6 +84,18 @@ in {
     settings = {
       PasswordAuthentication = false;
       PermitRootLogin = "no";
+      # `devbox code` hands the editor a Remote SSH target and then gets out of
+      # the way, so there is no guest process for devbox to start with an
+      # environment. The credential broker's variables travel as ssh
+      # environment instead: the host's `Host` block sends them with `SetEnv`,
+      # and this is the half that lets sshd through. Nothing here is a
+      # credential and nothing here is written into the box — the box token
+      # arrives per connection and lives only in that session.
+      #
+      # sshd's default AcceptEnv is empty, so without this the variables are
+      # dropped silently and the editor's terminal has no broker at all.
+      # Kept in step with `broker::SSH_ACCEPT_ENV` by a test.
+      AcceptEnv = "DEVBOX_BROKER_URL DEVBOX_BROKER_TOKEN DEVBOX_BROKER_GITHUB_URL DEVBOX_RUN_ID DEVBOX_SECRET_*_URL ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN OPENAI_BASE_URL OPENAI_API_KEY";
     };
   };
   virtualisation.docker.enable = lib.mkDefault (sets.container or false);

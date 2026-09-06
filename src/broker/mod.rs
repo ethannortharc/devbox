@@ -387,6 +387,128 @@ fn shell_word(value: &str) -> Option<&str> {
         .then_some(value)
 }
 
+/// The `AcceptEnv` patterns a box's sshd is configured with — §6.3, via ssh.
+///
+/// `devbox code` hands VS Code or Cursor a Remote SSH target and then gets out
+/// of the way, so there is no guest argv for [`with_env`] to wrap. The other
+/// two places a variable could come from are both worse: writing the token
+/// into a guest shell profile is exactly what v5 removed from `provision.rs`,
+/// and `sshd_config`'s own `SetEnv` would put it on the box's disk. What is
+/// left is ssh's environment passing — the *host's* `Host` block sends the
+/// pairs with `SetEnv`, and sshd lets them through because of this list. The
+/// token never lands in the box.
+///
+/// Patterns rather than plain names in two places, because
+/// [`session_env`] can produce a variable per generic provider and their names
+/// are not knowable here. sshd matches `AcceptEnv` by glob.
+pub const SSH_ACCEPT_ENV: &[&str] = &[
+    "DEVBOX_BROKER_URL",
+    "DEVBOX_BROKER_TOKEN",
+    "DEVBOX_BROKER_GITHUB_URL",
+    "DEVBOX_RUN_ID",
+    "DEVBOX_SECRET_*_URL",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_KEY",
+];
+
+/// The single `AcceptEnv` line devbox writes, in both images.
+pub fn accept_env_line() -> String {
+    format!("AcceptEnv {}", SSH_ACCEPT_ENV.join(" "))
+}
+
+/// Whether this host has any reason to reconfigure a box's sshd.
+///
+/// The guest half of the ssh path is a `nixos-rebuild` on NixOS — minutes, and
+/// a window where the box's firewall is down and then restored. Spending that
+/// on a host that has no credential to send would be indefensible: there is
+/// nothing for sshd to accept. So the check is gated on the broker being
+/// configured at all, which is also the moment it starts being useful.
+///
+/// The consequence, stated plainly: the first devbox command that enters a box
+/// after `devbox secret set` reconfigures that box. That is a one-time cost
+/// per box, and it is why it is not paid by anyone who has not asked for a
+/// broker.
+pub fn wants_ssh_env(state_dir: &Path) -> bool {
+    if std::env::var_os(DISABLE_ENV).is_some() {
+        return false;
+    }
+    !configured_providers(state_dir).is_empty()
+}
+
+/// Whether a box's effective `AcceptEnv` already covers what devbox sends.
+///
+/// Deliberately exact-token containment rather than pattern subsumption. The
+/// question "does `DEVBOX_*` subsume `DEVBOX_SECRET_*_URL`" has a real answer,
+/// but getting it wrong in the permissive direction leaves a box that silently
+/// drops the broker variables — the failure this whole path exists to prevent.
+/// Getting it wrong the other way costs one redundant reconfigure, which is
+/// the same trade [`crate::sandbox::agent_sync::parse_probe`] already makes.
+pub fn sshd_accepts_broker_env(configured: &[String]) -> bool {
+    SSH_ACCEPT_ENV
+        .iter()
+        .all(|wanted| configured.iter().any(|have| have == wanted))
+}
+
+/// Render the `SetEnv` line for an ssh `Host` block.
+///
+/// **One line, every pair.** ssh takes the first obtained value for a keyword
+/// and ignores later ones, so a block with three `SetEnv` lines sends only the
+/// first variable — measured against a real box: three lines delivered one
+/// variable into the session, one line with the same three pairs delivered all
+/// three. Several pairs on a single line is the spelling that works.
+///
+/// Returns the empty string when there is nothing to send: a bare `SetEnv`
+/// with no arguments is a config error, not a no-op.
+///
+/// A value that cannot be represented in ssh's config grammar is *dropped with
+/// a warning* rather than escaped-by-hope. OpenSSH groups a token with double
+/// quotes and offers no escape for a quote inside one, so a value containing
+/// `"`, a backslash, or a newline has no faithful spelling; emitting a mangled
+/// one would send the wrong token to the broker and produce a 401 that reads
+/// like a broker bug. Every value devbox generates is a URL or hex, so this is
+/// a guard against a future change, not a case that happens today.
+pub fn set_env_line(env: &[(String, String)]) -> String {
+    let tokens: Vec<String> = env
+        .iter()
+        .filter_map(|(name, value)| match ssh_config_token(name, value) {
+            Some(token) => Some(token),
+            None => {
+                tracing::warn!(
+                    variable = %name,
+                    "cannot represent this value in an ssh config; `devbox code` will not send it"
+                );
+                None
+            }
+        })
+        .collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    format!("  SetEnv {}\n", tokens.join(" "))
+}
+
+/// One `NAME=value` token for an ssh config, or `None` if it cannot be one.
+fn ssh_config_token(name: &str, value: &str) -> Option<String> {
+    let valid_name = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid_name {
+        return None;
+    }
+    if value.contains(['"', '\\', '\n', '\r']) || value.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if value.contains(char::is_whitespace) || value.contains('#') {
+        return Some(format!("\"{name}={value}\""));
+    }
+    Some(format!("{name}={value}"))
+}
+
 /// Wrap a guest command so it runs with `env`.
 ///
 /// Every runtime's `exec_cmd`/`argv` takes an argv and no environment, and two
@@ -558,6 +680,146 @@ mod tests {
                 "{key} carries a credential-shaped value"
             );
         }
+    }
+
+    #[test]
+    fn every_variable_session_env_can_produce_is_accepted_over_ssh() {
+        // The two halves have to agree or `devbox code` silently drops
+        // variables: what `session_env` sets is what sshd must let through.
+        let produced = session_env(
+            "http://h:1",
+            "tok",
+            &[
+                "anthropic".to_string(),
+                "openai".to_string(),
+                "github".to_string(),
+                "w1b-test".to_string(),
+            ],
+        );
+        for (name, _) in &produced {
+            assert!(
+                SSH_ACCEPT_ENV
+                    .iter()
+                    .any(|pattern| glob_matches(pattern, name)),
+                "{name} is set for a session but no AcceptEnv pattern covers it"
+            );
+        }
+        // Plus the one the run wrapper adds.
+        assert!(SSH_ACCEPT_ENV.contains(&"DEVBOX_RUN_ID"));
+    }
+
+    /// sshd's own `AcceptEnv` matching, only for the test above.
+    fn glob_matches(pattern: &str, name: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == name,
+            Some((head, tail)) => {
+                name.len() >= head.len() + tail.len()
+                    && name.starts_with(head)
+                    && name.ends_with(tail)
+            }
+        }
+    }
+
+    #[test]
+    fn a_box_is_current_only_when_it_has_every_token_devbox_writes() {
+        let ours: Vec<String> = SSH_ACCEPT_ENV.iter().map(|s| s.to_string()).collect();
+        assert!(sshd_accepts_broker_env(&ours));
+
+        assert!(!sshd_accepts_broker_env(&[]));
+        assert!(
+            !sshd_accepts_broker_env(&["LANG".into(), "LC_*".into()]),
+            "a stock Debian AcceptEnv is not enough"
+        );
+
+        // A broader hand-written pattern is not credited: see the doc comment.
+        // The cost is one redundant reconfigure, not a silently broken box.
+        assert!(!sshd_accepts_broker_env(&["DEVBOX_*".into()]));
+
+        // Order does not matter, and extra entries are fine.
+        let mut shuffled = ours.clone();
+        shuffled.reverse();
+        shuffled.push("LANG".into());
+        assert!(sshd_accepts_broker_env(&shuffled));
+
+        // Dropping any single one makes it stale.
+        for index in 0..ours.len() {
+            let mut missing = ours.clone();
+            let removed = missing.remove(index);
+            assert!(
+                !sshd_accepts_broker_env(&missing),
+                "a box missing {removed} must not read as current"
+            );
+        }
+    }
+
+    #[test]
+    fn the_accept_env_line_is_one_line_of_valid_sshd_syntax() {
+        let line = accept_env_line();
+        assert!(line.starts_with("AcceptEnv "));
+        assert!(!line.contains('\n'));
+        assert!(line.contains("DEVBOX_BROKER_TOKEN"));
+        assert!(line.contains("DEVBOX_SECRET_*_URL"));
+    }
+
+    /// Measured against a real box: a block carrying one `SetEnv` line per
+    /// variable delivered exactly *one* variable into the session, because ssh
+    /// takes the first obtained value for a keyword and ignores the rest. One
+    /// line with the same pairs delivered all of them.
+    #[test]
+    fn every_variable_goes_on_one_set_env_line() {
+        let env = vec![
+            ("DEVBOX_BROKER_URL".to_string(), "http://h:7879".to_string()),
+            ("DEVBOX_BROKER_TOKEN".to_string(), "deadbeef".to_string()),
+        ];
+        let rendered = set_env_line(&env);
+        assert_eq!(
+            rendered,
+            "  SetEnv DEVBOX_BROKER_URL=http://h:7879 DEVBOX_BROKER_TOKEN=deadbeef\n"
+        );
+        assert_eq!(
+            rendered.matches("SetEnv").count(),
+            1,
+            "a second SetEnv line would be dropped by ssh, silently"
+        );
+        // Nothing to send means no directive at all: a bare `SetEnv` with no
+        // argument is a config error, not an empty setting.
+        assert_eq!(set_env_line(&[]), "");
+    }
+
+    #[test]
+    fn a_value_with_no_faithful_spelling_is_dropped_rather_than_mangled() {
+        // Quotable: whitespace and `#` survive inside double quotes.
+        assert_eq!(
+            set_env_line(&[("A".into(), "one two".into())]),
+            "  SetEnv \"A=one two\"\n"
+        );
+        assert_eq!(
+            set_env_line(&[("A".into(), "x#y".into())]),
+            "  SetEnv \"A=x#y\"\n"
+        );
+
+        // Not quotable: OpenSSH has no escape for these inside a token.
+        for bad in ["a\"b", "a\\b", "a\nb", "a\rb", "a\u{7}b"] {
+            assert_eq!(
+                set_env_line(&[("A".into(), bad.to_string())]),
+                "",
+                "{bad:?} must not be emitted"
+            );
+        }
+        // A name that is not a shell identifier is refused too.
+        for bad in ["", "1A", "A-B", "A B", "A=B"] {
+            assert_eq!(
+                set_env_line(&[(bad.to_string(), "v".into())]),
+                "",
+                "{bad:?}"
+            );
+        }
+        // One unrepresentable value does not take the others down with it.
+        assert_eq!(
+            set_env_line(&[("A".into(), "ok".into()), ("B".into(), "a\"b".into())]),
+            "  SetEnv A=ok\n"
+        );
+        {}
     }
 
     #[test]

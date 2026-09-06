@@ -161,6 +161,42 @@ before this landed still holds the original bytes in its `raw` column on the
 host's own disk, and is redacted when it is read. What is protected is
 everything devbox renders — which is what leaves the machine.
 
+### The editor's route in
+
+`devbox code` is the one entry point with no guest argv to wrap. It hands VS
+Code or Cursor a Remote SSH target and launches the editor **on the host**; the
+remote server inside the box is started by the editor, not by devbox, so
+`env -- K=V …` has nothing to attach to.
+
+The variables travel as ssh environment instead:
+
+| Half | Where | What it does |
+|---|---|---|
+| Host | the `# devbox-start:devbox-<box>` block in `~/.ssh/config` | one `SetEnv NAME=value` line per broker variable |
+| Guest | `AcceptEnv` in sshd — `nix/devbox-module.nix` on NixOS, `/etc/ssh/sshd_config.d/60-devbox-broker.conf` elsewhere | lets exactly those names through; sshd's default `AcceptEnv` is empty, so without it they are dropped in silence |
+
+The two lists are one list: `broker::SSH_ACCEPT_ENV`, with a test holding the
+nix module to it.
+
+Nothing here is written into the box. The token arrives per connection and
+lives only in that session — the alternative, a devbox-managed `export` block in
+the guest's shell profile, is exactly what v5 removed from `provision.rs` and is
+not coming back for the sake of one command.
+
+Two consequences worth stating:
+
+- The block in `~/.ssh/config` carries the box's broker token, so devbox keeps
+  that file at mode `0600`. It is not an API key — it buys scoped, logged,
+  brokered access and nothing else — but it is a credential, and a dotfiles
+  repository is not the place for it.
+- The token is rotated on every box start, so the block is refreshed then too.
+  Devbox only ever *refreshes* a block `devbox code` already created; a box you
+  have never opened in an editor gets nothing written to your ssh config.
+
+An `isolated` box behaves here exactly as it does for `devbox run`: the
+variables are still set, the broker's address is not exempted from the firewall,
+and the request fails. That is the posture working, not the wiring failing.
+
 ## Run attribution
 
 A run is a command devbox started; attribution decides which events belong to
