@@ -28,6 +28,10 @@ let
   # devbox recorded it, and "incus" is the safe assumption there: the agent it
   # gates was unconditional until now, so an unknown box keeps what it had.
   runtime = sandbox.runtime or "incus";
+  # Whether `/workspace` carries `nofail`. Decided when the box was born and
+  # never afterwards — see the mount below for why changing it later cannot be
+  # applied at all.
+  workspaceNofail = sandbox.workspace_nofail or false;
   hasEditor = sets.editor or true;
   hasShell = sets.shell or true;
 
@@ -193,15 +197,16 @@ in {
   # The reload fails, `nixos-rebuild switch` exits 4, and NixOS rolls the whole
   # generation back — so a box in that state cannot complete *any* devbox
   # repair, not just the one that changed the options. W3-6 added `nofail` here
-  # and hit exactly that on devtest: generation 5 built, failed to activate,
-  # and the box stayed on generation 4 with nothing to show for it.
+  # unconditionally and hit exactly that on devtest: generation 5 built, failed
+  # to activate, and the box stayed on generation 4 with nothing to show for it.
   #
-  # `nofail` would have been worth having — without it an overlay that cannot
+  # `nofail` is still worth having, because without it an overlay that cannot
   # be assembled takes `local-fs.target` down and the box comes up in emergency
-  # mode with no sshd. But it is not worth reaching a box that can no longer be
-  # repaired, and it was never the fix for anything: the boxes that were being
-  # lost were lost to a stale cidata UUID, which is fixed in the generated
-  # `configuration.nix` and needs no option change here.
+  # mode with no sshd. It is only ever added at the one moment it is free: the
+  # first provision, before `/workspace` exists, when there is no mount to
+  # reload and nothing to refuse. `workspace_nofail` is written into
+  # `devbox-state.toml` then and never revisited, so an older box keeps exactly
+  # the options it was born with — including through a reprovision.
   fileSystems."/workspace" = lib.mkIf isOverlay {
     device = "overlay";
     fsType = "overlay";
@@ -209,6 +214,9 @@ in {
       "lowerdir=/mnt/host"
       "upperdir=/var/devbox/overlay/upper"
       "workdir=/var/devbox/overlay/work"
+    ] ++ lib.optionals workspaceNofail [
+      "nofail"
+      "x-systemd.device-timeout=5s"
     ];
     depends = [ "/mnt/host" ];
   };

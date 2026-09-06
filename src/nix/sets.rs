@@ -274,45 +274,89 @@ pub fn generate_state_toml(
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
 ) -> String {
-    generate_state_toml_with(sets, languages, custom_packages, None, None, None, None)
+    generate_state_toml_with(sets, languages, custom_packages, &GuestShape::default())
 }
 
-/// Generate `devbox-state.toml`, preserving the guest identity and mount mode.
+/// What `devbox-state.toml` records about the box *itself*, as opposed to what
+/// is installed in it.
 ///
-/// `devbox-module.nix` reads `[user].name`, `[user].home`,
-/// `[sandbox].runtime` and `[sandbox].mount_mode` from this file. Regenerating it from sets alone
-/// silently resets the guest username to `dev` and the mount mode to
-/// `overlay` — which breaks a box whose guest user differs, or whose workspace
-/// is writable, on the very next rebuild — and drops the guest home, which
-/// re-homes the passwd entry away from the box's `authorized_keys`.
+/// One struct rather than a row of parameters because every single one of
+/// these has been silently dropped at least once by a writer that did not know
+/// it existed, and each was rediscovered as a bug: the guest username reset to
+/// `dev`, the guest home re-homing the passwd entry away from the box's
+/// `authorized_keys`, the runtime re-enabling the Incus agent on a Lima box,
+/// and the mount mode turning a writable workspace back into an overlay. A key
+/// added here is now a compile error at every writer instead of a silent loss
+/// at one of them.
+///
+/// Every field is `Option` except the last: absent means "the box does not
+/// say", which each consumer reads as its own conservative default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GuestShape {
+    pub user: Option<String>,
+    pub home: Option<String>,
+    pub runtime: Option<String>,
+    pub mount_mode: Option<String>,
+    /// Whether `/workspace` carries `nofail`.
+    ///
+    /// Decided once, when the box is born, and never afterwards — see
+    /// `devbox-module.nix`. `false` is what a box that does not say gets, and
+    /// that is deliberate: it is the option set every box built before 0.2.2
+    /// already has, and changing a mounted overlay's options is what W3-10
+    /// found leaves a box unable to complete any rebuild at all.
+    pub workspace_nofail: bool,
+}
+
+impl GuestShape {
+    /// Read the shape a box already declares.
+    pub fn read(doc: &toml::Value) -> Self {
+        let string =
+            |table: &str, key: &str| doc.get(table)?.get(key)?.as_str().map(str::to_string);
+        Self {
+            user: string("user", "name"),
+            home: string("user", "home"),
+            runtime: string("sandbox", "runtime"),
+            mount_mode: string("sandbox", "mount_mode"),
+            workspace_nofail: doc
+                .get("sandbox")
+                .and_then(|s| s.get("workspace_nofail"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Generate `devbox-state.toml`, preserving everything in [`GuestShape`].
+///
+/// Regenerating it from sets alone is what drops those keys; see the struct for
+/// what each loss costs.
 pub fn generate_state_toml_with(
     sets: &HashMap<String, bool>,
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
-    username: Option<&str>,
-    home: Option<&str>,
-    runtime: Option<&str>,
-    mount_mode: Option<&str>,
+    shape: &GuestShape,
 ) -> String {
     let mut toml = String::new();
 
-    if let Some(name) = username {
+    if let Some(name) = &shape.user {
         toml.push_str(&format!("[user]\nname = \"{name}\"\n"));
-        if let Some(home) = home {
+        if let Some(home) = &shape.home {
             toml.push_str(&format!("home = \"{home}\"\n"));
         }
         toml.push('\n');
     }
-    if mount_mode.is_some() || runtime.is_some() {
+    if shape.mount_mode.is_some() || shape.runtime.is_some() || shape.workspace_nofail {
         toml.push_str("[sandbox]\n");
-        if let Some(mode) = mount_mode {
+        if let Some(mode) = &shape.mount_mode {
             toml.push_str(&format!("mount_mode = \"{mode}\"\n"));
         }
-        // Dropping this re-enables the Incus guest agent on a Lima box, where
-        // it fails and is restarted every five seconds for the life of the
-        // box — the same shape of loss as dropping the username or the home.
-        if let Some(runtime) = runtime {
+        if let Some(runtime) = &shape.runtime {
             toml.push_str(&format!("runtime = \"{runtime}\"\n"));
+        }
+        // Written only when true. A box that never had it must not gain the
+        // key, because the key is what would change its mount options.
+        if shape.workspace_nofail {
+            toml.push_str("workspace_nofail = true\n");
         }
         toml.push('\n');
     }
@@ -866,10 +910,13 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            Some("ethan.linux"),
-            Some("/home/ethan.linux.guest"),
-            Some("lima"),
-            Some("writable"),
+            &GuestShape {
+                user: Some("ethan.linux".into()),
+                home: Some("/home/ethan.linux.guest".into()),
+                runtime: Some("lima".into()),
+                mount_mode: Some("writable".into()),
+                workspace_nofail: true,
+            },
         );
         assert!(toml.contains("[user]"));
         assert!(toml.contains("name = \"ethan.linux\""));
@@ -877,6 +924,7 @@ mod tests {
         assert!(toml.contains("[sandbox]"));
         assert!(toml.contains("mount_mode = \"writable\""));
         assert!(toml.contains("runtime = \"lima\""));
+        assert!(toml.contains("workspace_nofail = true"));
         let parsed: toml::Value = toml.parse().expect("valid TOML");
         assert_eq!(
             parsed["user"]["home"].as_str(),
@@ -887,6 +935,52 @@ mod tests {
         let bare = generate_state_toml(&HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(!bare.contains("[user]"));
         assert!(!bare.contains("[sandbox]"));
+    }
+
+    /// The freeze rule, at the level the writers see it: a box that does not
+    /// say `workspace_nofail` must not be given the key, because the key is
+    /// what would change a mounted overlay's options — which overlayfs refuses
+    /// and NixOS rolls the whole generation back over.
+    #[test]
+    fn a_shape_without_the_workspace_flag_writes_no_such_key() {
+        let toml = generate_state_toml_with(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &GuestShape {
+                user: Some("dev".into()),
+                mount_mode: Some("overlay".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!toml.contains("workspace_nofail"), "{toml}");
+    }
+
+    /// And reading a box's own file gives back what that box said, so a
+    /// regeneration preserves it rather than deciding again.
+    #[test]
+    fn the_shape_round_trips_through_the_state_file() {
+        let original = GuestShape {
+            user: Some("ethan".into()),
+            home: Some("/home/ethan.guest".into()),
+            runtime: Some("lima".into()),
+            mount_mode: Some("overlay".into()),
+            workspace_nofail: true,
+        };
+        let toml =
+            generate_state_toml_with(&HashMap::new(), &HashMap::new(), &HashMap::new(), &original);
+        let parsed: toml::Value = toml.parse().expect("valid TOML");
+        assert_eq!(GuestShape::read(&parsed), original);
+    }
+
+    /// A box that says nothing reads as every conservative default, and
+    /// `workspace_nofail` false is the one that matters: it is the option set
+    /// every box built before 0.2.2 already has.
+    #[test]
+    fn a_silent_state_file_reads_as_leave_everything_alone() {
+        let parsed: toml::Value = "[sets]\nsystem = true\n".parse().unwrap();
+        assert_eq!(GuestShape::read(&parsed), GuestShape::default());
+        assert!(!GuestShape::default().workspace_nofail);
     }
 
     #[test]

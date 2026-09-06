@@ -19,6 +19,7 @@ pub mod mcp;
 pub mod nix_cmd;
 pub mod policy;
 pub mod prune;
+pub mod repair;
 pub mod report;
 pub mod reprovision;
 pub mod run;
@@ -195,6 +196,9 @@ pub enum Command {
     /// Inspect the host-side credential broker
     #[command(name = "broker")]
     BrokerCmd(broker::BrokerArgs),
+
+    /// Repairs that touch your own files, and so are never done unasked
+    Repair(repair::RepairArgs),
 }
 
 impl Command {
@@ -224,6 +228,7 @@ impl Command {
                 | Self::Watch(_)
                 | Self::Behavior(_)
                 | Self::Policy(_)
+                | Self::Repair(_)
                 | Self::Web(_)
         )
     }
@@ -278,6 +283,7 @@ impl Command {
             Command::Export(args) => export::run(args, manager).await,
             Command::Secret(args) => secret::run(args, manager).await,
             Command::BrokerCmd(args) => broker::run(args, manager).await,
+            Command::Repair(args) => repair::run(args, manager).await,
         }
     }
 }

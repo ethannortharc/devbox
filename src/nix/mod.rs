@@ -63,28 +63,13 @@ pub async fn write_set_modules(
     selection: &compose::Selection,
 ) -> Result<()> {
     // Read back what the box already declares, so regenerating the state file
-    // does not reset the guest username, the guest home, or the mount mode
-    // (all three of which the NixOS module reads from it).
+    // does not reset any of it. See `GuestShape` for what each loss costs —
+    // every field there was found the hard way.
     let existing = read_state_toml(runtime, sandbox_name).await?;
-    let username = existing
+    let shape = existing
         .as_ref()
-        .and_then(|t| toml_string(t, "user", "name"));
-    // Dropping this one is not cosmetic: without it the module falls back to
-    // `isNormalUser`'s `/home/<name>` and the next rebuild re-homes the passwd
-    // entry away from the directory holding the box's `authorized_keys` —
-    // which is the failure this key exists to prevent. A `devbox sets apply`
-    // would otherwise undo it during an unrelated change.
-    let home = existing
-        .as_ref()
-        .and_then(|t| toml_string(t, "user", "home"));
-    let mount_mode = existing
-        .as_ref()
-        .and_then(|t| toml_string(t, "sandbox", "mount_mode"));
-    // Same reason as the home above: the module gates the Incus guest agent on
-    // this, and a Lima box that loses it restarts a failing agent forever.
-    let runtime_name = existing
-        .as_ref()
-        .and_then(|t| toml_string(t, "sandbox", "runtime"));
+        .map(crate::nix::sets::GuestShape::read)
+        .unwrap_or_default();
 
     // The set index and every set module are pushed regardless of selection:
     // they are small text files, and having them all present means toggling a
@@ -125,10 +110,7 @@ pub async fn write_set_modules(
         &sets_map(&config),
         &languages_map(&config),
         &extra,
-        username.as_deref(),
-        home.as_deref(),
-        runtime_name.as_deref(),
-        mount_mode.as_deref(),
+        &shape,
     );
     write_state_toml(runtime, sandbox_name, &state_toml).await
 }
@@ -184,11 +166,6 @@ async fn read_state_toml(runtime: &dyn Runtime, sandbox_name: &str) -> Result<Op
         )
     })?;
     Ok(Some(parsed))
-}
-
-/// Pull `table.key` out of a parsed TOML document.
-fn toml_string(doc: &toml::Value, table: &str, key: &str) -> Option<String> {
-    doc.get(table)?.get(key)?.as_str().map(str::to_string)
 }
 
 /// Toggle additional sets/languages on a running sandbox, then rebuild.
