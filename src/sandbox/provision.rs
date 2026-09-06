@@ -1327,7 +1327,7 @@ async fn broker_base_url(runtime: &dyn Runtime, name: &str) -> Option<String> {
 /// either fails in the guest or, worse, names a plaintext token file that the
 /// copy would be pointing at. The broker is how the guest gets git
 /// credentials now, so there is nothing here worth carrying across.
-fn strip_credential_sections(content: &str) -> String {
+pub(crate) fn strip_credential_sections(content: &str) -> String {
     let mut out = String::new();
     let mut in_credential = false;
     for line in content.lines() {
@@ -1346,7 +1346,6 @@ fn strip_credential_sections(content: &str) -> String {
 
 // ── Shared Helpers ──────────────────────────────────────────
 
-/// Generate devbox-state.toml content from active sets and languages.
 /// Which user a box runs as, and the home that user's login shell actually
 /// uses.
 ///
@@ -1359,6 +1358,85 @@ pub(crate) async fn guest_identity(runtime: &dyn Runtime, name: &str) -> Result<
     Ok((username, home))
 }
 
+/// What the guest answered when asked whether it is a box being born.
+///
+/// Every field is what the *box* said rather than what the host inferred, and
+/// `answered` is the one that matters most: a probe that never ran must not be
+/// read as "this box has no state file".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BirthProbe {
+    /// The probe ran to completion in the guest.
+    pub answered: bool,
+    /// `/etc/devbox/devbox-state.toml` exists.
+    pub has_state: bool,
+    /// What that file says about `workspace_nofail`, if anything.
+    pub state_says_nofail: bool,
+    /// `/etc/fstab` already declares a `/workspace` mount.
+    pub fstab_has_workspace: bool,
+    /// That declaration carries `nofail`.
+    ///
+    /// From `/etc/fstab`, deliberately, and not from the running mount.
+    /// `nofail` is an fstab and systemd option: it never reaches the kernel,
+    /// so `findmnt -no OPTIONS /workspace` does not report it on a box that
+    /// has it — measured on a box built with it, which lists only
+    /// `rw,relatime,lowerdir=…,upperdir=…,workdir=…,uuid=on`. Comparing the
+    /// recorded key against the *mount* would therefore call every such box a
+    /// mismatch and refuse every rebuild it ever needed.
+    pub fstab_has_nofail: bool,
+    /// `/workspace` is mounted right now.
+    pub workspace_mounted: bool,
+}
+
+/// Ask the box the questions the grant depends on, in one command.
+///
+/// The trailing `probe=ok` is the whole point. Lima's `exec_cmd` shells out to
+/// `limactl shell`, and a VM that is not up — or an ssh connection that
+/// stutters for a moment — comes back as a **non-zero exit rather than an
+/// `Err`**. An exit code therefore cannot tell "this box has no state file"
+/// apart from "this box could not be asked". A marker the guest prints only
+/// after every question has been answered can.
+pub(crate) const BIRTH_PROBE: &str = r#"
+if [ -e /etc/devbox/devbox-state.toml ]; then
+  printf 'state=present\n'
+  printf 'nofail=%s\n' "$(awk -F= '/^[[:space:]]*workspace_nofail[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' /etc/devbox/devbox-state.toml 2>/dev/null)"
+else
+  printf 'state=absent\n'
+fi
+workspace_line=$(awk '$2 == "/workspace" { print; exit }' /etc/fstab 2>/dev/null)
+if [ -n "$workspace_line" ]; then
+  printf 'fstab=yes\n'
+  case ",$(printf '%s' "$workspace_line" | awk '{print $4}')," in
+    *,nofail,*) printf 'fstabnofail=yes\n' ;;
+    *) printf 'fstabnofail=no\n' ;;
+  esac
+else
+  printf 'fstab=no\n'
+fi
+if findmnt -n /workspace >/dev/null 2>&1; then
+  printf 'mounted=yes\n'
+else
+  printf 'mounted=no\n'
+fi
+printf 'probe=ok\n'
+"#;
+
+/// Read [`BIRTH_PROBE`]'s output.
+pub(crate) fn parse_birth_probe(stdout: &str) -> BirthProbe {
+    let mut probe = BirthProbe::default();
+    for line in stdout.lines() {
+        match line.trim() {
+            "probe=ok" => probe.answered = true,
+            "state=present" => probe.has_state = true,
+            "nofail=true" => probe.state_says_nofail = true,
+            "fstab=yes" => probe.fstab_has_workspace = true,
+            "fstabnofail=yes" => probe.fstab_has_nofail = true,
+            "mounted=yes" => probe.workspace_mounted = true,
+            _ => {}
+        }
+    }
+    probe
+}
+
 /// Whether this box's `/workspace` may carry `nofail`.
 ///
 /// Decided once, at the box's birth, and never revisited. `nofail` is what
@@ -1367,37 +1445,92 @@ pub(crate) async fn guest_identity(runtime: &dyn Runtime, name: &str) -> Result<
 /// it to a box that already has the mount is what W3-10 found leaves that box
 /// unable to complete any rebuild at all: `switch-to-configuration` reloads a
 /// mount unit whose options changed, a reload of an overlay is a remount, and
-/// overlayfs answers every one of those with
-/// `No changes allowed in reconfigure`. The switch then exits 4 and NixOS
-/// rolls the generation back, for good, because `/etc` has already moved.
+/// overlayfs answers every one of those with `No changes allowed in
+/// reconfigure`. The switch exits 4 and NixOS rolls the generation back, for
+/// good, because `/etc` has already moved.
 ///
-/// So: a box with no state file has never been provisioned and gets it; a box
-/// that already says `true` keeps it; a box that has a state file and does not
-/// say so was built without it and must never be given it. Reprovisioning an
-/// existing box therefore preserves whatever that box was born with, which is
-/// the case a naive "new boxes get nofail" rule would get wrong.
-async fn workspace_nofail_for(runtime: &dyn Runtime, name: &str) -> bool {
-    let result = runtime
-        .exec_cmd(name, &["cat", "/etc/devbox/devbox-state.toml"], false)
-        .await;
-    let Ok(result) = result else {
-        // The box could not be asked. `false` leaves the mount exactly as it
-        // is, which is the answer that cannot break anything.
+/// A grant therefore needs two independent things to be true, and a box that
+/// could not answer gets neither:
+///
+/// 1. the box has no state file, so it has never been provisioned;
+/// 2. it has no `/workspace` in `/etc/fstab` and none mounted, so there is no
+///    mount whose options a rebuild could be asked to change.
+///
+/// The second is not redundant. W4-2 granted on the first alone and read a
+/// non-zero exit as "no state file" — which is also what a stuttering ssh
+/// connection looks like. One unlucky moment during a `reprovision` of an old
+/// box would have written the key onto a box whose mount does not have it, and
+/// that box could then never be rebuilt again. Narrow window, permanent
+/// consequence.
+pub(crate) fn grant_workspace_nofail(probe: &BirthProbe) -> bool {
+    if !probe.answered {
         return false;
-    };
-    if result.exit_code != 0 {
-        // No state file: this box is being provisioned for the first time and
-        // its `/workspace` does not exist yet, so the options are still free.
-        return true;
     }
-    result
-        .stdout
-        .parse::<toml::Value>()
-        .ok()
-        .map(|doc| crate::nix::sets::GuestShape::read(&doc).workspace_nofail)
-        .unwrap_or(false)
+    if probe.has_state {
+        // This box has been through this before. What it decided then is what
+        // its mount was built with, and that is not ours to revise.
+        return probe.state_says_nofail;
+    }
+    !probe.fstab_has_workspace && !probe.workspace_mounted
 }
 
+async fn workspace_nofail_for(runtime: &dyn Runtime, name: &str) -> bool {
+    let stdout = match runtime
+        .exec_cmd(name, &["sh", "-c", BIRTH_PROBE], false)
+        .await
+    {
+        Ok(result) => result.stdout,
+        Err(_) => String::new(),
+    };
+    grant_workspace_nofail(&parse_birth_probe(&stdout))
+}
+
+/// Refuse to rebuild a box whose recorded workspace options are not the ones
+/// it is actually mounted with.
+///
+/// The key is a record of how the mount was built, not a wish about how it
+/// should be. If the two disagree — because someone edited the state file by
+/// hand — the next rebuild changes the mount's options, overlayfs refuses the
+/// remount, the switch exits 4, and the box can never be rebuilt again. Worth
+/// stopping in front of, because there is no stopping after.
+///
+/// The comparison is against `/etc/fstab`, not against the running mount:
+/// `nofail` never reaches the kernel, so a box that has it reports mount
+/// options without it and would look like a mismatch forever. fstab is also
+/// the right thing to compare — it is what `switch-to-configuration` diffs to
+/// decide whether the unit needs the reload that cannot succeed.
+///
+/// A box with no `/workspace` line has nothing to disagree with, which is the
+/// state every box being provisioned is in.
+pub(crate) fn refuse_on_workspace_mismatch(box_name: &str, probe: &BirthProbe) -> Result<()> {
+    if !probe.answered || !probe.fstab_has_workspace {
+        return Ok(());
+    }
+    if probe.state_says_nofail == probe.fstab_has_nofail {
+        return Ok(());
+    }
+    let (says, has) = if probe.state_says_nofail {
+        ("nofail", "without it")
+    } else {
+        ("no nofail", "with it")
+    };
+    // `concat!` with positional arguments rather than a `\`-continued literal:
+    // rustfmt rejoins a continued string and leaves its indentation inside.
+    bail!(
+        concat!(
+            "box '{}' was not rebuilt. Its devbox-state.toml records the workspace mount as ",
+            "'{}' while /etc/fstab declares it {}, and overlayfs refuses to remount ",
+            "with different options — so a rebuild from here would fail to activate and roll ",
+            "back, permanently. That key records how the mount was built; it is not a setting. ",
+            "If it was edited by hand, put it back.",
+        ),
+        box_name,
+        says,
+        has
+    )
+}
+
+/// Generate devbox-state.toml content from active sets and languages.
 fn generate_state_toml(
     sets: &[String],
     languages: &[String],
@@ -2828,6 +2961,115 @@ mod tests {
         }
         async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
             unimplemented!()
+        }
+    }
+
+    fn probe(lines: &str) -> BirthProbe {
+        parse_birth_probe(lines)
+    }
+
+    /// A box being born: no state file, no `/workspace` anywhere. The only
+    /// moment the mount options are free.
+    #[test]
+    fn a_box_with_no_state_and_no_workspace_gets_nofail() {
+        let p = probe("state=absent\nfstab=no\nmounted=no\nprobe=ok\n");
+        assert!(grant_workspace_nofail(&p));
+    }
+
+    /// The case W4-2 got wrong from the other direction: no state file, but
+    /// the box plainly already has a workspace. Granting here would change a
+    /// mounted overlay's options, which overlayfs refuses and NixOS rolls the
+    /// whole generation back over.
+    #[test]
+    fn a_box_with_no_state_but_a_workspace_gets_nothing() {
+        assert!(!grant_workspace_nofail(&probe(
+            "state=absent\nfstab=yes\nmounted=no\nprobe=ok\n"
+        )));
+        assert!(!grant_workspace_nofail(&probe(
+            "state=absent\nfstab=no\nmounted=yes\nprobe=ok\n"
+        )));
+    }
+
+    /// The bug this whole change exists for. `limactl shell` answers a VM that
+    /// is not up, or an ssh stutter, with a non-zero exit and no output — not
+    /// with an `Err`. Without the marker that reads exactly like "no state
+    /// file", and one unlucky moment during a reprovision writes the key onto
+    /// a box that must never have it.
+    #[test]
+    fn a_probe_that_did_not_answer_grants_nothing() {
+        // What an ssh failure actually looks like: empty stdout.
+        assert!(!grant_workspace_nofail(&probe("")));
+        // And a half-answer, cut off before the marker.
+        assert!(!grant_workspace_nofail(&probe("state=absent\nfstab=no\n")));
+        // Even one that would otherwise have said yes.
+        assert!(!grant_workspace_nofail(&probe(
+            "state=absent\nfstab=no\nmounted=no\n"
+        )));
+    }
+
+    /// A box that has been through this keeps what it decided, either way.
+    #[test]
+    fn a_box_that_already_decided_is_not_asked_again() {
+        assert!(grant_workspace_nofail(&probe(
+            "state=present\nnofail=true\nfstab=yes\nmounted=yes\nprobe=ok\n"
+        )));
+        assert!(!grant_workspace_nofail(&probe(
+            "state=present\nnofail=\nfstab=yes\nmounted=yes\nprobe=ok\n"
+        )));
+    }
+
+    /// The state file and the mount are a record and the thing recorded. When
+    /// they disagree the box is one rebuild from being unrebuildable, so the
+    /// rebuild does not happen.
+    #[test]
+    fn a_state_file_that_disagrees_with_fstab_stops_the_rebuild() {
+        let says_yes = refuse_on_workspace_mismatch(
+            "devtest",
+            &probe("state=present\nnofail=true\nfstab=yes\nfstabnofail=no\nprobe=ok\n"),
+        )
+        .expect_err("a record that disagrees with fstab is refused");
+        assert!(says_yes.to_string().contains("'nofail'"), "{says_yes}");
+        assert!(says_yes.to_string().contains("without it"), "{says_yes}");
+
+        let says_no = refuse_on_workspace_mismatch(
+            "devtest",
+            &probe("state=present\nnofail=\nfstab=yes\nfstabnofail=yes\nprobe=ok\n"),
+        )
+        .expect_err("and so is the other direction");
+        assert!(says_no.to_string().contains("'no nofail'"), "{says_no}");
+        assert!(says_no.to_string().contains("with it"), "{says_no}");
+
+        for message in [says_yes.to_string(), says_no.to_string()] {
+            assert!(message.contains("devtest"), "{message}");
+            assert!(message.contains("edited by hand"), "{message}");
+            // rustfmt rejoins a `\`-continued literal and leaves its
+            // indentation in the text; this is what notices.
+            assert!(!message.contains("  "), "{message}");
+        }
+    }
+
+    /// The comparison is against `/etc/fstab`, never the running mount.
+    /// `nofail` is an fstab option and never reaches the kernel, so a box
+    /// built *with* it reports mount options *without* it — measured on a
+    /// fresh box:
+    /// `rw,relatime,lowerdir=…,upperdir=…,workdir=…,uuid=on`. Comparing the
+    /// key against that would call every such box a mismatch and refuse every
+    /// rebuild it ever needed.
+    #[test]
+    fn agreement_and_a_box_with_no_workspace_line_both_pass() {
+        for stdout in [
+            // key and fstab agree, both ways
+            "state=present\nnofail=true\nfstab=yes\nfstabnofail=yes\nprobe=ok\n",
+            "state=present\nnofail=\nfstab=yes\nfstabnofail=no\nprobe=ok\n",
+            // no /workspace declared at all: every box being provisioned
+            "state=absent\nfstab=no\nmounted=no\nprobe=ok\n",
+            // and a probe that did not answer must not refuse anything either
+            "",
+        ] {
+            assert!(
+                refuse_on_workspace_mismatch("devtest", &probe(stdout)).is_ok(),
+                "{stdout:?}"
+            );
         }
     }
 

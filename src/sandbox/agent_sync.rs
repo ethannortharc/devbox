@@ -544,6 +544,28 @@ impl Refresh {
             || self.boot_mount_repaired
     }
 
+    /// What to tell the user when a repair waited for a run, or `None` when
+    /// nothing waited.
+    ///
+    /// Derived from the flag rather than printed at the branch, so "a deferral
+    /// says so" and "anything else says nothing" are one testable answer
+    /// instead of two places that have to agree.
+    ///
+    /// A deferral looks exactly like "nothing was wrong" from outside — same
+    /// silence, same speed — and until W4-5 the only way to tell them apart
+    /// was a log level nobody turns on until they are already confused.
+    pub fn deferral_notice(&self, name: &str) -> Option<String> {
+        self.deferred.then(|| {
+            format!(
+                "devbox: a run is in flight in '{name}'; \
+                 the pending repair will happen after it ends"
+            )
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+        })
+    }
+
     /// One line naming what was put right, or `None` when nothing was.
     ///
     /// Each of these is a different thing to have been wrong, and a caller
@@ -655,6 +677,14 @@ pub async fn ensure_current(
     if crate::obs::run_in_flight(&manager.state_dir, name) {
         mark_pending(&manager.state_dir, name, host);
         refresh.deferred = true;
+        // Said out loud, not only in a log nobody has enabled. This deferral
+        // is indistinguishable from "devbox decided nothing was wrong": the
+        // command is quiet, quick, and changes nothing. W4-2 spent a while
+        // suspecting the drift comparison before finding it needed
+        // `DEVBOX_LOG=info` to see this line at all.
+        if let Some(notice) = refresh.deferral_notice(name) {
+            eprintln!("{notice}");
+        }
         tracing::info!(
             box_id = %name,
             "a run is in flight; the agent update waits for it to finish"
@@ -837,6 +867,18 @@ async fn reconfigure(
         if what.is_empty() {
             return Ok(());
         }
+        // Before anything is generated, and certainly before the rebuild: a
+        // box whose recorded workspace options are not the ones it is mounted
+        // with cannot be rebuilt at all, and finding that out from the exit
+        // code afterwards is finding it out too late.
+        let probe = super::provision::parse_birth_probe(
+            &runtime
+                .exec_cmd(name, &["sh", "-c", super::provision::BIRTH_PROBE], false)
+                .await
+                .map(|result| result.stdout)
+                .unwrap_or_default(),
+        );
+        super::provision::refuse_on_workspace_mismatch(name, &probe)?;
         println!("Regenerating {} for box '{name}'...", what.join(", "));
         // The module needs to know which hypervisor this is before it can
         // stop enabling the Incus guest agent on a Lima box. A box provisioned
@@ -978,6 +1020,36 @@ mod tests {
         );
         // And one provisioned before the probe asked the question.
         assert!(parse_probe("sha=absent\nunit=\n").accept_env.is_empty());
+    }
+
+    /// The deferral has to be visible: it is silent and fast, exactly like
+    /// "nothing was wrong", and the two mean opposite things.
+    #[test]
+    fn the_deferral_names_the_box_and_says_the_repair_survives() {
+        // Nothing deferred, nothing said — including when other things *were*
+        // repaired, which is the common case.
+        assert_eq!(Refresh::default().deferral_notice("devtest"), None);
+        assert_eq!(
+            Refresh {
+                pushed: true,
+                ..Default::default()
+            }
+            .deferral_notice("devtest"),
+            None
+        );
+
+        let notice = Refresh {
+            deferred: true,
+            ..Default::default()
+        }
+        .deferral_notice("devtest")
+        .expect("a deferral says so");
+        assert!(notice.contains("devtest"), "{notice}");
+        assert!(notice.contains("run is in flight"), "{notice}");
+        // The half that stops it reading as a refusal.
+        assert!(notice.contains("after it ends"), "{notice}");
+        assert!(!notice.contains('\n'), "one line: {notice}");
+        assert!(!notice.contains("  "), "{notice}");
     }
 
     /// The module decides sshd's AcceptEnv, the guest user's home, the

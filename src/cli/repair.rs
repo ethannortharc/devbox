@@ -52,15 +52,17 @@ const WORTH_MERGING: &[&str] = &[
     ".gitconfig",
     ".claude/settings.json",
     ".codex/config.toml",
-    ".config",
+    // Named one by one rather than as `.config`. That directory is where most
+    // programs put their settings *and* where several put their tokens —
+    // `.config/gh/hosts.yml` is a GitHub OAuth token, `.config/gcloud` is a
+    // credential store — so copying it wholesale would carry them into the
+    // real home under the name of a settings merge. These four are the ones
+    // devbox itself writes, so they are the ones it knows are settings.
+    ".config/aichat",
+    ".config/yazi",
+    ".config/opencode/config.json",
+    ".config/go",
 ];
-
-const _: () = {
-    // `.claude/settings.json` is settings; `.claude/.credentials.json` is not,
-    // and the two live in the same directory. Merging a whole `.claude` would
-    // carry the second along with the first, so the list names files.
-    assert!(WORTH_MERGING.len() == 4);
-};
 
 /// Files that are credentials, and are deleted rather than archived.
 ///
@@ -72,9 +74,19 @@ const _: () = {
 /// exact leak. So they are removed, and the removal is reported rather than
 /// done quietly: the user should know a credential was found and where it was.
 const CREDENTIALS: &[&str] = &[
+    // What devbox v4 put there itself.
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".devbox-ai-env",
+    // And what anything the user ran inside the box may have left. None of
+    // these is devbox's doing, but all of them would end up in an archive that
+    // stays in the guest, which is the one outcome this repair must not have.
+    ".config/gh/hosts.yml",
+    ".config/gcloud",
+    ".netrc",
+    ".npmrc",
+    ".docker/config.json",
+    ".aws/credentials",
 ];
 
 pub async fn run(args: RepairArgs, manager: &SandboxManager) -> Result<()> {
@@ -271,6 +283,32 @@ async fn apply(
         }
     }
 
+    // A gitconfig carried over from the stale home brings whatever it had,
+    // and what these had was a `[credential]` section pointing at a helper on
+    // the *host* — `!/opt/homebrew/bin/gh auth git-credential`, a path that
+    // does not exist in the box. Not a leak, but every credential lookup in
+    // the box then fails on a binary that was never there. Provisioning has
+    // stripped those sections since v5; the merge goes through the same
+    // function rather than a second copy of the rule.
+    let gitconfig = format!("{real_home}/.gitconfig");
+    let read = runtime
+        .exec_cmd(name, &["cat", &gitconfig], false)
+        .await
+        .ok()
+        .filter(|result| result.exit_code == 0)
+        .map(|result| result.stdout);
+    if let Some(before) = read {
+        let after = crate::sandbox::provision::strip_credential_sections(&before);
+        if after != before {
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(after.as_bytes());
+            let write = format!("printf %s '{encoded}' | base64 -d > '{gitconfig}'");
+            if runtime.run_as_root(name, &write, false).await.is_ok() {
+                println!("  stripped a [credential] section from the merged .gitconfig");
+            }
+        }
+    }
+
     // Before the archive, never after: a credential that reached the tarball
     // is a credential this repair put back into the box.
     for entry in CREDENTIALS {
@@ -365,18 +403,43 @@ mod tests {
 
     /// A credential must never appear in the merge list, and must never be
     /// reachable by merging a directory that contains one.
+    ///
+    /// The second half is the one that bites. `.config` was on the merge list
+    /// until W4-5, and `.config/gh/hosts.yml` is a GitHub OAuth token: merging
+    /// the directory would have copied the token into the real home and called
+    /// it a settings merge.
     #[test]
     fn no_credential_is_carried_over_or_archived() {
+        assert!(!CREDENTIALS.is_empty());
         for credential in CREDENTIALS {
             assert!(!WORTH_MERGING.contains(credential), "{credential}");
-            // And no entry may be a parent directory of one: merging `.claude`
-            // would take `.claude/.credentials.json` with it.
             for merged in WORTH_MERGING {
                 assert!(
                     !credential.starts_with(&format!("{merged}/")),
                     "merging {merged} would carry {credential}"
                 );
+                // And the other direction: a merged path must not sit inside
+                // something being deleted as a credential, or the merge would
+                // read from a directory that is about to go.
+                assert!(
+                    !merged.starts_with(&format!("{credential}/")),
+                    "{merged} lives inside {credential}, which is deleted"
+                );
             }
+        }
+    }
+
+    /// Nothing on the merge list may be a whole directory that other programs
+    /// also write into. `.config` is the example; the entries under it name
+    /// one program each.
+    #[test]
+    fn the_merge_list_never_names_a_shared_directory() {
+        assert!(!WORTH_MERGING.contains(&".config"));
+        assert!(!WORTH_MERGING.contains(&".claude"));
+        assert!(!WORTH_MERGING.contains(&".codex"));
+        for merged in WORTH_MERGING {
+            assert_ne!(*merged, ".", "{merged}");
+            assert!(!merged.starts_with('/'), "{merged}");
         }
     }
 
