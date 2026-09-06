@@ -31,15 +31,28 @@ use crate::sandbox::SandboxManager;
 
 /// Protocol revisions this server implements.
 ///
-/// Both are the same wire protocol for what these four tools do; the newer one
-/// adds capabilities (audio content, completions, tool annotations) that a
-/// read-only evidence server does not use. Listing both means a client pinned
-/// to either gets its own version echoed rather than a downgrade it has to
-/// decide about.
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-03-26", "2024-11-05"];
+/// All three are the same wire protocol for what these four tools do; the
+/// newer ones add capabilities (audio content, completions, tool annotations,
+/// structured output, elicitation, resource links) that a read-only evidence
+/// server does not use, and authorization rules that apply to HTTP transports
+/// rather than to stdio. Listing all three means a client pinned to any of
+/// them gets its own version echoed rather than a downgrade it has to decide
+/// about.
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// What we answer with when the client asks for something we do not know.
-pub const LATEST_PROTOCOL: &str = "2025-03-26";
+///
+/// `2025-06-18` rather than `2025-03-26`, because it is the newest revision
+/// this server actually conforms to. Batching is required by `2025-03-26` and
+/// is the one thing here that does not do it (see [`BATCH_UNSUPPORTED`]);
+/// `2025-06-18` removed batching from the protocol, so naming it is the
+/// honest answer to "what do you speak" rather than a claim walked back by an
+/// error later in the session.
+///
+/// A client that asks for `2025-03-26` still gets `2025-03-26` echoed: the gap
+/// is one message shape it probably never sends, and telling it we are older
+/// than it asked for would cost it the features it does use.
+pub const LATEST_PROTOCOL: &str = "2025-06-18";
 
 /// The most events one `watch` call will return.
 const WATCH_MAX: usize = 200;
@@ -672,6 +685,34 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["protocolVersion"], LATEST_PROTOCOL);
+    }
+
+    /// The version this server volunteers has to be one whose contract it
+    /// keeps. `2025-03-26` and everything before it inherit JSON-RPC batching,
+    /// which this server answers with `-32600`; `2025-06-18` removed it. So
+    /// the default must not be one of the older two — while a client that asks
+    /// for one still gets its own version back, because the gap is a single
+    /// message shape it probably never sends and a downgrade would cost it
+    /// features it does use.
+    #[tokio::test]
+    async fn the_version_we_volunteer_is_one_we_do_not_have_to_walk_back() {
+        const REQUIRE_BATCHING: &[&str] = &["2025-03-26", "2024-11-05"];
+        assert!(
+            !REQUIRE_BATCHING.contains(&LATEST_PROTOCOL),
+            "{LATEST_PROTOCOL} mandates batching, which this server refuses",
+        );
+
+        let (_dir, manager) = manager();
+        for asked in REQUIRE_BATCHING {
+            assert!(SUPPORTED_PROTOCOLS.contains(asked), "{asked} was dropped");
+            let response = ask(
+                &manager,
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                       "params":{"protocolVersion":asked}}),
+            )
+            .await;
+            assert_eq!(response["result"]["protocolVersion"], *asked);
+        }
     }
 
     /// A batch is well-formed JSON full of well-formed requests, so the
