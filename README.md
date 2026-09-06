@@ -37,7 +37,7 @@ than no tool at all.
 
 ## Quick start
 
-> ### Upgrading from 0.2.0 or earlier? Read this before you stop a box.
+> ### Upgrading from 0.2.1 or earlier? Read this before you stop a box.
 >
 > Every NixOS box devbox has ever created on Lima records Lima's `cidata`
 > mount by device UUID — and Lima regenerates that ISO, with a new UUID, on
@@ -47,19 +47,29 @@ than no tool at all.
 >
 > **A box that is still running repairs itself.** The first devbox command
 > that enters it (`devbox exec <box> -- true` will do) rewrites the mount by
-> label and runs one `nixos-rebuild` — about nine seconds. `devbox stop` now
-> does that repair for you first, and refuses to stop the box if the repair
-> fails, because stopping it is the step you cannot undo. `--force` overrides
-> that, with a warning.
+> label and runs one `nixos-rebuild` — about nine seconds. `devbox stop` does
+> that repair for you first, and refuses to stop the box if the repair fails,
+> because stopping it is the step you cannot undo. `--force` overrides that,
+> with a warning.
+>
+> **If you are on 0.2.1, that sentence was not yet true of `exec` and
+> `shell`.** They opened a run of their own before repairing, a repair waits
+> for runs in flight, and so each was waiting for itself; only `devbox run`
+> (once its run had ended) and commands that open no run — `devbox code`,
+> `reprovision`, and the pre-check in `stop` — ever applied one. 0.2.2 repairs
+> before it records, so the advice above holds. A box you only ever entered
+> through `exec` or `shell` picks up everything it was owed on the next such
+> command. If you followed the 0.2.1 advice and then stopped a Lima box, check
+> that it boots.
 >
 > **A box that is already stopped and will not boot cannot be recovered.**
 > There is no sshd to get in through and the file to change is inside the
 > guest's filesystem. `devbox destroy` it and create it again; anything in its
 > overlay that was never committed is gone.
 >
-> Unrelated to the mount, every box built before 0.2.1 also does **one** extra
-> `nixos-rebuild` on the next command that enters it, so it picks up this
-> release's guest-side changes. It happens once per box.
+> Unrelated to the mount, a box built before this release does **one** extra
+> `nixos-rebuild` on the next command that enters it, so it picks up the
+> guest-side changes. It happens once per box.
 
 ### Install
 
@@ -169,6 +179,17 @@ Host filesystem ──(read-only)──> /mnt/host (lower layer)
 Nothing reaches your real files until you run `devbox commit`. `devbox discard`
 throws the upper layer away.
 
+Boxes created from 0.2.2 on mount `/workspace` with `nofail` and a five-second
+device timeout, so an overlay that cannot assemble costs you the workspace
+rather than the box — without it a failed mount takes `local-fs.target` with it
+and the box comes up in emergency mode with no sshd. **A box created before
+0.2.2 keeps the options it was born with and never gains them.** That is not
+conservatism: overlayfs rejects any remount that changes options, and
+`switch-to-configuration` reloads a mount unit whose options moved, so granting
+`nofail` to an existing box fails the rebuild, rolls the generation back, and
+leaves the box unable to accept any later repair. The decision is recorded in
+the box's state file at birth and never recomputed.
+
 A **checkpoint** is a copy of that upper layer, not a new overlay level — the
 kernel supports a fixed number of layers and stacking one per run would run
 out. `devbox run` takes one before and one after, and the report's Files
@@ -245,6 +266,29 @@ devbox broker reach mybox                          # how this box gets to the br
 scheme, so pointing it at a plaintext broker fails at the TLS handshake.
 Supporting it would mean a TLS listener and a trust anchor inside the box,
 which is the thing this design refuses. `git` over smart HTTP works.
+
+**A box older than 0.2.1 may still have credentials in it.** Devbox before then
+wrote settings — and, before v5, API keys — into `/home/<user>` while the
+guest's login shell used `/home/<user>.guest`, so that directory was left
+behind full of things nobody reads.
+
+```bash
+devbox repair stale-home --dry-run    # list it, change nothing
+devbox repair stale-home              # merge, archive, remove (asks first)
+devbox repair stale-home --keep       # everything but the removal
+```
+
+Settings worth keeping are merged into the real home without overwriting
+anything that is already there, and a merged `.gitconfig` loses its host-only
+credential helper the same way provisioning strips it. The rest is archived to
+the **host**, at `~/.devbox/archives/<box>-stale-home-<UTC>.tar.gz`, and the
+archive is checked against the guest's copy — bytes and sha256 — before
+anything is deleted; it therefore outlives the box. Credential files are the
+exception: `.claude/.credentials.json`, `.codex/auth.json`,
+`.config/gh/hosts.yml`, `.netrc`, `.npmrc`, `.docker/config.json`,
+`.aws/credentials` and gcloud's databases are **deleted and named, never merged
+and never archived**, including under `--keep`. Archiving a key into a tarball
+would put back exactly what the broker exists to remove.
 
 ### Egress: a posture, for the box or for one run
 
@@ -381,6 +425,7 @@ its own, the box name comes second — `devbox snapshot save nightly devtest`,
 | `devbox mcp self` | Run devbox's own MCP server: runs and events, as tools |
 | `devbox export --format <fmt>` | Export events as OCSF, OTLP/JSON, or JSON Lines |
 | `devbox store redact` | Strip credentials from argvs recorded before redaction existed (`--dry-run`) |
+| `devbox repair stale-home` | Clean up the `/home/<user>` an older devbox wrote into (`--dry-run`, `--keep`, `--yes`) |
 | `devbox web` | Start the local web console without touching a box |
 | `devbox code` | Open VS Code / Cursor into a box via Remote SSH |
 | `devbox use <name>` | Point an existing box at the current directory |
