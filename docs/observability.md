@@ -149,7 +149,36 @@ waits for that box's own runs, leaving
 `~/.devbox/boxes/<name>/agent-update-pending` behind until it can be done;
 `devbox doctor` prints it, `devbox run` finishes the job on its way out, and
 `devbox exec` and `devbox shell` do it on the way in — before they open a run
-of their own, which is what they used to defer to.
+of their own, which is what they used to defer to. A deferral is not silent:
+the command that would have repaired the box prints one line on stderr,
+
+```
+devbox: a run is in flight in 'devtest'; the pending repair will happen after it ends
+```
+
+because at `warn` the only other trace of it was indistinguishable from
+nothing being wrong.
+
+### Reading an agent restart out of the log
+
+Three lines answer "did the agent change, and for how long was nothing
+captured" without opening `capture.json`:
+
+```
+16:43:08.270  INFO agent connected box_id=devtest version=0.2.1 ebpf=true pid=229727
+16:43:28.067  INFO observability agent stream ended box_id=devtest pid=229727 events=76 elapsed_ms=19796 ok=true
+16:43:29.436  INFO restarting observability agent box_id=devtest attempt=2 after_ms=1368
+16:43:29.499  INFO agent connected box_id=devtest version=0.2.1 ebpf=true pid=229813
+```
+
+The pid changed (229727 → 229813); the old connection lived 19.8 s, delivered
+76 frames and ended cleanly; the restart began 1.37 s later and the new agent
+was attached 63 ms after that. Two details are deliberate. The frame count is
+carried out by an out-parameter rather than a return value, so a stream that
+ends in an error still reports what it delivered instead of claiming zero. And
+`restarting` is logged on the branch where the start actually succeeded, so a
+box whose claim is held elsewhere never claims a restart that did not
+happen.
 
 ## Secrets that reach an argv
 
@@ -339,7 +368,7 @@ tiers — and only the first of them is a warning:
 
 | Line | Means | Terminal |
 |---|---|---|
-| **capture restarted** — *events before this were lost* | The agent's health record was re-published **after** this run's first attributed event **and** the agent process id changed. Something the run did was not recorded. | two warning lines |
+| **capture was interrupted** | The agent's health record was re-published **after** this run's first attributed event **and** the agent process id changed. Something the run did was not recorded. | two warning lines |
 | capture re-attached — *same agent, nothing lost* | The record was re-published, but either nothing had been attributed yet or the same agent process kept sending. | nothing |
 | neither line | Nothing re-published during the run. | nothing |
 
@@ -348,7 +377,32 @@ routine: a collector handover at the very start of a run has nothing to lose,
 and a re-publish by the same agent lost nothing either. An agent too old to
 report its own pid is read as "cannot say", which lands in the middle tier —
 devbox would rather miss a warning than manufacture one out of an unanswerable
-question.
+question. The three-way decision is one function with the five shapes under
+test, and the store setter takes its result — so losing the call is a compile
+error rather than a report that quietly stops saying anything.
+
+**An interruption names the window.** "Capture restarted at Y" leaves a reader
+to doubt the whole run; the two ends say which part to doubt. `from` is the
+last event this run had already attributed before the restart (or the run's
+start, if it had none), `to` is the moment the new agent attached.
+
+```
+| **capture was interrupted** | the last event recorded for this run was at 2026-09-06T16:43:08.422Z; a new agent attached at 2026-09-06T16:43:29.499Z; nothing the sandbox did in between reached this report |
+```
+
+```json
+"capture_gap": { "from": "2026-09-06T16:43:08.422Z", "to": "2026-09-06T16:43:29.499Z" }
+```
+
+```html
+<dd class="interrupted">interrupted: the last event recorded for this run was at 2026-09-06T16:43:08.422Z; a new agent attached at 2026-09-06T16:43:29.499Z; nothing the sandbox did in between reached this report</dd>
+```
+
+`capture_gap` is absent from `report.json` when nothing restarted, and it is
+derived — no column, no migration. Read it as an **outer bound**, not as a
+measure of loss: in the run above the window is 21 s while the agent was
+actually down for about 2 s. It claims only that nothing between those two
+timestamps reached this report, which is the one thing the report can know.
 
 `dropped during the run` is a difference between two daemon-wide snapshots, so
 concurrent activity in another box can inflate it. That is the current limit of

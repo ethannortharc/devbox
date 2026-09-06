@@ -76,7 +76,7 @@ can attribute events to them — see [observability.md](observability.md#run-att
 | Network | One row per peer — connections, ports, TLS seen, bytes each way, duration. Plus TLS server names and DNS answers. |
 | Processes | The process tree, by pid. Devbox's own wrapper is folded into one `[devbox wrapper]` row, so the root of the tree is your command. Credentials that reached a command line read `***` — see below. |
 | Credentials | Each brokered credential the run reached for: provider, upstream, methods, uses, last use. `2 (1 denied)` means the scope refused one of them. |
-| Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. Plus, if capture was disturbed mid-run, one of two lines: **capture restarted** (a warning — the agent changed after this run had already recorded something, so something was lost) or *capture re-attached* (no warning — same agent, nothing lost). |
+| Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. Plus, if capture was disturbed mid-run, one of two lines: **capture was interrupted** (a warning — the agent changed after this run had already recorded something; it names the window it cannot vouch for, and `report.json` carries it as `capture_gap`) or *capture re-attached* (no warning — same agent, nothing lost). |
 
 The outside-overlay table is the one worth reading twice. `devbox discard`
 undoes `/workspace`; it does not undo a package the run installed into `$HOME`,
