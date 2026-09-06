@@ -2743,92 +2743,33 @@ mod tests {
     }
 
     use crate::runtime::SandboxStatus;
+    use crate::runtime::stub::StubRuntime;
 
     /// A box that answers the username probe however the test says.
-    struct StubGuest {
-        /// What `Runtime::exec_runs_as_root` reports.
-        root_exec: bool,
-        /// stdout for the `id -un` probe.
-        id_un: &'static str,
-        /// stdout for the /etc/passwd scan.
-        passwd_scan: &'static str,
-    }
-
-    #[async_trait::async_trait]
-    impl Runtime for StubGuest {
-        fn name(&self) -> &str {
-            "stub"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn priority(&self) -> u32 {
-            0
-        }
-        fn exec_runs_as_root(&self) -> bool {
-            self.root_exec
-        }
-        async fn exec_cmd(&self, _: &str, cmd: &[&str], _: bool) -> Result<ExecResult> {
-            let joined = cmd.join(" ");
-            let stdout = if joined.contains("id -un") {
-                self.id_un.to_string()
-            } else if joined.contains("/etc/passwd") {
-                self.passwd_scan.to_string()
-            } else {
-                String::new()
-            };
-            Ok(ExecResult {
-                exit_code: 0,
-                stdout,
-                stderr: String::new(),
+    ///
+    /// `root_exec` is what `Runtime::exec_runs_as_root` reports; `id_un` is the
+    /// stdout of the `id -un` probe, and `passwd_scan` that of the /etc/passwd
+    /// scan.
+    fn stub_guest(root_exec: bool, id_un: &'static str, passwd_scan: &'static str) -> StubRuntime {
+        StubRuntime::new()
+            .with_name("stub")
+            .with_exec_runs_as_root(root_exec)
+            .with_status(SandboxStatus::Running)
+            .with_exec_cmd(move |_: &str, cmd: &[&str], _: bool| {
+                let joined = cmd.join(" ");
+                let stdout = if joined.contains("id -un") {
+                    id_un.to_string()
+                } else if joined.contains("/etc/passwd") {
+                    passwd_scan.to_string()
+                } else {
+                    String::new()
+                };
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
             })
-        }
-        async fn create(
-            &self,
-            _: &crate::runtime::CreateOpts,
-        ) -> Result<crate::runtime::SandboxInfo> {
-            unimplemented!()
-        }
-        async fn start(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn stop(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn destroy(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn status(&self, _: &str) -> Result<SandboxStatus> {
-            Ok(SandboxStatus::Running)
-        }
-        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
-            unimplemented!()
-        }
-        async fn list(&self) -> Result<Vec<crate::runtime::SandboxInfo>> {
-            unimplemented!()
-        }
-        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_list(&self, _: &str) -> Result<Vec<crate::runtime::SnapshotInfo>> {
-            unimplemented!()
-        }
-        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
-            unimplemented!()
-        }
-        async fn update_mounts(
-            &self,
-            _: &str,
-            _: &[crate::runtime::Mount],
-        ) -> Result<crate::runtime::MountUpdate> {
-            unimplemented!()
-        }
-        async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
-            unimplemented!()
-        }
     }
 
     /// The Lima case, and the whole reason for the change: the guest user
@@ -2836,12 +2777,8 @@ mod tests {
     /// devbox needs is the one the box itself reports.
     #[tokio::test]
     async fn the_box_is_asked_who_it_is_rather_than_scanned_for() {
-        let guest = StubGuest {
-            root_exec: false,
-            id_un: "devbox-user=ethan.linux\n",
-            // Empty, the way every Lima box answers it.
-            passwd_scan: "",
-        };
+        // The passwd scan comes back empty, the way every Lima box answers it.
+        let guest = stub_guest(false, "devbox-user=ethan.linux\n", "");
         assert_eq!(detect_vm_username(&guest, "devtest").await, "ethan.linux");
     }
 
@@ -2849,12 +2786,8 @@ mod tests {
     /// account devbox provisions, so the scan is what it uses.
     #[tokio::test]
     async fn a_root_exec_runtime_is_not_asked_id_un_at_all() {
-        let guest = StubGuest {
-            root_exec: true,
-            // Would win if it were consulted. It must not be.
-            id_un: "devbox-user=root\n",
-            passwd_scan: "dev\n",
-        };
+        // `id -un` would win if it were consulted. It must not be.
+        let guest = stub_guest(true, "devbox-user=root\n", "dev\n");
         assert_eq!(detect_vm_username(&guest, "devtest").await, "dev");
     }
 
@@ -2862,11 +2795,7 @@ mod tests {
     /// user and the image's default account is commonly root.
     #[tokio::test]
     async fn a_box_that_answers_root_falls_through_to_the_scan() {
-        let guest = StubGuest {
-            root_exec: false,
-            id_un: "devbox-user=root\n",
-            passwd_scan: "dev\n",
-        };
+        let guest = stub_guest(false, "devbox-user=root\n", "dev\n");
         assert_eq!(detect_vm_username(&guest, "devtest").await, "dev");
     }
 
@@ -2874,11 +2803,11 @@ mod tests {
     /// for the answer — which is what the marker is for.
     #[tokio::test]
     async fn a_chatty_login_shell_does_not_rename_the_user() {
-        let guest = StubGuest {
-            root_exec: false,
-            id_un: "Welcome to NixOS!\nLast login: Fri\ndevbox-user=ethan\n",
-            passwd_scan: "dev\n",
-        };
+        let guest = stub_guest(
+            false,
+            "Welcome to NixOS!\nLast login: Fri\ndevbox-user=ethan\n",
+            "dev\n",
+        );
         assert_eq!(detect_vm_username(&guest, "devtest").await, "ethan");
     }
 
