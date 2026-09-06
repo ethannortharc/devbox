@@ -93,8 +93,7 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
     ordered.sort_by(|a, b| {
         a.pid
             .cmp(&b.pid)
-            .then_with(|| a.ts_wall.cmp(&b.ts_wall))
-            .then_with(|| a.ts_mono_ns.cmp(&b.ts_mono_ns))
+            .then_with(|| a.ordering_key().cmp(&b.ordering_key()))
     });
 
     // Keyed on (pid, incarnation) so the same pid can hold several chains.
@@ -120,6 +119,14 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
             //
             // A rollback is the strongest evidence available that this is a
             // different incarnation, so it says so directly.
+            //
+            // An event with no monotonic reading at all cannot answer this
+            // question either way, and reading its zero as a rollback would
+            // split a chain on the arrival of a host-written event that has
+            // nothing to do with the process.
+            if !event.has_monotonic() || *prev == 0 {
+                return false;
+            }
             event.ts_mono_ns < *prev || event.ts_mono_ns - *prev > PID_REUSE_GAP_NS
         });
         let re_exec = event.kind == EventType::Exec && *has_exec.get(&pid).unwrap_or(&false);
@@ -137,7 +144,11 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
             *incarnation.entry(pid).or_insert(0) += 1;
             has_exec.insert(pid, false);
         }
-        last_ts.insert(pid, event.ts_mono_ns);
+        // Only a real reading updates the gap baseline; a sentinel would make
+        // the next event look like a jump from the beginning of time.
+        if event.has_monotonic() {
+            last_ts.insert(pid, event.ts_mono_ns);
+        }
 
         let key = (pid, *incarnation.get(&pid).unwrap_or(&0));
         // Exit closes the chain it belongs to, not the one after it.
@@ -152,7 +163,7 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
     let mut chains: Vec<Chain> = by_pid
         .into_iter()
         .map(|((pid, _generation), mut group)| {
-            group.sort_by_key(|e| e.ts_mono_ns);
+            group.sort_by_key(|e| e.ordering_key());
 
             let first = group[0];
             let command = group
@@ -198,7 +209,7 @@ pub fn chains(events: &[Event]) -> Vec<Chain> {
         a.events[0]
             .ts_wall
             .cmp(&b.events[0].ts_wall)
-            .then_with(|| a.events[0].ts_mono_ns.cmp(&b.events[0].ts_mono_ns))
+            .then_with(|| a.events[0].ordering_key().cmp(&b.events[0].ordering_key()))
             .then(a.pid.cmp(&b.pid))
     });
     chains
@@ -692,5 +703,70 @@ mod tests {
         assert!(chains(&[]).is_empty());
         assert!(dns_map(&[]).is_empty());
         assert!(tree(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_event_with_no_monotonic_reading_sorts_by_its_wall_clock() {
+        // The broker runs on the *host*: it has no reading from the box's
+        // clock, so its credential events carry the `NO_MONOTONIC` sentinel.
+        // Sorting a chain by the monotonic field alone put them at the front
+        // of the run's process tree, at whatever offset the host had been up
+        // for — which is a number about a different machine.
+        let mut first = base(900, 1, 1_000_000_000, EventType::Exec);
+        first.ts_wall = "2026-09-05T10:00:00.000Z".into();
+        let mut middle = base(
+            900,
+            1,
+            crate::obs::event::NO_MONOTONIC,
+            EventType::Credential,
+        );
+        middle.ts_wall = "2026-09-05T10:00:01.000Z".into();
+        middle.credential = Some(crate::obs::event::Credential {
+            provider: "anthropic".into(),
+            verdict: "allowed".into(),
+            ..Default::default()
+        });
+        let mut last = base(900, 1, 3_000_000_000, EventType::Exit);
+        last.ts_wall = "2026-09-05T10:00:02.000Z".into();
+
+        // Deliberately out of order on the way in.
+        let chains = chains(&[last.clone(), middle.clone(), first.clone()]);
+        assert_eq!(chains.len(), 1, "one pid, one incarnation: {chains:#?}");
+        let order: Vec<&str> = chains[0]
+            .events
+            .iter()
+            .map(|e| e.ts_wall.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "2026-09-05T10:00:00.000Z",
+                "2026-09-05T10:00:01.000Z",
+                "2026-09-05T10:00:02.000Z",
+            ],
+            "the sentinel decided the order instead of the wall clock"
+        );
+    }
+
+    #[test]
+    fn a_sentinel_does_not_read_as_a_clock_rollback() {
+        // The gap heuristic splits a chain when the monotonic clock goes
+        // backwards, because that means a reboot and a reused pid. A zero is
+        // not a rollback — it is the absence of a reading — and treating it as
+        // one split a process's chain the moment a broker event landed in it.
+        let mut exec = base(900, 1, 5_000_000_000, EventType::Exec);
+        exec.ts_wall = "2026-09-05T10:00:00.000Z".into();
+        let mut credential = base(900, 1, crate::obs::event::NO_MONOTONIC, EventType::Connect);
+        credential.ts_wall = "2026-09-05T10:00:01.000Z".into();
+        let mut after = base(900, 1, 5_500_000_000, EventType::Connect);
+        after.ts_wall = "2026-09-05T10:00:02.000Z".into();
+
+        let chains = chains(&[exec, credential, after]);
+        assert_eq!(
+            chains.len(),
+            1,
+            "the sentinel split one process into several: {chains:#?}"
+        );
+        assert_eq!(chains[0].events.len(), 3);
     }
 }

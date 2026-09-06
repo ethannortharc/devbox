@@ -80,11 +80,7 @@ pub fn summarize(box_id: &str, events: &[Event]) -> Summary {
     // and end times came out reversed for any window spanning a reboot. The
     // monotonic value still breaks ties, which is what gives sub-millisecond
     // events within one boot a stable order.
-    events.sort_by(|a, b| {
-        a.ts_wall
-            .cmp(&b.ts_wall)
-            .then_with(|| a.ts_mono_ns.cmp(&b.ts_mono_ns))
-    });
+    events.sort_by(|a, b| a.ordering_key().cmp(&b.ordering_key()));
 
     let mut summary = Summary {
         box_id: box_id.to_string(),
