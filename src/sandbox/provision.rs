@@ -17,7 +17,7 @@ pub type ProvisionReporter<'a> = &'a (dyn Fn(&str) + Sync);
 
 // ── Embedded Nix files (for NixOS provisioning) ─────────────
 
-const NIX_DEVBOX_MODULE: &str = include_str!("../../nix/devbox-module.nix");
+pub(crate) const NIX_DEVBOX_MODULE: &str = include_str!("../../nix/devbox-module.nix");
 const NIX_OBSD_MODULE: &str = include_str!("../../nix/obsd-module.nix");
 
 // ── Embedded config files (yazi, etc.) ───────────────────
@@ -651,6 +651,7 @@ pub async fn post_cache_setup(
         languages,
         &username,
         Some(vm_home.as_str()),
+        runtime.name(),
         mount_mode,
         &package_names,
     );
@@ -797,6 +798,7 @@ async fn provision_nixos(
         languages,
         &username,
         Some(home_dir.as_str()),
+        runtime.name(),
         mount_mode,
         packages,
     );
@@ -852,6 +854,10 @@ async fn provision_nixos(
     let retry = format!("devbox exec {name} -- sudo nixos-rebuild switch");
     require_install_success(&result, "nixos-rebuild switch", &retry)?;
     println!("NixOS rebuild complete.");
+    // A freshly provisioned box is built from the module this build ships;
+    // say so, or `agent_sync` reads it as unknown and rebuilds it once for
+    // nothing on the very next command.
+    stamp_module_build(runtime, name).await;
 
     // Detect the actual VM user/home after nixos-rebuild (may differ from
     // host username — e.g. Lima creates "ethan.linux" from host "ethan").
@@ -1348,6 +1354,7 @@ fn generate_state_toml(
     languages: &[String],
     username: &str,
     home: Option<&str>,
+    runtime: &str,
     mount_mode: &str,
     packages: &[String],
 ) -> String {
@@ -1397,6 +1404,10 @@ fn generate_state_toml(
 
     toml.push_str("\n[sandbox]\n");
     toml.push_str(&format!("mount_mode = \"{mount_mode}\"\n"));
+    // Which hypervisor the box runs under. The module gates the Incus guest
+    // agent on it: on Lima there is no incus host to talk to, so the agent
+    // fails and systemd restarts it every five seconds forever.
+    toml.push_str(&format!("runtime = \"{runtime}\"\n"));
 
     // Ad-hoc packages. Quoted, because an attribute path like
     // `python312Packages.ipython` is otherwise read as a nested table and the
@@ -1664,6 +1675,25 @@ pub(crate) async fn record_guest_home(runtime: &dyn Runtime, name: &str, home: &
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &updated).await
 }
 
+/// Record which hypervisor a box runs under in its `devbox-state.toml`.
+///
+/// The module gates the Incus guest agent on this key, and a box provisioned
+/// before devbox wrote it has no key at all — where the module has to assume
+/// Incus, because switching the agent off on a real Incus box would break
+/// `incus exec` after every rebuild. So the repair supplies the answer rather
+/// than leaving the module to guess it.
+pub(crate) async fn record_guest_runtime(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let current = runtime
+        .exec_cmd(name, &["cat", "/etc/devbox/devbox-state.toml"], false)
+        .await
+        .with_context(|| format!("read the declared state of box '{name}'"))?;
+    if current.exit_code != 0 {
+        bail!("box '{name}' has no readable devbox-state.toml, so its runtime cannot be recorded");
+    }
+    let updated = with_state_value(&current.stdout, "sandbox", "runtime", runtime.name())?;
+    write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &updated).await
+}
+
 /// Set `[user].home` in a `devbox-state.toml`, leaving everything else alone.
 ///
 /// Split out from the guest round trip because the part that can be wrong is
@@ -1671,18 +1701,32 @@ pub(crate) async fn record_guest_home(runtime: &dyn Runtime, name: &str, home: &
 /// package table, and losing any of them would change what the next rebuild
 /// installs.
 fn with_user_home(state: &str, home: &str) -> Result<String> {
+    with_state_value(state, "user", "home", home)
+}
+
+/// Set one `[table].key` in a `devbox-state.toml`, leaving everything else
+/// alone.
+///
+/// Read-modify-write rather than regenerate, because the callers run from
+/// `agent_sync`, which knows nothing about the box's sets, languages or
+/// packages — and rewriting the file from what it does know would reset all
+/// three.
+fn with_state_value(state: &str, table: &str, key: &str, value: &str) -> Result<String> {
     let mut doc: toml::Value = state
         .parse()
         .context("the box's devbox-state.toml is not valid TOML")?;
-    let table = doc
+    let root = doc
         .as_table_mut()
         .context("the box's devbox-state.toml is not a table")?;
-    let user = table
-        .entry("user")
+    let section = root
+        .entry(table)
         .or_insert_with(|| toml::Value::Table(Default::default()));
-    user.as_table_mut()
-        .context("the box's devbox-state.toml has a [user] that is not a table")?
-        .insert("home".to_string(), toml::Value::String(home.to_string()));
+    section
+        .as_table_mut()
+        .with_context(|| {
+            format!("the box's devbox-state.toml has a [{table}] that is not a table")
+        })?
+        .insert(key.to_string(), toml::Value::String(value.to_string()));
     toml::to_string(&doc).context("could not re-serialise the box's devbox-state.toml")
 }
 
@@ -1708,6 +1752,24 @@ pub(crate) async fn realign_passwd_home(
         );
     }
     Ok(())
+}
+
+/// Record which `devbox-module.nix` this box was last built from.
+///
+/// Written only after a `nixos-rebuild` that succeeded, because that is the
+/// question `agent_sync` asks: not "which file is in /etc/devbox" — that one
+/// is put there before the rebuild and stays there when it fails — but "which
+/// bytes is this system actually built from".
+///
+/// Best effort. A box that cannot record it reports no stamp, which reads as
+/// "cannot tell" and costs one redundant rebuild, never a wrong answer.
+pub(crate) async fn stamp_module_build(runtime: &dyn Runtime, name: &str) {
+    let digest = crate::sandbox::agent_sync::host_module_digest();
+    if let Err(error) =
+        write_file_to_vm(runtime, name, "/etc/devbox/module-built.sha", digest).await
+    {
+        tracing::debug!(box_id = %name, %error, "could not stamp the module build");
+    }
 }
 
 pub(crate) async fn write_obsd_module(runtime: &dyn Runtime, name: &str) -> Result<()> {
@@ -2878,6 +2940,7 @@ mod tests {
             &langs,
             "testuser",
             Some("/home/testuser.guest"),
+            "lima",
             "overlay",
             &[],
         );
@@ -2905,7 +2968,7 @@ mod tests {
             "lang-rust".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", None, "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "dev", None, "lima", "overlay", &[]);
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
@@ -2921,7 +2984,7 @@ mod tests {
             "ai-code".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", None, "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "dev", None, "lima", "overlay", &[]);
 
         assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("ai_infra = false"));
@@ -2937,6 +3000,7 @@ mod tests {
             &["go".to_string()],
             "ethan",
             None,
+            "incus",
             "writable",
             &["ripgrep".to_string()],
         );
@@ -2959,7 +3023,7 @@ mod tests {
     /// that has already been repaired must not be rewritten forever.
     #[test]
     fn recording_the_home_twice_says_the_same_thing() {
-        let base = generate_state_toml(&[], &[], "ethan", None, "overlay", &[]);
+        let base = generate_state_toml(&[], &[], "ethan", None, "lima", "overlay", &[]);
         let once = with_user_home(&base, "/home/ethan.guest").unwrap();
         let twice = with_user_home(&once, "/home/ethan.guest").unwrap();
         assert_eq!(once, twice);
@@ -2970,12 +3034,25 @@ mod tests {
         assert!(with_user_home("this is not = = toml", "/home/x").is_err());
     }
 
+    /// The module gates the Incus guest agent on this key. On a Lima box that
+    /// agent has no host to talk to, fails, and is restarted every five
+    /// seconds for the life of the box.
+    #[test]
+    fn the_state_file_records_which_hypervisor_the_box_runs_under() {
+        for runtime in ["lima", "incus", "docker"] {
+            let toml = generate_state_toml(&[], &[], "dev", None, runtime, "overlay", &[]);
+            let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
+            assert_eq!(parsed["sandbox"]["runtime"].as_str(), Some(runtime));
+            assert_eq!(parsed["sandbox"]["mount_mode"].as_str(), Some("overlay"));
+        }
+    }
+
     /// A box that could not be asked gets no `home` key at all. Writing a
     /// guessed one would move the passwd entry away from wherever the keys
     /// really are, which is strictly worse than the NixOS default.
     #[test]
     fn a_home_that_is_not_known_is_left_out_rather_than_guessed() {
-        let toml = generate_state_toml(&[], &[], "dev", None, "overlay", &[]);
+        let toml = generate_state_toml(&[], &[], "dev", None, "lima", "overlay", &[]);
         assert!(toml.contains("name = \"dev\""), "{toml}");
         assert!(!toml.contains("home ="), "{toml}");
         // The section still has to parse: `[user]` then a blank line then
@@ -2987,8 +3064,15 @@ mod tests {
 
     #[test]
     fn a_known_home_round_trips_through_the_state_file() {
-        let toml =
-            generate_state_toml(&[], &[], "ethan", Some("/home/ethan.guest"), "overlay", &[]);
+        let toml = generate_state_toml(
+            &[],
+            &[],
+            "ethan",
+            Some("/home/ethan.guest"),
+            "lima",
+            "overlay",
+            &[],
+        );
         let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
         assert_eq!(parsed["user"]["home"].as_str(), Some("/home/ethan.guest"));
         assert_eq!(parsed["user"]["name"].as_str(), Some("ethan"));
@@ -2998,7 +3082,7 @@ mod tests {
     fn generate_state_toml_bare() {
         let sets = vec![];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "user", None, "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "user", None, "lima", "overlay", &[]);
 
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));

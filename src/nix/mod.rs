@@ -80,6 +80,11 @@ pub async fn write_set_modules(
     let mount_mode = existing
         .as_ref()
         .and_then(|t| toml_string(t, "sandbox", "mount_mode"));
+    // Same reason as the home above: the module gates the Incus guest agent on
+    // this, and a Lima box that loses it restarts a failing agent forever.
+    let runtime_name = existing
+        .as_ref()
+        .and_then(|t| toml_string(t, "sandbox", "runtime"));
 
     // The set index and every set module are pushed regardless of selection:
     // they are small text files, and having them all present means toggling a
@@ -122,6 +127,7 @@ pub async fn write_set_modules(
         &extra,
         username.as_deref(),
         home.as_deref(),
+        runtime_name.as_deref(),
         mount_mode.as_deref(),
     );
     write_state_toml(runtime, sandbox_name, &state_toml).await

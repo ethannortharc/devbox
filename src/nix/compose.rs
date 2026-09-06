@@ -619,6 +619,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             toml.contains("\"terraform\" = \"nixpkgs#terraform\""),
@@ -736,6 +737,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &sel.declared_sources().into_iter().collect(),
+            None,
             None,
             None,
             None,

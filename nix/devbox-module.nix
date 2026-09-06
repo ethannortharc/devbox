@@ -24,6 +24,10 @@ let
   sandbox = devboxConfig.sandbox or {};
   mountMode = sandbox.mount_mode or "overlay";
   isOverlay = mountMode == "overlay";
+  # Which hypervisor this box runs under. Absent on a box provisioned before
+  # devbox recorded it, and "incus" is the safe assumption there: the agent it
+  # gates was unconditional until now, so an unknown box keeps what it had.
+  runtime = sandbox.runtime or "incus";
   hasEditor = sets.editor or true;
   hasShell = sets.shell or true;
 
@@ -116,7 +120,14 @@ in {
   # 9p mount setup, and critically: restartIfChanged=false / stopIfChanged=false
   # so nixos-rebuild doesn't kill the agent mid-switch (which would drop our
   # incus exec connection).
-  virtualisation.incus.agent.enable = true;
+  #
+  # Only on Incus. There is no incus host on the other side of a Lima box, so
+  # the agent cannot find its 9p channel and systemd restarts it forever:
+  # measured on devbox-devtest, `9pnet_virtio: no channels available for
+  # device config` and `Failed to start Incus - agent.` every five seconds,
+  # for the life of the box. It is pure noise in the one place — the journal —
+  # a person goes to find out why something else is wrong.
+  virtualisation.incus.agent.enable = lib.mkDefault (runtime == "incus");
 
   # ── Dynamic linker compat ─────────────────────────
   # Required for VS Code Server, Cursor, and other dynamically linked
@@ -172,13 +183,25 @@ in {
   # In overlay mode, /mnt/host is the read-only host mount from Lima.
   # We overlay it at /workspace with a writable upper layer.
   #
-  # `nofail`, so that a workspace which cannot be assembled costs the user
-  # their workspace and not their box. Without it this mount is required by
-  # `local-fs.target`, and anything that makes it unmountable — a host share
-  # Lima did not bring back, a moved project directory, a missing upper —
-  # drops the whole guest into emergency mode, where there is no sshd and
-  # therefore no way in to fix it. A box that boots without /workspace can at
-  # least be looked at.
+  # These options must never change on a box that already has the mount, and
+  # that is a kernel rule rather than a preference. `switch-to-configuration`
+  # reloads a mount unit whose options differ, a reload of an overlay is a
+  # `mount -o remount`, and overlayfs refuses every one of those:
+  #
+  #   mount: /workspace: fsconfig() failed: overlay: No changes allowed in reconfigure.
+  #
+  # The reload fails, `nixos-rebuild switch` exits 4, and NixOS rolls the whole
+  # generation back — so a box in that state cannot complete *any* devbox
+  # repair, not just the one that changed the options. W3-6 added `nofail` here
+  # and hit exactly that on devtest: generation 5 built, failed to activate,
+  # and the box stayed on generation 4 with nothing to show for it.
+  #
+  # `nofail` would have been worth having — without it an overlay that cannot
+  # be assembled takes `local-fs.target` down and the box comes up in emergency
+  # mode with no sshd. But it is not worth reaching a box that can no longer be
+  # repaired, and it was never the fix for anything: the boxes that were being
+  # lost were lost to a stale cidata UUID, which is fixed in the generated
+  # `configuration.nix` and needs no option change here.
   fileSystems."/workspace" = lib.mkIf isOverlay {
     device = "overlay";
     fsType = "overlay";
@@ -186,8 +209,6 @@ in {
       "lowerdir=/mnt/host"
       "upperdir=/var/devbox/overlay/upper"
       "workdir=/var/devbox/overlay/work"
-      "nofail"
-      "x-systemd.device-timeout=5s"
     ];
     depends = [ "/mnt/host" ];
   };

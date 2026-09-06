@@ -16,7 +16,19 @@ pub struct DevboxConfig {
     #[serde(default)]
     pub languages: LanguagesSection,
 
-    #[serde(default)]
+    /// What to mount into the box.
+    ///
+    /// `default_mounts`, not `Default::default`, and the difference is the
+    /// whole point. `#[serde(default)]` gave an *empty* map when a
+    /// `devbox.toml` had no `[mounts]` table, so a hand-written or trimmed
+    /// config produced a box with no project mount at all: `/workspace` still
+    /// mounted — an overlay whose lower layer is an empty directory mounts
+    /// perfectly well — and none of the user's files were in it. Silently.
+    ///
+    /// A serde default only applies to a *missing* field, so this keeps the
+    /// distinction the user is entitled to: no `[mounts]` at all means "the
+    /// usual one", and an explicit empty `[mounts]` means "none".
+    #[serde(default = "default_mounts")]
     pub mounts: HashMap<String, MountEntry>,
 
     #[serde(default)]
@@ -205,17 +217,27 @@ pub struct ResourcesSection {
     pub memory: String,
 }
 
+/// The mount a box has unless its `devbox.toml` says otherwise: the project
+/// directory at `/workspace`.
+///
+/// The same entry `devbox init` writes, so a generated config and an absent
+/// one describe the same box.
+pub fn default_mounts() -> HashMap<String, MountEntry> {
+    let mut mounts = HashMap::new();
+    mounts.insert(
+        "workspace".to_string(),
+        MountEntry {
+            host: ".".to_string(),
+            target: "/workspace".to_string(),
+            readonly: false,
+        },
+    );
+    mounts
+}
+
 impl Default for DevboxConfig {
     fn default() -> Self {
-        let mut mounts = HashMap::new();
-        mounts.insert(
-            "workspace".to_string(),
-            MountEntry {
-                host: ".".to_string(),
-                target: "/workspace".to_string(),
-                readonly: false,
-            },
-        );
+        let mounts = default_mounts();
 
         Self {
             sandbox: SandboxSection::default(),
@@ -492,6 +514,45 @@ mod tests {
         assert!(loaded.languages.go);
         assert!(loaded.sets.ai_code);
         assert_eq!(loaded.sandbox.runtime, "auto");
+    }
+
+    /// The bug this default exists for: a `devbox.toml` that says nothing
+    /// about mounts used to produce a box with no project mount, and nothing
+    /// anywhere said so. The overlay still mounts — its lower layer is just an
+    /// empty directory — so the box looks fine and holds none of the user's
+    /// files.
+    #[test]
+    fn a_config_with_no_mounts_table_still_mounts_the_project() {
+        let config: DevboxConfig =
+            toml::from_str("[sandbox]\nruntime = \"lima\"\n\n[policy]\negress = \"open\"\n")
+                .expect("parses");
+        assert_eq!(config.mounts.len(), 1, "{:?}", config.mounts);
+        let workspace = &config.mounts["workspace"];
+        assert_eq!(workspace.host, ".");
+        assert_eq!(workspace.target, "/workspace");
+        assert!(!workspace.readonly);
+    }
+
+    /// Writing the table and leaving it empty is the one way to say "no
+    /// mounts", and it has to keep meaning that.
+    #[test]
+    fn an_empty_mounts_table_means_no_mounts() {
+        let config: DevboxConfig =
+            toml::from_str("[sandbox]\nruntime = \"lima\"\n\n[mounts]\n").expect("parses");
+        assert!(config.mounts.is_empty(), "{:?}", config.mounts);
+    }
+
+    /// And a config that names its own mounts gets exactly those — the
+    /// default is not merged in underneath them.
+    #[test]
+    fn a_custom_mounts_table_replaces_the_default() {
+        let config: DevboxConfig = toml::from_str(
+            "[mounts.cache]\nhost = \"var/cache\"\ntarget = \"/cache\"\nreadonly = true\n",
+        )
+        .expect("parses");
+        assert_eq!(config.mounts.len(), 1, "{:?}", config.mounts);
+        assert!(config.mounts.contains_key("cache"));
+        assert!(!config.mounts.contains_key("workspace"));
     }
 }
 

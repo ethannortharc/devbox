@@ -49,6 +49,33 @@ pub fn host_digest() -> &'static str {
     DIGEST.get_or_init(|| super::provision::sha256_hex(crate::embedded::OBSD))
 }
 
+/// sha256 of the `devbox-module.nix` this build ships.
+///
+/// The counterpart to [`host_digest`], for the other file devbox pushes into
+/// a box and then depends on the contents of.
+pub fn host_module_digest() -> &'static str {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST.get_or_init(|| {
+        super::provision::sha256_hex(super::provision::NIX_DEVBOX_MODULE.as_bytes())
+    })
+}
+
+/// Whether the box was built with the module this build ships.
+///
+/// No stamp means no, not "cannot tell". Every box provisioned before devbox
+/// started stamping is genuinely built from an older module, and the ones that
+/// matter are built from one that enables the Incus guest agent on a Lima box
+/// and restarts it every five seconds forever. One rebuild fixes that and
+/// writes the stamp, so the answer converges after a single repair.
+///
+/// The case this does *not* converge on is a box whose rebuild keeps failing —
+/// and that box should keep saying so on every command rather than quietly
+/// accept a repair that did not happen. It is how devtest was found sitting on
+/// generation 4 with a generation 5 that had rolled back.
+pub fn module_is_current(guest: Option<&str>, host: &str) -> bool {
+    guest == Some(host)
+}
+
 /// What the guest said about the agent it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Digest {
@@ -86,6 +113,20 @@ pub struct GuestAgent {
     pub accept_env: Vec<String>,
     /// The device `/etc/fstab` names for Lima's cidata ISO, if any.
     pub cidata_device: Option<String>,
+    /// sha256 of the `devbox-module.nix` the box was last *built* with.
+    ///
+    /// A version string cannot answer this: the module is a file this build
+    /// carries, and two builds calling themselves the same version can ship
+    /// different bytes of it. That is the trap W0-5c named for the agent, and
+    /// the module has exactly the same shape.
+    ///
+    /// Read from a stamp written after a successful `nixos-rebuild`, not by
+    /// hashing the file in `/etc/devbox`. The file is pushed *before* the
+    /// rebuild, so hashing it would report a box as current the moment the
+    /// copy landed — including when the rebuild that was supposed to use it
+    /// then failed and rolled back, which is precisely the case that must keep
+    /// being retried.
+    pub module_digest: Option<String>,
     /// The user the probe ran as, and the two answers about where that user
     /// lives: the environment the session was given, and what `/etc/passwd`
     /// says. On a Lima box these disagree — see [`home_drift`].
@@ -232,20 +273,22 @@ fn short(digest: &str) -> &str {
 /// `-r` prints `<hex> *<path>` — so one `cut` reads all of them, and the
 /// result is validated as hex on the host rather than trusted.
 pub const PROBE: &str = r#"
-if [ -x /usr/local/bin/devbox-obsd ]; then
+devbox_sha() {
   if command -v sha256sum >/dev/null 2>&1; then
-    sha=$(sha256sum /usr/local/bin/devbox-obsd 2>/dev/null | cut -d' ' -f1)
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
   elif command -v shasum >/dev/null 2>&1; then
-    sha=$(shasum -a 256 /usr/local/bin/devbox-obsd 2>/dev/null | cut -d' ' -f1)
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
   elif command -v openssl >/dev/null 2>&1; then
-    sha=$(openssl dgst -sha256 -r /usr/local/bin/devbox-obsd 2>/dev/null | cut -d' ' -f1)
-  else
-    sha=nohasher
+    openssl dgst -sha256 -r "$1" 2>/dev/null | cut -d' ' -f1
   fi
+}
+if [ -x /usr/local/bin/devbox-obsd ]; then
+  sha=$(devbox_sha /usr/local/bin/devbox-obsd)
   [ -n "$sha" ] || sha=nohasher
 else
   sha=absent
 fi
+module=$(cat /etc/devbox/module-built.sha 2>/dev/null | tr -d "[:space:]")
 if command -v systemctl >/dev/null 2>&1; then
   unit=$(systemctl show -p ExecStart --value devbox-obsd 2>/dev/null | tr '\n' ' ')
 else
@@ -264,6 +307,7 @@ printf 'passwdhome=%s\n' "$(printf '%s' "$pwent" | cut -d: -f6)"
 printf 'sha=%s\n' "$sha"
 printf 'unit=%s\n' "$unit"
 printf 'acceptenv=%s\n' "$acceptenv"
+printf 'module=%s\n' "$module"
 "#;
 
 /// Read [`PROBE`] output.
@@ -276,6 +320,7 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
     let mut exec_start = None;
     let mut accept_env = Vec::new();
     let mut cidata_device = None;
+    let mut module_digest = None;
     let mut user = None;
     let mut shell_home = None;
     let mut passwd_home = None;
@@ -302,6 +347,10 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
             // Empty means the box has no such entry, which is the answer a
             // healthy Ubuntu box and a repaired NixOS box both give.
             "cidata" if !value.is_empty() => cidata_device = Some(value.to_string()),
+            // Only a real digest counts. A box with no hasher, or none of the
+            // file, reads as "cannot tell" — and cannot tell must not become a
+            // rebuild on every single command.
+            "module" if is_sha256_hex(value) => module_digest = Some(value.to_string()),
             // Empty means the box could not answer, which reads the same as
             // not asked: no drift, no repair.
             "user" if !value.is_empty() => user = Some(value.to_string()),
@@ -315,6 +364,7 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
         exec_start,
         accept_env,
         cidata_device,
+        module_digest,
         user,
         shell_home,
         passwd_home,
@@ -570,12 +620,21 @@ pub async fn ensure_current(
     // `nixos-rebuild` freezing `/etc/fstab` into the store that turns a
     // recorded UUID into a permanent one.
     let boot_doomed = image == "nixos" && guest.boot_mount_is_doomed();
+    // The module is a file this build carries and the box keeps a copy of, so
+    // the only honest comparison is of the bytes. It decides more than one
+    // thing inside the guest — sshd's AcceptEnv, the user's home, /workspace's
+    // mount options, whether the Incus guest agent runs — and a box left on an
+    // older copy is wrong in whichever of those changed, silently, forever.
+    // Only NixOS builds from it.
+    let module_stale = image == "nixos"
+        && !module_is_current(guest.module_digest.as_deref(), host_module_digest());
 
     let mut refresh = Refresh::default();
     if !verdict.is_stale()
         && unit_current
         && ssh_env_current
         && !boot_doomed
+        && !module_stale
         && home_drift.is_none()
     {
         clear_pending(&manager.state_dir, name);
@@ -632,6 +691,7 @@ pub async fn ensure_current(
         unit: !unit_current,
         ssh_env: !ssh_env_current,
         boot_mount: boot_doomed,
+        module: module_stale,
         home: home_drift.as_deref(),
     };
     if drift.any() {
@@ -704,13 +764,16 @@ struct Drift<'a> {
     /// `/etc/fstab` pins Lima's cidata ISO by a UUID that will not exist after
     /// the next start, which would leave the box unable to boot.
     boot_mount: bool,
+    /// The box was built from an older `devbox-module.nix` than this build
+    /// ships.
+    module: bool,
     /// The home the box's passwd entry should name, when it names another.
     home: Option<&'a str>,
 }
 
 impl Drift<'_> {
     fn any(&self) -> bool {
-        self.unit || self.ssh_env || self.boot_mount || self.home.is_some()
+        self.unit || self.ssh_env || self.boot_mount || self.module || self.home.is_some()
     }
 
     /// What to tell the user is being regenerated, in the order it happens.
@@ -724,6 +787,9 @@ impl Drift<'_> {
         }
         if self.boot_mount {
             what.push("the boot-time mount that would have stranded it");
+        }
+        if self.module {
+            what.push("its NixOS module");
         }
         if self.home.is_some() {
             what.push("the guest user's home directory");
@@ -763,6 +829,7 @@ async fn reconfigure(
         unit: unit_stale,
         ssh_env: ssh_env_stale,
         boot_mount: boot_doomed,
+        module: _,
         home: home_drift,
     } = drift;
     if image == "nixos" {
@@ -771,6 +838,16 @@ async fn reconfigure(
             return Ok(());
         }
         println!("Regenerating {} for box '{name}'...", what.join(", "));
+        // The module needs to know which hypervisor this is before it can
+        // stop enabling the Incus guest agent on a Lima box. A box provisioned
+        // before devbox recorded it has no such key, so the repair supplies
+        // one — cheap, idempotent, and it must land before the rebuild reads
+        // the file.
+        if drift.module
+            && let Err(error) = super::provision::record_guest_runtime(runtime, name).await
+        {
+            tracing::debug!(box_id = %name, %error, "could not record the box's runtime");
+        }
         if let Some(home) = home_drift {
             // Recorded in the state file rather than fixed with `usermod`,
             // because on NixOS the passwd entry is *built*: a `usermod -d`
@@ -778,7 +855,7 @@ async fn reconfigure(
             // reads this key and declares `users.users.<name>.home` from it.
             super::provision::record_guest_home(runtime, name, home).await?;
         }
-        if ssh_env_stale || home_drift.is_some() || boot_doomed {
+        if ssh_env_stale || home_drift.is_some() || boot_doomed || drift.module {
             // The `AcceptEnv` setting lives in the module, and the box has
             // whichever copy of it was current when the box was provisioned.
             // Regenerating `configuration.nix` alone would import a module
@@ -791,6 +868,9 @@ async fn reconfigure(
         crate::nix::rebuild::nixos_rebuild(runtime, name)
             .await
             .with_context(|| format!("reconfigure box '{name}'"))?;
+        // Only now. The stamp says "this box was *built* from these bytes",
+        // and a rebuild that rolled back did not build from anything.
+        super::provision::stamp_module_build(runtime, name).await;
         // The rebuild took devbox's nftables table with it. Every other
         // rebuild path in this codebase restores here, and each one was added
         // after the box had already come back with open egress once.
@@ -898,6 +978,43 @@ mod tests {
         );
         // And one provisioned before the probe asked the question.
         assert!(parse_probe("sha=absent\nunit=\n").accept_env.is_empty());
+    }
+
+    /// The module decides sshd's AcceptEnv, the guest user's home, the
+    /// workspace mount options and whether the Incus agent runs. A box keeps
+    /// whichever copy it was provisioned with, and two builds calling
+    /// themselves the same version can carry different bytes of it — so the
+    /// comparison is of the bytes, the way W0-5c settled it for the agent.
+    #[test]
+    fn a_box_built_from_an_older_module_is_not_current() {
+        let host = host_module_digest();
+        assert!(host.len() == 64, "{host}");
+        assert!(module_is_current(Some(host), host));
+        assert!(!module_is_current(Some(OTHER), host));
+    }
+
+    /// An unstamped box is one that was never built from this module, not one
+    /// whose state is unknown — every box made before stamping existed is
+    /// genuinely older, and one rebuild both fixes it and stamps it. The case
+    /// this does not converge on is a box whose rebuild keeps failing, and
+    /// that box should keep saying so rather than quietly accept a repair that
+    /// did not happen.
+    #[test]
+    fn a_box_with_no_stamp_is_rebuilt_once() {
+        assert!(!module_is_current(None, host_module_digest()));
+        // The parser only accepts a real digest, so a box that could not read
+        // its stamp arrives as `None` rather than as junk to compare.
+        assert_eq!(
+            parse_probe("module=nohasher\nsha=absent\n").module_digest,
+            None
+        );
+        assert_eq!(parse_probe("module=\nsha=absent\n").module_digest, None);
+    }
+
+    #[test]
+    fn the_probe_reads_back_a_module_digest() {
+        let guest = parse_probe(&format!("module={OTHER}\nsha=absent\nunit=\n"));
+        assert_eq!(guest.module_digest.as_deref(), Some(OTHER));
     }
 
     /// The state every devbox NixOS Lima box has been left in since March: a
