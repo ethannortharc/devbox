@@ -615,6 +615,67 @@ const RUN_SEARCH_DEPTH: usize = 200;
 
 /// The shim. Everything it prints goes to stderr: stdout is the agent's
 /// JSON-RPC channel and one stray `println!` corrupts the session.
+/// Whether this MCP session has a run row behind it.
+///
+/// Recording used to be fatal: an `mcp run` whose row could not be written
+/// refused to start the server at all, on the reasoning that a sandboxed
+/// server nothing is recording is the thing this command exists to prevent.
+///
+/// That trades the wrong way round. The evidence plane is devbox's *second*
+/// promise; the first is that the agent's server runs inside a box, and it is
+/// still doing that. Refusing means an agent whose devbox state directory is
+/// read-only — a full disk, a restrictive sandbox, a home on a network mount
+/// that went away — loses the sandbox as well as the report, and the sandbox
+/// is the half that was protecting it. So the session runs, unrecorded and
+/// loudly said so, rather than not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recording {
+    Recorded,
+    Unrecorded,
+}
+
+/// Turn the insert's result into a [`Recording`], announcing a failure.
+///
+/// Returns no error *by construction*: there is no `?` for a later edit to
+/// reintroduce here, which is the property that keeps the session starting.
+///
+/// The warning goes to stderr, never stdout. Stdout is the JSON-RPC transport
+/// and one stray line on it ends the session with a parse error the agent
+/// reports as "server crashed" — which would turn a missing report into
+/// exactly the outage this change exists to avoid.
+pub(crate) fn recording_of(inserted: Result<()>, name: &str) -> Recording {
+    match inserted {
+        Ok(()) => Recording::Recorded,
+        Err(error) => {
+            for line in unrecorded_warning(name, &error) {
+                eprintln!("{line}");
+            }
+            Recording::Unrecorded
+        }
+    }
+}
+
+/// What the user is told when the run could not be recorded.
+///
+/// `concat!` with positional arguments, not a `\`-continued literal: rustfmt
+/// rejoins a continued string and keeps the continuation's indentation *inside*
+/// it, which has already reached users once as a run of twenty spaces in the
+/// middle of a sentence. Returned rather than printed so the wording is
+/// testable, and two lines because the cause and the consequence are two
+/// different things to say.
+pub(crate) fn unrecorded_warning(name: &str, error: &anyhow::Error) -> Vec<String> {
+    vec![
+        format!("devbox mcp: the run for '{name}' could not be recorded: {error:#}"),
+        format!(
+            concat!(
+                "devbox mcp: starting '{}' anyway — it is still sandboxed, but this ",
+                "session is unrecorded, so `devbox mcp report {}` will not see it.",
+            ),
+            name, name
+        ),
+    ]
+}
+
 async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     let dir = project_dir()?;
     // The project registry first, then the global one. The agent chose this
@@ -699,43 +760,44 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // An MCP server is a run like any other, and `kind = mcp` is the one that
     // makes `mcp report` possible. The row goes in before the server starts so
     // the collector is already attributing when its first event arrives.
-    //
-    // Fatal if it cannot be recorded, deliberately. The product is a box whose
-    // side effects are visible; a sandboxed MCP server that nothing is
-    // recording is the one thing this command exists to prevent, and starting
-    // it anyway would be sandboxing with the evidence quietly switched off.
     let run_id = crate::obs::run::new_run_id();
     let started_at = crate::cli::run::now();
-    crate::cli::run::insert_wrapped_run(
-        manager,
-        &box_name,
-        &run_id,
-        RunKind::Mcp,
-        &entry.command,
-        crate::cli::run::GUEST_CWD,
+    let recording = recording_of(
+        crate::cli::run::insert_wrapped_run(
+            manager,
+            &box_name,
+            &run_id,
+            RunKind::Mcp,
+            &entry.command,
+            crate::cli::run::GUEST_CWD,
+            &args.name,
+            &started_at,
+            saved.egress,
+            entry.posture.unwrap_or(saved.egress),
+        ),
         &args.name,
-        &started_at,
-        saved.egress,
-        entry.posture.unwrap_or(saved.egress),
-    )
-    .with_context(|| {
-        format!(
-            "MCP server '{}' was not started because its run could not be recorded",
-            args.name
-        )
-    })?;
+    );
+
     let dropped_before = crate::obs::daemon::stats_snapshot(manager)
         .map(|s| s.dropped + s.persist_failed)
         .unwrap_or(0);
-    let checkpoint_start =
-        crate::cli::run::take_checkpoint(manager, &state, &box_name, &run_id, "run-start").await;
-    let readback = crate::cli::run::spawn_scope_readback(
-        manager,
-        manager.runtime_for_sandbox(&state)?,
-        &box_name,
-        &run_id,
-        &started_at,
-    );
+    // Both of these write against the run row. Without one they would leave a
+    // checkpoint in the box that nothing will ever cite and a scope update
+    // against a row that is not there.
+    let (checkpoint_start, readback) = match recording {
+        Recording::Recorded => (
+            crate::cli::run::take_checkpoint(manager, &state, &box_name, &run_id, "run-start")
+                .await,
+            Some(crate::cli::run::spawn_scope_readback(
+                manager,
+                manager.runtime_for_sandbox(&state)?,
+                &box_name,
+                &run_id,
+                &started_at,
+            )),
+        ),
+        Recording::Unrecorded => (None, None),
+    };
 
     // The environment the server sees: the broker's, this run's id, then the
     // registration's own — last, so a `[mcp.x] env` entry wins over a name the
@@ -780,7 +842,10 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     // Cleanup runs whatever happened above, including a shim that failed to
     // start: `wrap_guest_command` may already have written the file.
     reap(runtime.as_ref(), &box_name, &pgid_file, &outcome).await;
-    let scope = readback.await.ok().flatten();
+    let scope = match readback {
+        Some(handle) => handle.await.ok().flatten(),
+        None => None,
+    };
     if switched {
         restore_posture(manager, &box_name).await;
     }
@@ -793,7 +858,9 @@ async fn run_server(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         &outcome,
         checkpoint_start,
         dropped_before,
-        scope.is_none(),
+        // Only meaningful for a session that has a row to attribute against.
+        recording == Recording::Recorded && scope.is_none(),
+        recording,
     )
     .await;
 
@@ -895,7 +962,19 @@ async fn close_the_run(
     checkpoint_start: Option<crate::sandbox::checkpoint::Checkpoint>,
     dropped_before: u64,
     no_scope: bool,
+    recording: Recording,
 ) {
+    // An unrecorded session has no row to finish, no checkpoints to link to it
+    // and no report to build — but the guest still has the cgroup the
+    // bootstrap made, and leaving that behind would accumulate one per session
+    // on a box whose store happens to be unwritable. So: the cleanup runs, the
+    // bookkeeping does not, and the reason is said once.
+    if recording == Recording::Unrecorded {
+        cleanup_run_cgroup(manager, state, box_name, run_id).await;
+        eprintln!("devbox mcp: this session was unrecorded, so no report was written for it.");
+        return;
+    }
+
     // The last batch is still in the collector's linger window.
     tokio::time::sleep(crate::cli::run::SETTLE).await;
 
@@ -959,11 +1038,7 @@ async fn close_the_run(
         eprintln!("devbox mcp: could not close the run: {error:#}");
     }
 
-    if let Ok(runtime) = manager.runtime_for_sandbox(state) {
-        let argv = crate::obs::run::cleanup_argv(run_id);
-        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let _ = runtime.exec_cmd(box_name, &refs, false).await;
-    }
+    cleanup_run_cgroup(manager, state, box_name, run_id).await;
     if no_scope {
         eprintln!(
             "devbox mcp: box '{box_name}' did not report a cgroup for this run, so its \
@@ -978,6 +1053,23 @@ async fn close_the_run(
         },
         Ok(None) => {}
         Err(error) => eprintln!("devbox mcp: could not build the run report: {error:#}"),
+    }
+}
+
+/// Remove the run's cgroup from the guest.
+///
+/// Best effort: the session is over either way, and a box that has gone away
+/// must not turn a finished session into a failure.
+async fn cleanup_run_cgroup(
+    manager: &SandboxManager,
+    state: &crate::sandbox::state::SandboxState,
+    box_name: &str,
+    run_id: &str,
+) {
+    if let Ok(runtime) = manager.runtime_for_sandbox(state) {
+        let argv = crate::obs::run::cleanup_argv(run_id);
+        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let _ = runtime.exec_cmd(box_name, &refs, false).await;
     }
 }
 
@@ -1309,6 +1401,37 @@ mod tests {
         let rendered = one_line(&command);
         assert!(!rendered.contains('\n'), "{rendered}");
         assert_eq!(rendered, "sh -c a\\nb\\tc\\\\d");
+    }
+
+    /// A run that could not be recorded no longer stops the server.
+    ///
+    /// The return type is the guarantee: `recording_of` has no error variant,
+    /// so there is no `?` at the call site for a later edit to reintroduce.
+    #[test]
+    fn a_run_that_cannot_be_recorded_does_not_stop_the_server() {
+        assert_eq!(recording_of(Ok(()), "fetch"), Recording::Recorded);
+        assert_eq!(
+            recording_of(Err(anyhow::anyhow!("read-only file system")), "fetch"),
+            Recording::Unrecorded,
+        );
+    }
+
+    /// The user has to learn three things from the warning: what failed, that
+    /// the server is running regardless, and where the missing evidence would
+    /// have been.
+    #[test]
+    fn the_unrecorded_warning_says_what_was_lost_and_what_was_not() {
+        let error = anyhow::anyhow!("read-only file system");
+        let lines = unrecorded_warning("fetch", &error);
+        let joined = lines.join("\n");
+        assert!(joined.contains("read-only file system"), "{joined}");
+        assert!(joined.contains("still sandboxed"), "{joined}");
+        assert!(joined.contains("devbox mcp report fetch"), "{joined}");
+        // rustfmt rejoins a `\`-continued literal and leaves the
+        // continuation's indentation in the text. This is what notices.
+        for line in &lines {
+            assert!(!line.contains("  "), "{line:?}");
+        }
     }
 
     #[test]
