@@ -7,13 +7,16 @@
 //! arms for methods the test never calls, re-typed in five places whenever the
 //! trait grew a method, and no two of them recording calls the same way.
 //!
-//! [`StubRuntime`] is that double, once. Nothing is scripted by default, and an
-//! unscripted method fails with its own name in the message — where
-//! `unimplemented!()` only said that *something* was missing, in a panic whose
-//! location is the double rather than the caller that walked into it. Every
-//! call is recorded, so the ordering assertions the doubles existed for come
-//! from [`StubRuntime::calls`] and [`StubRuntime::exec_commands`] instead of
-//! from a `Mutex<Vec<String>>` re-invented per module.
+//! [`StubRuntime`] is that double, once. Nothing is scripted by default, and
+//! an unscripted method panics with its own name in the message. It panics
+//! rather than returning an error on purpose: reaching a call the test did not
+//! think about is a fact about the test, and an error can be swallowed by the
+//! code under test and never reported — which is exactly the semantics the
+//! `unimplemented!()` arms had. What changes is only that the message now says
+//! *which* call it was, instead of leaving the reader to find it. Every call is
+//! recorded, so the ordering assertions the doubles existed for come from
+//! [`StubRuntime::calls`] and [`StubRuntime::exec_commands`] instead of from a
+//! `Mutex<Vec<String>>` re-invented per module.
 //!
 //! It is compiled into the library rather than gated behind `#[cfg(test)]`
 //! because `tests/mcp.rs` needs it too, and an integration test links against
@@ -38,7 +41,7 @@
 
 use std::sync::Mutex;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 
 use super::{
@@ -93,10 +96,13 @@ type StatusFn = Box<dyn Fn(&str) -> Result<SandboxStatus> + Send + Sync>;
 type ExecCmdFn = Box<dyn Fn(&str, &[&str], bool) -> Result<ExecResult> + Send + Sync>;
 type ArgvFn = Box<dyn Fn(&str, &[&str], bool) -> Vec<String> + Send + Sync>;
 
-/// What an unscripted method answers: the method's own name, so a test that
-/// reaches a call it did not think about is told which one.
-fn unscripted<T>(method: &str) -> Result<T> {
-    bail!("StubRuntime: {method} not scripted")
+/// How an unscripted method fails: by name, so a test that reaches a call it
+/// did not think about is told which one.
+///
+/// Returning `!` lets the fallible methods and [`Runtime::argv`], which has no
+/// error channel at all, fail the same way.
+fn unscripted(method: &str) -> ! {
+    panic!("StubRuntime: {method} not scripted")
 }
 
 fn owned(cmd: &[&str]) -> Vec<String> {
@@ -140,7 +146,7 @@ impl Default for StubRuntime {
 }
 
 impl StubRuntime {
-    /// A stub with nothing scripted: every method fails, and says so by name.
+    /// A stub with nothing scripted: every method panics, and says which one.
     pub fn new() -> Self {
         Self::default()
     }
@@ -330,8 +336,6 @@ impl Runtime for StubRuntime {
         }
     }
 
-    /// Unlike the fallible methods this can only panic, because the trait
-    /// returns the argv itself. The message still names the method.
     fn argv(&self, name: &str, cmd: &[&str], interactive: bool) -> Vec<String> {
         self.record(Call::Argv {
             name: name.to_string(),
@@ -340,13 +344,13 @@ impl Runtime for StubRuntime {
         });
         match &self.argv {
             Some(f) => f(name, cmd, interactive),
-            None => panic!("StubRuntime: argv not scripted"),
+            None => unscripted("argv"),
         }
     }
 
-    // Nothing below has ever been scripted by a test double. They stay
-    // unscripted rather than unimplemented, so reaching one reports the method
-    // instead of aborting the test binary's thread with a bare panic.
+    // No test double has ever scripted anything below, so none of these has a
+    // builder. They keep the `unimplemented!()` semantics the five doubles had,
+    // and add the method's name to the message.
 
     async fn list(&self) -> Result<Vec<SandboxInfo>> {
         unscripted("list")
@@ -381,20 +385,30 @@ impl Runtime for StubRuntime {
 mod tests {
     use super::*;
 
+    use anyhow::bail;
+
     /// The whole point of the replacement: `unimplemented!()` said only that
     /// something was missing, and left the reader to find which call it was.
     #[tokio::test]
+    #[should_panic(expected = "StubRuntime: stop not scripted")]
     async fn an_unscripted_method_names_itself() {
-        let stub = StubRuntime::new();
-        let err = stub.stop("box").await.expect_err("nothing is scripted");
-        assert_eq!(err.to_string(), "StubRuntime: stop not scripted");
-        assert!(
-            stub.snapshot_list("box")
-                .await
-                .expect_err("nor is this")
-                .to_string()
-                .contains("snapshot_list")
-        );
+        let _ = StubRuntime::new().stop("box").await;
+    }
+
+    /// Including the tail with no builder at all, which is where the five
+    /// doubles spent most of their `unimplemented!()` arms.
+    #[tokio::test]
+    #[should_panic(expected = "StubRuntime: snapshot_list not scripted")]
+    async fn a_method_with_no_builder_names_itself_too() {
+        let _ = StubRuntime::new().snapshot_list("box").await;
+    }
+
+    /// `argv` has no error channel, so this is the one method whose failure
+    /// mode could never have been anything else.
+    #[test]
+    #[should_panic(expected = "StubRuntime: argv not scripted")]
+    fn an_unscripted_argv_names_itself() {
+        StubRuntime::new().argv("box", &["true"], false);
     }
 
     /// "It was asked and refused" and "it was never asked" are different bugs,
