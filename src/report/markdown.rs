@@ -149,10 +149,16 @@ fn coverage(out: &mut String, report: &RunReport) {
     // Three tiers, and only one of them is a warning. A stream that was
     // re-published without changing agent lost nothing, and saying so in the
     // same voice as a real interruption is how a warning stops being read.
-    if !report.run.capture_restarted_at.is_empty() {
+    if let Some(gap) = &report.capture_gap {
+        // Both ends, not just the restart. "Capture restarted at Y" leaves a
+        // reader to assume the whole run is suspect; the window tells them
+        // which part to doubt, and how long it was.
+        // One literal, not a `\`-continued one: rustfmt joins a continued
+        // string back onto a single line and leaves the continuation's
+        // indentation inside the message.
         out.push_str(&format!(
-            "| **capture restarted** | {} — events before this were lost |\n",
-            report.run.capture_restarted_at
+            "| **capture was interrupted** | the previous agent's last event was at {}; a new agent attached at {}; anything the sandbox did between them was not recorded |\n",
+            gap.from, gap.to
         ));
     } else if !report.run.capture_reattached_at.is_empty() {
         out.push_str(&format!(

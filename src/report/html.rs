@@ -115,6 +115,7 @@ mod tests {
             violations: Vec::new(),
             credential_use: Vec::new(),
             coverage: Coverage::default(),
+            capture_gap: None,
         }
     }
 

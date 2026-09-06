@@ -1113,7 +1113,7 @@ fn only_a_stream_that_moved_after_events_and_changed_agent_is_an_interruption() 
     let store = prepared(None, Some("2026-09-05T10:00:00.050Z"));
     let text = markdown::render(&built_from(&store));
     assert!(
-        !text.contains("capture restarted"),
+        !text.contains("capture was interrupted"),
         "an attach at the run's start was called an interruption:\n{text}"
     );
     assert!(
@@ -1136,17 +1136,17 @@ fn only_a_stream_that_moved_after_events_and_changed_agent_is_an_interruption() 
     //    something is actually gone.
     let store = prepared(Some("2026-09-05T10:00:00.900Z"), None);
     let text = markdown::render(&built_from(&store));
+    assert!(text.contains("**capture was interrupted**"), "{text}");
     assert!(
-        text.contains("**capture restarted** | 2026-09-05T10:00:00.900Z"),
+        text.contains("a new agent attached at 2026-09-05T10:00:00.900Z"),
         "{text}"
     );
-    assert!(text.contains("events before this were lost"), "{text}");
     assert!(!text.contains("re-attached"), "both tiers at once: {text}");
 
     // 4. Nothing at all: the ordinary run says nothing about its capture.
     let store = prepared(None, None);
     let text = markdown::render(&built_from(&store));
-    assert!(!text.contains("capture restarted"), "{text}");
+    assert!(!text.contains("capture was interrupted"), "{text}");
     assert!(!text.contains("re-attached"), "{text}");
 }
 
@@ -1168,6 +1168,114 @@ fn built_from(store: &Store) -> RunReport {
         Vec::new(),
         0,
     )
+}
+
+#[test]
+fn an_interrupted_run_says_which_stretch_of_it_is_missing() {
+    // A run row carries only the moment the new agent attached — the gap's
+    // end. On its own that leaves a reader to assume the whole run is
+    // suspect. The beginning is the last thing the old agent delivered, which
+    // the report already has in its own events, so it is derived rather than
+    // stored: no column, no migration.
+    let mut store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+
+    let mut attributor = Attributor::new();
+    attributor.set_active(store.active_runs().unwrap());
+    let events = fixture();
+    let tags: Vec<_> = events.iter().map(|e| attributor.attribute(e)).collect();
+    store.insert_batch_tagged(&events, &tags).unwrap();
+    // The fixture's newest event is at .500; the restart is after it.
+    store
+        .set_run_capture(RUN, CaptureVerdict::Interrupted, "2026-09-05T10:00:00.900Z")
+        .unwrap();
+
+    let report = built_from(&store);
+    let gap = report
+        .capture_gap
+        .as_ref()
+        .expect("an interrupted run has a gap");
+    assert_eq!(gap.to, "2026-09-05T10:00:00.900Z");
+    assert_eq!(
+        gap.from, "2026-09-05T10:00:00.500Z",
+        "the gap starts at the last event the old agent delivered"
+    );
+
+    let text = markdown::render(&report);
+    assert!(text.contains("**capture was interrupted**"), "{text}");
+    assert!(
+        text.contains("last event was at 2026-09-05T10:00:00.500Z"),
+        "markdown does not name the gap's start:\n{text}"
+    );
+    assert!(
+        text.contains("a new agent attached at 2026-09-05T10:00:00.900Z"),
+        "{text}"
+    );
+    // Scoped to the line itself: the process tree legitimately indents with
+    // two spaces, so checking the whole document proves nothing.
+    let line = text
+        .lines()
+        .find(|l| l.contains("capture was interrupted"))
+        .expect("the interrupted line");
+    assert!(
+        !line.contains("  "),
+        "a continued literal leaked its indentation into the message: {line}"
+    );
+
+    let page = html::render(&report).unwrap();
+    assert!(page.contains("2026-09-05T10:00:00.500Z"), "{page}");
+    assert!(page.contains("a new agent attached at 2026-09-05T10:00:00.900Z"));
+
+    let encoded = json::render(&report).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["capture_gap"]["from"], "2026-09-05T10:00:00.500Z");
+    assert_eq!(value["capture_gap"]["to"], "2026-09-05T10:00:00.900Z");
+}
+
+#[test]
+fn a_run_whose_capture_held_has_no_gap_field_at_all() {
+    // Absent, not empty. A `capture_gap` of two blank strings in an audit
+    // record reads as "the gap is unknown", which is a different claim from
+    // "there was no gap".
+    let mut store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+    let mut attributor = Attributor::new();
+    attributor.set_active(store.active_runs().unwrap());
+    let events = fixture();
+    let tags: Vec<_> = events.iter().map(|e| attributor.attribute(e)).collect();
+    store.insert_batch_tagged(&events, &tags).unwrap();
+
+    let report = built_from(&store);
+    assert!(report.capture_gap.is_none());
+    let value: serde_json::Value = serde_json::from_str(&json::render(&report).unwrap()).unwrap();
+    assert!(value.get("capture_gap").is_none(), "{value}");
+    assert!(!markdown::render(&report).contains("capture was interrupted"));
+    assert!(!html::render(&report).unwrap().contains("interrupted:"));
+}
+
+#[test]
+fn a_run_interrupted_before_it_delivered_anything_falls_back_to_its_start() {
+    // Nothing is known about any of it, and the run's own start is the honest
+    // bound. Silently reporting a gap of zero length would be worse.
+    let store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+    store
+        .set_run_capture(RUN, CaptureVerdict::Interrupted, "2026-09-05T10:00:00.010Z")
+        .unwrap();
+
+    let report = built_from(&store);
+    let gap = report.capture_gap.as_ref().expect("a gap");
+    assert_eq!(gap.from, record().started_at);
+    assert_eq!(gap.to, "2026-09-05T10:00:00.010Z");
 }
 
 #[test]
@@ -1199,14 +1307,17 @@ fn a_run_whose_capture_restarted_says_so_in_every_rendering() {
     );
     let text = markdown::render(&report);
     assert!(
-        text.contains("**capture restarted** | 2026-09-05T10:00:00.900Z"),
+        text.contains("**capture was interrupted**"),
         "the markdown does not say the coverage was interrupted:\n{text}"
     );
-    assert!(text.contains("events before this were lost"), "{text}");
+    assert!(
+        text.contains("a new agent attached at 2026-09-05T10:00:00.900Z"),
+        "{text}"
+    );
 
     let page = html::render(&report).unwrap();
     assert!(
-        page.contains("restarted at 2026-09-05T10:00:00.900Z"),
+        page.contains("a new agent attached at 2026-09-05T10:00:00.900Z"),
         "{page}"
     );
 
@@ -1223,8 +1334,8 @@ fn a_run_whose_capture_restarted_says_so_in_every_rendering() {
         Vec::new(),
         0,
     );
-    assert!(!markdown::render(&quiet).contains("capture restarted"));
-    assert!(!html::render(&quiet).unwrap().contains("restarted at"));
+    assert!(!markdown::render(&quiet).contains("capture was interrupted"));
+    assert!(!html::render(&quiet).unwrap().contains("interrupted:"));
 }
 
 #[test]
