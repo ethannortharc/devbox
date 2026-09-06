@@ -227,6 +227,13 @@ fn replace_outdated_owner(
     // The whole group where the owner recorded one, for the reason the
     // collector's takeover does it: a daemon's children share its group, and
     // signalling the pid alone leaves them behind.
+    identity::note_handover(
+        state_dir,
+        KIND,
+        owner.pid,
+        mine,
+        &identity::reason(owner, mine),
+    );
     if owner.pgid != 0 {
         let stopped = crate::procgroup::stop_group(owner.pgid, "__broker", REPLACEMENT_TIMEOUT)
             .with_context(|| format!("stop the outdated broker group {}", owner.pgid))?;
@@ -343,10 +350,59 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
         },
     )?;
 
+    identity::log_replacing(&manager.state_dir, KIND, &me);
+
+    // The same periodic sweep the collector runs. Looking only before starting
+    // a broker left a rival that appeared afterwards running until the next
+    // broker start — and on a host whose secrets have since been removed, a
+    // broker never starts again, so "until the next start" meant "forever".
+    //
+    // The owner is the one process that can do this both cheaply and safely:
+    // it knows exactly which pids to spare, and nothing is waiting on the
+    // answer.
+    let (stop_sweep, mut sweeping) = tokio::sync::watch::channel(false);
+    let sweeper = tokio::spawn({
+        let state_dir = manager.state_dir.clone();
+        let me = me.clone();
+        async move {
+            let mut tick = tokio::time::interval(identity::ORPHAN_SWEEP_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    // `changed`, not `wait_for`: the latter hands back a
+                    // borrow of the watched value, and holding one across the
+                    // other arm's await makes this future non-`Send`. Only one
+                    // value is ever sent, so a change is the stop.
+                    _ = sweeping.changed() => break,
+                    _ = tick.tick() => {
+                        let state_dir = state_dir.clone();
+                        let me = me.clone();
+                        // Off the runtime's workers: the scan shells out to
+                        // `ps`, and this runtime is also serving requests.
+                        let swept = tokio::task::spawn_blocking(move || {
+                            reap_orphans(&state_dir, Some(&me))
+                        })
+                        .await
+                        .unwrap_or(0);
+                        if swept > 0 {
+                            tracing::warn!(
+                                swept,
+                                "reclaimed brokers that were serving this state directory unaccounted"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let state = Arc::new(BrokerState::new(manager.state_dir.clone())?);
     let served = axum::serve(listener, super::server::router(state))
         .with_graceful_shutdown(shutdown_signal());
     let outcome = served.await.context("serve the credential broker");
+    let _ = stop_sweep.send(true);
+    let _ = sweeper.await;
+    identity::log_being_replaced(&manager.state_dir, KIND, me.pid);
 
     // The endpoint record outlives nothing: a stale port is worse than an
     // absent one, because `guest_env` would hand a box an address that no

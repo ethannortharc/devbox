@@ -637,6 +637,24 @@ impl Store {
             .context("failed to read a run")
     }
 
+    /// Forget which checkpoints a run was built on.
+    ///
+    /// Called after those checkpoints have been deleted. The run row stays —
+    /// `devbox runs` is the history — but it must stop naming trees that no
+    /// longer exist, or `devbox layer diff --from <start>` fails with "no such
+    /// checkpoint" and the reader has no way to know it was collected on
+    /// purpose.
+    pub fn forget_run_checkpoints(&self, run_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET checkpoint_start = NULL, checkpoint_end = NULL
+                   WHERE run_id = ?1",
+                params![run_id],
+            )
+            .context("failed to forget a run's checkpoints")?;
+        Ok(())
+    }
+
     /// Runs newest first.
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
         let mut stmt = self

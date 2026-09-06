@@ -309,6 +309,12 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         );
     }
 
+    // The run is closed, so an agent update this box was owed can happen now.
+    // Doing it here rather than leaving it for the next lifecycle command is
+    // what keeps a box that is only ever used through `devbox run` from
+    // holding an old agent indefinitely.
+    apply_deferred_agent_update(manager, &name, &state).await;
+
     if !args.no_report {
         let rendered = render(manager, &store, &run_id, &name, &state).await?;
         if args.open
@@ -322,6 +328,53 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         Ok(0) => Ok(()),
         Ok(code) => std::process::exit(code),
         Err(e) => Err(e),
+    }
+}
+
+/// Do the agent update this run was holding up, if there was one.
+///
+/// Best effort throughout, and quiet when there is nothing to do: this runs at
+/// the end of every `devbox run`, and a run that finished must not start
+/// reporting errors about a background concern of devbox's own.
+async fn apply_deferred_agent_update(
+    manager: &SandboxManager,
+    name: &str,
+    state: &crate::sandbox::state::SandboxState,
+) {
+    use crate::sandbox::agent_sync;
+
+    if agent_sync::pending(&manager.state_dir, name).is_none() {
+        return;
+    }
+    // Another run may have started between this one ending and now.
+    if crate::obs::run_in_flight(&manager.state_dir, name) {
+        return;
+    }
+    let Ok(Some(claim)) = crate::web::build::try_claim_box(&manager.state_dir, name) else {
+        return;
+    };
+    let Ok(runtime) = manager.runtime_for_sandbox(state) else {
+        return;
+    };
+    match agent_sync::ensure_current(
+        manager,
+        runtime.as_ref(),
+        name,
+        &state.image,
+        agent_sync::Scope::Full,
+        &claim,
+    )
+    .await
+    {
+        Ok(refresh) if refresh.changed() => {
+            eprintln!("Note: box '{name}' had an agent update waiting for this run; it is done.")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            box_id = %name,
+            %error,
+            "the agent update this run deferred could not be applied"
+        ),
     }
 }
 

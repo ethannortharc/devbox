@@ -22,13 +22,6 @@ use crate::sandbox::SandboxManager;
 const DISABLE_ENV: &str = "DEVBOX_NO_COLLECTOR_DAEMON";
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often the owning daemon looks for rivals on its own state directory.
-///
-/// Slow on purpose. Nothing is waiting on the answer, and the usual answer is
-/// "none" — the cost that matters is the one a user's command would pay, and
-/// this moves it off that path entirely.
-const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
 /// How long an unaccounted daemon is given to go quietly.
 ///
 /// Shorter than a replacement's: nothing is waiting on this one's shutdown to
@@ -115,7 +108,7 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
                     // replacement between builds of the same release — a
                     // genuinely incompatible agent is refused by the version
                     // check regardless.
-                    if let Some(busy) = a_run_is_in_flight(&manager.state_dir) {
+                    if let Some(busy) = crate::obs::any_run_in_flight(&manager.state_dir) {
                         tracing::debug!(
                             box_id = %busy,
                             "deferring the collector handover until this run finishes"
@@ -278,36 +271,6 @@ fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
     reaped
 }
 
-/// Ask an older binary to release the stable daemon lock, then prove it did
-/// before launching the replacement. The pid comes from a 0600 record held
-/// under the same advisory lock, so another local user cannot redirect the
-/// Whether any box has a run the collector is still attributing to.
-///
-/// Names the box rather than answering yes, so the log line says which one.
-/// Best effort in the permissive direction: a store that cannot be read is not
-/// evidence of a live run, and refusing every handover because one box's
-/// database is unreadable would be a worse failure than the gap this avoids.
-fn a_run_is_in_flight(state_dir: &Path) -> Option<String> {
-    let boxes = std::fs::read_dir(state_dir.join("boxes")).ok()?;
-    for entry in boxes.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !crate::sandbox::state::is_safe_name(&name) {
-            continue;
-        }
-        let path = super::collector::store_path(state_dir, &name);
-        if !path.exists() {
-            continue;
-        }
-        let Ok(store) = super::store::Store::open(&path) else {
-            continue;
-        };
-        if store.active_runs().is_ok_and(|runs| !runs.is_empty()) {
-            return Some(name);
-        }
-    }
-    None
-}
-
 /// signal. A bounded wait is important: two collectors must never supervise
 /// the same boxes just because shutdown got stuck.
 fn replace_outdated_owner(
@@ -322,6 +285,13 @@ fn replace_outdated_owner(
     // stops the daemon and leaves a `limactl`/`ssh` pair attached to a guest.
     // The group is only signalled if it is still *led* by a live
     // `__collector`, which is what proves the recorded id was not recycled.
+    identity::note_handover(
+        state_dir,
+        KIND,
+        owner.pid,
+        mine,
+        &identity::reason(owner, mine),
+    );
     if owner.pgid != 0 {
         let stopped = crate::procgroup::stop_group(owner.pgid, "__collector", REPLACEMENT_TIMEOUT)
             .with_context(|| format!("stop the outdated collector group {}", owner.pgid))?;
@@ -442,6 +412,10 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     me.pgid = crate::procgroup::lead_own_group()
         .context("give the collector daemon a process group of its own")?;
     publish_owner_identity(&manager.state_dir, &me)?;
+    // Whichever side of a handover this is, say so. A daemon log that shows an
+    // exit and a start with nothing between them is what made the capture gap
+    // in W3-7 take two rounds to explain.
+    identity::log_replacing(&manager.state_dir, KIND, &me);
 
     let stats = Arc::new(Stats::default());
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
@@ -458,7 +432,7 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     // no user is waiting on. Doing it only before a spawn — which is where a
     // CLI command can afford it — leaves a rival that appears afterwards
     // running until the next time a daemon happens to start.
-    let mut sweep = tokio::time::interval(ORPHAN_SWEEP_INTERVAL);
+    let mut sweep = tokio::time::interval(identity::ORPHAN_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -486,6 +460,7 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
             }
         }
     }
+    identity::log_being_replaced(&manager.state_dir, KIND, me.pid);
     let _ = stop.send(true);
     let _ = supervised.await;
     publish_stats(&manager.state_dir, stats.snapshot())?;

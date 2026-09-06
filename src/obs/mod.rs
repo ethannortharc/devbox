@@ -49,6 +49,129 @@ pub(crate) fn uses_ebpf(runtime: &str) -> bool {
     crate::embedded::obsd_has_ebpf() && runtime != "docker"
 }
 
+/// Whether this box has a run the collector is still attributing to.
+///
+/// The question both the daemon handover and the agent refresh have to ask
+/// before they stop anything: the stdio agent is a run's only route to the
+/// host, so restarting it mid-run drops whatever had not yet been delivered.
+///
+/// `status = 'running'` is the flag, and `ended_at IS NULL` is the check on
+/// it. `finish_run` writes both in one statement so they normally agree, and
+/// this refuses to take a half-written row as evidence of a live run — a
+/// stuck `running` with an end time would otherwise defer every handover and
+/// every agent update on that box forever.
+pub fn run_in_flight(state_dir: &std::path::Path, name: &str) -> bool {
+    if !crate::sandbox::state::is_safe_name(name) {
+        return false;
+    }
+    let path = collector::store_path(state_dir, name);
+    if !path.exists() {
+        return false;
+    }
+    let Ok(store) = store::Store::open(&path) else {
+        // Unreadable is not evidence of a run. Treating it as one would make a
+        // damaged store into a permanent block on updating that box's agent.
+        return false;
+    };
+    store.active_runs().is_ok_and(|runs| {
+        runs.iter()
+            .any(|run| run.ended_at.as_ref().is_none_or(|ended| ended.is_empty()))
+    })
+}
+
+/// The same question for the whole host: which box, if any, has a run in
+/// flight.
+///
+/// The collector handover is host-wide — it ends one daemon and every stdio
+/// agent that is its child — so it has to ask about every box, not just one.
+pub fn any_run_in_flight(state_dir: &std::path::Path) -> Option<String> {
+    let boxes = std::fs::read_dir(state_dir.join("boxes")).ok()?;
+    for entry in boxes.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if run_in_flight(state_dir, &name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod run_flight_tests {
+    use super::*;
+    use crate::obs::run::{RunKind, RunRecord, RunStatus};
+
+    /// A state directory with one box whose store holds `run`.
+    fn state_with(run: RunRecord) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let path = collector::store_path(dir.path(), &run.box_id);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("box directory");
+        let store = store::Store::open(&path).expect("store");
+        store.insert_run(&run).expect("insert the run");
+        dir
+    }
+
+    fn running() -> RunRecord {
+        RunRecord {
+            run_id: "r1".into(),
+            box_id: "alpha".into(),
+            kind: RunKind::Run.as_str().to_string(),
+            started_at: "2026-09-06T00:00:00.000Z".into(),
+            ended_at: None,
+            status: RunStatus::Running.as_str().to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_running_run_is_in_flight() {
+        let dir = state_with(running());
+        assert!(run_in_flight(dir.path(), "alpha"));
+        assert_eq!(any_run_in_flight(dir.path()).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_finished_run_is_not() {
+        let dir = state_with(RunRecord {
+            ended_at: Some("2026-09-06T00:00:01.000Z".into()),
+            status: RunStatus::Finished.as_str().to_string(),
+            ..running()
+        });
+        assert!(!run_in_flight(dir.path(), "alpha"));
+        assert_eq!(any_run_in_flight(dir.path()), None);
+    }
+
+    /// The half-written row: `status` still says running, but the end time is
+    /// there. `finish_run` writes both in one statement, so this can only come
+    /// from something that went wrong — and taking it as a live run would
+    /// defer every handover and every agent update on that box forever.
+    #[test]
+    fn a_row_that_says_running_but_has_an_end_time_is_not_in_flight() {
+        let dir = state_with(RunRecord {
+            ended_at: Some("2026-09-06T00:00:01.000Z".into()),
+            ..running()
+        });
+        assert!(!run_in_flight(dir.path(), "alpha"));
+    }
+
+    #[test]
+    fn a_box_with_no_store_and_an_unsafe_name_are_both_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!run_in_flight(dir.path(), "never-seen"));
+        assert!(!run_in_flight(dir.path(), "../escape"));
+        assert_eq!(any_run_in_flight(dir.path()), None);
+    }
+
+    /// One box's run does not hold up another box's agent, but it does hold up
+    /// the host-wide handover — which ends every box's agent at once.
+    #[test]
+    fn one_boxs_run_is_the_hosts_business_but_not_another_boxs() {
+        let dir = state_with(running());
+        assert!(run_in_flight(dir.path(), "alpha"));
+        assert!(!run_in_flight(dir.path(), "beta"));
+        assert!(any_run_in_flight(dir.path()).is_some());
+    }
+}
+
 #[cfg(test)]
 mod transport_tests {
     #[test]
