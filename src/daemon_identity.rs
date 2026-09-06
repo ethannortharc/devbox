@@ -152,6 +152,25 @@ impl OwnerIdentity {
         })
     }
 
+    /// The build, without the process.
+    ///
+    /// For the handover note, where the pid would be a lie: the note is
+    /// written by the *command* that decided, and the daemon that ends up
+    /// running is a child it has not spawned yet. What carries across that gap
+    /// is which build is taking over, which is also the thing that decided.
+    pub fn describe_build(&self) -> String {
+        let mut described = format!("version {}", self.version);
+        if !self.commit.is_empty() {
+            described.push_str(&format!(" commit {}", self.commit));
+        }
+        match self.build.as_str() {
+            "" => described.push_str(" build unrecorded"),
+            UNKNOWN_BUILD => described.push_str(" build unknown"),
+            build => described.push_str(&format!(" build {}", short(build))),
+        }
+        described
+    }
+
     /// A one-line rendering for `devbox doctor`.
     pub fn describe(&self) -> String {
         let mut described = format!("pid {} version {}", self.pid, self.version);
@@ -451,10 +470,7 @@ pub fn note_handover(state_dir: &Path, kind: Kind, from: i32, mine: &OwnerIdenti
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body = format!(
-        "from={from}\nto={}\nreason={why}\n",
-        mine.describe().replace('\n', " ")
-    );
+    let body = format!("from={from}\nto={}\nreason={why}\n", mine.describe_build());
     if let Err(error) = std::fs::write(&path, body) {
         // The handover still happens; only its explanation is lost.
         tracing::debug!(%error, "could not record a {} handover", kind.noun());
@@ -1100,7 +1116,10 @@ mod tests {
         );
         let note = read_handover(dir.path(), kind).expect("a note");
         assert_eq!(note.from, 500);
-        assert!(note.to.contains("version 0.2.0"), "{note:?}");
+        // The build, and not a pid: the note is written by the command that
+        // decided, whose pid is not the daemon that will be running.
+        assert_eq!(note.to, "version 0.2.0 build bbbb");
+        assert!(!note.to.contains("pid"), "{note:?}");
         assert_eq!(note.reason, "same version, build aaaa -> bbbb");
 
         clear_handover(dir.path(), kind);

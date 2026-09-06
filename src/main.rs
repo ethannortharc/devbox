@@ -73,9 +73,24 @@ async fn open_console_for_cwd(manager: &SandboxManager, tools: Option<&[String]>
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
 
+    // A background daemon writes to its own file; a command writes to the
+    // user's terminal. `warn` is right for the second and wrong for the
+    // first: it left `logs/collector.log` almost empty, which is why a
+    // handover — the thing that ends one daemon and starts another — showed up
+    // there as an exit followed by a start with nothing joining them, and why
+    // finding that took two rounds. `DEVBOX_LOG` and `RUST_LOG` still win.
+    //
+    // The only guest-driven line at this level is the agent's own stderr, and
+    // that was already bounded at `MAX_STDERR_LINES` for exactly this reason.
+    let default =
+        if std::env::args().any(|argument| argument == "__collector" || argument == "__broker") {
+            "info"
+        } else {
+            "warn"
+        };
     let filter = EnvFilter::try_from_env("DEVBOX_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+        .unwrap_or_else(|_| EnvFilter::new(default));
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
