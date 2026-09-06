@@ -63,6 +63,10 @@ bytes = "1"
 tempfile = "3"
 
 [dev-dependencies]
+# `start_paused`, which is not in tokio's `full`. It is what turns the
+# keepalive-cancels-the-reader bug from a heisenbug that four people saw once
+# each into a test with an exact ordering.
+tokio = { version = "1", features = ["full", "test-util"] }
 futures = "0.3.33"
 http-body-util = "0.1.4"
 serde_json = "1"

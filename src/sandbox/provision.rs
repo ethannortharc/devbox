@@ -646,7 +646,14 @@ pub async fn post_cache_setup(
     };
 
     // Update state file with current sandbox metadata
-    let state_toml = generate_state_toml(sets, languages, &username, mount_mode, &package_names);
+    let state_toml = generate_state_toml(
+        sets,
+        languages,
+        &username,
+        Some(vm_home.as_str()),
+        mount_mode,
+        &package_names,
+    );
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     if let Err(error) = install_obsd_binary(runtime, name).await {
@@ -767,7 +774,15 @@ async fn provision_nixos(
     //    fresh images:nixos/* images — nixos-rebuild will create it via
     //    devbox-module.nix, but we need the homedir for writing config files
     //    before rebuild. We create it manually and let NixOS fix ownership later.)
-    let home_dir = format!("/home/{username}");
+    //
+    //    Asked of the box rather than assumed to be `/home/<name>`. Lima has
+    //    already created this user, with a home its cloud-init chose — on a
+    //    Mac that is `/home/<name>.guest`, because the host's own home is
+    //    mounted and the two would otherwise collide — and it put the box's
+    //    `authorized_keys` there. Building `/home/<name>` here and letting
+    //    NixOS re-home the passwd entry onto it is what left sshd looking for
+    //    keys in an empty directory.
+    let home_dir = detect_vm_home(runtime, name, &username).await;
     run_in_vm(
         runtime,
         name,
@@ -777,7 +792,14 @@ async fn provision_nixos(
     .await?;
 
     // 5. Push devbox-state.toml (includes mount_mode for overlay setup)
-    let state_toml = generate_state_toml(sets, languages, &username, mount_mode, packages);
+    let state_toml = generate_state_toml(
+        sets,
+        languages,
+        &username,
+        Some(home_dir.as_str()),
+        mount_mode,
+        packages,
+    );
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     // 6. Push devbox-module.nix
@@ -1325,6 +1347,7 @@ fn generate_state_toml(
     sets: &[String],
     languages: &[String],
     username: &str,
+    home: Option<&str>,
     mount_mode: &str,
     packages: &[String],
 ) -> String {
@@ -1342,7 +1365,18 @@ fn generate_state_toml(
     let lang_names = ["go", "rust", "python", "node", "java", "ruby"];
 
     let mut toml = String::from("[user]\n");
-    toml.push_str(&format!("name = \"{username}\"\n\n"));
+    toml.push_str(&format!("name = \"{username}\"\n"));
+    // The home the box's login shell actually uses, so `devbox-module.nix` can
+    // declare it. Without it NixOS defaults `isNormalUser` to `/home/<name>`
+    // and rewrites the passwd entry Lima wrote, which is how a box ends up
+    // with its `authorized_keys` in one directory and sshd looking in another.
+    // Omitted rather than guessed when the box could not be asked: a wrong
+    // value here is worse than the default, because it moves the entry away
+    // from wherever the keys really are.
+    if let Some(home) = home {
+        toml.push_str(&format!("home = \"{home}\"\n"));
+    }
+    toml.push('\n');
 
     toml.push_str("[sets]\n");
     for s in &set_names {
@@ -1608,6 +1642,72 @@ pub(crate) async fn write_devbox_module(runtime: &dyn Runtime, name: &str) -> Re
         NIX_DEVBOX_MODULE,
     )
     .await
+}
+
+/// Record the box's real login home in its `devbox-state.toml`.
+///
+/// Read-modify-write rather than regenerate: this runs from `agent_sync`,
+/// which knows nothing about the box's sets, languages or packages, and
+/// rewriting the file from what it does know would reset all three.
+pub(crate) async fn record_guest_home(runtime: &dyn Runtime, name: &str, home: &str) -> Result<()> {
+    let current = runtime
+        .exec_cmd(name, &["cat", "/etc/devbox/devbox-state.toml"], false)
+        .await
+        .with_context(|| format!("read the declared state of box '{name}'"))?;
+    if current.exit_code != 0 {
+        bail!(
+            "box '{name}' has no readable devbox-state.toml, so its guest home \
+             cannot be recorded"
+        );
+    }
+    let updated = with_user_home(&current.stdout, home)?;
+    write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &updated).await
+}
+
+/// Set `[user].home` in a `devbox-state.toml`, leaving everything else alone.
+///
+/// Split out from the guest round trip because the part that can be wrong is
+/// this one: the file also carries the sets, the languages and the ad-hoc
+/// package table, and losing any of them would change what the next rebuild
+/// installs.
+fn with_user_home(state: &str, home: &str) -> Result<String> {
+    let mut doc: toml::Value = state
+        .parse()
+        .context("the box's devbox-state.toml is not valid TOML")?;
+    let table = doc
+        .as_table_mut()
+        .context("the box's devbox-state.toml is not a table")?;
+    let user = table
+        .entry("user")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    user.as_table_mut()
+        .context("the box's devbox-state.toml has a [user] that is not a table")?
+        .insert("home".to_string(), toml::Value::String(home.to_string()));
+    toml::to_string(&doc).context("could not re-serialise the box's devbox-state.toml")
+}
+
+/// Point a non-NixOS box's passwd entry at the home its login shell uses.
+///
+/// Deliberately without `-m`. The directory already exists and holds the box's
+/// `authorized_keys`, its shell rc and its settings; `usermod -m` would move
+/// that content to the *other* path, which is the opposite of the repair.
+pub(crate) async fn realign_passwd_home(
+    runtime: &dyn Runtime,
+    name: &str,
+    home: &str,
+) -> Result<()> {
+    let user = detect_vm_username(runtime, name).await;
+    let result = runtime
+        .run_as_root(name, &format!("usermod -d {home} {user}"), false)
+        .await
+        .with_context(|| format!("move the passwd home of box '{name}'"))?;
+    if result.exit_code != 0 {
+        bail!(
+            "could not point '{user}' at {home} in box '{name}': {}",
+            result.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_obsd_module(runtime: &dyn Runtime, name: &str) -> Result<()> {
@@ -2773,9 +2873,19 @@ mod tests {
             "container".to_string(),
         ];
         let langs = vec!["go".to_string()];
-        let toml = generate_state_toml(&sets, &langs, "testuser", "overlay", &[]);
+        let toml = generate_state_toml(
+            &sets,
+            &langs,
+            "testuser",
+            Some("/home/testuser.guest"),
+            "overlay",
+            &[],
+        );
 
         assert!(toml.contains("name = \"testuser\""));
+        // The home the box actually uses, so `devbox-module.nix` can declare
+        // it and NixOS stops re-homing the passwd entry onto /home/<name>.
+        assert!(toml.contains("home = \"/home/testuser.guest\""), "{toml}");
         assert!(toml.contains("system = true"));
         assert!(toml.contains("shell = true"));
         assert!(toml.contains("container = true"));
@@ -2795,7 +2905,7 @@ mod tests {
             "lang-rust".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "dev", None, "overlay", &[]);
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
@@ -2811,17 +2921,84 @@ mod tests {
             "ai-code".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "dev", None, "overlay", &[]);
 
         assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("ai_infra = false"));
+    }
+
+    /// The repair rewrites one key and must not disturb the rest: the sets,
+    /// the languages and the ad-hoc package table all decide what the next
+    /// rebuild installs.
+    #[test]
+    fn recording_the_home_leaves_the_rest_of_the_state_file_alone() {
+        let before = generate_state_toml(
+            &["system".to_string(), "shell".to_string()],
+            &["go".to_string()],
+            "ethan",
+            None,
+            "writable",
+            &["ripgrep".to_string()],
+        );
+        let after = with_user_home(&before, "/home/ethan.guest").expect("rewritten");
+
+        let parsed: toml::Value = after.parse().expect("valid TOML");
+        assert_eq!(parsed["user"]["home"].as_str(), Some("/home/ethan.guest"));
+        assert_eq!(parsed["user"]["name"].as_str(), Some("ethan"));
+        assert_eq!(parsed["sandbox"]["mount_mode"].as_str(), Some("writable"));
+        assert_eq!(parsed["sets"]["system"].as_bool(), Some(true));
+        assert_eq!(parsed["sets"]["network"].as_bool(), Some(false));
+        assert_eq!(parsed["languages"]["go"].as_bool(), Some(true));
+        assert!(
+            parsed["custom_packages"].get("ripgrep").is_some(),
+            "{after}"
+        );
+    }
+
+    /// Idempotent, because the drift check runs on every box entry and a box
+    /// that has already been repaired must not be rewritten forever.
+    #[test]
+    fn recording_the_home_twice_says_the_same_thing() {
+        let base = generate_state_toml(&[], &[], "ethan", None, "overlay", &[]);
+        let once = with_user_home(&base, "/home/ethan.guest").unwrap();
+        let twice = with_user_home(&once, "/home/ethan.guest").unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_state_file_that_is_not_toml_is_refused_rather_than_replaced() {
+        assert!(with_user_home("this is not = = toml", "/home/x").is_err());
+    }
+
+    /// A box that could not be asked gets no `home` key at all. Writing a
+    /// guessed one would move the passwd entry away from wherever the keys
+    /// really are, which is strictly worse than the NixOS default.
+    #[test]
+    fn a_home_that_is_not_known_is_left_out_rather_than_guessed() {
+        let toml = generate_state_toml(&[], &[], "dev", None, "overlay", &[]);
+        assert!(toml.contains("name = \"dev\""), "{toml}");
+        assert!(!toml.contains("home ="), "{toml}");
+        // The section still has to parse: `[user]` then a blank line then
+        // `[sets]`, with or without the home in between.
+        let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
+        assert!(parsed["user"].get("home").is_none());
+        assert_eq!(parsed["user"]["name"].as_str(), Some("dev"));
+    }
+
+    #[test]
+    fn a_known_home_round_trips_through_the_state_file() {
+        let toml =
+            generate_state_toml(&[], &[], "ethan", Some("/home/ethan.guest"), "overlay", &[]);
+        let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
+        assert_eq!(parsed["user"]["home"].as_str(), Some("/home/ethan.guest"));
+        assert_eq!(parsed["user"]["name"].as_str(), Some("ethan"));
     }
 
     #[test]
     fn generate_state_toml_bare() {
         let sets = vec![];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "user", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, "user", None, "overlay", &[]);
 
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));

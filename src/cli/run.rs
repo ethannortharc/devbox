@@ -40,6 +40,14 @@ pub(crate) const GUEST_CWD: &str = "/workspace";
 /// that only just made it had already lost the wrapper.
 const SCOPE_READBACK_MS: u64 = 5_000;
 
+/// How long the gate waits for capture to come back before letting go.
+///
+/// Longer than a handover takes (about two seconds, measured) and shorter than
+/// the guest's own gate deadline, so a wait that succeeds still has time to
+/// open the gate.
+const CAPTURE_WAIT: Duration = Duration::from_millis(4_000);
+const CAPTURE_POLL: Duration = Duration::from_millis(100);
+
 /// How long to let the collector settle before reading the run's events.
 ///
 /// The collector batches with a 250ms linger, so the last events of a command
@@ -215,6 +223,18 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         .as_ref()
         .map(crate::obs::health::capture_composition)
         .unwrap_or_default();
+    // Did the stream this run's events travelled on restart underneath it?
+    //
+    // `since` is the moment the current capture stream was established. If it
+    // is later than the run started, the stream the run began on is not the
+    // stream it ended on — a collector handover replaced the agent, and
+    // whatever the old one had not yet delivered is gone. The events are
+    // missing either way; what this decides is whether the report says so.
+    let capture_restarted_at = health
+        .as_ref()
+        .map(|h| h.since.clone())
+        .filter(|since| since.as_str() > started_at.as_str())
+        .unwrap_or_default();
     let agent_version = health.map(|h| h.agent_version).unwrap_or_default();
     let dropped = crate::obs::daemon::stats_snapshot(manager)
         .map(|s| (s.dropped + s.persist_failed).saturating_sub(dropped_before))
@@ -239,6 +259,17 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "could not back-fill a run's late events"),
         }
+    }
+
+    if !capture_restarted_at.is_empty() {
+        if let Err(e) = store.set_run_capture_restart(&run_id, &capture_restarted_at) {
+            tracing::warn!(error = %e, "could not record a run's capture interruption");
+        }
+        // Two calls rather than one `\`-continued literal: rustfmt joins a
+        // continued string back onto one line and the continuation's
+        // indentation survives into the message.
+        eprintln!("Warning: capture restarted at {capture_restarted_at}, during this run.");
+        eprintln!("         Its report is missing whatever the previous agent had not delivered.");
     }
 
     if checkpoint_start.is_some() || checkpoint_end.is_some() {
@@ -593,6 +624,29 @@ pub(crate) fn spawn_scope_readback(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "could not back-fill a run's early events"),
             }
+        }
+
+        // Before the gate, wait for capture to actually be live.
+        //
+        // A collector handover ends the agent that delivers events and starts
+        // a new one, and for about two seconds in between nothing is captured.
+        // A run released into that window comes back empty — not "quiet", but
+        // *empty*, with a cgroup id that matches nothing. Measured at two in
+        // twenty on a box another build was running commands against.
+        //
+        // The gate is already holding the command, so this costs latency and
+        // nothing else. Bounded: capture that never comes back is a run that
+        // still has to happen, and it is flagged rather than delayed forever.
+        let deadline = tokio::time::Instant::now() + CAPTURE_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            let live = crate::obs::health::load(&manager_dir, &name)
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.state == crate::obs::health::CaptureState::Streaming);
+            if live {
+                break;
+            }
+            tokio::time::sleep(CAPTURE_POLL).await;
         }
 
         // Now the gate. The path came from inside the box and becomes a shell

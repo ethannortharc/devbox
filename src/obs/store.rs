@@ -20,11 +20,14 @@ use super::run::{
 /// 1. events + meta, as v4 shipped them. A store created before the key
 ///    existed reports 1 by its absence, not by its content.
 /// 2. `runs`, and `events.run_id` / `events.attribution` (§4.1).
+/// 4. `runs.capture_restarted_at`: whether the agent delivering this run's
+///    events was replaced while it ran, which is the difference between a
+///    quiet command and a report missing its own evidence.
 /// 3. `runs.file_scope` and `runs.start_gate`: what the agent was watching
 ///    while the run happened, and whether the host got to register it before
 ///    the command started. Both describe how much the report can claim, and
 ///    neither can be reconstructed afterwards.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Opens and owns a box's event database.
 pub struct Store {
@@ -219,7 +222,8 @@ impl Store {
                 dropped_events   INTEGER NOT NULL DEFAULT 0,
                 ended_by         TEXT,
                 file_scope       TEXT NOT NULL DEFAULT '',
-                start_gate       TEXT NOT NULL DEFAULT ''
+                start_gate       TEXT NOT NULL DEFAULT '',
+                capture_restarted_at TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
@@ -312,7 +316,12 @@ impl Store {
                 run_columns.push(row.context("failed to read a runs column")?);
             }
         }
-        for column in ["ended_by", "file_scope", "start_gate"] {
+        for column in [
+            "ended_by",
+            "file_scope",
+            "start_gate",
+            "capture_restarted_at",
+        ] {
             if run_columns.iter().any(|c| c == column) {
                 continue;
             }
@@ -486,6 +495,17 @@ impl Store {
                 ],
             )
             .context("failed to record a run")?;
+        Ok(())
+    }
+
+    /// Record that capture restarted while this run was going.
+    pub fn set_run_capture_restart(&self, run_id: &str, at: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET capture_restarted_at = ?2 WHERE run_id = ?1",
+                params![run_id, at],
+            )
+            .context("failed to record a run's capture interruption")?;
         Ok(())
     }
 
@@ -1438,7 +1458,7 @@ fn event_params<'a>(
 const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
-     ended_by, file_scope, start_gate";
+     ended_by, file_scope, start_gate, capture_restarted_at";
 
 /// Decode a stored event, with credentials removed from its argv.
 ///
@@ -1548,6 +1568,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         // have to read back the same.
         file_scope: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
         start_gate: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
+        capture_restarted_at: row.get::<_, Option<String>>(22)?.unwrap_or_default(),
     })
 }
 

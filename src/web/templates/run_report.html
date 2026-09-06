@@ -88,6 +88,7 @@
         color: var(--fg-faint); margin: 22px 0 10px; font-weight: 600;
       }
       td.denied { color: var(--err); }
+      .interrupted { color: var(--warn); }
       .empty { color: var(--fg-faint); font-style: italic; }
       .note {
         color: var(--fg-muted); font-size: 13px; margin: 0 0 12px;
@@ -117,6 +118,10 @@
         {% endif %}
         <dt>posture</dt><dd>{{ posture }}</dd>
         <dt>capture</dt><dd>{{ sources }}{% if !report.coverage.agent_version.is_empty() %} · agent {{ report.coverage.agent_version }}{% endif %}</dd>
+        {%- if !report.run.capture_restarted_at.is_empty() %}
+        <dt>capture</dt>
+        <dd class="interrupted">restarted at {{ report.run.capture_restarted_at }} — events before this were lost</dd>
+        {%- endif %}
         <dt>events</dt>
         <dd>
           {{ report.coverage.events }} attributed{% for kv in attribution %} · {{ kv.1 }} by {{ kv.0 }}{% endfor %}

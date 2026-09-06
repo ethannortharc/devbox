@@ -85,6 +85,12 @@ pub struct GuestAgent {
     pub accept_env: Vec<String>,
     /// The device `/etc/fstab` names for Lima's cidata ISO, if any.
     pub cidata_device: Option<String>,
+    /// The user the probe ran as, and the two answers about where that user
+    /// lives: the environment the session was given, and what `/etc/passwd`
+    /// says. On a Lima box these disagree — see [`home_drift`].
+    pub user: Option<String>,
+    pub shell_home: Option<String>,
+    pub passwd_home: Option<String>,
 }
 
 impl GuestAgent {
@@ -105,6 +111,33 @@ impl GuestAgent {
         self.cidata_device
             .as_deref()
             .is_some_and(|device| device.starts_with("/dev/disk/by-uuid/"))
+    }
+
+    /// The home a box's passwd entry should name but does not, if any.
+    ///
+    /// Lima creates the guest user with a home its cloud-init chooses — on a
+    /// Mac `/home/<name>.guest`, because the host's own home is mounted into
+    /// the guest and the two names would collide — and writes the box's
+    /// `authorized_keys` there. devbox then declared the user to NixOS without
+    /// a `home`, so `isNormalUser`'s `/home/<name>` default won and the first
+    /// `nixos-rebuild` moved the passwd entry off the directory holding the
+    /// keys. sshd resolves the home from passwd, so every ssh connection
+    /// opened after that rebuild was refused; the box stayed reachable only
+    /// through the connection `limactl` had already authenticated, which
+    /// carries the passwd entry cached at authentication time — which is also
+    /// why that session's `$HOME` still named the old directory.
+    ///
+    /// `None` when the two agree, when either is missing, or when the shell
+    /// home is not an absolute path. The repair moves passwd *to* the session
+    /// home, never the other way: that is where the keys, the settings and the
+    /// data already are.
+    pub fn home_drift(&self) -> Option<&str> {
+        let shell = self.shell_home.as_deref()?;
+        let passwd = self.passwd_home.as_deref()?;
+        if shell.is_empty() || passwd.is_empty() || !shell.starts_with('/') {
+            return None;
+        }
+        (shell != passwd).then_some(shell)
     }
 }
 
@@ -222,6 +255,11 @@ acceptenv=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
   | tr '\n' ' ')
 cidata=$(awk '$2 == "/mnt/lima-cidata" { print $1; exit }' /etc/fstab 2>/dev/null)
 printf 'cidata=%s\n' "$cidata"
+me=$(id -un 2>/dev/null)
+pwent=$(getent passwd "$me" 2>/dev/null || grep "^${me}:" /etc/passwd 2>/dev/null | head -n 1)
+printf 'user=%s\n' "$me"
+printf 'shellhome=%s\n' "$HOME"
+printf 'passwdhome=%s\n' "$(printf '%s' "$pwent" | cut -d: -f6)"
 printf 'sha=%s\n' "$sha"
 printf 'unit=%s\n' "$unit"
 printf 'acceptenv=%s\n' "$acceptenv"
@@ -237,6 +275,9 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
     let mut exec_start = None;
     let mut accept_env = Vec::new();
     let mut cidata_device = None;
+    let mut user = None;
+    let mut shell_home = None;
+    let mut passwd_home = None;
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -260,6 +301,11 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
             // Empty means the box has no such entry, which is the answer a
             // healthy Ubuntu box and a repaired NixOS box both give.
             "cidata" if !value.is_empty() => cidata_device = Some(value.to_string()),
+            // Empty means the box could not answer, which reads the same as
+            // not asked: no drift, no repair.
+            "user" if !value.is_empty() => user = Some(value.to_string()),
+            "shellhome" if !value.is_empty() => shell_home = Some(value.to_string()),
+            "passwdhome" if !value.is_empty() => passwd_home = Some(value.to_string()),
             _ => {}
         }
     }
@@ -268,6 +314,9 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
         exec_start,
         accept_env,
         cidata_device,
+        user,
+        shell_home,
+        passwd_home,
     }
 }
 
@@ -341,6 +390,8 @@ pub struct Refresh {
     /// The box's `/etc/fstab` no longer pins Lima's cidata ISO by a UUID that
     /// will not exist after the next start.
     pub boot_mount_repaired: bool,
+    /// The passwd entry was moved onto the home the login shell actually uses.
+    pub home_realigned: bool,
     pub restarted: bool,
     /// What was found but deliberately not acted on.
     pub notes: Vec<String>,
@@ -348,7 +399,36 @@ pub struct Refresh {
 
 impl Refresh {
     pub fn changed(&self) -> bool {
-        self.pushed || self.unit_rewritten || self.ssh_env_rewritten || self.boot_mount_repaired
+        self.pushed
+            || self.unit_rewritten
+            || self.ssh_env_rewritten
+            || self.home_realigned
+            || self.boot_mount_repaired
+    }
+
+    /// One line naming what was put right, or `None` when nothing was.
+    ///
+    /// Each of these is a different thing to have been wrong, and a caller
+    /// that announces the agent swap for all of them tells the user something
+    /// untrue about three quarters of the time.
+    pub fn summary(&self) -> Option<String> {
+        let mut done: Vec<&str> = Vec::new();
+        if self.pushed {
+            done.push("its observability agent is now the one this devbox ships");
+        }
+        if self.unit_rewritten {
+            done.push("its agent service was regenerated");
+        }
+        if self.ssh_env_rewritten {
+            done.push("its sshd now carries the credential broker's environment");
+        }
+        if self.home_realigned {
+            done.push("its passwd entry now names the home its login shell uses");
+        }
+        if self.boot_mount_repaired {
+            done.push("its boot-time mounts no longer name a device that will not come back");
+        }
+        (!done.is_empty()).then(|| done.join("; "))
     }
 }
 
@@ -380,14 +460,36 @@ pub async fn ensure_current(
     // no use for.
     let ssh_env_current = !crate::broker::wants_ssh_env(&manager.state_dir)
         || crate::broker::sshd_accepts_broker_env(&guest.accept_env);
+    // A box whose passwd entry names a different directory than its login
+    // shell uses cannot accept a *new* ssh connection at all: sshd looks for
+    // `authorized_keys` under the passwd home, and the keys are under the
+    // other one. Everything still works through the connection `limactl`
+    // already holds, which is why the box looks healthy right up until that
+    // connection goes away — so this is repaired on sight rather than when
+    // something finally fails.
+    //
+    // Only where the probe's answer is about the box user. Incus and Docker
+    // exec as root, where `$HOME` describes the exec and not the account.
+    let home_drift = if runtime.exec_runs_as_root() {
+        None
+    } else {
+        guest.home_drift().map(str::to_string)
+    };
 
-    // Fixed on sight, and ahead of everything else here, because it is the one
-    // condition whose window closes: the box is fine until someone stops it,
-    // and after that there is no way back in to repair it.
+    // Fixed on sight, because it is the one condition here whose window
+    // closes: the box is fine until someone stops it, and after that there is
+    // no way back in to repair it. Only NixOS boxes can have it — it is
+    // `nixos-rebuild` freezing `/etc/fstab` into the store that turns a
+    // recorded UUID into a permanent one.
     let boot_doomed = image == "nixos" && guest.boot_mount_is_doomed();
 
     let mut refresh = Refresh::default();
-    if !verdict.is_stale() && unit_current && ssh_env_current && !boot_doomed {
+    if !verdict.is_stale()
+        && unit_current
+        && ssh_env_current
+        && !boot_doomed
+        && home_drift.is_none()
+    {
         return Ok(refresh);
     }
 
@@ -420,17 +522,19 @@ pub async fn ensure_current(
         unit: !unit_current,
         ssh_env: !ssh_env_current,
         boot_mount: boot_doomed,
+        home: home_drift.as_deref(),
     };
     if drift.any() {
         match scope {
             Scope::Full => {
-                // One reconfigure for both, because on NixOS each of them
+                // One reconfigure for all three, because on NixOS each of them
                 // costs the same `nixos-rebuild` and doing it twice would
                 // take the box's firewall down twice.
                 reconfigure(manager, runtime, name, image, claim, drift).await?;
                 refresh.unit_rewritten = !unit_current;
                 refresh.ssh_env_rewritten = !ssh_env_current;
                 refresh.boot_mount_repaired = boot_doomed;
+                refresh.home_realigned = home_drift.is_some();
             }
             Scope::BinaryOnly => {
                 if !unit_current {
@@ -456,6 +560,13 @@ pub async fn ensure_current(
                             .to_string(),
                     );
                 }
+                if let Some(home) = &home_drift {
+                    refresh.notes.push(format!(
+                        "this box's passwd entry does not name {home}, where its login shell \
+                         and its ssh keys live, so a new ssh connection to it is refused; the \
+                         next devbox command that starts or enters this box fixes it"
+                    ));
+                }
             }
         }
     }
@@ -472,8 +583,8 @@ pub async fn ensure_current(
 /// One value rather than a row of booleans at the call site, because they are
 /// answered together, acted on together, and — on NixOS — cost exactly one
 /// rebuild between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Drift {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drift<'a> {
     /// The agent's service definition no longer matches this host's build.
     unit: bool,
     /// sshd drops the credential broker's environment.
@@ -481,11 +592,13 @@ struct Drift {
     /// `/etc/fstab` pins Lima's cidata ISO by a UUID that will not exist after
     /// the next start, which would leave the box unable to boot.
     boot_mount: bool,
+    /// The home the box's passwd entry should name, when it names another.
+    home: Option<&'a str>,
 }
 
-impl Drift {
+impl Drift<'_> {
     fn any(&self) -> bool {
-        self.unit || self.ssh_env || self.boot_mount
+        self.unit || self.ssh_env || self.boot_mount || self.home.is_some()
     }
 
     /// What to tell the user is being regenerated, in the order it happens.
@@ -499,6 +612,9 @@ impl Drift {
         }
         if self.boot_mount {
             what.push("the boot-time mount that would have stranded it");
+        }
+        if self.home.is_some() {
+            what.push("the guest user's home directory");
         }
         what
     }
@@ -529,12 +645,13 @@ async fn reconfigure(
     name: &str,
     image: &str,
     claim: &crate::web::build::BoxClaim,
-    drift: Drift,
+    drift: Drift<'_>,
 ) -> Result<()> {
     let Drift {
         unit: unit_stale,
         ssh_env: ssh_env_stale,
-        boot_mount: _,
+        boot_mount: boot_doomed,
+        home: home_drift,
     } = drift;
     if image == "nixos" {
         let what = drift.describe();
@@ -542,7 +659,14 @@ async fn reconfigure(
             return Ok(());
         }
         println!("Regenerating {} for box '{name}'...", what.join(", "));
-        if ssh_env_stale {
+        if let Some(home) = home_drift {
+            // Recorded in the state file rather than fixed with `usermod`,
+            // because on NixOS the passwd entry is *built*: a `usermod -d`
+            // here would be undone by the very rebuild below. The module
+            // reads this key and declares `users.users.<name>.home` from it.
+            super::provision::record_guest_home(runtime, name, home).await?;
+        }
+        if ssh_env_stale || home_drift.is_some() || boot_doomed {
             // The `AcceptEnv` setting lives in the module, and the box has
             // whichever copy of it was current when the box was provisioned.
             // Regenerating `configuration.nix` alone would import a module
@@ -566,6 +690,14 @@ async fn reconfigure(
                     .context(format!("box '{name}' was rebuilt to bring it up to date"))
             })?;
     } else {
+        if let Some(home) = home_drift {
+            // No rebuild to be undone by here, so the passwd entry is moved
+            // directly. Without `-m`: the directory already exists and holds
+            // the box's keys and settings — moving it is the one thing this
+            // repair must not do.
+            println!("Pointing box '{name}' at the home its login shell uses ({home})...");
+            super::provision::realign_passwd_home(runtime, name, home).await?;
+        }
         if unit_stale {
             println!("Rewriting the {AGENT_UNIT} service for box '{name}'...");
             super::provision::install_ubuntu_obsd_service(runtime, name).await?;
@@ -685,6 +817,46 @@ mod tests {
     fn a_box_with_no_cidata_entry_is_left_alone() {
         assert!(!parse_probe("sha=absent\nunit=\n").boot_mount_is_doomed());
         assert!(!parse_probe("cidata=\nsha=absent\nunit=\n").boot_mount_is_doomed());
+    }
+
+    /// The state a Lima box lands in after its first `nixos-rebuild`: the
+    /// session lives in the home Lima made, passwd names the one NixOS
+    /// defaulted to, and the ssh keys are under the first. Captured verbatim
+    /// from devbox-devtest.
+    #[test]
+    fn a_passwd_home_that_is_not_the_session_home_is_drift() {
+        let guest = parse_probe(
+            "user=ethan\nshellhome=/home/ethan.guest\npasswdhome=/home/ethan\n\
+             sha=absent\nunit=\nacceptenv=\n",
+        );
+        assert_eq!(guest.user.as_deref(), Some("ethan"));
+        // The session home is the repair target: that is where the keys, the
+        // settings and the data already are.
+        assert_eq!(guest.home_drift(), Some("/home/ethan.guest"));
+    }
+
+    #[test]
+    fn a_box_whose_two_answers_agree_needs_nothing() {
+        let guest =
+            parse_probe("user=dev\nshellhome=/home/dev\npasswdhome=/home/dev\nsha=absent\nunit=\n");
+        assert_eq!(guest.home_drift(), None);
+    }
+
+    /// Every way the probe can fail to answer reads as "no drift". A repair
+    /// driven by a half-answer would move the passwd entry somewhere neither
+    /// the keys nor the data are.
+    #[test]
+    fn an_unanswerable_probe_is_never_read_as_drift() {
+        // A box provisioned before the probe asked at all.
+        assert_eq!(parse_probe("sha=absent\nunit=\n").home_drift(), None);
+        for stdout in [
+            "user=dev\nshellhome=\npasswdhome=/home/dev\nsha=absent\n",
+            "user=dev\nshellhome=/home/dev\npasswdhome=\nsha=absent\n",
+            // Not an absolute path: nothing devbox should point passwd at.
+            "user=dev\nshellhome=relative\npasswdhome=/home/dev\nsha=absent\n",
+        ] {
+            assert_eq!(parse_probe(stdout).home_drift(), None, "{stdout:?}");
+        }
     }
 
     /// A box that is otherwise perfect but drops the broker's ssh environment

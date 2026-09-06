@@ -643,10 +643,24 @@ impl Collector {
         );
 
         let box_id = hello.box_id;
+        // The reader decides when this connection is over. Nothing else may.
+        //
+        // This used to be a plain `select!` against `write_heartbeats`, and a
+        // `select!` cancels the arm that did not finish — so a keepalive that
+        // failed took the read loop down with it, mid-drain, and every frame
+        // the agent had already sent but the collector had not yet read was
+        // never read and never counted. It looked like the agent had sent
+        // fewer events than it did, which is the one thing `received` exists
+        // to be able to deny.
+        //
+        // A failed keepalive says the *write* half is gone. That is not a
+        // reason to stop reading what the agent already wrote — those bytes
+        // are in the buffer either way, and reading them is how they get
+        // counted.
         let served = if send_heartbeats {
             tokio::select! {
                 result = self.read_event_stream(reader, tx, &box_id) => result,
-                result = write_heartbeats(writer) => result,
+                () = keepalive(writer) => unreachable!("the keepalive never resolves"),
             }
         } else {
             self.read_event_stream(reader, tx, &box_id).await
@@ -873,6 +887,24 @@ impl Collector {
 }
 
 const EXEC_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Send keepalives, and then never finish.
+///
+/// The "never finish" is the point. This runs in a `select!` beside the read
+/// loop, where completing means cancelling the other arm — and the other arm
+/// is the only thing that can tell the difference between an agent that sent
+/// nothing and an agent whose frames nobody read.
+async fn keepalive<W>(writer: &mut W)
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(error) = write_heartbeats(writer).await {
+        // Ordinary at the end of any session: the agent closes, and the next
+        // keepalive has nowhere to go. Worth a line, not a failure.
+        tracing::debug!(%error, "keepalive stopped; reading on until the agent's stream ends");
+    }
+    std::future::pending::<()>().await
+}
 
 async fn write_heartbeats<W>(writer: &mut W) -> Result<()>
 where
@@ -1153,6 +1185,10 @@ mod tests {
             .unwrap();
         let _ = read_frame(&mut agent).await;
 
+        // Enough to go well past the byte budget, so the queue has to shed —
+        // which is the thing under test. The number itself is not load-bearing.
+        const SENT: u64 = 600;
+
         // Each event carries a large, valid payload.
         let mut event = crate::obs::Event {
             ts_wall: "2026-08-06T22:14:01.000Z".into(),
@@ -1175,7 +1211,7 @@ mod tests {
             policy: None,
             credential: None,
         };
-        for i in 0..600u64 {
+        for i in 0..SENT {
             // 200 KB each: six hundred of them is well past the byte budget,
             // and how many survive depends on how fast the writer drains.
             event.ts_mono_ns = i + 1;
@@ -1187,7 +1223,12 @@ mod tests {
         let _ = served.await;
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.received, 600, "every event arrived");
+        // The invariant, not a race. How many of the six hundred survive the
+        // queue depends on how fast the writer drains, which depends on the
+        // machine — but `received` counts what *arrived*, and all six hundred
+        // did: every one of them was written and acknowledged by the duplex
+        // before the agent was dropped.
+        assert_eq!(snapshot.received, SENT, "every event arrived");
         assert_eq!(
             collector
                 .queued_bytes
@@ -1197,6 +1238,140 @@ mod tests {
         );
         // Whatever the writer could not keep up with was dropped and counted,
         // never silently discarded.
+        assert_eq!(
+            snapshot.stored + snapshot.dropped + snapshot.persist_failed,
+            snapshot.received,
+            "every arrival was either stored or counted as lost"
+        );
+    }
+
+    /// A writer that accepts the handshake and then fails everything after.
+    ///
+    /// Stands in for the half of a connection that goes away first, which is
+    /// what a keepalive discovers and what used to end the read loop with it.
+    struct WriterThatDiesAfterTheAck {
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for WriterThatDiesAfterTheAck {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            // The ack is two writes: the length prefix and the payload.
+            self.writes += 1;
+            if self.writes <= 2 {
+                std::task::Poll::Ready(Ok(buf.len()))
+            } else {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the agent stopped reading",
+                )))
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_write_half_does_not_stop_the_collector_reading() {
+        // The bug behind four separate flaky-test sightings, none of which
+        // wrote down the name. `serve_agent` ran the read loop in a `select!`
+        // beside the keepalive writer, and `select!` cancels the arm that did
+        // not finish — so a keepalive that failed took the reader down with
+        // it, and every frame already sitting in the buffer went unread and
+        // therefore uncounted. `received` said the agent had sent fewer events
+        // than it had, which is the one claim that counter cannot be allowed
+        // to get wrong.
+        //
+        // Here the write half is dead from the moment the ack is out, and the
+        // read half still holds three events. All three must be counted.
+        let collector = Arc::new(
+            Collector::new(
+                std::path::PathBuf::from("/unused"),
+                Store::open_in_memory().unwrap(),
+            )
+            .for_box("alpha"),
+        );
+        let stats = collector.stats();
+
+        let hello = Hello {
+            protocol: PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            box_id: "alpha".into(),
+            capture: vec![],
+            source: String::new(),
+            file_scope: Vec::new(),
+            ebpf: false,
+        };
+        let event = crate::obs::Event {
+            ts_wall: "2026-08-06T22:14:01.000Z".into(),
+            ts_mono_ns: 1,
+            box_id: "alpha".into(),
+            cgroup_id: 1,
+            pid: 1,
+            tid: 1,
+            ppid: 1,
+            comm: "x".into(),
+            uid: 0,
+            kind: crate::obs::EventType::Exec,
+            net: None,
+            exec: Some(crate::obs::event::Exec {
+                path: "/bin/true".into(),
+                ..Default::default()
+            }),
+            file: None,
+            api: None,
+            policy: None,
+            credential: None,
+        };
+
+        // The agent says hello, goes quiet past the first keepalive, and only
+        // then sends its events. Time is paused, so "past the first keepalive"
+        // costs nothing: the runtime jumps to each timer in turn, and the
+        // ordering — keepalive at five seconds, events at six — is exact
+        // rather than a race the machine's load decides.
+        let (mut agent, host) = tokio::io::duplex(1 << 20);
+        let (mut reader, _unused) = tokio::io::split(host);
+        write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&event).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(EXEC_HEARTBEAT + Duration::from_secs(1)).await;
+            for _ in 0..3 {
+                write_frame(&mut agent, &payload).await.unwrap();
+            }
+            drop(agent);
+        });
+
+        let mut writer = WriterThatDiesAfterTheAck { writes: 0 };
+        let (tx, rx) = mpsc::channel::<Queued>(QUEUE_DEPTH);
+        let mut store_writer = tokio::task::JoinSet::new();
+        store_writer.spawn(Arc::clone(&collector).write_loop(rx));
+        let _ = collector
+            .serve_agent(&mut reader, &mut writer, tx, None, true)
+            .await;
+        while store_writer.join_next().await.is_some() {}
+
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.received, 3,
+            "frames the agent had already sent went uncounted"
+        );
         assert_eq!(
             snapshot.stored + snapshot.dropped + snapshot.persist_failed,
             snapshot.received

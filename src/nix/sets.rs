@@ -274,26 +274,33 @@ pub fn generate_state_toml(
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
 ) -> String {
-    generate_state_toml_with(sets, languages, custom_packages, None, None)
+    generate_state_toml_with(sets, languages, custom_packages, None, None, None)
 }
 
 /// Generate `devbox-state.toml`, preserving the guest identity and mount mode.
 ///
-/// `devbox-module.nix` reads `[user].name` and `[sandbox].mount_mode` from this
-/// file. Regenerating it from sets alone silently resets the guest username to
-/// `dev` and the mount mode to `overlay` — which breaks a box whose guest user
-/// differs, or whose workspace is writable, on the very next rebuild.
+/// `devbox-module.nix` reads `[user].name`, `[user].home` and
+/// `[sandbox].mount_mode` from this file. Regenerating it from sets alone
+/// silently resets the guest username to `dev` and the mount mode to
+/// `overlay` — which breaks a box whose guest user differs, or whose workspace
+/// is writable, on the very next rebuild — and drops the guest home, which
+/// re-homes the passwd entry away from the box's `authorized_keys`.
 pub fn generate_state_toml_with(
     sets: &HashMap<String, bool>,
     languages: &HashMap<String, bool>,
     custom_packages: &HashMap<String, String>,
     username: Option<&str>,
+    home: Option<&str>,
     mount_mode: Option<&str>,
 ) -> String {
     let mut toml = String::new();
 
     if let Some(name) = username {
-        toml.push_str(&format!("[user]\nname = \"{name}\"\n\n"));
+        toml.push_str(&format!("[user]\nname = \"{name}\"\n"));
+        if let Some(home) = home {
+            toml.push_str(&format!("home = \"{home}\"\n"));
+        }
+        toml.push('\n');
     }
     if let Some(mode) = mount_mode {
         toml.push_str(&format!("[sandbox]\nmount_mode = \"{mode}\"\n\n"));
@@ -842,18 +849,26 @@ mod tests {
     fn state_toml_preserves_guest_identity_and_mount_mode() {
         // The NixOS module reads these; regenerating without them resets the
         // guest username to `dev` and the mount mode to `overlay` on the very
-        // next rebuild.
+        // next rebuild, and re-homes the passwd entry away from the box's
+        // `authorized_keys`.
         let toml = generate_state_toml_with(
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             Some("ethan.linux"),
+            Some("/home/ethan.linux.guest"),
             Some("writable"),
         );
         assert!(toml.contains("[user]"));
         assert!(toml.contains("name = \"ethan.linux\""));
+        assert!(toml.contains("home = \"/home/ethan.linux.guest\""));
         assert!(toml.contains("[sandbox]"));
         assert!(toml.contains("mount_mode = \"writable\""));
+        let parsed: toml::Value = toml.parse().expect("valid TOML");
+        assert_eq!(
+            parsed["user"]["home"].as_str(),
+            Some("/home/ethan.linux.guest")
+        );
 
         // Absent when unknown, rather than written as a wrong default.
         let bare = generate_state_toml(&HashMap::new(), &HashMap::new(), &HashMap::new());

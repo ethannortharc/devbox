@@ -768,10 +768,13 @@ impl SandboxManager {
         .await
         {
             Ok(refresh) => {
-                if refresh.changed() {
-                    println!(
-                        "Observability agent in box '{name}' is now the one this devbox ships."
-                    );
+                // Named for what actually changed. This used to say the agent
+                // had been replaced whatever the reason was, so a box that was
+                // only rebuilt to move its passwd home reported a swap that
+                // never happened — and one whose ssh keys had just been made
+                // findable again said nothing about it.
+                if let Some(summary) = refresh.summary() {
+                    println!("Box '{name}': {summary}.");
                 }
             }
             // One failure here is not like the others. Regenerating the unit
