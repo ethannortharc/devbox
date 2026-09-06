@@ -172,13 +172,12 @@ in {
   # In overlay mode, /mnt/host is the read-only host mount from Lima.
   # We overlay it at /workspace with a writable upper layer.
   #
-  # `nofail`, so that a workspace which cannot be assembled costs the user
-  # their workspace and not their box. Without it this mount is required by
-  # `local-fs.target`, and anything that makes it unmountable — a host share
-  # Lima did not bring back, a moved project directory, a missing upper —
-  # drops the whole guest into emergency mode, where there is no sshd and
-  # therefore no way in to fix it. A box that boots without /workspace can at
-  # least be looked at.
+  # `nofail` would have been worth having — without it an overlay that cannot
+  # be assembled takes `local-fs.target` down and the box comes up in emergency
+  # mode with no sshd. But it is not worth reaching a box that can no longer be
+  # repaired, and it was never the fix for anything: the boxes that were being
+  # lost were lost to a stale cidata UUID, which is fixed in the generated
+  # `configuration.nix` and needs no option change here.
   fileSystems."/workspace" = lib.mkIf isOverlay {
     device = "overlay";
     fsType = "overlay";
@@ -186,8 +185,6 @@ in {
       "lowerdir=/mnt/host"
       "upperdir=/var/devbox/overlay/upper"
       "workdir=/var/devbox/overlay/work"
-      "nofail"
-      "x-systemd.device-timeout=5s"
     ];
     depends = [ "/mnt/host" ];
   };
