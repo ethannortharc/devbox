@@ -1201,13 +1201,13 @@ fn an_interrupted_run_says_which_stretch_of_it_is_missing() {
     assert_eq!(gap.to, "2026-09-05T10:00:00.900Z");
     assert_eq!(
         gap.from, "2026-09-05T10:00:00.500Z",
-        "the gap starts at the last event the old agent delivered"
+        "the gap starts at the last event this run recorded"
     );
 
     let text = markdown::render(&report);
     assert!(text.contains("**capture was interrupted**"), "{text}");
     assert!(
-        text.contains("last event was at 2026-09-05T10:00:00.500Z"),
+        text.contains("last event recorded for this run was at 2026-09-05T10:00:00.500Z"),
         "markdown does not name the gap's start:\n{text}"
     );
     assert!(

@@ -157,7 +157,7 @@ fn coverage(out: &mut String, report: &RunReport) {
         // string back onto a single line and leaves the continuation's
         // indentation inside the message.
         out.push_str(&format!(
-            "| **capture was interrupted** | the previous agent's last event was at {}; a new agent attached at {}; anything the sandbox did between them was not recorded |\n",
+            "| **capture was interrupted** | the last event recorded for this run was at {}; a new agent attached at {}; nothing the sandbox did in between reached this report |\n",
             gap.from, gap.to
         ));
     } else if !report.run.capture_reattached_at.is_empty() {

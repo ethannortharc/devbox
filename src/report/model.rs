@@ -53,8 +53,8 @@ pub struct RunReport {
     /// "not recorded" rather than as "none happened".
     pub credential_use: Vec<CredentialUse>,
     pub coverage: Coverage,
-    /// The window during which nothing was recorded, when capture was
-    /// interrupted. `None` otherwise.
+    /// The window this run has no record of, when capture was interrupted.
+    /// `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_gap: Option<CaptureGap>,
 }
@@ -62,15 +62,20 @@ pub struct RunReport {
 /// The stretch of a run for which there is no record.
 ///
 /// A run row carries only the moment the *new* agent attached, which is the
-/// gap's end. Its beginning is the last thing the old agent managed to deliver
-/// — and that is knowable from the run's own events, so it is derived here
-/// rather than stored. A reader told only "capture restarted at Y" has to
-/// assume the whole run is suspect; told "between X and Y" they know which
-/// part to doubt.
+/// gap's end. Its beginning is the last thing this run managed to record — and
+/// that is knowable from the run's own events, so it is derived here rather
+/// than stored. A reader told only "capture restarted at Y" has to assume the
+/// whole run is suspect; told "between X and Y" they know which part to doubt.
+///
+/// It is an outer bound, not a measurement of the outage. A run that sat idle
+/// for twenty seconds and lost two of them reports twenty, because the report
+/// knows when it last recorded something, not when the agent stopped. Erring
+/// wide is the right direction for a claim about missing evidence: the window
+/// is the stretch that cannot be vouched for, not the stretch that was lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureGap {
-    /// The last event the previous agent delivered, or the run's start when it
-    /// delivered none.
+    /// The last event this run recorded before capture came back, or the
+    /// run's start when it had recorded none.
     pub from: String,
     /// When the new agent attached.
     pub to: String,
