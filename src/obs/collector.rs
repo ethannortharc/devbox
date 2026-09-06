@@ -97,6 +97,15 @@ pub struct Hello {
     /// thing to every reader: not narrowed.
     #[serde(default)]
     pub file_scope: Vec<String>,
+    /// The agent process's pid inside the box.
+    ///
+    /// Distinguishes two things that look identical from the host: the
+    /// collector re-publishing its view of a stream that never went away, and
+    /// a stream now served by a different agent process. Only the second can
+    /// have lost events. Zero from an agent predating the field, which reads
+    /// as "cannot tell" rather than as "did not change".
+    #[serde(default)]
+    pub pid: u32,
 }
 
 /// The collector's reply.
@@ -989,6 +998,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: true,
+            pid: 0,
         };
         let ack = evaluate_hello(&hello, None);
         assert!(!ack.accepted);
@@ -1064,6 +1074,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: true,
+            pid: 0,
         };
         assert!(evaluate_hello(&hello, None).accepted);
         assert!(evaluate_hello(&hello, Some("myapp")).accepted);
@@ -1079,6 +1090,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: true,
+            pid: 0,
         };
         let ack = evaluate_hello(&hello, None);
         assert!(!ack.accepted);
@@ -1095,6 +1107,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: false,
+            pid: 0,
         };
         assert!(!evaluate_hello(&nameless, None).accepted);
 
@@ -1179,6 +1192,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: false,
+            pid: 0,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
             .await
@@ -1316,6 +1330,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: false,
+            pid: 0,
         };
         let event = crate::obs::Event {
             ts_wall: "2026-08-06T22:14:01.000Z".into(),
@@ -1420,6 +1435,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: true,
+            pid: 0,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
             .await
@@ -1473,6 +1489,7 @@ mod tests {
             source: String::new(),
             file_scope: Vec::new(),
             ebpf: false,
+            pid: 0,
         };
         write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
             .await

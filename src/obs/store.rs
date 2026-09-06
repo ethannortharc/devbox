@@ -20,6 +20,9 @@ use super::run::{
 /// 1. events + meta, as v4 shipped them. A store created before the key
 ///    existed reports 1 by its absence, not by its content.
 /// 2. `runs`, and `events.run_id` / `events.attribution` (§4.1).
+/// 5. `runs.capture_reattached_at`: a stream that was re-published without
+///    changing agent, which loses nothing and is recorded rather than warned
+///    about.
 /// 4. `runs.capture_restarted_at`: whether the agent delivering this run's
 ///    events was replaced while it ran, which is the difference between a
 ///    quiet command and a report missing its own evidence.
@@ -27,7 +30,7 @@ use super::run::{
 ///    while the run happened, and whether the host got to register it before
 ///    the command started. Both describe how much the report can claim, and
 ///    neither can be reconstructed afterwards.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// Opens and owns a box's event database.
 pub struct Store {
@@ -223,7 +226,8 @@ impl Store {
                 ended_by         TEXT,
                 file_scope       TEXT NOT NULL DEFAULT '',
                 start_gate       TEXT NOT NULL DEFAULT '',
-                capture_restarted_at TEXT NOT NULL DEFAULT ''
+                capture_restarted_at TEXT NOT NULL DEFAULT '',
+                capture_reattached_at TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
@@ -321,6 +325,7 @@ impl Store {
             "file_scope",
             "start_gate",
             "capture_restarted_at",
+            "capture_reattached_at",
         ] {
             if run_columns.iter().any(|c| c == column) {
                 continue;
@@ -498,7 +503,9 @@ impl Store {
         Ok(())
     }
 
-    /// Record that capture restarted while this run was going.
+    /// Record that capture restarted while this run was going — a different
+    /// agent process took over after the run had already produced events, so
+    /// whatever the old one had not delivered is gone.
     pub fn set_run_capture_restart(&self, run_id: &str, at: &str) -> Result<()> {
         self.conn
             .execute(
@@ -507,6 +514,36 @@ impl Store {
             )
             .context("failed to record a run's capture interruption")?;
         Ok(())
+    }
+
+    /// Record that capture re-attached without changing agent. Nothing was
+    /// lost; this is here so a reader can tell "nothing happened" from "the
+    /// stream was re-published and nothing happened".
+    pub fn set_run_capture_reattach(&self, run_id: &str, at: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET capture_reattached_at = ?2 WHERE run_id = ?1",
+                params![run_id, at],
+            )
+            .context("failed to record a run's capture re-attach")?;
+        Ok(())
+    }
+
+    /// The wall clock of the earliest event attributed to a run.
+    ///
+    /// The line that separates a re-attach from an interruption: a stream that
+    /// changed *before* this run had produced anything cannot have lost any of
+    /// it. `None` when the run has no attributed events at all.
+    pub fn first_attributed_at(&self, run_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(ts_wall) FROM events WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .context("failed to read a run's first attributed event")
     }
 
     /// Record how the start gate went, once the host knows.
@@ -1476,7 +1513,7 @@ fn event_params<'a>(
 const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
-     ended_by, file_scope, start_gate, capture_restarted_at";
+     ended_by, file_scope, start_gate, capture_restarted_at, capture_reattached_at";
 
 /// Decode a stored event, with credentials removed from its argv.
 ///
@@ -1587,6 +1624,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         file_scope: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
         start_gate: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
         capture_restarted_at: row.get::<_, Option<String>>(22)?.unwrap_or_default(),
+        capture_reattached_at: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
     })
 }
 

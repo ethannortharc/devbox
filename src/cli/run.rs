@@ -119,6 +119,14 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     let dropped_before = crate::obs::daemon::stats_snapshot(manager)
         .map(|s| s.dropped + s.persist_failed)
         .unwrap_or(0);
+    // Which agent process was serving this box when the run began. Compared
+    // at the end: a `since` that moved while this stayed put is the collector
+    // re-publishing its view, not a new agent, and nothing was lost.
+    let agent_pid_before = crate::obs::health::load(&manager.state_dir, &name)
+        .ok()
+        .flatten()
+        .map(|h| h.agent_pid)
+        .unwrap_or(0);
 
     // A checkpoint before the command, so the report's Files section can be
     // about *this run* rather than about everything the box has accumulated.
@@ -223,18 +231,15 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         .as_ref()
         .map(crate::obs::health::capture_composition)
         .unwrap_or_default();
-    // Did the stream this run's events travelled on restart underneath it?
-    //
-    // `since` is the moment the current capture stream was established. If it
-    // is later than the run started, the stream the run began on is not the
-    // stream it ended on — a collector handover replaced the agent, and
-    // whatever the old one had not yet delivered is gone. The events are
-    // missing either way; what this decides is whether the report says so.
-    let capture_restarted_at = health
+    // When the current capture stream was established, if that was after this
+    // run began. What it *means* is decided further down — a stream that moved
+    // is not on its own a stream that lost anything.
+    let capture_since = health
         .as_ref()
         .map(|h| h.since.clone())
         .filter(|since| since.as_str() > started_at.as_str())
         .unwrap_or_default();
+    let agent_pid_after = health.as_ref().map(|h| h.agent_pid).unwrap_or(0);
     let agent_version = health.map(|h| h.agent_version).unwrap_or_default();
     let dropped = crate::obs::daemon::stats_snapshot(manager)
         .map(|s| (s.dropped + s.persist_failed).saturating_sub(dropped_before))
@@ -261,15 +266,47 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
         }
     }
 
-    if !capture_restarted_at.is_empty() {
-        if let Err(e) = store.set_run_capture_restart(&run_id, &capture_restarted_at) {
-            tracing::warn!(error = %e, "could not record a run's capture interruption");
+    // Did anything actually go missing, or did the stream merely move?
+    //
+    // `since` moving is not enough on its own. A collector attaching to this
+    // box republishes the health record, and that lands within the first
+    // hundred milliseconds of a run often enough that the old rule — `since`
+    // later than `started_at` — put a warning about lost events on reports
+    // where the agent never changed and nothing was lost. Two things have to
+    // be true instead:
+    //
+    //   the stream moved *after* this run had already produced an event, so
+    //   there was something to lose; and
+    //
+    //   a different agent process is serving now, so it was actually lost
+    //   rather than delivered by the same agent through a republished view.
+    //
+    // A pid of zero on either side is an agent that predates the field: it
+    // cannot answer, and "cannot tell" is not "changed", so it reads as a
+    // re-attach rather than manufacturing a warning nobody can act on.
+    if !capture_since.is_empty() {
+        let after_first_event = store
+            .first_attributed_at(&run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|first| capture_since > first);
+        let agent_changed =
+            agent_pid_before != 0 && agent_pid_after != 0 && agent_pid_before != agent_pid_after;
+
+        if after_first_event && agent_changed {
+            if let Err(e) = store.set_run_capture_restart(&run_id, &capture_since) {
+                tracing::warn!(error = %e, "could not record a run's capture interruption");
+            }
+            // Two calls rather than one `\`-continued literal: rustfmt joins a
+            // continued string back onto one line and the continuation's
+            // indentation survives into the message.
+            eprintln!("Warning: capture restarted at {capture_since}, during this run.");
+            eprintln!(
+                "         Its report is missing whatever the previous agent had not delivered."
+            );
+        } else if let Err(e) = store.set_run_capture_reattach(&run_id, &capture_since) {
+            tracing::warn!(error = %e, "could not record a run's capture re-attach");
         }
-        // Two calls rather than one `\`-continued literal: rustfmt joins a
-        // continued string back onto one line and the continuation's
-        // indentation survives into the message.
-        eprintln!("Warning: capture restarted at {capture_restarted_at}, during this run.");
-        eprintln!("         Its report is missing whatever the previous agent had not delivered.");
     }
 
     if checkpoint_start.is_some() || checkpoint_end.is_some() {

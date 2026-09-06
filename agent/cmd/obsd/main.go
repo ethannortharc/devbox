@@ -533,6 +533,7 @@ func stream(ctx context.Context, cfg config, source *capture.Scope, out io.Write
 		Source:    source.Name(),
 		EBPF:      sourceIncludes(source, "ebpf"),
 		FileScope: source.Prefixes(),
+		PID:       os.Getpid(),
 	}
 
 	// Capture starts before the collector is reachable, and keeps running when
