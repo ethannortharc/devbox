@@ -53,6 +53,32 @@ pub struct RunReport {
     /// "not recorded" rather than as "none happened".
     pub credential_use: Vec<CredentialUse>,
     pub coverage: Coverage,
+    /// The window this run has no record of, when capture was interrupted.
+    /// `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_gap: Option<CaptureGap>,
+}
+
+/// The stretch of a run for which there is no record.
+///
+/// A run row carries only the moment the *new* agent attached, which is the
+/// gap's end. Its beginning is the last thing this run managed to record — and
+/// that is knowable from the run's own events, so it is derived here rather
+/// than stored. A reader told only "capture restarted at Y" has to assume the
+/// whole run is suspect; told "between X and Y" they know which part to doubt.
+///
+/// It is an outer bound, not a measurement of the outage. A run that sat idle
+/// for twenty seconds and lost two of them reports twenty, because the report
+/// knows when it last recorded something, not when the agent stopped. Erring
+/// wide is the right direction for a claim about missing evidence: the window
+/// is the stretch that cannot be vouched for, not the stretch that was lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureGap {
+    /// The last event this run recorded before capture came back, or the
+    /// run's start when it had recorded none.
+    pub from: String,
+    /// When the new agent attached.
+    pub to: String,
 }
 
 /// This document's schema version.
@@ -365,6 +391,7 @@ impl RunReport {
             processes: processes(events),
             violations: summary.violations.clone(),
             credential_use: credential_use(events),
+            capture_gap: capture_gap(&run, events),
             coverage,
             run,
         }
@@ -378,6 +405,33 @@ impl RunReport {
     ) -> std::path::PathBuf {
         state_dir.join("runs").join(box_id).join(run_id)
     }
+}
+
+/// The window a run has no record of, when its capture was interrupted.
+///
+/// Derived rather than stored: the end is on the run row already, and the
+/// beginning is the newest attributed event that predates it — which is in the
+/// events the report is being built from. Nothing to migrate.
+///
+/// A run whose capture was interrupted before it had delivered anything falls
+/// back to its own start, which is the honest bound: nothing is known about
+/// any of it.
+fn capture_gap(run: &RunRecord, events: &[Event]) -> Option<CaptureGap> {
+    let to = &run.capture_restarted_at;
+    if to.is_empty() {
+        return None;
+    }
+    let from = events
+        .iter()
+        .map(|e| e.ts_wall.as_str())
+        .filter(|ts| ts < &to.as_str())
+        .max()
+        .unwrap_or(run.started_at.as_str())
+        .to_string();
+    Some(CaptureGap {
+        from,
+        to: to.clone(),
+    })
 }
 
 /// The guest's `$HOME`, from the wrapper's own argv.

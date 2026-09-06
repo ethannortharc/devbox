@@ -648,9 +648,15 @@ impl Collector {
             box_id = %hello.box_id,
             version = %hello.version,
             ebpf = hello.ebpf,
+            // Without this, three log lines around a restart cannot answer the
+            // one question that decides whether anything was lost: is this the
+            // same agent process, or a new one?
+            pid = hello.pid,
             "agent connected"
         );
 
+        let agent_pid = hello.pid;
+        let connected_at = std::time::Instant::now();
         let box_id = hello.box_id;
         // The reader decides when this connection is over. Nothing else may.
         //
@@ -666,14 +672,36 @@ impl Collector {
         // reason to stop reading what the agent already wrote — those bytes
         // are in the buffer either way, and reading them is how they get
         // counted.
+        // Counted out here, not returned, so that a stream which ends in an
+        // error still says how much it carried before it broke. A count
+        // returned alongside an error is a count thrown away, and `events = 0`
+        // on a connection that delivered fifty is worse than no line at all.
+        let mut arrived = 0u64;
         let served = if send_heartbeats {
             tokio::select! {
-                result = self.read_event_stream(reader, tx, &box_id) => result,
+                result = self.read_event_stream(reader, tx, &box_id, &mut arrived) => result,
                 () = keepalive(writer) => unreachable!("the keepalive never resolves"),
             }
         } else {
-            self.read_event_stream(reader, tx, &box_id).await
+            self.read_event_stream(reader, tx, &box_id, &mut arrived)
+                .await
         };
+        // The collector's own statement that this stream is over.
+        //
+        // The supervisor logs a stream that ended in *error*, and the agent
+        // forwards its own last words — but an agent ended by a signal closes
+        // cleanly, so the ordinary restart produced no line from the collector
+        // at all. Read with the `agent connected` line that follows it, this
+        // says how long the box went unwatched and whether the agent that came
+        // back is the one that left.
+        tracing::info!(
+            box_id = %box_id,
+            pid = agent_pid,
+            events = arrived,
+            elapsed_ms = connected_at.elapsed().as_millis() as u64,
+            ok = served.is_ok(),
+            "observability agent stream ended"
+        );
         // The closing edge, reported only for an agent that was accepted — a
         // refused one never claimed to be capturing.
         if let Some(hook) = &self.on_agent {
@@ -682,11 +710,20 @@ impl Collector {
         served
     }
 
+    /// Read frames until the agent's stream ends, tallying them in `arrived`.
+    ///
+    /// The tally is the collector's own answer to "how much did this
+    /// connection carry", which is what makes the line it ends on worth
+    /// reading: a stream that ended after four events and one that ended
+    /// after forty thousand are different events in an operator's day. It is
+    /// written through a reference rather than returned so that neither an
+    /// error nor a cancellation can take it down with them.
     async fn read_event_stream<R>(
         &self,
         reader: &mut R,
         tx: mpsc::Sender<Queued>,
         box_id: &str,
+        arrived: &mut u64,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin,
@@ -696,6 +733,7 @@ impl Collector {
                 continue; // keepalive
             }
             self.stats.received.fetch_add(1, Ordering::Relaxed);
+            *arrived += 1;
 
             let mut event: Event = match serde_json::from_slice(&frame) {
                 Ok(e) => e,
@@ -1390,6 +1428,102 @@ mod tests {
         assert_eq!(
             snapshot.stored + snapshot.dropped + snapshot.persist_failed,
             snapshot.received
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_says_which_agent_ended_and_how_much_it_carried() {
+        // An agent stopped by a signal ends its stream cleanly: no error, so
+        // nothing was logged, so a restart looked exactly like nothing having
+        // happened. Reading the log after a capture gap, the two questions are
+        // "is the agent that came back the one that left" and "how long was it
+        // gone" — which needs a pid on both edges and a line on the closing
+        // one.
+        let log = crate::obs::testlog::Captured::install();
+        let collector = Arc::new(
+            Collector::new(
+                std::path::PathBuf::from("/unused"),
+                Store::open_in_memory().unwrap(),
+            )
+            .for_box("alpha"),
+        );
+
+        let hello = Hello {
+            protocol: PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            box_id: "alpha".into(),
+            capture: vec![],
+            source: String::new(),
+            file_scope: Vec::new(),
+            ebpf: false,
+            pid: 4242,
+        };
+        let event = crate::obs::Event {
+            ts_wall: "2026-09-05T09:00:00.000Z".into(),
+            ts_mono_ns: 1,
+            box_id: "alpha".into(),
+            cgroup_id: 1,
+            pid: 1,
+            tid: 1,
+            ppid: 1,
+            comm: "x".into(),
+            uid: 0,
+            kind: crate::obs::EventType::Exec,
+            net: None,
+            exec: Some(crate::obs::event::Exec {
+                path: "/bin/true".into(),
+                ..Default::default()
+            }),
+            file: None,
+            api: None,
+            policy: None,
+            credential: None,
+        };
+
+        let (mut agent, host) = tokio::io::duplex(1 << 20);
+        let (mut reader, mut writer) = tokio::io::split(host);
+        write_frame(&mut agent, &serde_json::to_vec(&hello).unwrap())
+            .await
+            .unwrap();
+        let payload = serde_json::to_vec(&event).unwrap();
+        for _ in 0..3 {
+            write_frame(&mut agent, &payload).await.unwrap();
+        }
+        // Half-closed, not dropped: an agent that goes away ends the stream
+        // the collector is reading, but dropping the whole duplex would also
+        // break the half the collector writes its acknowledgement to, and the
+        // handshake would fail before there was any stream to end.
+        {
+            use tokio::io::AsyncWriteExt;
+            agent.shutdown().await.unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel::<Queued>(QUEUE_DEPTH);
+        let mut store_writer = tokio::task::JoinSet::new();
+        store_writer.spawn(Arc::clone(&collector).write_loop(rx));
+        collector
+            .serve_agent(&mut reader, &mut writer, tx, None, false)
+            .await
+            .unwrap();
+        while store_writer.join_next().await.is_some() {}
+
+        let connected = log.line("agent connected");
+        assert!(
+            connected.contains("pid=4242"),
+            "the opening edge does not name the agent process: {connected}"
+        );
+        let ended = log.line("observability agent stream ended");
+        assert!(
+            ended.contains("pid=4242") && ended.contains("box_id=alpha"),
+            "the closing edge does not name the agent process: {ended}"
+        );
+        assert!(
+            ended.contains("events=3"),
+            "the closing edge miscounts what the connection carried: {ended}"
+        );
+        assert!(
+            ended.contains("ok=true"),
+            "a clean end is reported as a failure: {ended}"
         );
     }
 

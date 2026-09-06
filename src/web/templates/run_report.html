@@ -120,9 +120,9 @@
         {% endif %}
         <dt>posture</dt><dd>{{ posture }}</dd>
         <dt>capture</dt><dd>{{ sources }}{% if !report.coverage.agent_version.is_empty() %} · agent {{ report.coverage.agent_version }}{% endif %}</dd>
-        {%- if !report.run.capture_restarted_at.is_empty() %}
+        {%- if let Some(gap) = report.capture_gap %}
         <dt>capture</dt>
-        <dd class="interrupted">restarted at {{ report.run.capture_restarted_at }} — events before this were lost</dd>
+        <dd class="interrupted">interrupted: the last event recorded for this run was at {{ gap.from }}; a new agent attached at {{ gap.to }}; nothing the sandbox did in between reached this report</dd>
         {%- else if !report.run.capture_reattached_at.is_empty() %}
         <dt>capture</dt>
         <dd class="reattached">re-attached at {{ report.run.capture_reattached_at }} — same agent, nothing lost</dd>

@@ -29,6 +29,91 @@ pub use event::{Event, EventType};
 pub use run::{Attribution, RunKind, RunRecord, RunStatus};
 pub use store::{Query, Retention, Store};
 
+/// Reads back what the daemon would have written to its log.
+///
+/// The observability daemon reports itself in `tracing` lines and nothing
+/// else, so for a few facts — an agent's stream ended, a collector is being
+/// restarted — the log line *is* the feature. A line nothing asserts on is
+/// one `git checkout --` away from being gone with every test still green,
+/// which is the same silence this whole area keeps having to fix.
+///
+/// The sink is global and the buffer is per-thread, which is not the obvious
+/// arrangement — a thread-local subscriber would be. That does not work:
+/// `tracing` decides once, process-wide, whether a call site is worth
+/// evaluating, and it decides it on whichever thread reaches the site first.
+/// Under `cargo test` that is routinely some other test running in parallel
+/// with no subscriber installed, and the answer it caches is "nobody is
+/// listening" — after which the line is silently skipped on the very thread
+/// that installed a listener. Installing globally, once, makes the answer
+/// "somebody is listening" for every thread; the per-thread buffer then keeps
+/// each test reading only its own output.
+#[cfg(test)]
+pub(crate) mod testlog {
+    use std::cell::RefCell;
+    use std::io::Write;
+
+    thread_local! {
+        static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// This thread's share of the daemon's log.
+    pub(crate) struct Captured;
+
+    impl Captured {
+        /// Start collecting this thread's log lines, discarding anything the
+        /// thread logged earlier.
+        pub(crate) fn install() -> Self {
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(ToCallingThread)
+                    .with_max_level(tracing::Level::INFO)
+                    // Plain text: colour codes land between a field's name and
+                    // its value, so an assertion on `box_id=alpha` fails
+                    // against a line that says exactly that.
+                    .with_ansi(false)
+                    .without_time()
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
+            BUFFER.with(|buffer| buffer.borrow_mut().clear());
+            Self
+        }
+
+        /// The one line carrying `needle`, or a panic showing everything that
+        /// was logged instead — a missing line is otherwise the least
+        /// informative failure there is.
+        pub(crate) fn line(&self, needle: &str) -> String {
+            let text = BUFFER.with(|buffer| String::from_utf8_lossy(&buffer.borrow()).into_owned());
+            match text.lines().find(|line| line.contains(needle)) {
+                Some(line) => line.to_string(),
+                None => panic!("nothing logged {needle:?}; the log held:\n{text}"),
+            }
+        }
+    }
+
+    struct ToCallingThread;
+
+    impl Write for ToCallingThread {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            BUFFER.with(|buffer| buffer.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for ToCallingThread {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            Self
+        }
+    }
+}
+
 /// Whether a box can connect to a host-owned Unix-domain socket through a
 /// bind mount.
 ///
