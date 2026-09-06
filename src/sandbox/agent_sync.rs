@@ -83,6 +83,29 @@ pub struct GuestAgent {
     /// unusual, and being wrong that way costs one redundant reconfigure —
     /// the same direction [`parse_probe`] already errs in.
     pub accept_env: Vec<String>,
+    /// The device `/etc/fstab` names for Lima's cidata ISO, if any.
+    pub cidata_device: Option<String>,
+}
+
+impl GuestAgent {
+    /// Whether this box will fail to boot the next time it is started.
+    ///
+    /// Lima rebuilds `cidata.iso` on every start, and an iso9660 volume's UUID
+    /// *is* its creation timestamp — so a UUID recorded for that mount is
+    /// already stale by the time the box is stopped. `nixos-generate-config`
+    /// records it exactly that way, and `nixos-rebuild` then freezes
+    /// `/etc/fstab` into the store, where Lima's own boot script can no longer
+    /// correct it. The next boot waits ninety seconds for a device that will
+    /// never appear, fails `local-fs.target`, and reaches emergency mode —
+    /// where there is no sshd, and so no way back in.
+    ///
+    /// This is not a degraded box, it is a box about to be lost, and the only
+    /// moment it can be repaired is while it is still running.
+    pub fn boot_mount_is_doomed(&self) -> bool {
+        self.cidata_device
+            .as_deref()
+            .is_some_and(|device| device.starts_with("/dev/disk/by-uuid/"))
+    }
 }
 
 /// Whether the box's agent is the one this host would install.
@@ -197,6 +220,8 @@ fi
 acceptenv=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
   | sed -n 's/^[[:space:]]*[Aa][Cc][Cc][Ee][Pp][Tt][Ee][Nn][Vv][[:space:]][[:space:]]*//p' \
   | tr '\n' ' ')
+cidata=$(awk '$2 == "/mnt/lima-cidata" { print $1; exit }' /etc/fstab 2>/dev/null)
+printf 'cidata=%s\n' "$cidata"
 printf 'sha=%s\n' "$sha"
 printf 'unit=%s\n' "$unit"
 printf 'acceptenv=%s\n' "$acceptenv"
@@ -211,6 +236,7 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
     let mut digest = Digest::Unhashable;
     let mut exec_start = None;
     let mut accept_env = Vec::new();
+    let mut cidata_device = None;
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -231,6 +257,9 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
             // Several `AcceptEnv` lines are additive in sshd, and the probe
             // joins them with spaces, so one split covers both spellings.
             "acceptenv" => accept_env = value.split_whitespace().map(str::to_string).collect(),
+            // Empty means the box has no such entry, which is the answer a
+            // healthy Ubuntu box and a repaired NixOS box both give.
+            "cidata" if !value.is_empty() => cidata_device = Some(value.to_string()),
             _ => {}
         }
     }
@@ -238,6 +267,7 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
         digest,
         exec_start,
         accept_env,
+        cidata_device,
     }
 }
 
@@ -308,6 +338,9 @@ pub struct Refresh {
     pub unit_rewritten: bool,
     /// sshd was reconfigured to accept the credential broker's environment.
     pub ssh_env_rewritten: bool,
+    /// The box's `/etc/fstab` no longer pins Lima's cidata ISO by a UUID that
+    /// will not exist after the next start.
+    pub boot_mount_repaired: bool,
     pub restarted: bool,
     /// What was found but deliberately not acted on.
     pub notes: Vec<String>,
@@ -315,7 +348,7 @@ pub struct Refresh {
 
 impl Refresh {
     pub fn changed(&self) -> bool {
-        self.pushed || self.unit_rewritten || self.ssh_env_rewritten
+        self.pushed || self.unit_rewritten || self.ssh_env_rewritten || self.boot_mount_repaired
     }
 }
 
@@ -348,8 +381,13 @@ pub async fn ensure_current(
     let ssh_env_current = !crate::broker::wants_ssh_env(&manager.state_dir)
         || crate::broker::sshd_accepts_broker_env(&guest.accept_env);
 
+    // Fixed on sight, and ahead of everything else here, because it is the one
+    // condition whose window closes: the box is fine until someone stops it,
+    // and after that there is no way back in to repair it.
+    let boot_doomed = image == "nixos" && guest.boot_mount_is_doomed();
+
     let mut refresh = Refresh::default();
-    if !verdict.is_stale() && unit_current && ssh_env_current {
+    if !verdict.is_stale() && unit_current && ssh_env_current && !boot_doomed {
         return Ok(refresh);
     }
 
@@ -378,24 +416,21 @@ pub async fn ensure_current(
         refresh.pushed = true;
     }
 
-    if !unit_current || !ssh_env_current {
+    let drift = Drift {
+        unit: !unit_current,
+        ssh_env: !ssh_env_current,
+        boot_mount: boot_doomed,
+    };
+    if drift.any() {
         match scope {
             Scope::Full => {
                 // One reconfigure for both, because on NixOS each of them
                 // costs the same `nixos-rebuild` and doing it twice would
                 // take the box's firewall down twice.
-                reconfigure(
-                    manager,
-                    runtime,
-                    name,
-                    image,
-                    claim,
-                    !unit_current,
-                    !ssh_env_current,
-                )
-                .await?;
+                reconfigure(manager, runtime, name, image, claim, drift).await?;
                 refresh.unit_rewritten = !unit_current;
                 refresh.ssh_env_rewritten = !ssh_env_current;
+                refresh.boot_mount_repaired = boot_doomed;
             }
             Scope::BinaryOnly => {
                 if !unit_current {
@@ -413,6 +448,14 @@ pub async fn ensure_current(
                             .to_string(),
                     );
                 }
+                if boot_doomed {
+                    refresh.notes.push(
+                        "this box pins Lima's cidata ISO by a UUID that changes on every \
+                         start, so stopping it now would leave it unable to boot; run a \
+                         devbox command that enters the box to repair it before stopping it"
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -421,6 +464,44 @@ pub async fn ensure_current(
     // file, so nothing changes until the processes holding the old inode go.
     refresh.restarted = restart_agents(runtime, name, guest.exec_start.is_some()).await;
     Ok(refresh)
+}
+
+/// What a box's configuration has drifted from, and so what a reconfigure has
+/// to put right.
+///
+/// One value rather than a row of booleans at the call site, because they are
+/// answered together, acted on together, and — on NixOS — cost exactly one
+/// rebuild between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Drift {
+    /// The agent's service definition no longer matches this host's build.
+    unit: bool,
+    /// sshd drops the credential broker's environment.
+    ssh_env: bool,
+    /// `/etc/fstab` pins Lima's cidata ISO by a UUID that will not exist after
+    /// the next start, which would leave the box unable to boot.
+    boot_mount: bool,
+}
+
+impl Drift {
+    fn any(&self) -> bool {
+        self.unit || self.ssh_env || self.boot_mount
+    }
+
+    /// What to tell the user is being regenerated, in the order it happens.
+    fn describe(&self) -> Vec<&'static str> {
+        let mut what = Vec::new();
+        if self.unit {
+            what.push("the observability service");
+        }
+        if self.ssh_env {
+            what.push("sshd's accepted environment");
+        }
+        if self.boot_mount {
+            what.push("the boot-time mount that would have stranded it");
+        }
+        what
+    }
 }
 
 /// Regenerate the parts of a box's configuration this host decides.
@@ -448,23 +529,19 @@ async fn reconfigure(
     name: &str,
     image: &str,
     claim: &crate::web::build::BoxClaim,
-    unit_stale: bool,
-    ssh_env_stale: bool,
+    drift: Drift,
 ) -> Result<()> {
+    let Drift {
+        unit: unit_stale,
+        ssh_env: ssh_env_stale,
+        boot_mount: _,
+    } = drift;
     if image == "nixos" {
-        match (unit_stale, ssh_env_stale) {
-            (true, true) => println!(
-                "Regenerating the {AGENT_UNIT} service and sshd configuration for box '{name}'..."
-            ),
-            (true, false) => {
-                println!("Regenerating the {AGENT_UNIT} service for box '{name}'...")
-            }
-            (false, true) => println!(
-                "Reconfiguring sshd in box '{name}' so `devbox code` can carry the \
-                 credential broker's environment..."
-            ),
-            (false, false) => return Ok(()),
+        let what = drift.describe();
+        if what.is_empty() {
+            return Ok(());
         }
+        println!("Regenerating {} for box '{name}'...", what.join(", "));
         if ssh_env_stale {
             // The `AcceptEnv` setting lives in the module, and the box has
             // whichever copy of it was current when the box was provisioned.
@@ -577,6 +654,37 @@ mod tests {
         );
         // And one provisioned before the probe asked the question.
         assert!(parse_probe("sha=absent\nunit=\n").accept_env.is_empty());
+    }
+
+    /// The state every devbox NixOS Lima box has been left in since March: a
+    /// mount pinned to an ISO UUID that Lima regenerates on every start. The
+    /// line is the one measured on w36a before it was stopped.
+    #[test]
+    fn a_cidata_mount_pinned_by_uuid_is_a_box_about_to_be_lost() {
+        let doomed = parse_probe(
+            "cidata=/dev/disk/by-uuid/2026-09-05-22-26-41-44\nsha=absent\nunit=\nacceptenv=\n",
+        );
+        assert_eq!(
+            doomed.cidata_device.as_deref(),
+            Some("/dev/disk/by-uuid/2026-09-05-22-26-41-44")
+        );
+        assert!(doomed.boot_mount_is_doomed());
+    }
+
+    /// The label is what Lima's own fstab uses, and it survives regeneration.
+    #[test]
+    fn a_cidata_mount_named_by_label_is_fine() {
+        let repaired =
+            parse_probe("cidata=/dev/disk/by-label/cidata\nsha=absent\nunit=\nacceptenv=\n");
+        assert!(!repaired.boot_mount_is_doomed());
+    }
+
+    /// A box with no such entry — Ubuntu, or anything that never ran
+    /// `nixos-generate-config` — must not be rebuilt for nothing.
+    #[test]
+    fn a_box_with_no_cidata_entry_is_left_alone() {
+        assert!(!parse_probe("sha=absent\nunit=\n").boot_mount_is_doomed());
+        assert!(!parse_probe("cidata=\nsha=absent\nunit=\n").boot_mount_is_doomed());
     }
 
     /// A box that is otherwise perfect but drops the broker's ssh environment

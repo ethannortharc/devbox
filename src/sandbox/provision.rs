@@ -2068,6 +2068,36 @@ pub(crate) async fn ensure_nixos_config(
 
 {bootloader_config}
 
+  # ── Lima's own mounts ──────────────────────────────
+  #
+  # `nixos-generate-config` records whatever is mounted when it runs, by UUID.
+  # For the cidata ISO that is a guarantee of failure: Lima rebuilds
+  # `cidata.iso` on every `limactl start`, and an iso9660 volume's UUID *is*
+  # its creation timestamp, so the device pinned at provision time never exists
+  # again. `local-fs.target` then fails and the box comes up in emergency mode
+  # with no sshd — reachable never again, from the user's point of view.
+  #
+  # Measured on a box built without this override, from its own journal:
+  #
+  #   Timed out waiting for device /dev/disk/by-uuid/2026-09-05-22-26-41-44.
+  #   Dependency failed for /mnt/lima-cidata.
+  #   Dependency failed for Local File Systems.
+  #   Reached target Emergency Mode.
+  #
+  # A plain Lima VM never hits this because Lima's own `/etc/fstab` names the
+  # volume by label and is rewritten on every boot. `nixos-rebuild` is what
+  # takes that self-healing away: it makes `/etc/fstab` a read-only symlink
+  # into the store, so Lima can no longer correct it.
+  #
+  # The label is stable across regeneration. `nofail` is the belt to that
+  # brace: a Lima mount that is missing for any other reason should leave the
+  # box bootable and diagnosable, not dead.
+  fileSystems."/mnt/lima-cidata" = lib.mkForce {{
+    device = "/dev/disk/by-label/cidata";
+    fsType = "auto";
+    options = [ "ro" "nofail" "x-systemd.device-timeout=5s" ];
+  }};
+
   # Networking
   networking.networkmanager.enable = true;
 
