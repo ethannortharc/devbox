@@ -146,6 +146,12 @@ fn coverage(out: &mut String, report: &RunReport) {
         "| dropped during the run | {} |\n",
         report.coverage.dropped_events
     ));
+    if !report.run.capture_restarted_at.is_empty() {
+        out.push_str(&format!(
+            "| **capture restarted** | {} — events before this were lost |\n",
+            report.run.capture_restarted_at
+        ));
+    }
     out.push_str(&format!(
         "| unattributed in the window | {} |\n",
         report.coverage.unattributed_in_window

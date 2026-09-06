@@ -221,6 +221,15 @@ pub struct RunRecord {
     /// while describing last week's run is worse than one that names none.
     /// Empty when the host could not ask.
     pub file_scope: String,
+    /// When capture restarted during this run, RFC3339; empty when it did not.
+    ///
+    /// A collector handover ends the agent that delivers events and starts a
+    /// new one, and a run that spans that gap comes back with fewer events
+    /// than it produced — or none. The gap itself is now avoided where the
+    /// host can see it coming, but "avoided where we can see it" is not
+    /// "cannot happen", and a report that is quietly missing its own evidence
+    /// is the one failure this whole component exists to prevent.
+    pub capture_restarted_at: String,
     /// How the start gate went: `ok`, `timeout`, or empty for a run recorded
     /// before the gate existed (and for `exec` / `shell`, which have no
     /// wrapper to gate).
@@ -426,37 +435,42 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 /// invocations in the same millisecond on the same box are a tie the report
 /// does not depend on breaking.
 pub fn new_run_id() -> String {
-    let now = chrono::Utc::now().timestamp_millis().max(0) as u64 & 0x0000_FFFF_FFFF_FFFF;
-    let mut random: u128 =
-        ((rand::random::<u64>() as u128) << 16) | (rand::random::<u16>() as u128);
+    let clock = chrono::Utc::now().timestamp_millis().max(0) as u64 & 0x0000_FFFF_FFFF_FFFF;
+    let entropy: u128 = ((rand::random::<u64>() as u128) << 16) | (rand::random::<u16>() as u128);
 
-    // Same millisecond as the previous id? Step the random field instead of
-    // rolling a fresh one, so the new id is strictly greater.
     let mut previous = LAST.load(Ordering::Relaxed);
-    loop {
+    let (ms, random) = loop {
         let last_ms = previous >> 16;
         let last_hi = previous & 0xFFFF;
-        if now == last_ms {
-            // The top 16 bits of the 80-bit random field, incremented. On the
-            // (astronomically unlikely) wrap the millisecond will have moved
-            // long before it matters.
-            let hi = (last_hi + 1) & 0xFFFF;
-            random = (random & ((1u128 << 64) - 1)) | ((hi as u128) << 64);
-        }
-        let hi = ((random >> 64) & 0xFFFF) as u64;
-        let next = (now << 16) | hi;
-        if next <= previous {
-            // Another thread moved it further along; take its value and retry.
-            previous = LAST.load(Ordering::Relaxed);
-            continue;
-        }
+
+        // The recorded millisecond is a *floor*, not something to compare
+        // against. A clock reading earlier than the last id — another thread
+        // that sampled it a moment later, or an NTP step — must still mint
+        // something greater, and the previous shape had no way to get there:
+        // the reading was taken once, outside the loop, so `next <= previous`
+        // stayed true forever and the thread spun on it. Reached for real the
+        // first time seventeen of these tests ran in parallel.
+        let (ms, hi) = if clock > last_ms {
+            (clock, ((entropy >> 64) & 0xFFFF) as u64)
+        } else if last_hi == 0xFFFF {
+            // Sixty-five thousand ids inside one millisecond. The counter has
+            // nowhere left to go, so the millisecond does.
+            (last_ms + 1, ((entropy >> 64) & 0xFFFF) as u64)
+        } else {
+            (last_ms, last_hi + 1)
+        };
+        let random = (entropy & ((1u128 << 64) - 1)) | ((hi as u128) << 64);
+
+        // Strictly greater by construction in all three branches, so the only
+        // reason to go round again is a real race with another thread.
+        let next = (ms << 16) | hi;
         match LAST.compare_exchange_weak(previous, next, Ordering::SeqCst, Ordering::Relaxed) {
-            Ok(_) => break,
+            Ok(_) => break (ms, random),
             Err(observed) => previous = observed,
         }
-    }
+    };
 
-    let value = ((now as u128) << 80) | random;
+    let value = ((ms as u128) << 80) | random;
     let mut out = [b'0'; 26];
     // 26 * 5 = 130 bits for a 128-bit value, so the first character only ever
     // carries the top two bits — exactly ULID's layout.
@@ -1079,6 +1093,29 @@ mod tests {
         // I, L, O and U are not in the alphabet, so an id that contains one
         // came from somewhere else and must not become a path component.
         assert!(!is_run_id("IIIIIIIIIIIIIIIIIIIIIIIIII"));
+    }
+
+    #[test]
+    fn minting_terminates_when_the_clock_reads_behind_the_last_id() {
+        // The shape that hung: one thread samples the clock, another mints an
+        // id in a later millisecond, and the first is left comparing a reading
+        // it can never grow past. Simulated by putting the shared floor a
+        // second into the future and asking for an id anyway — this returns,
+        // or the test times out with the whole suite.
+        let ahead = (chrono::Utc::now().timestamp_millis() as u64 + 1_000) & 0x0000_FFFF_FFFF_FFFF;
+        LAST.store((ahead << 16) | 0xFFFF, Ordering::SeqCst);
+        let first = new_run_id();
+        let second = new_run_id();
+        assert!(is_run_id(&first) && is_run_id(&second));
+        assert!(second > first, "{first} then {second}");
+        // And the floor was respected rather than stepped over: the shared
+        // high-water mark only ever moves forward, whatever this thread's
+        // clock said.
+        let floor = (ahead << 16) | 0xFFFF;
+        assert!(
+            LAST.load(Ordering::SeqCst) > floor,
+            "the high-water mark went backwards"
+        );
     }
 
     #[test]

@@ -737,7 +737,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
     }
 
     let mut store = Store::open(&path).expect("a v4 store must still open");
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
     // The identity survives: a migration that reset the generation would tell
     // every reader its cursor belonged to a different database.
     assert_eq!(store.generation().unwrap(), 4242);
@@ -786,7 +786,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
 
     // Re-opening is not a second migration.
     let reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 3);
+    assert_eq!(reopened.schema_version().unwrap(), 4);
     assert_eq!(reopened.count().unwrap(), 10);
 }
 
@@ -1038,7 +1038,7 @@ fn a_v2_runs_table_gains_the_new_columns_without_losing_a_row() {
     }
 
     let store = Store::open(&path).expect("a v2 store must still open");
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
 
     let migrated = store.get_run(RUN).unwrap().expect("the pre-upgrade run");
     assert_eq!(migrated.run_id, RUN);
@@ -1061,7 +1061,64 @@ fn a_v2_runs_table_gains_the_new_columns_without_losing_a_row() {
     assert_eq!(read_back.start_gate, "timeout");
 
     // Re-opening is not a second migration.
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 3);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 4);
+}
+
+#[test]
+fn a_run_whose_capture_restarted_says_so_in_every_rendering() {
+    // The failure this exists for: a collector handover ends the agent that
+    // delivers events and starts a new one, and a run spanning that gap comes
+    // back with fewer events than it produced — or none at all, which reads
+    // exactly like a command that did nothing. Measured at one in ten on a box
+    // another build was running lifecycle commands against.
+    let store = Store::open_in_memory().unwrap();
+    let mut live = record();
+    live.status = RunStatus::Running.as_str().to_string();
+    live.ended_at = None;
+    store.insert_run(&live).unwrap();
+    store
+        .set_run_capture_restart(RUN, "2026-09-05T10:00:00.900Z")
+        .unwrap();
+
+    let record = store.get_run(RUN).unwrap().unwrap();
+    assert_eq!(record.capture_restarted_at, "2026-09-05T10:00:00.900Z");
+
+    let report = RunReport::build(
+        record,
+        &fixture(),
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    let text = markdown::render(&report);
+    assert!(
+        text.contains("**capture restarted** | 2026-09-05T10:00:00.900Z"),
+        "the markdown does not say the coverage was interrupted:\n{text}"
+    );
+    assert!(text.contains("events before this were lost"), "{text}");
+
+    let page = html::render(&report).unwrap();
+    assert!(
+        page.contains("restarted at 2026-09-05T10:00:00.900Z"),
+        "{page}"
+    );
+
+    // And a run whose capture held steady says nothing at all — a warning on
+    // every report is a warning nobody reads.
+    let clean = store.get_run(RUN).unwrap().unwrap();
+    let mut clean = clean;
+    clean.capture_restarted_at = String::new();
+    let quiet = RunReport::build(
+        clean,
+        &fixture(),
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    );
+    assert!(!markdown::render(&quiet).contains("capture restarted"));
+    assert!(!html::render(&quiet).unwrap().contains("restarted at"));
 }
 
 #[test]
