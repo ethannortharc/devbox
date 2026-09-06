@@ -14,7 +14,7 @@ use clap::Args;
 use crate::cli::box_arg::BoxArg;
 use crate::obs::collector::store_path;
 use crate::obs::run::{
-    self, EndedBy, GuestScope, RunKind, RunRecord, RunStatus, bootstrap, cleanup_argv,
+    self, EndedBy, GuestScope, RunKind, RunRecord, RunStatus, StartGate, bootstrap, cleanup_argv,
     readback_argv,
 };
 use crate::obs::{Query, Store};
@@ -34,6 +34,10 @@ pub(crate) const GUEST_CWD: &str = "/workspace";
 /// in repeated round trips, and because it runs concurrently with the command
 /// itself — a run that beats this deadline has simply had its first second of
 /// events attributed by the parent chain instead of by cgroup.
+/// Shorter than the guest's own wait (`obs::run::GATE_SECONDS`), and it has to
+/// be: this budget is spent *reading* the wrapper's record, and opening the
+/// gate afterwards costs another round trip. Equal deadlines meant a readback
+/// that only just made it had already lost the wrapper.
 const SCOPE_READBACK_MS: u64 = 5_000;
 
 /// How long to let the collector settle before reading the run's events.
@@ -219,6 +223,24 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     let checkpoint_end = take_checkpoint(manager, &state, &name, &run_id, "run-end").await;
 
     let store = Store::open(&path).context("failed to reopen the box's event store")?;
+
+    // One more back-fill, now that everything has settled.
+    //
+    // The collector re-reads the live runs once per flush batch, so events
+    // that arrived between the gate opening and that re-read were attributed
+    // against a list that did not yet carry this run's cgroup. Claiming them
+    // here rather than waiting for the collector keeps the whole path free of
+    // sleeps that guess at somebody else's timing — and the match is still the
+    // exact one the kernel made, so nothing is being widened to fill a hole.
+    if let Some(scope) = &scope {
+        let cgroup = scope.exclusive_cgroup_id();
+        match store.backfill_run(&run_id, cgroup, &started_at) {
+            Ok(n) if n > 0 => tracing::debug!(run = %run_id, claimed = n, "back-filled at the end"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not back-fill a run's late events"),
+        }
+    }
+
     if checkpoint_start.is_some() || checkpoint_end.is_some() {
         let start = checkpoint_start.as_ref().map(|c| c.id.as_str());
         let end = checkpoint_end.as_ref().map(|c| c.id.as_str());
@@ -481,6 +503,15 @@ pub(crate) fn insert_wrapped_run(
     posture_before: Posture,
     posture_during: Posture,
 ) -> Result<()> {
+    // What the agent is watching *now*, recorded now. The scope can change
+    // between the run and the report — a re-provision, a different transport —
+    // and a Files section naming today's scope while describing last week's
+    // run would be worse than one naming none.
+    let file_scope = crate::obs::health::load(&manager.state_dir, name)
+        .ok()
+        .flatten()
+        .map(|health| health.file_scope.join(", "))
+        .unwrap_or_default();
     let record = RunRecord {
         run_id: run_id.to_string(),
         box_id: name.to_string(),
@@ -492,6 +523,7 @@ pub(crate) fn insert_wrapped_run(
         status: RunStatus::Running.as_str().to_string(),
         posture_before: posture_before.to_string(),
         posture_during: posture_during.to_string(),
+        file_scope,
         ..Default::default()
     };
     // The run row goes in before the command starts, so the collector — which
@@ -503,12 +535,23 @@ pub(crate) fn insert_wrapped_run(
         .context("failed to record the run")
 }
 
-/// Learn the guest scope while the command runs.
+/// Learn the guest scope, register it, and let the command go.
 ///
-/// Not before: the cgroup only exists once the wrapper has entered it, and the
-/// wrapper is the command. A task rather than a poll loop of execs — one `sh`
-/// waiting in the guest costs one round trip instead of a hundred, and does
-/// not fill the box's own event stream with the act of watching it.
+/// The wrapper publishes the cgroup it entered and then blocks on a pipe. This
+/// reads the record, writes it to the run row, and opens the pipe — in that
+/// order, which is the whole point: until it happens the host does not know
+/// which cgroup to attribute to, and a command that finished in the meantime
+/// produced a report whose process tree started partway down the wrapper's own
+/// children. `devbox run -- true` hit that several times in four attempts.
+///
+/// Everything here is best effort in the same direction. A gate that cannot be
+/// opened is a slower start and a `start_gate: timeout` in the record; it is
+/// never a reason for the command not to run, which is why the guest carries
+/// its own deadline as well.
+///
+/// A task rather than a poll loop of execs — one `sh` waiting in the guest
+/// costs one round trip instead of a hundred, and does not fill the box's own
+/// event stream with the act of watching it.
 pub(crate) fn spawn_scope_readback(
     manager: &SandboxManager,
     runtime: Box<dyn crate::runtime::Runtime>,
@@ -521,21 +564,54 @@ pub(crate) fn spawn_scope_readback(
     let run_id = run_id.to_string();
     let started = started_at.to_string();
     tokio::spawn(async move {
+        let store = Store::open(&store_path(&manager_dir, &name)).ok();
+        // Every exit from here writes an outcome, including the ones that
+        // learn nothing: a blank `start_gate` has to keep meaning "this run
+        // predates the gate" rather than doubling as "we gave up".
         let argv = readback_argv(&run_id, SCOPE_READBACK_MS);
         let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let result = runtime.exec_cmd(&name, &refs, false).await.ok()?;
-        let scope: GuestScope = serde_json::from_str(result.stdout.trim()).ok()?;
+        let read = runtime.exec_cmd(&name, &refs, false).await;
+        let scope = read
+            .ok()
+            .and_then(|result| serde_json::from_str::<GuestScope>(result.stdout.trim()).ok());
+        let Some(scope) = scope else {
+            if let Some(store) = &store {
+                let _ = store.set_run_start_gate(&run_id, StartGate::Timeout);
+            }
+            return None;
+        };
         let cgroup = scope.exclusive_cgroup_id();
-        let store = Store::open(&store_path(&manager_dir, &name)).ok()?;
-        store.set_run_scope(&run_id, cgroup, scope.root_pid).ok()?;
-        // And claim what the run's cgroup already produced. The collector
-        // could not have attributed those: they were written before this
-        // line, which is the first moment the host knew which cgroup to
-        // look for. Everything after it the collector handles itself.
-        match store.backfill_run(&run_id, cgroup, &started) {
-            Ok(n) if n > 0 => tracing::debug!(run = %run_id, claimed = n, "back-filled"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "could not back-fill a run's early events"),
+
+        if let Some(store) = &store {
+            let _ = store.set_run_scope(&run_id, cgroup, scope.root_pid);
+            // Claim whatever the run's cgroup already produced. With the gate
+            // working there is usually nothing here — the wrapper's own execs
+            // happen before it publishes — but the wrapper that timed out is
+            // exactly the one that needs this.
+            match store.backfill_run(&run_id, cgroup, &started) {
+                Ok(n) if n > 0 => tracing::debug!(run = %run_id, claimed = n, "back-filled"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "could not back-fill a run's early events"),
+            }
+        }
+
+        // Now the gate. The path came from inside the box and becomes a shell
+        // word, so it is checked against the two the bootstrap can choose from
+        // rather than trusted.
+        let gate = if run::is_gate_path(&scope.gate, &run_id) {
+            let argv = run::gate_release_argv(&scope.gate);
+            let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            match runtime.exec_cmd(&name, &refs, false).await {
+                Ok(result) if result.exit_code == 0 => StartGate::Ok,
+                _ => StartGate::Timeout,
+            }
+        } else {
+            // A wrapper from before the gate existed, or a path this host did
+            // not hand out. Either way the command is running unregistered.
+            StartGate::Timeout
+        };
+        if let Some(store) = &store {
+            let _ = store.set_run_start_gate(&run_id, gate);
         }
         Some(scope)
     })

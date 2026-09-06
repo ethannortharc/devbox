@@ -50,6 +50,9 @@ fn resource_attributes(ctx: &Context) -> Vec<Value> {
     if let Some(run_id) = &ctx.run_id {
         attrs.push(string_attr("devbox.run.id", run_id));
     }
+    if let Some(file_scope) = &ctx.file_scope {
+        attrs.push(string_attr("devbox.file_scope", file_scope));
+    }
     attrs
 }
 

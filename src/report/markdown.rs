@@ -156,6 +156,14 @@ fn coverage(out: &mut String, report: &RunReport) {
 fn files(out: &mut String, report: &RunReport) {
     out.push_str("## Files\n\n");
     out.push_str(&format!("_scope: {}_\n\n", report.files.scope));
+    // What the agent was watching, so "nothing outside the workspace" can be
+    // told apart from "nothing was looked for outside the workspace".
+    if !report.run.file_scope.is_empty() {
+        out.push_str(&format!(
+            "_file events observed under: {}_\n\n",
+            report.run.file_scope
+        ));
+    }
     if report.files.is_empty() {
         out.push_str("No changes to the workspace overlay.\n\n");
         outside(out, report);

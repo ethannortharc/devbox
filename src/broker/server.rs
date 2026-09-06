@@ -573,7 +573,11 @@ pub fn credential_event(box_id: &str, credential: Credential) -> Event {
         ts_wall: chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string(),
-        ts_mono_ns: monotonic_ns(),
+        // Not this process's clock. The field is a total order over the
+        // *box's* boot, and the broker runs on the host — filling it from here
+        // sorted a credential event into the middle of a run's process tree at
+        // whatever offset the host happened to have been up for.
+        ts_mono_ns: crate::obs::event::NO_MONOTONIC,
         box_id: box_id.to_string(),
         cgroup_id: 0,
         // The convention the store already uses for an event with no guest
@@ -593,13 +597,6 @@ pub fn credential_event(box_id: &str, credential: Credential) -> Event {
         policy: None,
         credential: Some(credential),
     }
-}
-
-fn monotonic_ns() -> u64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_nanos() as u64
 }
 
 #[cfg(test)]

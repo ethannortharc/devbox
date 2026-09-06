@@ -106,6 +106,21 @@ impl FromStr for EventType {
     }
 }
 
+/// `ts_mono_ns` for a writer with no reading from the box's clock.
+///
+/// The field is a total order over one guest's boot, and only something
+/// running *inside* that guest can produce a value in it. The credential
+/// broker is a host process: it filled the field from its own process clock,
+/// which is a different origin on a different machine, so its events sorted
+/// into the middle of a run's process tree at whatever offset the host had
+/// been up for.
+///
+/// Zero says "no reading", and every ordering falls back to `ts_wall` for it.
+/// A sentinel rather than an `Option` because this is the Rust half of a wire
+/// contract with the Go agent, and a nullable integer there would mean
+/// teaching both sides a new shape to express what "unset" already means.
+pub const NO_MONOTONIC: u64 = 0;
+
 /// One captured activity, in the canonical envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -114,6 +129,9 @@ pub struct Event {
     pub ts_wall: String,
     /// Kernel monotonic nanoseconds. The ordering key — a wall clock can step
     /// backwards under NTP, and correlation needs a total order that cannot.
+    ///
+    /// [`NO_MONOTONIC`] when the writer has no reading from *this box's*
+    /// clock to give.
     pub ts_mono_ns: u64,
 
     pub box_id: String,
@@ -327,6 +345,25 @@ impl Event {
             bail!("{} event is missing its sub-object", self.kind);
         }
         Ok(())
+    }
+
+    /// The key every ordering of events uses.
+    ///
+    /// Wall clock first, monotonic second — and the monotonic half is a
+    /// tiebreak, never the whole key. Ordering by it alone put an event with
+    /// [`NO_MONOTONIC`] at the front of whatever it was sorted with, which for
+    /// the broker's credential events meant the start of the run's process
+    /// tree rather than the moment they happened.
+    ///
+    /// `ts_mono_ns` also restarts at each guest boot while the store persists
+    /// across them, so it cannot be the primary key regardless of sentinels.
+    pub fn ordering_key(&self) -> (&str, u64) {
+        (&self.ts_wall, self.ts_mono_ns)
+    }
+
+    /// Whether this event carries a reading from the box's own clock.
+    pub fn has_monotonic(&self) -> bool {
+        self.ts_mono_ns != NO_MONOTONIC
     }
 
     /// The peer this event names, preferring the human-readable form.

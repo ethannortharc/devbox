@@ -11,14 +11,20 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
-use super::run::{ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag};
+use super::run::{
+    ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag, StartGate,
+};
 
 /// The schema this build writes, recorded in `meta` under `schema`.
 ///
 /// 1. events + meta, as v4 shipped them. A store created before the key
 ///    existed reports 1 by its absence, not by its content.
 /// 2. `runs`, and `events.run_id` / `events.attribution` (§4.1).
-const SCHEMA_VERSION: u32 = 2;
+/// 3. `runs.file_scope` and `runs.start_gate`: what the agent was watching
+///    while the run happened, and whether the host got to register it before
+///    the command started. Both describe how much the report can claim, and
+///    neither can be reconstructed afterwards.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Opens and owns a box's event database.
 pub struct Store {
@@ -86,6 +92,21 @@ impl Query {
             .unwrap_or(Self::DEFAULT_LIMIT)
             .clamp(1, Self::MAX_LIMIT)
     }
+}
+
+/// What a redaction sweep found, and what it did about it.
+///
+/// `matched` and `rewritten` differ only on a dry run, which is the whole
+/// point of having both: someone about to rewrite an audit database wants to
+/// know how much of it will change before it does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedactionSweep {
+    /// `exec` rows examined.
+    pub scanned: u64,
+    /// Rows whose stored argv held something the rule removes.
+    pub matched: u64,
+    /// Rows rewritten. Zero on a dry run.
+    pub rewritten: u64,
 }
 
 /// Retention policy for a box's store (§7.4).
@@ -196,7 +217,9 @@ impl Store {
                 capture_sources  TEXT    NOT NULL DEFAULT '',
                 agent_version    TEXT    NOT NULL DEFAULT '',
                 dropped_events   INTEGER NOT NULL DEFAULT 0,
-                ended_by         TEXT
+                ended_by         TEXT,
+                file_scope       TEXT NOT NULL DEFAULT '',
+                start_gate       TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
@@ -289,7 +312,7 @@ impl Store {
                 run_columns.push(row.context("failed to read a runs column")?);
             }
         }
-        for column in ["ended_by"] {
+        for column in ["ended_by", "file_scope", "start_gate"] {
             if run_columns.iter().any(|c| c == column) {
                 continue;
             }
@@ -434,8 +457,9 @@ impl Store {
                    (run_id, box_id, kind, argv, cwd, label, started_at, ended_at, exit_code,
                     status, posture_before, posture_during, cgroup_id, root_pid,
                     checkpoint_start, checkpoint_end, capture_sources, agent_version,
-                    dropped_events, ended_by)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    dropped_events, ended_by, file_scope, start_gate)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
+                         ?20,?21,?22)",
                 params![
                     run.run_id,
                     run.box_id,
@@ -457,9 +481,27 @@ impl Store {
                     run.agent_version,
                     run.dropped_events,
                     run.ended_by,
+                    run.file_scope,
+                    run.start_gate,
                 ],
             )
             .context("failed to record a run")?;
+        Ok(())
+    }
+
+    /// Record how the start gate went, once the host knows.
+    ///
+    /// Separate from [`Store::set_run_scope`] because the two answers arrive
+    /// at different moments and for different reasons: the scope is what the
+    /// wrapper reported, the gate is whether the host got to act on it in
+    /// time.
+    pub fn set_run_start_gate(&self, run_id: &str, gate: StartGate) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET start_gate = ?2 WHERE run_id = ?1",
+                params![run_id, gate.as_str()],
+            )
+            .context("failed to record a run's start gate")?;
         Ok(())
     }
 
@@ -652,6 +694,91 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Rewrite the stored `raw` of every exec row that holds a credential.
+    ///
+    /// The one thing redaction-on-read cannot do. Reading is enough for
+    /// everything devbox renders, which is what leaves the machine — but the
+    /// bytes are still on the host's disk, and a database someone wants to
+    /// hand over, or simply not keep, needs them gone.
+    ///
+    /// Not automatic, and not part of opening a store. This rewrites an
+    /// append-only audit log: the row that comes back afterwards is not the
+    /// row the agent sent, and that is a decision for a person to make once,
+    /// with `--dry-run` first, rather than something a version upgrade does on
+    /// its way past.
+    ///
+    /// Only the `raw` column. `run_id`, `attribution` and every lifted column
+    /// describe the same event either way, and the ids are what a report and
+    /// an export are keyed on.
+    pub fn redact_stored_argv(&mut self, dry_run: bool) -> Result<RedactionSweep> {
+        let mut sweep = RedactionSweep::default();
+
+        // Collected before rewriting rather than streamed into an open
+        // statement: SQLite does not promise what a cursor sees when its own
+        // table is written underneath it, and an audit sweep is not the place
+        // to find out.
+        let pending: Vec<(i64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, raw FROM events WHERE type = 'exec'")
+                .context("failed to prepare the redaction sweep")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("failed to scan for stored credentials")?;
+
+            let mut pending = Vec::new();
+            for row in rows {
+                let (id, raw) = row.context("failed to read a row")?;
+                sweep.scanned += 1;
+                // Decoded rather than string-matched: the rule is about an
+                // argv, and `raw` is JSON in which the same bytes could be a
+                // path or a comm. Anything that no longer decodes is left
+                // alone — this sweep removes credentials, it does not repair
+                // rows.
+                let Ok(mut event) = serde_json::from_str::<Event>(&raw) else {
+                    continue;
+                };
+                let Some(exec) = event.exec.as_mut() else {
+                    continue;
+                };
+                if !exec.argv.iter().any(|a| super::redact::has_secret(a)) {
+                    continue;
+                }
+                sweep.matched += 1;
+                if dry_run {
+                    continue;
+                }
+                exec.argv = super::redact::argv(&exec.argv);
+                match serde_json::to_string(&event) {
+                    Ok(clean) => pending.push((id, clean)),
+                    Err(e) => tracing::warn!(id, error = %e, "could not re-encode a redacted row"),
+                }
+            }
+            pending
+        };
+
+        if pending.is_empty() {
+            return Ok(sweep);
+        }
+
+        // One transaction: a sweep interrupted halfway leaves a database that
+        // is half rewritten and reports neither number honestly.
+        let tx = self.conn.transaction().context("failed to begin")?;
+        for (id, clean) in &pending {
+            tx.execute(
+                "UPDATE events SET raw = ?2 WHERE id = ?1",
+                params![id, clean],
+            )
+            .with_context(|| format!("failed to rewrite event {id}"))?;
+            sweep.rewritten += 1;
+        }
+        tx.commit()
+            .context("failed to commit the redaction sweep")?;
+        Ok(sweep)
     }
 
     /// Policy refusals per run, for the console's Runs tab.
@@ -1311,7 +1438,7 @@ fn event_params<'a>(
 const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
-     ended_by";
+     ended_by, file_scope, start_gate";
 
 /// Decode a stored event, with credentials removed from its argv.
 ///
@@ -1416,6 +1543,11 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         agent_version: row.get(17)?,
         dropped_events: row.get::<_, i64>(18)? as u64,
         ended_by: row.get(19)?,
+        // `ALTER TABLE … ADD COLUMN` gives a migrated row NULL where a fresh
+        // table has `DEFAULT ''`, so both spellings of "nothing recorded"
+        // have to read back the same.
+        file_scope: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
+        start_gate: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
     })
 }
 
@@ -1439,6 +1571,72 @@ fn normalize_ts(ts: &str) -> String {
 mod tests {
     use super::*;
     use crate::obs::event::{Exec, Net};
+
+    #[test]
+    fn a_sweep_rewrites_stored_credentials_and_counts_what_it_did() {
+        // Redaction-on-read covers everything devbox renders. This is the one
+        // thing it cannot do: the bytes on the host's own disk.
+        let mut store = Store::open_in_memory().unwrap();
+
+        let mut leaky = event(EventType::Exec, 900, "2026-09-05T10:00:00.000Z");
+        leaky.exec = Some(Exec {
+            path: "/bin/sh".into(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "env -- DEVBOX_BROKER_TOKEN=sk-secret DEVBOX_RUN_ID=01X true".into(),
+            ],
+            ..Default::default()
+        });
+        let clean = event(EventType::Exec, 901, "2026-09-05T10:00:01.000Z");
+        let not_an_exec = event(EventType::Connect, 902, "2026-09-05T10:00:02.000Z");
+
+        // Written straight to `raw`, the way a store filled before redaction
+        // existed holds them — `insert` redacts nothing.
+        for e in [&leaky, &clean, &not_an_exec] {
+            store.insert(e).unwrap();
+        }
+        assert!(
+            raw_of(&store, 1).contains("sk-secret"),
+            "the fixture has to start out leaky, or this proves nothing"
+        );
+
+        // A dry run reports and writes nothing.
+        let sweep = store.redact_stored_argv(true).unwrap();
+        assert_eq!(sweep.scanned, 2, "two exec rows, and only exec rows");
+        assert_eq!(sweep.matched, 1);
+        assert_eq!(sweep.rewritten, 0);
+        assert!(raw_of(&store, 1).contains("sk-secret"), "a dry run wrote");
+
+        let sweep = store.redact_stored_argv(false).unwrap();
+        assert_eq!((sweep.scanned, sweep.matched, sweep.rewritten), (2, 1, 1));
+        let raw = raw_of(&store, 1);
+        assert!(!raw.contains("sk-secret"), "the credential survived: {raw}");
+        assert!(raw.contains("***"), "{raw}");
+        assert!(
+            raw.contains("DEVBOX_RUN_ID=01X"),
+            "the run id went too: {raw}"
+        );
+
+        // Idempotent, and the row is still a readable event with its ids
+        // intact — a report and an export are keyed on those.
+        let again = store.redact_stored_argv(false).unwrap();
+        assert_eq!((again.matched, again.rewritten), (0, 0));
+        let read_back = store.query(&Query::default()).unwrap();
+        assert_eq!(read_back.len(), 3, "the sweep must not lose a row");
+        assert_eq!(read_back[0].pid, 900);
+    }
+
+    /// The stored bytes of one row, which is the thing under test here —
+    /// `query` would redact on the way out and hide the answer.
+    fn raw_of(store: &Store, id: i64) -> String {
+        store
+            .conn
+            .query_row("SELECT raw FROM events WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
 
     #[test]
     fn a_summary_with_no_since_reads_the_newest_events_not_the_oldest() {

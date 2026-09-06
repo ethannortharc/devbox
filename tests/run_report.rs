@@ -737,7 +737,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
     }
 
     let mut store = Store::open(&path).expect("a v4 store must still open");
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     // The identity survives: a migration that reset the generation would tell
     // every reader its cursor belonged to a different database.
     assert_eq!(store.generation().unwrap(), 4242);
@@ -786,7 +786,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
 
     // Re-opening is not a second migration.
     let reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     assert_eq!(reopened.count().unwrap(), 10);
 }
 
@@ -964,6 +964,104 @@ fn destroying_a_box_takes_its_reports_with_it() {
         "`devbox report` can still find a destroyed box's run"
     );
     assert!(kept.html.exists(), "a neighbour's report was taken too");
+}
+
+#[test]
+fn a_v2_runs_table_gains_the_new_columns_without_losing_a_row() {
+    // The shape of the risk: a store that has been recording runs since 0.2.0,
+    // opened by a binary that expects two columns it does not have. `ALTER
+    // TABLE … ADD COLUMN` gives the old rows NULL where a fresh table has
+    // `DEFAULT ''`, so both spellings of "nothing recorded" have to read back
+    // the same or every pre-upgrade run fails to decode.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+
+    {
+        // v2's schema, written out rather than produced by dropping columns
+        // off today's: the point is to open what 0.2.0 actually left behind.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_wall     TEXT    NOT NULL,
+                ts_mono_ns  INTEGER NOT NULL,
+                box_id      TEXT    NOT NULL,
+                cgroup_id   INTEGER NOT NULL,
+                pid         INTEGER NOT NULL,
+                tid         INTEGER NOT NULL,
+                ppid        INTEGER NOT NULL,
+                comm        TEXT    NOT NULL,
+                uid         INTEGER NOT NULL,
+                type        TEXT    NOT NULL,
+                peer        TEXT,
+                dport       INTEGER,
+                path        TEXT,
+                raw         TEXT    NOT NULL,
+                run_id      TEXT,
+                attribution TEXT
+            );
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta (key, value) VALUES ('generation', '4242');
+            INSERT INTO meta (key, value) VALUES ('schema', '2');
+            CREATE TABLE runs (
+                run_id           TEXT PRIMARY KEY,
+                box_id           TEXT    NOT NULL,
+                kind             TEXT    NOT NULL,
+                argv             TEXT    NOT NULL,
+                cwd              TEXT    NOT NULL DEFAULT '',
+                label            TEXT    NOT NULL DEFAULT '',
+                started_at       TEXT    NOT NULL,
+                ended_at         TEXT,
+                exit_code        INTEGER,
+                status           TEXT    NOT NULL,
+                posture_before   TEXT    NOT NULL DEFAULT '',
+                posture_during   TEXT    NOT NULL DEFAULT '',
+                cgroup_id        INTEGER NOT NULL DEFAULT 0,
+                root_pid         INTEGER NOT NULL DEFAULT 0,
+                checkpoint_start TEXT,
+                checkpoint_end   TEXT,
+                capture_sources  TEXT    NOT NULL DEFAULT '',
+                agent_version    TEXT    NOT NULL DEFAULT '',
+                dropped_events   INTEGER NOT NULL DEFAULT 0,
+                ended_by         TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (run_id, box_id, kind, argv, started_at, status)
+             VALUES (?1, ?2, 'run', '[\"true\"]', '2026-09-05T10:00:00.000Z', 'finished')",
+            rusqlite::params![RUN, BOX],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).expect("a v2 store must still open");
+    assert_eq!(store.schema_version().unwrap(), 3);
+
+    let migrated = store.get_run(RUN).unwrap().expect("the pre-upgrade run");
+    assert_eq!(migrated.run_id, RUN);
+    assert_eq!(
+        migrated.file_scope, "",
+        "a NULL from ADD COLUMN must read as the empty default"
+    );
+    assert_eq!(migrated.start_gate, "");
+
+    // And the new half works on the migrated database.
+    let mut fresh = record();
+    fresh.run_id = "01K4SZ0000000000000000EFGH".into();
+    fresh.file_scope = "/workspace, /home".into();
+    store.insert_run(&fresh).unwrap();
+    store
+        .set_run_start_gate(&fresh.run_id, devbox::obs::run::StartGate::Timeout)
+        .unwrap();
+    let read_back = store.get_run(&fresh.run_id).unwrap().unwrap();
+    assert_eq!(read_back.file_scope, "/workspace, /home");
+    assert_eq!(read_back.start_gate, "timeout");
+
+    // Re-opening is not a second migration.
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 3);
 }
 
 #[test]

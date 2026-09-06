@@ -44,6 +44,7 @@ fn ctx() -> export::Context {
         box_name: "myapp".into(),
         product_version: "0.0.0-test".into(),
         run_id: None,
+        file_scope: None,
     }
 }
 
