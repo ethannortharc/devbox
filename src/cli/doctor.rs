@@ -105,34 +105,39 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
     println!("Sandboxes registered: {}", sandboxes.len());
 
     println!("\nObservability collector:");
+    let collector = print_ownership(manager, crate::daemon_identity::Kind::Collector, None);
     match crate::obs::daemon::status(manager) {
-        Ok(Some(identity)) => {
-            println!("  Process:  \x1b[32mrunning\x1b[0m ({identity})");
-            match crate::obs::daemon::stats_snapshot(manager) {
-                Ok(stats) => println!(
-                    "  Events:   received={} stored={} dropped={} rejected={} persist_failed={} agents={}",
-                    stats.received,
-                    stats.stored,
-                    stats.dropped,
-                    stats.rejected,
-                    stats.persist_failed,
-                    stats.agents_connected,
-                ),
-                Err(error) => println!("  Metrics:  \x1b[31munreadable\x1b[0m — {error}"),
-            }
-        }
-        Ok(None) => println!(
-            "  Process:  \x1b[33mnot running\x1b[0m — it starts automatically with box lifecycle commands"
-        ),
-        Err(error) => println!("  Process:  \x1b[31munknown\x1b[0m — {error}"),
+        Ok(Some(_)) if collector => match crate::obs::daemon::stats_snapshot(manager) {
+            Ok(stats) => println!(
+                "  Events:   received={} stored={} dropped={} rejected={} persist_failed={} agents={}",
+                stats.received,
+                stats.stored,
+                stats.dropped,
+                stats.rejected,
+                stats.persist_failed,
+                stats.agents_connected,
+            ),
+            Err(error) => println!("  Metrics:  \x1b[31munreadable\x1b[0m — {error}"),
+        },
+        // No counters to show for a lock nobody healthy holds; `print_ownership`
+        // has already said what is there.
+        _ => {}
     }
     print_unaccounted("  Orphans: ", crate::obs::daemon::unaccounted(manager));
 
     println!("\nCredential broker:");
-    println!("  Process:  {}", crate::cli::broker::status_line(manager));
+    let providers = crate::broker::configured_providers(&manager.state_dir);
+    let idle = providers
+        .is_empty()
+        .then_some("no secrets configured, so there is nothing to broker");
+    if print_ownership(manager, crate::daemon_identity::Kind::Broker, idle) {
+        match crate::broker::endpoint(&manager.state_dir) {
+            Some(endpoint) => println!("  Endpoint: http://127.0.0.1:{}", endpoint.port),
+            None => println!("  Endpoint: \x1b[33mnot yet published\x1b[0m"),
+        }
+    }
     print_unaccounted("  Orphans: ", crate::broker::daemon::unaccounted(manager));
     println!("  Secrets:  {}", crate::cli::secret::backend_label(manager));
-    let providers = crate::broker::configured_providers(&manager.state_dir);
     println!(
         "  Providers: {}",
         if providers.is_empty() {
@@ -416,6 +421,64 @@ async fn print_host_reach(
 /// and told to the collector in the handshake, and the difference is the whole
 /// question a reader has when `devbox watch` shows connections with no process
 /// against them: proc polling reads /proc/net/tcp, which has no pid column.
+/// Who owns a daemon's lock, in the one line a reader needs.
+///
+/// The identity is the whole point: two builds of one version are two
+/// different daemons, and the build digest is the only field that says so
+/// (W0-5c). The group is here because it is what a takeover signals, and a
+/// daemon that recorded none can only be stopped by pid — which leaves its
+/// children.
+///
+/// Returns whether a healthy owner was found, so the caller knows whether the
+/// counters it was about to print describe anything.
+fn print_ownership(
+    manager: &SandboxManager,
+    kind: crate::daemon_identity::Kind,
+    idle: Option<&str>,
+) -> bool {
+    use crate::daemon_identity::{Broken, Ownership, UNREADABLE_STRIKES, decide_broken, ownership};
+
+    match ownership(&manager.state_dir, kind) {
+        Ok(Ownership::Held(owner)) => {
+            println!("  Process:  \x1b[32mrunning\x1b[0m ({})", owner.describe());
+            true
+        }
+        Ok(Ownership::Free) => {
+            println!(
+                "  Process:  \x1b[33mnot running\x1b[0m — {}",
+                idle.unwrap_or("it starts automatically with box lifecycle commands")
+            );
+            false
+        }
+        Ok(Ownership::Unreadable(unreadable)) => {
+            println!("  Process:  \x1b[31mlock held, identity unreadable\x1b[0m");
+            println!("    reason: {}", unreadable.detail);
+            match decide_broken(unreadable.holder.as_ref(), unreadable.strikes) {
+                Broken::NotOurs { pid, command } => {
+                    println!(
+                        "    lock held by pid {pid} that is not a devbox daemon; it will not be signalled"
+                    );
+                    println!("    command: {command}");
+                }
+                Broken::Unidentified => {
+                    println!("    the holder could not be identified; nothing will be signalled")
+                }
+                Broken::Wait { strikes } => println!(
+                    "    unreadable for {strikes} of the {UNREADABLE_STRIKES} commands needed before it is replaced"
+                ),
+                Broken::Replace { pid, pgid, .. } => println!(
+                    "    pid {pid} (group {pgid}) will be replaced by the next lifecycle command"
+                ),
+            }
+            false
+        }
+        Err(error) => {
+            println!("  Process:  \x1b[31munknown\x1b[0m — {error}");
+            false
+        }
+    }
+}
+
 /// Daemons serving this state directory that no ownership record accounts for.
 ///
 /// Printed rather than reaped, because `doctor` diagnoses. The number is the

@@ -15,7 +15,6 @@
 //! `fs_usage` and nothing else.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -30,49 +29,32 @@ use crate::sandbox::SandboxManager;
 
 const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OwnerIdentity {
-    pid: i32,
-    version: String,
-    /// The daemon's own process group, or `0` when it has none recorded.
-    ///
-    /// Same reason as the collector's (see [`crate::obs::daemon`]): a daemon's
-    /// children inherit its group, and stopping the pid alone leaves them.
-    /// Written only after the daemon has proved it *leads* the group.
-    pgid: i32,
-}
-
 /// How long an unaccounted broker is given to go quietly.
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn lock_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("locks").join("broker-daemon.lock")
-}
+use crate::daemon_identity::{self as identity, Kind, OwnerIdentity, should_replace};
+
+/// Which daemon this module owns.
+const KIND: Kind = Kind::Broker;
 
 fn identity_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("locks").join("broker-daemon.owner")
+    KIND.identity_path(state_dir)
+}
+
+fn open_lock(state_dir: &Path) -> Result<File> {
+    identity::open_lock(state_dir, KIND)
+}
+
+fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
+    identity::read(state_dir, KIND)
+}
+
+fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()> {
+    identity::publish(state_dir, KIND, owner)
 }
 
 fn log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("logs").join("broker.log")
-}
-
-fn open_lock(state_dir: &Path) -> Result<File> {
-    let path = lock_path(state_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create broker lock directory {}", parent.display()))?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("protect broker lock directory {}", parent.display()))?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("open broker daemon lock {}", path.display()))
 }
 
 /// Ensure the per-user broker exists.
@@ -100,12 +82,34 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
     let probe = open_lock(&manager.state_dir)?;
     match probe.try_lock() {
         Err(std::fs::TryLockError::WouldBlock) => {
-            let owner = read_owner_identity(&manager.state_dir)?;
-            if owner.version == env!("CARGO_PKG_VERSION") {
-                return Ok(());
-            }
-            if !replace_outdated_owner(&probe, &manager.state_dir, &owner)? {
-                return Ok(());
+            match read_owner_identity(&manager.state_dir) {
+                Ok(owner) => {
+                    identity::clear_unreadable(&manager.state_dir, KIND);
+                    let mine = OwnerIdentity::mine(KIND)?;
+                    if !should_replace(&owner, &mine) {
+                        return Ok(());
+                    }
+                    if !replace_outdated_owner(&probe, &manager.state_dir, &owner, &mine)? {
+                        return Ok(());
+                    }
+                }
+                // A record that cannot be read is its own case. It is not
+                // "no owner" — something holds the lock — and it is not
+                // grounds for a signal either: the record is unreadable for a
+                // moment every time a daemon starts, between taking the lock
+                // and publishing. `take_over_broken` decides, and returns
+                // `true` only when the lock is free again.
+                Err(reason) => {
+                    if !identity::take_over_broken(
+                        &probe,
+                        &manager.state_dir,
+                        KIND,
+                        &reason,
+                        REPLACEMENT_TIMEOUT,
+                    )? {
+                        return Ok(());
+                    }
+                }
             }
         }
         Err(std::fs::TryLockError::Error(error)) => {
@@ -209,96 +213,17 @@ fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
     reaped
 }
 
-fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
-    let path = identity_path(state_dir);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read broker daemon ownership record {}", path.display()))?;
-    parse_owner_identity(&text).with_context(|| {
-        format!(
-            "broker daemon owns {} but published an invalid identity",
-            path.display()
-        )
-    })
-}
-
-fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()> {
-    let path = identity_path(state_dir);
-    let parent = path.parent().context("broker identity has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create broker identity directory {}", parent.display()))?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("protect broker identity directory {}", parent.display()))?;
-
-    let temporary = parent.join(format!(
-        ".broker-daemon.owner-{}-{:016x}.tmp",
-        owner.pid,
-        rand::random::<u64>()
-    ));
-    let published = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("create broker identity {}", temporary.display()))?;
-        writeln!(
-            file,
-            "pid={} version={} pgid={}",
-            owner.pid, owner.version, owner.pgid
-        )
-        .context("write broker daemon identity")?;
-        file.sync_all().context("flush broker daemon identity")?;
-        drop(file);
-        std::fs::rename(&temporary, &path)
-            .with_context(|| format!("publish broker daemon identity {}", path.display()))?;
-        Ok(())
-    })();
-    if published.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    published
-}
-
-fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
-    let mut pid = None;
-    let mut version = None;
-    // Absent for a record written before this field existed, and a malformed
-    // one is no group: nothing here may turn an unparseable number into a
-    // signal.
-    let mut pgid = 0;
-    for field in text.split_whitespace() {
-        if let Some(value) = field.strip_prefix("pid=") {
-            pid = Some(
-                value
-                    .parse::<i32>()
-                    .context("broker pid is not an integer")?,
-            );
-        } else if let Some(value) = field.strip_prefix("version=") {
-            version = Some(value.to_string());
-        } else if let Some(value) = field.strip_prefix("pgid=") {
-            pgid = value.parse::<i32>().unwrap_or(0);
-        }
-    }
-    let pid = pid.context("broker identity has no pid")?;
-    if pid <= 1 || pid == std::process::id() as i32 {
-        bail!("broker identity contains unsafe pid {pid}")
-    }
-    let version = version
-        .filter(|value| !value.is_empty())
-        .context("broker identity has no version")?;
-    // A group id that is not the owner's own pid is not the owner's group.
-    if pgid != pid {
-        pgid = 0;
-    }
-    Ok(OwnerIdentity { pid, version, pgid })
-}
-
 /// Ask an older binary to release the lock, then prove it did.
 ///
 /// The pid comes from a 0600 record held under the same advisory lock, and is
 /// checked against the process's own command line before any signal is sent,
 /// so a stale record cannot be turned into a way to kill an unrelated process.
-fn replace_outdated_owner(probe: &File, state_dir: &Path, owner: &OwnerIdentity) -> Result<bool> {
+fn replace_outdated_owner(
+    probe: &File,
+    state_dir: &Path,
+    owner: &OwnerIdentity,
+    mine: &OwnerIdentity,
+) -> Result<bool> {
     // The whole group where the owner recorded one, for the reason the
     // collector's takeover does it: a daemon's children share its group, and
     // signalling the pid alone leaves them behind.
@@ -354,9 +279,12 @@ fn replace_outdated_owner(probe: &File, state_dir: &Path, owner: &OwnerIdentity)
                 return Ok(true);
             }
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                // Another lifecycle command may have won the release and
+                // already started this build. Do not wait for that healthy
+                // replacement to exit, and do not spawn a duplicate.
                 if read_owner_identity(state_dir)
                     .ok()
-                    .is_some_and(|owner| owner.version == env!("CARGO_PKG_VERSION"))
+                    .is_some_and(|current| !should_replace(&current, mine))
                 {
                     return Ok(false);
                 }
@@ -402,12 +330,9 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
 
     // A group of our own before anything is published about us, so the id we
     // record can only ever name this daemon and its descendants.
-    let me = OwnerIdentity {
-        pid: i32::try_from(std::process::id()).context("broker pid exceeds i32")?,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        pgid: crate::procgroup::lead_own_group()
-            .context("give the broker daemon a process group of its own")?,
-    };
+    let mut me = OwnerIdentity::mine(KIND)?;
+    me.pgid = crate::procgroup::lead_own_group()
+        .context("give the broker daemon a process group of its own")?;
     publish_owner_identity(&manager.state_dir, &me)?;
     super::publish_endpoint(
         &manager.state_dir,
@@ -504,57 +429,11 @@ mod tests {
     #[test]
     fn daemon_bookkeeping_stays_under_private_state_directories() {
         let root = Path::new("/tmp/devbox-test-state");
-        assert_eq!(
-            lock_path(root),
-            root.join("locks").join("broker-daemon.lock")
-        );
-        assert_eq!(
-            identity_path(root),
-            root.join("locks").join("broker-daemon.owner")
-        );
+        // The lock and the ownership record — and that they are distinct from
+        // the collector's, or the two daemons would fight over one lock — are
+        // the shared module's to place, and
+        // `each_daemon_keeps_its_own_lock_record_and_tally` pins them there.
         assert_eq!(log_path(root), root.join("logs").join("broker.log"));
-        // Distinct from the collector's, or the two daemons would fight over
-        // one lock and only one of them would ever run.
-        assert_ne!(
-            lock_path(root),
-            root.join("locks").join("collector-daemon.lock")
-        );
-    }
-
-    #[test]
-    fn broker_owner_identity_round_trips_and_rejects_unsafe_pids() {
-        assert_eq!(
-            parse_owner_identity("pid=4242 version=1.2.3 pgid=4242\n").unwrap(),
-            OwnerIdentity {
-                pid: 4242,
-                version: "1.2.3".to_string(),
-                pgid: 4242,
-            }
-        );
-        for invalid in ["", "pid=1 version=old", "pid=nope version=old", "pid=42"] {
-            assert!(parse_owner_identity(invalid).is_err(), "{invalid:?}");
-        }
-    }
-
-    #[test]
-    fn broker_owner_identity_is_published_as_a_complete_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = OwnerIdentity {
-            pid: 4242,
-            version: "1.2.3".to_string(),
-            pgid: 4242,
-        };
-        publish_owner_identity(dir.path(), &owner).unwrap();
-        assert_eq!(read_owner_identity(dir.path()).unwrap(), owner);
-        assert!(
-            std::fs::read_dir(dir.path().join("locks"))
-                .unwrap()
-                .all(|entry| !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp"))
-        );
     }
 
     #[test]
@@ -565,7 +444,7 @@ mod tests {
         };
         try_ensure_running(&manager).unwrap();
         assert!(
-            !lock_path(dir.path()).exists(),
+            !KIND.lock_path(dir.path()).exists(),
             "an empty host must not even create the lock"
         );
     }

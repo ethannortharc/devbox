@@ -23,6 +23,7 @@
 
 pub mod broker;
 pub mod cli;
+pub mod daemon_identity;
 pub mod embedded;
 pub mod export;
 pub mod mcp;

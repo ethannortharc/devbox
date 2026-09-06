@@ -7,7 +7,6 @@
 //! pile of idle supervisors when several CLI commands race to start one.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -36,157 +35,29 @@ const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// hand over, and it runs on the path of an ordinary command.
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// What a build publishes when it cannot identify itself.
-///
-/// Its own executable can be gone — a worktree deleted while its daemon still
-/// runs is not hypothetical — and an identity that cannot be computed must
-/// read as "unknown", never as "the same as yours".
-const UNKNOWN_BUILD: &str = "unknown";
+use crate::daemon_identity::{self as identity, Kind, OwnerIdentity, should_replace};
 
-/// Who owns the daemon lock.
-///
-/// The version alone was the whole identity, and that was wrong for the same
-/// reason the guest agent's version was (see [`crate::sandbox::agent_sync`]):
-/// one version number now covers builds with different capture capabilities.
-/// A pre-eBPF `0.1.6` daemon left running kept spawning guest agents with
-/// `-no-ebpf`, and every newer `0.1.6` binary looked at the version, agreed it
-/// was current, and left it alone — so a box could have an eBPF agent
-/// installed and still be told not to use it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OwnerIdentity {
-    pid: i32,
-    version: String,
-    /// The commit this build was made from, as a label for humans. Empty for
-    /// an owner from before this field existed.
-    commit: String,
-    /// sha256 of the owner's own executable — the identity that decides.
-    ///
-    /// The commit cannot: two builds of one commit differ whenever the working
-    /// tree, the embedded agent, or a feature flag differ, which is precisely
-    /// the case this exists for. Empty for an owner from before this field
-    /// existed, which is itself proof it is not this binary.
-    build: String,
-    /// The daemon's own process group, or `0` when it has none recorded.
-    ///
-    /// A daemon's children — the exec transports that carry a guest agent's
-    /// stdio — inherit this group, and `kill_on_drop` does not run when the
-    /// daemon is killed rather than dropped. Signalling the pid alone
-    /// therefore stops the daemon and leaves its `limactl`/`ssh` pair holding
-    /// a guest. The daemon writes this only after proving it *leads* the group
-    /// (see [`crate::procgroup::lead_own_group`]); zero means an older build
-    /// that never did, and the takeover falls back to the single pid.
-    pgid: i32,
-}
-
-impl OwnerIdentity {
-    /// This process, as an owner.
-    fn mine() -> Result<Self> {
-        Ok(Self {
-            pid: i32::try_from(std::process::id()).context("collector pid exceeds i32")?,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            commit: build_commit().to_string(),
-            build: host_build_digest().to_string(),
-            // Filled in by `run` once it has made a group of its own. A
-            // process that has not done that must not claim a group: the one
-            // it is in belongs to whoever started it.
-            pgid: 0,
-        })
-    }
-
-    /// A one-line rendering for `devbox doctor`.
-    fn describe(&self) -> String {
-        let mut described = format!("pid {} version {}", self.pid, self.version);
-        if !self.commit.is_empty() {
-            described.push_str(&format!(" commit {}", self.commit));
-        }
-        match self.build.as_str() {
-            "" => described.push_str(" build unrecorded"),
-            UNKNOWN_BUILD => described.push_str(" build unknown"),
-            build => described.push_str(&format!(" build {}", &build[..build.len().min(12)])),
-        }
-        described
-    }
-}
-
-/// The commit this binary was built from, or an empty string.
-///
-/// Stamped by `build.rs`, which reruns when the agent's own inputs change —
-/// so it names the commit of the last agent rebuild, not necessarily HEAD.
-/// That is why it is a label and [`host_build_digest`] is the identity.
-fn build_commit() -> &'static str {
-    option_env!("DEVBOX_BUILD_COMMIT").unwrap_or("")
-}
-
-/// sha256 of this process's own executable, computed once.
-///
-/// Streamed rather than read whole: this runs on every lifecycle command, and
-/// a debug build is tens of megabytes.
-fn host_build_digest() -> &'static str {
-    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DIGEST.get_or_init(|| {
-        digest_executable().unwrap_or_else(|error| {
-            tracing::debug!(%error, "cannot identify this devbox build");
-            UNKNOWN_BUILD.to_string()
-        })
-    })
-}
-
-fn digest_executable() -> Result<String> {
-    use std::io::Read as _;
-
-    use sha2::{Digest as _, Sha256};
-
-    let path = std::env::current_exe().context("locate this devbox executable")?;
-    let mut file = File::open(&path)
-        .with_context(|| format!("read this devbox executable {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut chunk)
-            .with_context(|| format!("read this devbox executable {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&chunk[..read]);
-    }
-    let mut encoded = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(encoded)
-}
-
-/// Whether `mine` should take the daemon over from `owner`.
-///
-/// Version first, because that is the compatibility boundary. Then build
-/// identity, because within one version it is the only thing that separates a
-/// daemon that can attach eBPF probes from one that cannot.
-///
-/// Two asymmetries are deliberate:
-///
-/// - An owner with no build identity is replaced. This binary always publishes
-///   one, so an owner without one cannot be this binary.
-/// - A challenger with no build identity replaces nobody of its own version.
-///   It cannot show it differs, and a takeover it cannot justify is one that
-///   repeats on every command.
-fn should_replace(owner: &OwnerIdentity, mine: &OwnerIdentity) -> bool {
-    if owner.version != mine.version {
-        return true;
-    }
-    if mine.build.is_empty() || mine.build == UNKNOWN_BUILD {
-        return false;
-    }
-    owner.build != mine.build
-}
-
-fn lock_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("locks").join("collector-daemon.lock")
-}
+/// Which daemon this module owns.
+const KIND: Kind = Kind::Collector;
 
 fn identity_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("locks").join("collector-daemon.owner")
+    KIND.identity_path(state_dir)
+}
+
+fn open_lock(state_dir: &Path) -> Result<File> {
+    identity::open_lock(state_dir, KIND)
+}
+
+fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
+    identity::read(state_dir, KIND)
+}
+
+fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()> {
+    identity::publish(state_dir, KIND, owner)
+}
+
+fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
+    identity::parse(text, KIND)
 }
 
 fn log_path(state_dir: &Path) -> PathBuf {
@@ -195,26 +66,6 @@ fn log_path(state_dir: &Path) -> PathBuf {
 
 fn stats_path(state_dir: &Path) -> PathBuf {
     state_dir.join("metrics").join("collector.json")
-}
-
-fn open_lock(state_dir: &Path) -> Result<File> {
-    let path = lock_path(state_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create collector lock directory {}", parent.display()))?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("protect collector lock directory {}", parent.display()))?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        // Ownership and identity are separate. This file is never truncated;
-        // the complete identity is atomically renamed beside it.
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("open collector daemon lock {}", path.display()))
 }
 
 /// Ensure the per-user collector daemon exists.
@@ -241,13 +92,34 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
     let probe = open_lock(&manager.state_dir)?;
     match probe.try_lock() {
         Err(std::fs::TryLockError::WouldBlock) => {
-            let owner = read_owner_identity(&manager.state_dir)?;
-            let mine = OwnerIdentity::mine()?;
-            if !should_replace(&owner, &mine) {
-                return Ok(());
-            }
-            if !replace_outdated_owner(&probe, &manager.state_dir, &owner, &mine)? {
-                return Ok(());
+            match read_owner_identity(&manager.state_dir) {
+                Ok(owner) => {
+                    identity::clear_unreadable(&manager.state_dir, KIND);
+                    let mine = OwnerIdentity::mine(KIND)?;
+                    if !should_replace(&owner, &mine) {
+                        return Ok(());
+                    }
+                    if !replace_outdated_owner(&probe, &manager.state_dir, &owner, &mine)? {
+                        return Ok(());
+                    }
+                }
+                // A record that cannot be read is its own case. It is not
+                // "no owner" — something holds the lock — and it is not
+                // grounds for a signal either: the record is unreadable for a
+                // moment every time a daemon starts, between taking the lock
+                // and publishing. `take_over_broken` decides, and returns
+                // `true` only when the lock is free again.
+                Err(reason) => {
+                    if !identity::take_over_broken(
+                        &probe,
+                        &manager.state_dir,
+                        KIND,
+                        &reason,
+                        REPLACEMENT_TIMEOUT,
+                    )? {
+                        return Ok(());
+                    }
+                }
             }
         }
         Err(std::fs::TryLockError::Error(error)) => {
@@ -383,109 +255,6 @@ fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
     reaped
 }
 
-fn read_owner_identity(state_dir: &Path) -> Result<OwnerIdentity> {
-    let path = identity_path(state_dir);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read collector daemon ownership record {}", path.display()))?;
-    parse_owner_identity(&text).with_context(|| {
-        format!(
-            "collector daemon owns {} but published an invalid identity",
-            path.display()
-        )
-    })
-}
-
-fn publish_owner_identity(state_dir: &Path, owner: &OwnerIdentity) -> Result<()> {
-    let path = identity_path(state_dir);
-    let parent = path.parent().context("collector identity has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create collector identity directory {}", parent.display()))?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("protect collector identity directory {}", parent.display()))?;
-
-    // A unique temporary avoids a crashed predecessor wedging publication.
-    // `rename` means a concurrent ensure/status reader observes either the
-    // previous complete record or this complete one, never a truncated file.
-    let temporary = parent.join(format!(
-        ".collector-daemon.owner-{}-{:016x}.tmp",
-        owner.pid,
-        rand::random::<u64>()
-    ));
-    let published = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("create collector identity {}", temporary.display()))?;
-        writeln!(
-            file,
-            "pid={} version={} commit={} build={} pgid={}",
-            owner.pid, owner.version, owner.commit, owner.build, owner.pgid
-        )
-        .context("write collector daemon identity")?;
-        file.sync_all().context("flush collector daemon identity")?;
-        drop(file);
-        std::fs::rename(&temporary, &path)
-            .with_context(|| format!("publish collector daemon identity {}", path.display()))?;
-        Ok(())
-    })();
-    if published.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    published
-}
-
-fn parse_owner_identity(text: &str) -> Result<OwnerIdentity> {
-    let mut pid = None;
-    let mut version = None;
-    // Absent, not invalid: a daemon started by a build from before these
-    // fields existed publishes neither, and that record must still parse —
-    // replacing it is exactly what the missing build identity is evidence for.
-    let mut commit = String::new();
-    let mut build = String::new();
-    let mut pgid = 0;
-    for field in text.split_whitespace() {
-        if let Some(value) = field.strip_prefix("pid=") {
-            pid = Some(
-                value
-                    .parse::<i32>()
-                    .context("collector pid is not an integer")?,
-            );
-        } else if let Some(value) = field.strip_prefix("version=") {
-            version = Some(value.to_string());
-        } else if let Some(value) = field.strip_prefix("commit=") {
-            commit = value.to_string();
-        } else if let Some(value) = field.strip_prefix("build=") {
-            build = value.to_string();
-        } else if let Some(value) = field.strip_prefix("pgid=") {
-            // A malformed group is no group. Nothing here may turn an
-            // unparseable number into a signal.
-            pgid = value.parse::<i32>().unwrap_or(0);
-        }
-    }
-    let pid = pid.context("collector identity has no pid")?;
-    if pid <= 1 || pid == std::process::id() as i32 {
-        bail!("collector identity contains unsafe pid {pid}")
-    }
-    let version = version
-        .filter(|value| !value.is_empty())
-        .context("collector identity has no version")?;
-    // A group id that is not the owner's own pid is not the owner's group.
-    // The daemon only ever writes one it leads, so anything else came from a
-    // corrupted record — and signalling it would reach a stranger.
-    if pgid != pid {
-        pgid = 0;
-    }
-    Ok(OwnerIdentity {
-        pid,
-        version,
-        commit,
-        build,
-        pgid,
-    })
-}
-
 /// Ask an older binary to release the stable daemon lock, then prove it did
 /// before launching the replacement. The pid comes from a 0600 record held
 /// under the same advisory lock, so another local user cannot redirect the
@@ -619,7 +388,7 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     // of our own, so the id we are about to record can only ever name us and
     // our descendants. Fatal if it fails — a daemon that cannot be stopped
     // cleanly is how this host collected a hundred and forty-seven of them.
-    let mut me = OwnerIdentity::mine()?;
+    let mut me = OwnerIdentity::mine(KIND)?;
     me.pgid = crate::procgroup::lead_own_group()
         .context("give the collector daemon a process group of its own")?;
     publish_owner_identity(&manager.state_dir, &me)?;
@@ -762,14 +531,9 @@ mod tests {
     #[test]
     fn daemon_bookkeeping_stays_under_private_state_directories() {
         let root = Path::new("/tmp/devbox-test-state");
-        assert_eq!(
-            lock_path(root),
-            root.join("locks").join("collector-daemon.lock")
-        );
-        assert_eq!(
-            identity_path(root),
-            root.join("locks").join("collector-daemon.owner")
-        );
+        // The lock and the ownership record are the shared module's to place;
+        // `each_daemon_keeps_its_own_lock_record_and_tally` pins them there.
+        // What is this daemon's own is where it logs and publishes counters.
         assert_eq!(log_path(root), root.join("logs").join("collector.log"));
         assert_eq!(
             stats_path(root),
@@ -791,144 +555,5 @@ mod tests {
         };
         publish_stats(&manager.state_dir, expected).unwrap();
         assert_eq!(stats_snapshot(&manager).unwrap(), expected);
-    }
-
-    fn owner(version: &str, build: &str) -> OwnerIdentity {
-        OwnerIdentity {
-            pid: 4242,
-            version: version.to_string(),
-            commit: String::new(),
-            build: build.to_string(),
-            pgid: 4242,
-        }
-    }
-
-    #[test]
-    fn collector_owner_identity_round_trips_and_rejects_unsafe_pids() {
-        assert_eq!(
-            parse_owner_identity("pid=4242 version=1.2.3 commit=abc123 build=ff00 pgid=4242\n")
-                .unwrap(),
-            OwnerIdentity {
-                pid: 4242,
-                version: "1.2.3".to_string(),
-                commit: "abc123".to_string(),
-                build: "ff00".to_string(),
-                pgid: 4242,
-            }
-        );
-        for invalid in ["", "pid=1 version=old", "pid=nope version=old", "pid=42"] {
-            assert!(parse_owner_identity(invalid).is_err(), "{invalid:?}");
-        }
-    }
-
-    /// A record written before the daemon carried a build identity still
-    /// parses — and reads as "not this binary", which is what it is.
-    #[test]
-    fn an_identity_from_before_the_build_field_still_parses() {
-        let old = parse_owner_identity("pid=4242 version=1.2.3\n").unwrap();
-        assert_eq!(old.build, "");
-        assert_eq!(old.commit, "");
-        assert!(should_replace(&old, &owner("1.2.3", "beef")));
-    }
-
-    /// The case this exists for: one version number, two builds. Before, the
-    /// version match alone left a pre-eBPF daemon running for the life of the
-    /// login session, and every box it attached to was told `-no-ebpf`.
-    #[test]
-    fn the_same_version_built_differently_is_taken_over() {
-        assert!(should_replace(
-            &owner("1.2.3", "aaaa"),
-            &owner("1.2.3", "bbbb")
-        ));
-    }
-
-    #[test]
-    fn the_same_build_is_left_alone() {
-        assert!(!should_replace(
-            &owner("1.2.3", "aaaa"),
-            &owner("1.2.3", "aaaa")
-        ));
-    }
-
-    #[test]
-    fn a_different_version_is_taken_over_whatever_the_build_says() {
-        assert!(should_replace(
-            &owner("1.2.2", "aaaa"),
-            &owner("1.2.3", "aaaa")
-        ));
-        assert!(should_replace(&owner("1.2.2", ""), &owner("1.2.3", "")));
-    }
-
-    /// A challenger that cannot hash its own executable — a deleted worktree,
-    /// an unreadable path — must not take over on every command it runs.
-    #[test]
-    fn a_challenger_that_cannot_identify_itself_replaces_nobody_of_its_version() {
-        assert!(!should_replace(
-            &owner("1.2.3", "aaaa"),
-            &owner("1.2.3", UNKNOWN_BUILD)
-        ));
-        assert!(!should_replace(&owner("1.2.3", ""), &owner("1.2.3", "")));
-        // It is still replaced across a version change, which is the boundary
-        // that never depended on build identity.
-        assert!(should_replace(
-            &owner("1.2.2", "aaaa"),
-            &owner("1.2.3", UNKNOWN_BUILD)
-        ));
-    }
-
-    #[test]
-    fn the_doctor_line_names_the_build_without_printing_all_of_it() {
-        let described = OwnerIdentity {
-            pid: 7,
-            version: "0.1.6".into(),
-            commit: "11cc51fbf1d3".into(),
-            build: "c7d70a0857d42e7fbf0062fec377477658ff76cc8412b3210e60023a1736cca0".into(),
-            pgid: 7,
-        }
-        .describe();
-        assert_eq!(
-            described,
-            "pid 7 version 0.1.6 commit 11cc51fbf1d3 build c7d70a0857d4"
-        );
-        assert!(owner("0.1.6", "").describe().ends_with("build unrecorded"));
-        assert!(
-            owner("0.1.6", UNKNOWN_BUILD)
-                .describe()
-                .ends_with("build unknown")
-        );
-    }
-
-    /// This binary can always identify itself, so nothing it publishes reads
-    /// as an owner worth replacing.
-    #[test]
-    fn this_build_identifies_itself() {
-        let mine = OwnerIdentity::mine().unwrap();
-        assert_ne!(mine.build, "", "a live test binary has an executable");
-        assert_ne!(mine.build, UNKNOWN_BUILD);
-        assert!(!should_replace(&mine, &mine));
-    }
-
-    #[test]
-    fn collector_owner_identity_is_published_as_a_complete_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = OwnerIdentity {
-            pid: 4242,
-            version: "1.2.3".to_string(),
-            commit: "abc123def456".to_string(),
-            build: "c7d70a08".to_string(),
-            pgid: 4242,
-        };
-        publish_owner_identity(dir.path(), &owner).unwrap();
-        assert_eq!(read_owner_identity(dir.path()).unwrap(), owner);
-        assert!(!lock_path(dir.path()).exists());
-        assert!(
-            std::fs::read_dir(dir.path().join("locks"))
-                .unwrap()
-                .all(|entry| !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp"))
-        );
     }
 }

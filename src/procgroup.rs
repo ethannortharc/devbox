@@ -326,6 +326,31 @@ fn members(pgid: i32) -> Result<usize> {
         .count())
 }
 
+/// Processes holding a file open.
+///
+/// `lsof -t` names them exactly, which is what the advisory lock protocol
+/// cannot: `flock` records no owner anywhere a reader can see. Absent or
+/// refused `lsof` returns nothing rather than an error — the caller has a
+/// second way to ask (the working-directory scan), and "we could not tell"
+/// must not read as "nobody".
+pub fn holders_of(path: &Path) -> Vec<i32> {
+    let Some(path) = path.to_str() else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new("lsof")
+        .args(["-t", "--", path])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|field| field.parse().ok())
+        .collect()
+}
+
 /// The working directory of a running process, when it can be read.
 ///
 /// A daemon is started with its state directory as its cwd, so this is how a
