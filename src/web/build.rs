@@ -697,104 +697,41 @@ pub async fn apply_selection(
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::{ExecResult, Runtime, SandboxStatus};
+    use crate::runtime::stub::StubRuntime;
+    use crate::runtime::{ExecResult, SandboxStatus};
 
-    /// A guest whose `cat` fails for a reason that is not "the file is absent".
-    struct FlakyGuest {
-        /// `test -e` says the file is there; reading it does not work.
-        read_fails: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl Runtime for FlakyGuest {
-        async fn exec_cmd(&self, _: &str, argv: &[&str], _: bool) -> anyhow::Result<ExecResult> {
-            match argv.first().copied() {
-                // Present.
-                Some("test") => Ok(ExecResult {
-                    exit_code: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }),
-                Some("cat") if self.read_fails => Ok(ExecResult {
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: "permission denied".into(),
-                }),
-                Some("cat") => Ok(ExecResult {
-                    exit_code: 0,
-                    stdout: "contents".into(),
-                    stderr: String::new(),
-                }),
-                // The sets tarball and anything else.
-                _ => Ok(ExecResult {
-                    exit_code: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }),
-            }
-        }
-        fn name(&self) -> &str {
-            "flaky"
-        }
-        async fn create(
-            &self,
-            _: &crate::runtime::CreateOpts,
-        ) -> anyhow::Result<crate::runtime::SandboxInfo> {
-            unimplemented!()
-        }
-        async fn start(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn stop(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn destroy(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn status(&self, _: &str) -> anyhow::Result<SandboxStatus> {
-            Ok(SandboxStatus::Running)
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn priority(&self) -> u32 {
-            0
-        }
-        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
-            unimplemented!()
-        }
-        async fn list(&self) -> anyhow::Result<Vec<crate::runtime::SandboxInfo>> {
-            unimplemented!()
-        }
-        async fn snapshot_create(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_restore(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_list(
-            &self,
-            _: &str,
-        ) -> anyhow::Result<Vec<crate::runtime::SnapshotInfo>> {
-            unimplemented!()
-        }
-        async fn upgrade(&self, _: &str, _: &[String]) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-        async fn update_mounts(
-            &self,
-            _: &str,
-            _: &[crate::runtime::Mount],
-        ) -> anyhow::Result<crate::runtime::MountUpdate> {
-            unimplemented!()
-        }
-        async fn rollback_mounts(
-            &self,
-            _: &str,
-            _: &crate::runtime::MountUpdate,
-        ) -> anyhow::Result<()> {
-            unimplemented!()
-        }
+    /// A guest whose `cat` fails for a reason that is not "the file is absent":
+    /// `test -e` says the file is there, and reading it does not work.
+    fn flaky_guest(read_fails: bool) -> StubRuntime {
+        StubRuntime::new()
+            .with_name("flaky")
+            .with_status(SandboxStatus::Running)
+            .with_exec_cmd(move |_: &str, argv: &[&str], _: bool| {
+                match argv.first().copied() {
+                    // Present.
+                    Some("test") => Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                    Some("cat") if read_fails => Ok(ExecResult {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "permission denied".into(),
+                    }),
+                    Some("cat") => Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: "contents".into(),
+                        stderr: String::new(),
+                    }),
+                    // The sets tarball and anything else.
+                    _ => Ok(ExecResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                }
+            })
     }
 
     #[tokio::test]
@@ -808,7 +745,7 @@ mod tests {
         // Refusing before anything is mutated is the only safe answer: there is
         // no rollback to fall back on if the rollback is the thing that is
         // broken.
-        let guest = FlakyGuest { read_fails: true };
+        let guest = flaky_guest(true);
         let err = match snapshot_generated(&guest, "b").await {
             Ok(_) => panic!("an unreadable file must stop the rebuild"),
             Err(e) => e,
@@ -822,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_readable_guest_still_snapshots() {
-        let guest = FlakyGuest { read_fails: false };
+        let guest = flaky_guest(false);
         let snap = match snapshot_generated(&guest, "b").await {
             Ok(snap) => snap,
             Err(e) => panic!("a healthy guest must snapshot: {e}"),
