@@ -14,8 +14,8 @@ use clap::Args;
 use crate::cli::box_arg::BoxArg;
 use crate::obs::collector::store_path;
 use crate::obs::run::{
-    self, EndedBy, GuestScope, RunKind, RunRecord, RunStatus, StartGate, bootstrap, cleanup_argv,
-    readback_argv,
+    self, CaptureVerdict, EndedBy, GuestScope, RunKind, RunRecord, RunStatus, StartGate, bootstrap,
+    cleanup_argv, readback_argv,
 };
 use crate::obs::{Query, Store};
 use crate::policy::{Policy, Posture};
@@ -267,46 +267,23 @@ pub async fn run(args: RunArgs, manager: &SandboxManager) -> Result<()> {
     }
 
     // Did anything actually go missing, or did the stream merely move?
-    //
-    // `since` moving is not enough on its own. A collector attaching to this
-    // box republishes the health record, and that lands within the first
-    // hundred milliseconds of a run often enough that the old rule — `since`
-    // later than `started_at` — put a warning about lost events on reports
-    // where the agent never changed and nothing was lost. Two things have to
-    // be true instead:
-    //
-    //   the stream moved *after* this run had already produced an event, so
-    //   there was something to lose; and
-    //
-    //   a different agent process is serving now, so it was actually lost
-    //   rather than delivered by the same agent through a republished view.
-    //
-    // A pid of zero on either side is an agent that predates the field: it
-    // cannot answer, and "cannot tell" is not "changed", so it reads as a
-    // re-attach rather than manufacturing a warning nobody can act on.
-    if !capture_since.is_empty() {
-        let after_first_event = store
-            .first_attributed_at(&run_id)
-            .ok()
-            .flatten()
-            .is_some_and(|first| capture_since > first);
-        let agent_changed =
-            agent_pid_before != 0 && agent_pid_after != 0 && agent_pid_before != agent_pid_after;
-
-        if after_first_event && agent_changed {
-            if let Err(e) = store.set_run_capture_restart(&run_id, &capture_since) {
-                tracing::warn!(error = %e, "could not record a run's capture interruption");
-            }
-            // Two calls rather than one `\`-continued literal: rustfmt joins a
-            // continued string back onto one line and the continuation's
-            // indentation survives into the message.
-            eprintln!("Warning: capture restarted at {capture_since}, during this run.");
-            eprintln!(
-                "         Its report is missing whatever the previous agent had not delivered."
-            );
-        } else if let Err(e) = store.set_run_capture_reattach(&run_id, &capture_since) {
-            tracing::warn!(error = %e, "could not record a run's capture re-attach");
-        }
+    // The rule, and why it is that rule, live in `run::capture_verdict`.
+    let first_attributed = store.first_attributed_at(&run_id).ok().flatten();
+    let verdict = run::capture_verdict(
+        &capture_since,
+        first_attributed.as_deref(),
+        agent_pid_before,
+        agent_pid_after,
+    );
+    if let Err(e) = store.set_run_capture(&run_id, verdict, &capture_since) {
+        tracing::warn!(error = %e, "could not record what happened to this run's capture");
+    }
+    if verdict == CaptureVerdict::Interrupted {
+        // Two calls rather than one `\`-continued literal: rustfmt joins a
+        // continued string back onto one line and the continuation's
+        // indentation survives into the message.
+        eprintln!("Warning: capture restarted at {capture_since}, during this run.");
+        eprintln!("         Its report is missing whatever the previous agent had not delivered.");
     }
 
     if checkpoint_start.is_some() || checkpoint_end.is_some() {

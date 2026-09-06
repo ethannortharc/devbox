@@ -312,6 +312,68 @@ impl fmt::Display for EndedBy {
     }
 }
 
+/// What a moving capture stream meant for one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureVerdict {
+    /// The stream never moved after this run began. Nothing to say.
+    Untouched,
+    /// It moved, but nothing was lost: either it moved before the run had
+    /// produced anything, or the same agent process went on delivering
+    /// through a view the collector merely republished.
+    Reattached,
+    /// It moved after the run had produced events, and a different agent
+    /// process is serving now. Whatever the old one had not yet delivered is
+    /// gone, and the report has to say so.
+    Interrupted,
+}
+
+/// Decide what a moving capture stream meant for one run.
+///
+/// A pure function on purpose. This decision used to live inline between
+/// reading the health record and writing the run row, where no test could
+/// reach it — and it was silently reverted twice, by a `git checkout --` that
+/// was meant to undo a scratch edit in the same file. Both times the whole
+/// suite stayed green, because the suite drives the store and the renderers
+/// and nothing drove the judgement. Now it can be driven directly.
+///
+/// - `since`: when the current stream was established, or empty if that was
+///   not after the run started.
+/// - `first_attributed`: the wall clock of the run's earliest attributed
+///   event, or `None` if it has none.
+/// - `pid_before` / `pid_after`: the agent process serving the box at the
+///   run's start and at its end. Zero means an agent too old to say.
+///
+/// Timestamps are compared as text, which is what they are everywhere else in
+/// this crate: RFC 3339, UTC, millisecond precision, fixed width.
+pub fn capture_verdict(
+    since: &str,
+    first_attributed: Option<&str>,
+    pid_before: u32,
+    pid_after: u32,
+) -> CaptureVerdict {
+    if since.is_empty() {
+        return CaptureVerdict::Untouched;
+    }
+
+    // Before the run produced anything there was nothing to lose. This is the
+    // ordinary case that used to raise a warning: a collector attaching to the
+    // box republishes its health record, and that lands inside the first
+    // hundred milliseconds of a run often enough to matter.
+    let after_first_event = first_attributed.is_some_and(|first| since > first);
+
+    // "Cannot tell" is deliberately not "changed". An agent too old to report
+    // its pid should not be able to manufacture a warning nobody can act on —
+    // at the cost of under-reporting a real interruption on such a box, which
+    // is the direction to be wrong in.
+    let agent_changed = pid_before != 0 && pid_after != 0 && pid_before != pid_after;
+
+    if after_first_event && agent_changed {
+        CaptureVerdict::Interrupted
+    } else {
+        CaptureVerdict::Reattached
+    }
+}
+
 /// How the start gate went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartGate {
@@ -1090,6 +1152,86 @@ mod tests {
             started_at: start.to_string(),
             ended_at: end.map(str::to_string),
         }
+    }
+
+    /// The five timings a moving capture stream can have.
+    ///
+    /// This decision was silently reverted twice — both times by a
+    /// `git checkout --` undoing a scratch edit in the same file, both times
+    /// with the whole suite still green, because it lived inline in `run()`
+    /// where nothing could reach it. These are the cases that would have gone
+    /// red.
+    #[test]
+    fn the_five_shapes_a_moving_capture_stream_can_have() {
+        const FIRST: &str = "2026-09-05T10:00:00.500Z";
+
+        // 1. The stream never moved after the run began: `since` arrives
+        //    empty, because the caller only fills it when it is later than
+        //    the run's start.
+        assert_eq!(
+            capture_verdict("", Some(FIRST), 100, 100),
+            CaptureVerdict::Untouched
+        );
+
+        // 2. It moved after the run started but before the run had produced
+        //    anything. Nothing existed to lose. This is the shape that used to
+        //    put a warning on ordinary reports: a collector attaching
+        //    republishes the health record, twenty-five milliseconds in.
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.025Z", Some(FIRST), 100, 200),
+            CaptureVerdict::Reattached,
+            "an attach before the first event is not an interruption"
+        );
+        // Including when the run never produced an event at all.
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.025Z", None, 100, 200),
+            CaptureVerdict::Reattached
+        );
+
+        // 3. After the first event, but the same agent is still serving — the
+        //    collector republished a view of a stream that never went away.
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.900Z", Some(FIRST), 100, 100),
+            CaptureVerdict::Reattached,
+            "the same agent delivered it; nothing was lost"
+        );
+
+        // 4. After the first event, and a different agent process. The one
+        //    case where something is actually gone.
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.900Z", Some(FIRST), 100, 200),
+            CaptureVerdict::Interrupted
+        );
+
+        // 5. An agent too old to report its pid. "Cannot tell" is not
+        //    "changed": it must not be able to manufacture a warning nobody
+        //    can act on, on either side of the run.
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.900Z", Some(FIRST), 0, 200),
+            CaptureVerdict::Reattached
+        );
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.900Z", Some(FIRST), 100, 0),
+            CaptureVerdict::Reattached
+        );
+        assert_eq!(
+            capture_verdict("2026-09-05T10:00:00.900Z", Some(FIRST), 0, 0),
+            CaptureVerdict::Reattached
+        );
+    }
+
+    #[test]
+    fn a_stream_that_moved_exactly_on_the_first_event_is_not_an_interruption() {
+        // The boundary. `since == first` means the stream was established at
+        // the same millisecond the first event was stamped, and the event is
+        // as likely to have arrived on the new stream as the old. Strictly
+        // later is what "after" has to mean, or the millisecond a run happens
+        // to start in decides whether it gets a warning.
+        const AT: &str = "2026-09-05T10:00:00.500Z";
+        assert_eq!(
+            capture_verdict(AT, Some(AT), 100, 200),
+            CaptureVerdict::Reattached
+        );
     }
 
     #[test]

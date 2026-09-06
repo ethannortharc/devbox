@@ -12,7 +12,8 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
 use super::run::{
-    ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag, StartGate,
+    ActiveRun, Attribution, Attributor, CaptureVerdict, EndedBy, RunRecord, RunStatus, RunTag,
+    StartGate,
 };
 
 /// The schema this build writes, recorded in `meta` under `schema`.
@@ -503,29 +504,30 @@ impl Store {
         Ok(())
     }
 
-    /// Record that capture restarted while this run was going — a different
-    /// agent process took over after the run had already produced events, so
-    /// whatever the old one had not delivered is gone.
-    pub fn set_run_capture_restart(&self, run_id: &str, at: &str) -> Result<()> {
+    /// Record what a moving capture stream meant for this run.
+    ///
+    /// One method taking the verdict, rather than one per column. The decision
+    /// is [`crate::obs::run::capture_verdict`]'s and this only writes it down —
+    /// which is also what stops the two from drifting apart: the judgement was
+    /// silently reverted twice while the suite stayed green, and a call site
+    /// that loses it now fails to compile rather than quietly writing the
+    /// wrong column.
+    ///
+    /// `Untouched` writes nothing. There is no column for "the stream did not
+    /// move", and a timestamp for it would be a fact about the collector
+    /// rather than about the run.
+    pub fn set_run_capture(&self, run_id: &str, verdict: CaptureVerdict, at: &str) -> Result<()> {
+        let column = match verdict {
+            CaptureVerdict::Untouched => return Ok(()),
+            CaptureVerdict::Interrupted => "capture_restarted_at",
+            CaptureVerdict::Reattached => "capture_reattached_at",
+        };
         self.conn
             .execute(
-                "UPDATE runs SET capture_restarted_at = ?2 WHERE run_id = ?1",
+                &format!("UPDATE runs SET {column} = ?2 WHERE run_id = ?1"),
                 params![run_id, at],
             )
-            .context("failed to record a run's capture interruption")?;
-        Ok(())
-    }
-
-    /// Record that capture re-attached without changing agent. Nothing was
-    /// lost; this is here so a reader can tell "nothing happened" from "the
-    /// stream was re-published and nothing happened".
-    pub fn set_run_capture_reattach(&self, run_id: &str, at: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET capture_reattached_at = ?2 WHERE run_id = ?1",
-                params![run_id, at],
-            )
-            .context("failed to record a run's capture re-attach")?;
+            .with_context(|| format!("failed to record a run's {column}"))?;
         Ok(())
     }
 
