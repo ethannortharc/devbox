@@ -12,8 +12,8 @@
 
 use devbox::obs::event::{Event, EventType, Exec, File, Net, Policy};
 use devbox::obs::run::{
-    ActiveRun, Attribution, Attributor, EndedBy, RunKind, RunRecord, RunStatus, is_run_id,
-    new_run_id,
+    ActiveRun, Attribution, Attributor, CaptureVerdict, EndedBy, RunKind, RunRecord, RunStatus,
+    is_run_id, new_run_id,
 };
 use devbox::obs::store::{Query, Store};
 use devbox::report::model::{RunReport, SCOPE_BOX};
@@ -1088,10 +1088,14 @@ fn only_a_stream_that_moved_after_events_and_changed_agent_is_an_interruption() 
         store.insert_batch_tagged(&events, &tags).unwrap();
 
         if let Some(at) = restart {
-            store.set_run_capture_restart(RUN, at).unwrap();
+            store
+                .set_run_capture(RUN, CaptureVerdict::Interrupted, at)
+                .unwrap();
         }
         if let Some(at) = reattach {
-            store.set_run_capture_reattach(RUN, at).unwrap();
+            store
+                .set_run_capture(RUN, CaptureVerdict::Reattached, at)
+                .unwrap();
         }
         store
     };
@@ -1179,7 +1183,7 @@ fn a_run_whose_capture_restarted_says_so_in_every_rendering() {
     live.ended_at = None;
     store.insert_run(&live).unwrap();
     store
-        .set_run_capture_restart(RUN, "2026-09-05T10:00:00.900Z")
+        .set_run_capture(RUN, CaptureVerdict::Interrupted, "2026-09-05T10:00:00.900Z")
         .unwrap();
 
     let record = store.get_run(RUN).unwrap().unwrap();
