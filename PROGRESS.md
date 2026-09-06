@@ -2244,3 +2244,44 @@ wave-2 checklist and will become the first issues of the next cycle:
 `RunRecord.file_scope`, a migration for pre-redaction rows, the broker's
 per-process monotonic clock, the run-start attribution race that can start
 a process tree mid-wrapper, and the amd64 CO-RE object once CI produces it.
+
+## 2026-09-05T23:40Z — 0.2.0 is out; the first green CI on GitHub
+
+**Released.** `v0.2.0` at `8d67295`:
+https://github.com/ethannortharc/devbox/releases/tag/v0.2.0 — `devbox-darwin-arm64`
+and `devbox-linux-amd64`, the names `install.sh` expects; the macOS binary
+downloaded and run on this host answers `devbox 0.2.0`. `v5-main` is on
+GitHub as well as the Gitea origin.
+
+**What the first runs of the workflows taught.** The release workflow died
+three times in its first step: on the 24.04 runners `bpftool` is a virtual
+package, and the runners' Azure kernels have no `linux-tools` package to
+provide it, so the binary now comes from libbpf's static releases. CI's
+stable rustc is 1.98, two lints ahead of the 1.94 here; golangci-lint's
+`latest` resolved to the v1 line and rejected the v2 config, and once v2
+actually ran on Linux it read the two `*_linux.go` files the macOS linter
+never compiles and found two unchecked closes. bpf2go names the amd64 pair
+`devbox_x86_bpfel`, not `devbox_amd64_bpfel`, which is why build.rs and the
+eBPF lane had never found it; the pair CI generated is now committed, so an
+x86-64 source build embeds the eBPF agent too.
+
+**Two defects the Linux runner surfaced.** W2-8: the mcp wrapper trusted
+`process_group(0)` and, when it did not take effect, recorded the caller's
+process group, so the reaper's SIGTERM took the whole `cargo test` down —
+the two tests covering that path had `if !/proc/self/stat.exists() { return }`
+at the top and had never run on macOS. The wrapper now proves `pgid == $$`
+or makes its own group with `setsid` or records nothing; every reaper refuses
+its own and its parent's group; the host side calls `killpg` with the same
+refusals. W2-9: 147 collector daemons on this host were not a takeover leak
+but `tests/mcp.rs` running the real binary with a throwaway `HOME`, three
+per test run; tests now set `DEVBOX_NO_COLLECTOR_DAEMON`, takeover stops a
+daemon by its process group, orphans inside a state directory are reclaimed
+on the next lifecycle command, and `doctor` counts them.
+
+**Gate** — CI run 34000677054 on `4993ad5`: Rust (ubuntu), Rust (macOS),
+MSRV, Go, eBPF all green; locally 900 tests across 15 binaries, clippy
+1.98.1 clean, Go lint clean under `GOOS=linux --build-tags ebpf`.
+
+**Open, for Ethan.** Publish the drafted release notes on the GitHub
+release; fast-forward `main` to `v5-main`; whether to rename the project.
+Everything else is in the checklist that becomes the next cycle's issues.
