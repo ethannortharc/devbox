@@ -124,6 +124,29 @@ pub enum LayerAction {
         #[arg(long)]
         force: bool,
     },
+    /// Delete old checkpoints
+    ///
+    /// By default this only touches checkpoints nobody has claimed: the ones a
+    /// run pinned are its report's evidence and are kept. `--runs-older-than`
+    /// lets those go too, once the run has ended, ended long enough ago, and
+    /// its report has actually been written.
+    Prune {
+        #[command(flatten)]
+        boxarg: BoxArg,
+
+        /// How many unclaimed checkpoints to keep
+        #[arg(long, value_name = "N", default_value_t = checkpoint::DEFAULT_KEEP)]
+        keep: usize,
+
+        /// Also drop the checkpoints of runs that ended longer ago than this
+        /// and whose report has been written (7d, 24h, 90m, 3600s)
+        #[arg(long, value_name = "AGE")]
+        runs_older_than: Option<String>,
+
+        /// Say what would be deleted, and delete nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 impl LayerAction {
@@ -142,7 +165,8 @@ impl LayerAction {
             | Self::Checkpoint { boxarg, .. }
             | Self::Checkpoints { boxarg }
             | Self::Restore { boxarg, .. }
-            | Self::CheckpointRm { boxarg, .. } => boxarg,
+            | Self::CheckpointRm { boxarg, .. }
+            | Self::Prune { boxarg, .. } => boxarg,
         }
     }
 }
@@ -333,7 +357,134 @@ pub async fn run(args: LayerArgs, manager: &SandboxManager) -> Result<()> {
                     .unwrap_or_default(),
             );
         }
+
+        LayerAction::Prune {
+            keep,
+            runs_older_than,
+            dry_run,
+            ..
+        } => {
+            prune(
+                manager,
+                runtime.as_ref(),
+                &name,
+                keep,
+                runs_older_than.as_deref(),
+                dry_run,
+            )
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+/// `devbox layer prune`.
+///
+/// Two passes, because they answer different questions. The unclaimed
+/// checkpoints go by count — keep the last `keep`, drop the rest — and the
+/// ones a run pinned go by age, and only once that run's report exists as a
+/// file. A run's report links to its start and end trees; until the report is
+/// written, deleting them destroys the only thing that could have produced it.
+async fn prune(
+    manager: &SandboxManager,
+    runtime: &dyn crate::runtime::Runtime,
+    name: &str,
+    keep: usize,
+    runs_older_than: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let checkpoints = checkpoint::list(runtime, name).await?;
+    let unclaimed = checkpoint::prune_plan(&checkpoints, keep);
+
+    // Read the runs before deleting anything, so a failure part-way leaves the
+    // store agreeing with the guest rather than ahead of it.
+    let expired = match runs_older_than {
+        None => Vec::new(),
+        Some(age) => {
+            let span = checkpoint::parse_age(age)?;
+            let cutoff =
+                (chrono::Utc::now() - span).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let store = Store::open(&crate::obs::collector::store_path(&manager.state_dir, name))?;
+            let pins = run_pins(manager, &store, name)?;
+            checkpoint::expired_run_pins(&pins, &cutoff)
+        }
+    };
+
+    if unclaimed.is_empty() && expired.is_empty() {
+        println!(
+            "Nothing to prune: {} checkpoints, all claimed or within the keep budget.",
+            checkpoints.len()
+        );
+        return Ok(());
+    }
+
+    if dry_run {
+        for id in &unclaimed {
+            println!("would delete {id} (unclaimed)");
+        }
+        for pin in &expired {
+            for id in [pin.start.as_ref(), pin.end.as_ref()].into_iter().flatten() {
+                println!("would delete {id} (run {}, report written)", pin.run_id);
+            }
+        }
+        return Ok(());
+    }
+
+    let dropped = checkpoint::prune(runtime, name, keep).await?;
+    for id in &dropped {
+        println!("Deleted checkpoint {id}.");
+    }
+
+    if !expired.is_empty() {
+        let store = Store::open(&crate::obs::collector::store_path(&manager.state_dir, name))?;
+        let released = checkpoint::drop_run_pins(runtime, name, &expired).await?;
+        for pin in &expired {
+            // The run stays in `devbox runs`; only its claim on two trees is
+            // released, and the row must stop naming them.
+            store.forget_run_checkpoints(&pin.run_id)?;
+        }
+        for id in &released {
+            println!("Deleted checkpoint {id} (run evidence, report kept).");
+        }
+        println!(
+            "Released {} run{} holding {} checkpoint{}.",
+            expired.len(),
+            if expired.len() == 1 { "" } else { "s" },
+            released.len(),
+            if released.len() == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
+/// Every run's claim on its checkpoints, with whether its report exists.
+fn run_pins(
+    manager: &SandboxManager,
+    store: &Store,
+    name: &str,
+) -> Result<Vec<checkpoint::RunPin>> {
+    // Every run, not a page of them: this is the one caller that has to see
+    // the old ones, because old is exactly what it is looking for.
+    let runs = store.list_runs(usize::MAX)?;
+    let mut pins = Vec::new();
+    for run in runs {
+        let reported = crate::report::RunReport::directory(&manager.state_dir, name, &run.run_id)
+            .join("report.json")
+            .exists();
+        pins.push(checkpoint::RunPin {
+            run_id: run.run_id.clone(),
+            ended_at: run.ended_at.clone(),
+            start: run
+                .checkpoint_start
+                .as_deref()
+                .and_then(|id| CheckpointId::parse(id).ok()),
+            end: run
+                .checkpoint_end
+                .as_deref()
+                .and_then(|id| CheckpointId::parse(id).ok()),
+            reported,
+        });
+    }
+    Ok(pins)
 }

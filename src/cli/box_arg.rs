@@ -173,6 +173,7 @@ mod tests {
             // the box is the second one — the `snapshot save` shape.
             case(&["layer", "restore", "01kfx9m2"], &[], &["--name"]),
             case(&["layer", "checkpoint-rm", "01kfx9m2"], &[], &["--name"]),
+            case(&["layer", "prune"], &[], &["--name"]),
             // `run`'s trailing command is `last = true`, so the box still has
             // to be readable from in front of the `--`.
             case(&["run"], &["--", "true"], &["--name"]),

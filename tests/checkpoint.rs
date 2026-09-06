@@ -8,8 +8,8 @@
 
 use devbox::obs::run::ActiveRun;
 use devbox::sandbox::checkpoint::{
-    Checkpoint, CheckpointId, diff_trees, parse_manifests, prune_plan, refuse_pinned_delete,
-    refuse_while_running, resolve_id,
+    Checkpoint, CheckpointId, RunPin, diff_trees, expired_run_pins, parse_age, parse_manifests,
+    prune_plan, refuse_pinned_delete, refuse_while_running, resolve_id,
 };
 use devbox::sandbox::overlay::{
     ChangeStatus, EntryKind, OverlayChange, TreeEntry, parse_tree_listing,
@@ -766,4 +766,98 @@ fn a_runs_checkpoints_are_never_pruned() {
     // Two of the three unpinned ones go; neither pinned one is touched, and
     // the pinned pair does not consume the keep budget either.
     assert_eq!(doomed, vec!["01k4sz000000000000", "01k4sz000000000002"]);
+}
+
+// ---------------------------------------------------------------------------
+// Letting a finished run's checkpoints go
+// ---------------------------------------------------------------------------
+
+fn pin(run: &str, ended: Option<&str>, reported: bool) -> RunPin {
+    RunPin {
+        run_id: run.to_string(),
+        ended_at: ended.map(str::to_string),
+        start: Some(CheckpointId::at(1, 1)),
+        end: Some(CheckpointId::at(2, 2)),
+        reported,
+    }
+}
+
+const CUTOFF: &str = "2026-09-01T00:00:00.000Z";
+
+#[test]
+fn a_run_that_ended_long_ago_with_a_report_may_let_its_checkpoints_go() {
+    let old = pin("r1", Some("2026-08-01T00:00:00.000Z"), true);
+    assert_eq!(
+        expired_run_pins(std::slice::from_ref(&old), CUTOFF),
+        vec![old]
+    );
+}
+
+#[test]
+fn a_recent_run_keeps_them() {
+    let recent = pin("r1", Some("2026-09-05T00:00:00.000Z"), true);
+    assert!(expired_run_pins(&[recent], CUTOFF).is_empty());
+}
+
+/// The condition that makes this safe at all. Until the report is on disk, the
+/// checkpoints are the only thing it could still be built from — so a run that
+/// never rendered one keeps them however old it is.
+#[test]
+fn a_run_whose_report_was_never_written_keeps_them_however_old_it_is() {
+    let ancient = pin("r1", Some("2020-01-01T00:00:00.000Z"), false);
+    assert!(expired_run_pins(&[ancient], CUTOFF).is_empty());
+}
+
+#[test]
+fn a_run_that_has_not_ended_keeps_them() {
+    assert!(expired_run_pins(&[pin("r1", None, true)], CUTOFF).is_empty());
+    assert!(expired_run_pins(&[pin("r1", Some(""), true)], CUTOFF).is_empty());
+}
+
+#[test]
+fn a_run_holding_no_checkpoints_is_not_reported_as_freeable() {
+    let mut empty = pin("r1", Some("2020-01-01T00:00:00.000Z"), true);
+    empty.start = None;
+    empty.end = None;
+    assert!(expired_run_pins(&[empty], CUTOFF).is_empty());
+}
+
+/// An aborted run has a start and no end. The one it does hold is still
+/// collected.
+#[test]
+fn a_run_with_only_a_start_still_releases_it() {
+    let mut half = pin("r1", Some("2020-01-01T00:00:00.000Z"), true);
+    half.end = None;
+    let freed = expired_run_pins(&[half], CUTOFF);
+    assert_eq!(freed.len(), 1);
+    assert!(freed[0].start.is_some() && freed[0].end.is_none());
+}
+
+#[test]
+fn ages_parse_in_the_spellings_people_type() {
+    assert_eq!(parse_age("7d").unwrap(), chrono::Duration::days(7));
+    assert_eq!(parse_age("24h").unwrap(), chrono::Duration::hours(24));
+    assert_eq!(parse_age("90m").unwrap(), chrono::Duration::minutes(90));
+    assert_eq!(
+        parse_age(" 3600s ").unwrap(),
+        chrono::Duration::seconds(3600)
+    );
+    for bad in ["", "7", "d", "7w", "-1d", "seven days", "1.5h"] {
+        assert!(parse_age(bad).is_err(), "{bad:?} was accepted");
+    }
+}
+
+/// `--runs-older-than` is a separate, narrower decision. It must not become a
+/// way for the count-based pass to start evicting a report's evidence.
+#[test]
+fn the_count_based_pass_still_never_touches_a_runs_checkpoints() {
+    let claimed = Checkpoint {
+        id: CheckpointId::at(1, 1),
+        label: None,
+        created_at: "2020-01-01T00:00:00Z".into(),
+        run_id: Some("r1".into()),
+        files: 0,
+        bytes: 0,
+    };
+    assert!(prune_plan(&[claimed], 0).is_empty());
 }

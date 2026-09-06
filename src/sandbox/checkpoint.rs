@@ -593,6 +593,37 @@ pub async fn delete(runtime: &dyn Runtime, box_name: &str, id: &CheckpointId) ->
     Ok(())
 }
 
+/// Delete the checkpoints a set of expired runs was pinning.
+///
+/// Returns what it deleted. The run rows themselves stay: `devbox runs` is the
+/// history, and losing it would be a worse trade than the disk this recovers.
+/// Their checkpoint columns are cleared by the caller, so nothing is left
+/// naming a tree that is gone.
+pub async fn drop_run_pins(
+    runtime: &dyn Runtime,
+    box_name: &str,
+    expired: &[RunPin],
+) -> Result<Vec<CheckpointId>> {
+    let mut dropped = Vec::new();
+    for pin in expired {
+        for id in [pin.start.as_ref(), pin.end.as_ref()].into_iter().flatten() {
+            let dir = checkpoint_dir(id);
+            let result = runtime
+                .run_as_root(box_name, &format!("rm -rf '{dir}'"), false)
+                .await?;
+            if result.exit_code != 0 {
+                bail!(
+                    "Failed to drop checkpoint {id} of run {}: {}",
+                    pin.run_id,
+                    result.stderr.trim()
+                );
+            }
+            dropped.push(id.clone());
+        }
+    }
+    Ok(dropped)
+}
+
 /// Drop the oldest checkpoints until only `keep` unpinned ones remain.
 ///
 /// Returns what it deleted.
@@ -615,6 +646,71 @@ pub async fn prune(
     }
 
     Ok(doomed)
+}
+
+/// A run's claim on two checkpoints, as far as pruning is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPin {
+    pub run_id: String,
+    /// When the run ended, RFC3339. `None` for a run still going.
+    pub ended_at: Option<String>,
+    pub start: Option<CheckpointId>,
+    pub end: Option<CheckpointId>,
+    /// Whether the run's report has been written to disk.
+    ///
+    /// The whole safety condition. A checkpoint pinned by a run is evidence
+    /// the report links to; once the report exists as a file it is
+    /// self-contained, and the tree it was built from is a convenience rather
+    /// than the record.
+    pub reported: bool,
+}
+
+/// Which runs have held their checkpoints long enough to let them go.
+///
+/// Three conditions, and dropping any one of them makes this unsafe:
+///
+/// - the run has **ended** — a live run's end checkpoint has not been taken
+///   yet, and its start one is what the end will be compared against;
+/// - it ended **before** the cutoff;
+/// - its **report has been written** — otherwise the evidence outlives nothing
+///   and the report can never be built.
+///
+/// A run whose end time cannot be parsed is kept. An unreadable timestamp is
+/// not evidence of age, and this is a delete.
+pub fn expired_run_pins(pins: &[RunPin], cutoff: &str) -> Vec<RunPin> {
+    pins.iter()
+        .filter(|pin| pin.reported)
+        .filter(|pin| {
+            pin.ended_at
+                .as_deref()
+                .is_some_and(|ended| !ended.is_empty() && ended < cutoff)
+        })
+        .filter(|pin| pin.start.is_some() || pin.end.is_some())
+        .cloned()
+        .collect()
+}
+
+/// `7d`, `24h`, `90m`, `3600s` — the spellings a person types for "older than".
+///
+/// Deliberately small: this exists to answer one flag, and a general duration
+/// grammar would accept `1y2mo` and then have to decide what a month is.
+pub fn parse_age(raw: &str) -> Result<chrono::Duration> {
+    let raw = raw.trim();
+    let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let amount: i64 = digits
+        .parse()
+        .with_context(|| format!("'{raw}' is not a duration like 7d, 24h, 90m or 3600s"))?;
+    if amount < 0 {
+        bail!("'{raw}' is a negative duration");
+    }
+    let span = match unit {
+        "d" => chrono::Duration::days(amount),
+        "h" => chrono::Duration::hours(amount),
+        "m" => chrono::Duration::minutes(amount),
+        "s" => chrono::Duration::seconds(amount),
+        _ => bail!("'{raw}' is not a duration like 7d, 24h, 90m or 3600s"),
+    };
+    Ok(span)
 }
 
 /// Which checkpoints a [`prune`] would delete, oldest first.
