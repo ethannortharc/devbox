@@ -1029,6 +1029,48 @@ async fn install_ubuntu_services(runtime: &dyn Runtime, name: &str, sets: &[Stri
         }
     }
 
+    // Never fatal: a box whose sshd will not take the drop-in is a box where
+    // `devbox code` has no broker, not a box that failed to provision.
+    if let Err(error) = write_sshd_accept_env(runtime, name).await {
+        eprintln!("Warning: could not configure sshd to accept the broker environment: {error:#}");
+    }
+
+    Ok(())
+}
+
+/// The sshd drop-in that lets the credential broker's variables through.
+pub(crate) const SSHD_DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/60-devbox-broker.conf";
+
+/// Tell a non-NixOS box's sshd to accept the broker's environment.
+///
+/// Only for images whose sshd reads `/etc/ssh/sshd_config.d/`, which is
+/// Debian and Ubuntu's layout — their stock `sshd_config` opens with an
+/// `Include` of that directory. NixOS has neither the `Include` nor a writable
+/// `/etc/ssh`: its `sshd_config` is a symlink into the store, so its half of
+/// this lives in `nix/devbox-module.nix` and arrives through a rebuild.
+///
+/// **Unverified against a real Ubuntu box** — no Ubuntu image was provisioned
+/// on the machine this was written on. The path and the `Include` behaviour
+/// are Debian policy, not a measurement here.
+pub(crate) async fn write_sshd_accept_env(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    let content = format!(
+        "# Written by devbox. Lets `devbox code` carry the credential broker's\n\
+         # variables into a Remote SSH session; no credential is stored here.\n\
+         {}\n",
+        crate::broker::accept_env_line()
+    );
+    run_in_vm(runtime, name, "mkdir -p /etc/ssh/sshd_config.d", false).await?;
+    write_file_to_vm(runtime, name, SSHD_DROPIN_PATH, &content).await?;
+    // A drop-in nothing re-reads is a drop-in that does nothing. `reload`
+    // rather than `restart`, so an editor already attached over ssh keeps its
+    // session.
+    let _ = run_in_vm(
+        runtime,
+        name,
+        "systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true",
+        false,
+    )
+    .await;
     Ok(())
 }
 
@@ -1551,6 +1593,23 @@ async fn write_file_to_vm(
 /// the module is where `enableEbpf` turns into both the `-no-ebpf` flag and
 /// the capability set that flag needs, so a box whose agent is replaced has to
 /// receive the module this host build ships, not the one it was born with.
+/// Push the current `devbox-module.nix` into a box.
+///
+/// The module is the declarative half of several devbox behaviours — the
+/// overlay mount, the package set, sshd's `AcceptEnv` — and a box keeps
+/// whichever copy was current when it was provisioned. Anything that changes
+/// the module has to push it before rebuilding, or the rebuild imports the old
+/// one and reports success.
+pub(crate) async fn write_devbox_module(runtime: &dyn Runtime, name: &str) -> Result<()> {
+    write_file_to_vm(
+        runtime,
+        name,
+        "/etc/devbox/devbox-module.nix",
+        NIX_DEVBOX_MODULE,
+    )
+    .await
+}
+
 pub(crate) async fn write_obsd_module(runtime: &dyn Runtime, name: &str) -> Result<()> {
     write_file_to_vm(
         runtime,

@@ -74,6 +74,15 @@ pub struct GuestAgent {
     /// unit — a container without systemd, or a box provisioned before the
     /// service existed.
     pub exec_start: Option<String>,
+    /// The `AcceptEnv` patterns sshd is configured with, read from
+    /// `sshd_config` plus the Debian-style drop-in directory.
+    ///
+    /// Textual, not `sshd -T`: the authoritative answer needs root and a
+    /// loadable host key, and this runs on the path of every box entry. The
+    /// approximation can only be wrong by missing an `Include` somewhere
+    /// unusual, and being wrong that way costs one redundant reconfigure —
+    /// the same direction [`parse_probe`] already errs in.
+    pub accept_env: Vec<String>,
 }
 
 /// Whether the box's agent is the one this host would install.
@@ -185,8 +194,12 @@ if command -v systemctl >/dev/null 2>&1; then
 else
   unit=
 fi
+acceptenv=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+  | sed -n 's/^[[:space:]]*[Aa][Cc][Cc][Ee][Pp][Tt][Ee][Nn][Vv][[:space:]][[:space:]]*//p' \
+  | tr '\n' ' ')
 printf 'sha=%s\n' "$sha"
 printf 'unit=%s\n' "$unit"
+printf 'acceptenv=%s\n' "$acceptenv"
 "#;
 
 /// Read [`PROBE`] output.
@@ -197,6 +210,7 @@ printf 'unit=%s\n' "$unit"
 pub fn parse_probe(stdout: &str) -> GuestAgent {
     let mut digest = Digest::Unhashable;
     let mut exec_start = None;
+    let mut accept_env = Vec::new();
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -214,10 +228,17 @@ pub fn parse_probe(stdout: &str) -> GuestAgent {
             // unit prints nothing for `ExecStart`, and a box without
             // systemd never ran it at all.
             "unit" if !value.is_empty() => exec_start = Some(value.to_string()),
+            // Several `AcceptEnv` lines are additive in sshd, and the probe
+            // joins them with spaces, so one split covers both spellings.
+            "acceptenv" => accept_env = value.split_whitespace().map(str::to_string).collect(),
             _ => {}
         }
     }
-    GuestAgent { digest, exec_start }
+    GuestAgent {
+        digest,
+        exec_start,
+        accept_env,
+    }
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -285,6 +306,8 @@ pub enum Scope {
 pub struct Refresh {
     pub pushed: bool,
     pub unit_rewritten: bool,
+    /// sshd was reconfigured to accept the credential broker's environment.
+    pub ssh_env_rewritten: bool,
     pub restarted: bool,
     /// What was found but deliberately not acted on.
     pub notes: Vec<String>,
@@ -292,7 +315,7 @@ pub struct Refresh {
 
 impl Refresh {
     pub fn changed(&self) -> bool {
-        self.pushed || self.unit_rewritten
+        self.pushed || self.unit_rewritten || self.ssh_env_rewritten
     }
 }
 
@@ -313,9 +336,20 @@ pub async fn ensure_current(
     let verdict = verdict(host, &guest.digest);
     let host_uses_ebpf = crate::obs::uses_ebpf(runtime.name());
     let unit_current = unit_is_current(guest.exec_start.as_deref(), host_uses_ebpf);
+    // A box provisioned before the broker existed has an sshd that drops the
+    // broker's variables, so `devbox code` opens an editor with no credentials
+    // and nothing says why. Same shape of problem as a stale unit — the box
+    // works, one capability is silently absent — so it is fixed on the same
+    // path, under the same claim.
+    //
+    // Only where a broker is configured, though. `wants_ssh_env` is what keeps
+    // a host that has never stored a secret from paying for a rebuild it has
+    // no use for.
+    let ssh_env_current = !crate::broker::wants_ssh_env(&manager.state_dir)
+        || crate::broker::sshd_accepts_broker_env(&guest.accept_env);
 
     let mut refresh = Refresh::default();
-    if !verdict.is_stale() && unit_current {
+    if !verdict.is_stale() && unit_current && ssh_env_current {
         return Ok(refresh);
     }
 
@@ -344,17 +378,42 @@ pub async fn ensure_current(
         refresh.pushed = true;
     }
 
-    if !unit_current {
+    if !unit_current || !ssh_env_current {
         match scope {
             Scope::Full => {
-                rewrite_unit(manager, runtime, name, image, claim).await?;
-                refresh.unit_rewritten = true;
+                // One reconfigure for both, because on NixOS each of them
+                // costs the same `nixos-rebuild` and doing it twice would
+                // take the box's firewall down twice.
+                reconfigure(
+                    manager,
+                    runtime,
+                    name,
+                    image,
+                    claim,
+                    !unit_current,
+                    !ssh_env_current,
+                )
+                .await?;
+                refresh.unit_rewritten = !unit_current;
+                refresh.ssh_env_rewritten = !ssh_env_current;
             }
-            Scope::BinaryOnly => refresh.notes.push(format!(
-                "the {AGENT_UNIT} unit still passes {}-no-ebpf; it is regenerated by the next \
-                 devbox command that starts or enters this box",
-                if host_uses_ebpf { "" } else { "no " }
-            )),
+            Scope::BinaryOnly => {
+                if !unit_current {
+                    refresh.notes.push(format!(
+                        "the {AGENT_UNIT} unit still passes {}-no-ebpf; it is regenerated by \
+                         the next devbox command that starts or enters this box",
+                        if host_uses_ebpf { "" } else { "no " }
+                    ));
+                }
+                if !ssh_env_current {
+                    refresh.notes.push(
+                        "sshd does not yet accept the credential broker's environment, so \
+                         `devbox code` opens an editor without it; the next devbox command \
+                         that starts or enters this box fixes it"
+                            .to_string(),
+                    );
+                }
+            }
         }
     }
 
@@ -364,29 +423,61 @@ pub async fn ensure_current(
     Ok(refresh)
 }
 
-/// Regenerate the service definition from this host's decisions.
+/// Regenerate the parts of a box's configuration this host decides.
+///
+/// Two things can be out of date and both are declarative, so both are fixed
+/// here: the agent's service definition, and sshd's `AcceptEnv`.
 ///
 /// The two images take different routes to the same place. Ubuntu's unit is a
-/// file devbox writes, so rewriting it and reloading systemd is the whole job.
-/// A NixOS unit is *built*: the flag lives in `configuration.nix`, and the
-/// capability set the agent needs for eBPF is derived from it inside
-/// `obsd-module.nix` — which is why this cannot be a drop-in that only edits
-/// `ExecStart`. An agent given `-no-ebpf` removed but not `CAP_BPF` fails its
-/// attach and degrades, silently, to exactly the state this was meant to fix.
-async fn rewrite_unit(
+/// file devbox writes and its sshd reads a drop-in directory, so each is one
+/// file plus a reload. A NixOS box is *built*: the agent's `-no-ebpf` flag
+/// lives in `configuration.nix` and the capability set eBPF needs is derived
+/// from it inside `obsd-module.nix` — which is why this cannot be a drop-in
+/// that only edits `ExecStart`; an agent given `-no-ebpf` removed but not
+/// `CAP_BPF` fails its attach and degrades, silently, to exactly the state
+/// this was meant to fix. `AcceptEnv` has the same shape: `/etc/ssh` is a
+/// symlink into the store, there is no `Include` and no drop-in directory, so
+/// the only honest way in is `devbox-module.nix` and a rebuild.
+///
+/// One rebuild covers both. Doing them separately would take the box's
+/// firewall down twice, and each `nixos-rebuild` is a window where the saved
+/// posture is not installed.
+async fn reconfigure(
     manager: &super::SandboxManager,
     runtime: &dyn Runtime,
     name: &str,
     image: &str,
     claim: &crate::web::build::BoxClaim,
+    unit_stale: bool,
+    ssh_env_stale: bool,
 ) -> Result<()> {
     if image == "nixos" {
-        println!("Regenerating the {AGENT_UNIT} service for box '{name}'...");
+        match (unit_stale, ssh_env_stale) {
+            (true, true) => println!(
+                "Regenerating the {AGENT_UNIT} service and sshd configuration for box '{name}'..."
+            ),
+            (true, false) => {
+                println!("Regenerating the {AGENT_UNIT} service for box '{name}'...")
+            }
+            (false, true) => println!(
+                "Reconfiguring sshd in box '{name}' so `devbox code` can carry the \
+                 credential broker's environment..."
+            ),
+            (false, false) => return Ok(()),
+        }
+        if ssh_env_stale {
+            // The `AcceptEnv` setting lives in the module, and the box has
+            // whichever copy of it was current when the box was provisioned.
+            // Regenerating `configuration.nix` alone would import a module
+            // that still has no `AcceptEnv` — the same "same version,
+            // different bytes" trap this module exists for.
+            super::provision::write_devbox_module(runtime, name).await?;
+        }
         super::provision::write_obsd_module(runtime, name).await?;
         super::provision::ensure_nixos_config(runtime, name, true).await?;
         crate::nix::rebuild::nixos_rebuild(runtime, name)
             .await
-            .with_context(|| format!("regenerate the {AGENT_UNIT} service in box '{name}'"))?;
+            .with_context(|| format!("reconfigure box '{name}'"))?;
         // The rebuild took devbox's nftables table with it. Every other
         // rebuild path in this codebase restores here, and each one was added
         // after the box had already come back with open egress once.
@@ -395,14 +486,23 @@ async fn rewrite_unit(
             .map_err(|error| {
                 error
                     .context(PostureLost)
-                    .context(format!("box '{name}' was rebuilt to update its agent"))
+                    .context(format!("box '{name}' was rebuilt to bring it up to date"))
             })?;
     } else {
-        println!("Rewriting the {AGENT_UNIT} service for box '{name}'...");
-        super::provision::install_ubuntu_obsd_service(runtime, name).await?;
-        let _ = runtime
-            .run_as_root(name, "systemctl daemon-reload", false)
-            .await;
+        if unit_stale {
+            println!("Rewriting the {AGENT_UNIT} service for box '{name}'...");
+            super::provision::install_ubuntu_obsd_service(runtime, name).await?;
+            let _ = runtime
+                .run_as_root(name, "systemctl daemon-reload", false)
+                .await;
+        }
+        if ssh_env_stale {
+            println!(
+                "Reconfiguring sshd in box '{name}' so `devbox code` can carry the \
+                 credential broker's environment..."
+            );
+            super::provision::write_sshd_accept_env(runtime, name).await?;
+        }
     }
     Ok(())
 }
@@ -457,6 +557,71 @@ mod tests {
 
     const HOST: &str = "aa11bb22cc33dd44ee55ff6607182930aabbccddeeff00112233445566778899";
     const OTHER: &str = "0011223344556677889900aabbccddeeff112233445566778899aabbccddeeff";
+
+    #[test]
+    fn the_probe_reads_the_boxes_accept_env() {
+        let guest = parse_probe(
+            "sha=absent\nunit=\nacceptenv=DEVBOX_BROKER_URL DEVBOX_BROKER_TOKEN LANG\n",
+        );
+        assert_eq!(
+            guest.accept_env,
+            vec!["DEVBOX_BROKER_URL", "DEVBOX_BROKER_TOKEN", "LANG"]
+        );
+
+        // A box whose sshd names nothing — which is NixOS's default, measured
+        // on devbox-devtest: `sshd -T` prints no `acceptenv` line at all.
+        assert!(
+            parse_probe("sha=absent\nunit=\nacceptenv=\n")
+                .accept_env
+                .is_empty()
+        );
+        // And one provisioned before the probe asked the question.
+        assert!(parse_probe("sha=absent\nunit=\n").accept_env.is_empty());
+    }
+
+    /// A box that is otherwise perfect but drops the broker's ssh environment
+    /// still has to be reconfigured, or `devbox code` opens an editor with no
+    /// credentials and nothing anywhere says why.
+    #[test]
+    fn an_sshd_that_drops_the_broker_environment_is_not_current() {
+        let ours: Vec<String> = crate::broker::SSH_ACCEPT_ENV
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(crate::broker::sshd_accepts_broker_env(&ours));
+        assert!(!crate::broker::sshd_accepts_broker_env(&[]));
+
+        let stale = parse_probe("sha=absent\nunit=\nacceptenv=LANG LC_*\n");
+        assert!(!crate::broker::sshd_accepts_broker_env(&stale.accept_env));
+
+        let current = parse_probe(&format!(
+            "sha=absent\nunit=\nacceptenv={}\n",
+            crate::broker::SSH_ACCEPT_ENV.join(" ")
+        ));
+        assert!(crate::broker::sshd_accepts_broker_env(&current.accept_env));
+    }
+
+    /// The nix module and the Rust constant are two spellings of one list, in
+    /// two languages, and only one of them is compiled here.
+    #[test]
+    fn the_nix_module_and_the_rust_constant_name_the_same_variables() {
+        let module = include_str!("../../nix/devbox-module.nix");
+        let line = module
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("AcceptEnv ="))
+            .expect("devbox-module.nix sets AcceptEnv");
+        let value = line
+            .split_once('"')
+            .and_then(|(_, rest)| rest.rsplit_once('"'))
+            .map(|(value, _)| value)
+            .expect("AcceptEnv is a quoted string");
+        assert_eq!(
+            value,
+            crate::broker::SSH_ACCEPT_ENV.join(" "),
+            "nix/devbox-module.nix has drifted from broker::SSH_ACCEPT_ENV"
+        );
+    }
 
     #[test]
     fn the_same_bytes_are_current() {

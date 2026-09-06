@@ -807,6 +807,7 @@ impl SandboxManager {
         crate::broker::daemon::ensure_running(self);
         if just_started {
             self.refresh_guest_gitconfig(runtime.as_ref(), name).await;
+            self.refresh_code_ssh_env(runtime.as_ref(), name).await;
         }
 
         Ok((state, runtime, claim))
@@ -822,6 +823,34 @@ impl SandboxManager {
     /// mean "no variables", never "the command fails".
     pub async fn broker_env(&self, runtime: &dyn Runtime, name: &str) -> Vec<(String, String)> {
         crate::broker::guest_env(&self.state_dir, runtime, name).await
+    }
+
+    /// Refresh the `SetEnv` lines in this box's `devbox code` ssh block.
+    ///
+    /// The block is what carries the broker variables into a Remote SSH
+    /// session, and the token in it is rotated by the start this is called
+    /// from — so without this, the first thing a user does after restarting a
+    /// box in their editor is authenticate with last session's token.
+    ///
+    /// Never creates a block. `devbox code` owns creating it; a box that has
+    /// never been opened in an editor gets nothing written to the user's ssh
+    /// configuration.
+    async fn refresh_code_ssh_env(&self, runtime: &dyn Runtime, name: &str) {
+        let host = format!("devbox-{name}");
+        // Cheap first: reading the file and finding no block costs nothing,
+        // while resolving the environment probes the guest.
+        match crate::cli::code::has_managed_block(&host) {
+            Ok(false) | Err(_) => return,
+            Ok(true) => {}
+        }
+        let env = self.broker_env(runtime, name).await;
+        match crate::cli::code::refresh_broker_env(&host, &env) {
+            Ok(true) => tracing::debug!(box_id = %name, "refreshed the ssh broker environment"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(box_id = %name, %error, "could not refresh the ssh broker environment")
+            }
+        }
     }
 
     /// Rewrite the devbox-managed `insteadOf` stanza in the guest gitconfig.

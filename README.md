@@ -718,13 +718,20 @@ Devbox configures `~/.ssh/config` for the box, refreshes the overlay layer, and
 launches the editor with Remote SSH pointed at `/workspace`. Works with any
 editor that supports [Remote SSH](https://code.visualstudio.com/docs/remote/ssh).
 
+The editor's remote terminal gets the credential broker too. Devbox adds
+`SetEnv` lines to the box's `Host` block and configures the box's sshd to accept
+them, so a terminal in VS Code sees the same `DEVBOX_BROKER_*` and
+`ANTHROPIC_BASE_URL` as `devbox shell` does. The token travels per connection
+and is never written inside the box; it is rotated whenever the box starts, and
+the `Host` block is refreshed with it.
+
 > **NixOS compatibility:** devbox enables `nix-ld` in the VM so VS Code Server
 > and other dynamically linked binaries run without issues.
 >
-> **Known gap:** `devbox code` does not inject the broker environment. The
-> editor's remote server is started by VS Code, not by devbox, so there is no
-> guest command line to wrap. Use `devbox shell` or `devbox run` for anything
-> that needs a brokered credential.
+> **One-time reconfigure:** a box created before you ran `devbox secret set` has
+> an sshd that drops those variables. The next devbox command that starts or
+> enters it reconfigures the box — on NixOS that is a `nixos-rebuild`, so it
+> takes a few minutes once. Hosts with no secrets stored are never reconfigured.
 
 ---
 
