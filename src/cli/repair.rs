@@ -8,6 +8,9 @@
 //! What lives here is the other kind: a repair that touches the user's own
 //! files. Nothing in this module runs without being asked for by name.
 
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
@@ -40,6 +43,13 @@ pub struct StaleHomeArgs {
     /// Do not ask before merging, archiving and removing
     #[arg(long)]
     pub yes: bool,
+
+    /// Archive and merge, but leave the directory in the box
+    ///
+    /// Credentials are still deleted: they are never archived and never
+    /// merged, so keeping them would only keep the leak.
+    #[arg(long)]
+    pub keep: bool,
 }
 
 /// The settings worth carrying over, in the order they are reported.
@@ -186,11 +196,22 @@ async fn stale_home(args: StaleHomeArgs, manager: &SandboxManager) -> Result<()>
         return Ok(());
     }
 
+    let host_path = archive_path(&manager.state_dir, &name, chrono::Utc::now());
+
     print!("{}", describe(&stale, &survey, &real_home));
     println!();
     println!("Settings worth keeping are copied into {real_home} — never over a file already");
-    println!("there. The rest is archived, then the directory is removed.");
-    println!("Any credential left there by devbox v4 is deleted, not archived.");
+    println!(
+        "there. Everything is archived to {} on this",
+        host_path.display()
+    );
+    println!("machine, not inside the box, and only then is the directory removed.");
+    println!("Any credential found there is deleted rather than archived.");
+    if args.keep {
+        println!();
+        println!("--keep: the directory stays in the box. Credentials are still deleted —");
+        println!("they are neither archived nor merged, so keeping them would keep only the leak.");
+    }
 
     if args.dry_run {
         println!("\n--dry-run: nothing was changed.");
@@ -201,22 +222,65 @@ async fn stale_home(args: StaleHomeArgs, manager: &SandboxManager) -> Result<()>
         return Ok(());
     }
 
-    let archive = format!(
-        "{real_home}/.devbox-stale-home-{}.tar.gz",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    // Named after the archive it becomes, so a pack left behind by a crash is
+    // recognisable rather than mysterious.
+    let guest_pack = format!(
+        "/tmp/{}",
+        host_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "devbox-stale-home.tar.gz".to_string())
     );
-    apply(
-        runtime.as_ref(),
-        &name,
-        &stale,
-        &real_home,
-        &username,
-        &archive,
-    )
-    .await?;
+
+    apply(runtime.as_ref(), &name, &stale, &real_home, &username).await?;
+    let archived =
+        archive_to_host(runtime.as_ref(), &name, &stale, &guest_pack, &host_path).await?;
+    std::fs::set_permissions(&host_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("protect {}", host_path.display()))?;
+
+    println!(
+        "archived to {} ({})",
+        host_path.display(),
+        archived.describe()
+    );
+
+    if args.keep {
+        println!("{stale} was left in the box (--keep).");
+    } else {
+        let removed = runtime
+            .run_as_root(&name, &format!("rm -rf '{stale}'"), false)
+            .await?;
+        if removed.exit_code != 0 {
+            bail!(
+                "the archive is safe on the host, but {stale} could not be removed from the \
+                 box: {}",
+                removed.stderr.trim()
+            );
+        }
+        println!("removed {stale} from the box.");
+    }
     drop(claim);
-    println!("Archived to {archive} and removed {stale}.");
     Ok(())
+}
+
+/// Where a box's stale-home archive goes on the host.
+///
+/// `<state_dir>/archives/`, not `boxes/<name>/`: that directory is removed
+/// with the box, and this is user data rescued *from* the box — it has to
+/// outlive `devbox destroy`, which is exactly the command someone reaches for
+/// after deciding the box is beyond saving.
+///
+/// The timestamp is UTC and sorts lexically, so a directory of these reads in
+/// the order they were made whatever the host's locale does.
+pub fn archive_path(
+    state_dir: &Path,
+    box_name: &str,
+    when: chrono::DateTime<chrono::Utc>,
+) -> PathBuf {
+    state_dir.join("archives").join(format!(
+        "{box_name}-stale-home-{}.tar.gz",
+        when.format("%Y%m%dT%H%M%SZ")
+    ))
 }
 
 fn confirm() -> Result<bool> {
@@ -245,19 +309,16 @@ async fn survey_stale(runtime: &dyn Runtime, name: &str, stale: &str) -> Result<
     Ok(parse_survey(&result.stdout))
 }
 
-/// Merge what is worth keeping, archive everything, then remove the directory.
+/// Merge what is worth keeping, and delete what must never leave the box.
 ///
-/// The archive is of the *whole* directory rather than only the part that was
-/// not merged. It is the safety net, and a net with holes cut in it for the
-/// files that were merged successfully is worth less than the disk it saves —
-/// it is also the only record of what a skipped merge left behind.
+/// Everything here is reversible-ish and cheap; the archive and the removal
+/// are the parts that are not, and they happen after this returns.
 async fn apply(
     runtime: &dyn Runtime,
     name: &str,
     stale: &str,
     real_home: &str,
     username: &str,
-    archive: &str,
 ) -> Result<()> {
     for entry in WORTH_MERGING {
         let from = format!("{stale}/{entry}");
@@ -310,11 +371,12 @@ async fn apply(
     }
 
     // Before the archive, never after: a credential that reached the tarball
-    // is a credential this repair put back into the box.
+    // is a credential this repair put back into the box — and now that the
+    // tarball leaves the box, one that reached it would be on the host too.
     for entry in CREDENTIALS {
         let path = format!("{stale}/{entry}");
         let command = format!(
-            "if [ -e '{path}' ]; then rm -f '{path}' && echo removed; else echo absent; fi"
+            "if [ -e '{path}' ]; then rm -rf '{path}' && echo removed; else echo absent; fi"
         );
         let result = runtime.run_as_root(name, &command, false).await?;
         if result.stdout.trim() == "removed" {
@@ -322,21 +384,167 @@ async fn apply(
         }
     }
 
-    let command = format!(
+    Ok(())
+}
+
+/// Pack the stale directory in the box, bring it to the host, and prove it
+/// arrived intact.
+///
+/// Nothing in the box is removed here. The caller does that, and only after
+/// this has returned — which is the whole ordering: an archive that is still
+/// only inside the box is not an archive, and a directory deleted before the
+/// copy is verified is data destroyed on the strength of a transfer nobody
+/// checked.
+///
+/// On any failure the box is left exactly as it was, the temporary pack is
+/// removed from it, and a half-written file on the host is removed too. A
+/// partial `.tar.gz` sitting in `~/.devbox/archives` would look like a
+/// successful rescue.
+async fn archive_to_host(
+    runtime: &dyn Runtime,
+    name: &str,
+    stale: &str,
+    guest_pack: &str,
+    host_path: &Path,
+) -> Result<Archived> {
+    let pack = format!(
         "set -e; \
-         tar czf '{archive}' -C \"$(dirname '{stale}')\" \"$(basename '{stale}')\"; \
-         chown {username}:users '{archive}'; \
-         chmod 600 '{archive}'; \
-         rm -rf '{stale}'"
+         rm -f '{guest_pack}'; \
+         tar czf '{guest_pack}' -C \"$(dirname '{stale}')\" \"$(basename '{stale}')\"; \
+         printf 'bytes=%s\\n' \"$(stat -c %s '{guest_pack}')\"; \
+         printf 'sha=%s\\n' \"$(sha256sum '{guest_pack}' | cut -d' ' -f1)\""
     );
-    let result = runtime.run_as_root(name, &command, false).await?;
-    if result.exit_code != 0 {
+    let packed = runtime.run_as_root(name, &pack, false).await?;
+    if packed.exit_code != 0 {
         bail!(
-            "nothing was removed: the archive could not be written: {}",
-            result.stderr.trim()
+            "nothing was changed: the archive could not be built in the box: {}",
+            packed.stderr.trim()
         );
     }
-    Ok(())
+    let Some(expected) = Archived::parse(&packed.stdout) else {
+        let _ = remove_guest_pack(runtime, name, guest_pack).await;
+        bail!(
+            "nothing was changed: the box did not report the archive's size and checksum, so \
+             the copy could not have been verified"
+        );
+    };
+
+    if let Some(parent) = host_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect {}", parent.display()))?;
+    }
+
+    let transfer = runtime.copy_from(name, guest_pack, host_path).await;
+    let verdict = transfer
+        .and_then(|()| measure_host_file(host_path))
+        .and_then(|actual| {
+            if actual == expected {
+                Ok(actual)
+            } else {
+                Err(anyhow::anyhow!(
+                    "the copy does not match what the box packed ({} vs {})",
+                    actual.describe(),
+                    expected.describe()
+                ))
+            }
+        });
+
+    // The pack inside the box goes either way: it has served its purpose on
+    // success, and on failure it is 200 MB of the box's disk with nothing
+    // pointing at it.
+    let _ = remove_guest_pack(runtime, name, guest_pack).await;
+
+    match verdict {
+        Ok(archived) => Ok(archived),
+        Err(error) => {
+            let _ = std::fs::remove_file(host_path);
+            Err(error.context(format!(
+                "nothing was removed from box '{name}': the archive did not reach the host \
+                 intact"
+            )))
+        }
+    }
+}
+
+async fn remove_guest_pack(runtime: &dyn Runtime, name: &str, guest_pack: &str) -> Result<()> {
+    runtime
+        .run_as_root(name, &format!("rm -f '{guest_pack}'"), false)
+        .await
+        .map(|_| ())
+}
+
+/// The size and checksum of an archive, on whichever side reported them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Archived {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl Archived {
+    /// Read `bytes=` and `sha=` out of the packing command's output.
+    ///
+    /// `None` unless both arrived and the checksum looks like one. A missing
+    /// value must not become a comparison that trivially succeeds — that would
+    /// turn the verification into a formality and delete the directory on the
+    /// strength of it.
+    pub fn parse(stdout: &str) -> Option<Self> {
+        let mut bytes = None;
+        let mut sha256 = None;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("bytes=") {
+                bytes = value.trim().parse::<u64>().ok().filter(|n| *n > 0);
+            } else if let Some(value) = line.strip_prefix("sha=") {
+                let value = value.trim();
+                if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    sha256 = Some(value.to_ascii_lowercase());
+                }
+            }
+        }
+        Some(Self {
+            bytes: bytes?,
+            sha256: sha256?,
+        })
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, sha256 {}",
+            crate::cli::watch::human_bytes(self.bytes),
+            &self.sha256[..12]
+        )
+    }
+}
+
+/// Hash and measure the file that arrived, without holding it in memory.
+///
+/// A home directory's archive is hundreds of megabytes; reading it into a
+/// `Vec` to hash it would work and would also be the kind of thing that only
+/// shows up on someone else's larger box.
+fn measure_host_file(path: &Path) -> Result<Archived> {
+    use sha2::{Digest, Sha256};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("read back {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut bytes = 0u64;
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .with_context(|| format!("read back {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    Ok(Archived { bytes, sha256 })
 }
 
 #[cfg(test)]
@@ -441,6 +649,198 @@ mod tests {
             assert_ne!(*merged, ".", "{merged}");
             assert!(!merged.starts_with('/'), "{merged}");
         }
+    }
+
+    /// The archive lives on the host, under `archives/`, and outlives the box.
+    ///
+    /// Not `boxes/<name>/`: that goes with `devbox destroy`, which is the
+    /// command someone reaches for right after deciding the box is beyond
+    /// saving — taking the rescued data with it.
+    #[test]
+    fn the_archive_goes_somewhere_destroy_does_not_reach() {
+        let when = chrono::DateTime::parse_from_rfc3339("2026-09-06T17:55:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let path = archive_path(Path::new("/home/u/.devbox"), "devtest", when);
+        assert_eq!(
+            path,
+            PathBuf::from("/home/u/.devbox/archives/devtest-stale-home-20260906T175530Z.tar.gz")
+        );
+        let inside_box = Path::new("/home/u/.devbox/boxes/devtest");
+        assert!(!path.starts_with(inside_box), "{}", path.display());
+        // Sorts lexically in the order they were made, whatever the locale.
+        let later = archive_path(
+            Path::new("/home/u/.devbox"),
+            "devtest",
+            when + chrono::Duration::seconds(1),
+        );
+        assert!(path < later);
+    }
+
+    /// Both halves must arrive, and the checksum must look like one. A missing
+    /// value that defaulted would make the verification a formality — and the
+    /// directory is deleted on the strength of it.
+    #[test]
+    fn a_half_reported_archive_is_not_a_verification() {
+        let good = Archived::parse(&format!("bytes=193333663\nsha={}\n", "ab".repeat(32)))
+            .expect("both halves");
+        assert_eq!(good.bytes, 193_333_663);
+        assert!(good.describe().contains("184.4MB"), "{}", good.describe());
+
+        for stdout in [
+            "",
+            "bytes=193333663\n",
+            &format!("sha={}\n", "ab".repeat(32)),
+            // Zero bytes is not an archive of a directory with files in it.
+            &format!("bytes=0\nsha={}\n", "ab".repeat(32)),
+            // Not a digest.
+            "bytes=10\nsha=nohasher\n",
+            "bytes=10\nsha=\n",
+        ] {
+            assert_eq!(Archived::parse(stdout), None, "{stdout:?}");
+        }
+    }
+
+    // ── the transfer, scripted ────────────────────────────
+
+    use crate::runtime::ExecResult;
+    use crate::runtime::stub::StubRuntime;
+
+    const PAYLOAD: &[u8] = b"a tarball's worth of bytes";
+
+    /// A box that packs `PAYLOAD` and reports its real size and digest.
+    fn box_that_packs(sha: &str, bytes: u64) -> StubRuntime {
+        let reply = format!("bytes={bytes}\nsha={sha}\n");
+        StubRuntime::new()
+            .with_exec_cmd(move |_, cmd, _| {
+                let joined = cmd.join(" ");
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: if joined.contains("tar czf") {
+                        reply.clone()
+                    } else {
+                        String::new()
+                    },
+                    stderr: String::new(),
+                })
+            })
+            .with_copy_from(|_, _, host_path| {
+                std::fs::write(host_path, PAYLOAD)?;
+                Ok(())
+            })
+    }
+
+    fn payload_sha() -> String {
+        crate::sandbox::provision::sha256_hex(PAYLOAD)
+    }
+
+    /// The good path: what the box packed is what arrived, so the caller is
+    /// told the size and digest it can go on to delete a directory over.
+    #[tokio::test]
+    async fn a_verified_copy_reports_what_arrived_and_clears_the_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("archives/devtest.tar.gz");
+        let guest = box_that_packs(&payload_sha(), PAYLOAD.len() as u64);
+
+        let archived = archive_to_host(&guest, "devtest", "/home/u", "/tmp/pack", &host)
+            .await
+            .expect("the copy matches what was packed");
+
+        assert_eq!(archived.bytes, PAYLOAD.len() as u64);
+        assert_eq!(archived.sha256, payload_sha());
+        assert!(host.exists());
+        assert!(guest.called("copy_from"));
+        // The pack inside the box has served its purpose.
+        assert!(
+            guest
+                .exec_commands()
+                .iter()
+                .any(|c| c.contains("rm -f '/tmp/pack'")),
+            "{:?}",
+            guest.exec_commands()
+        );
+        // The directory itself is the caller's to remove, never this function's.
+        assert!(
+            !guest
+                .exec_commands()
+                .iter()
+                .any(|c| c.contains("rm -rf '/home/u'")),
+            "{:?}",
+            guest.exec_commands()
+        );
+    }
+
+    /// A copy that does not match is a copy that did not happen. The host's
+    /// half-written file goes, and the error says the box was left alone —
+    /// because the caller is about to decide whether to delete a directory.
+    #[tokio::test]
+    async fn a_mismatched_copy_leaves_nothing_behind_and_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("archives/devtest.tar.gz");
+        // The box claims a digest that is not the payload's.
+        let guest = box_that_packs(&"ab".repeat(32), PAYLOAD.len() as u64);
+
+        let error = archive_to_host(&guest, "devtest", "/home/u", "/tmp/pack", &host)
+            .await
+            .expect_err("a mismatch is not an archive");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("nothing was removed"), "{message}");
+        assert!(!host.exists(), "the half-written archive is gone");
+        assert!(
+            guest
+                .exec_commands()
+                .iter()
+                .any(|c| c.contains("rm -f '/tmp/pack'")),
+            "{:?}",
+            guest.exec_commands()
+        );
+    }
+
+    /// And a transfer that never happened is the same answer, by the same
+    /// route: nothing on the host, nothing removed from the box.
+    #[tokio::test]
+    async fn a_failed_transfer_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("archives/devtest.tar.gz");
+        let reply = format!("bytes=26\nsha={}\n", payload_sha());
+        let guest = StubRuntime::new()
+            .with_exec_cmd(move |_, _, _| {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: reply.clone(),
+                    stderr: String::new(),
+                })
+            })
+            .with_copy_from(|_, _, _| bail!("no route to the box"));
+
+        let error = archive_to_host(&guest, "devtest", "/home/u", "/tmp/pack", &host)
+            .await
+            .expect_err("a transfer that failed is not an archive");
+        assert!(format!("{error:#}").contains("nothing was removed"));
+        assert!(!host.exists());
+    }
+
+    /// A box that cannot say what it packed cannot have the copy verified, so
+    /// it is not one — even though the transfer itself would have succeeded.
+    #[tokio::test]
+    async fn a_box_that_reports_no_checksum_is_refused_before_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("archives/devtest.tar.gz");
+        let guest = StubRuntime::new().with_exec_cmd(|_, _, _| {
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout: "bytes=26\n".to_string(),
+                stderr: String::new(),
+            })
+        });
+
+        let error = archive_to_host(&guest, "devtest", "/home/u", "/tmp/pack", &host)
+            .await
+            .expect_err("no checksum, no verification");
+        assert!(format!("{error:#}").contains("could not have been verified"));
+        assert!(!guest.called("copy_from"), "it never got as far as copying");
+        assert!(!host.exists());
     }
 
     /// Long listings stop, and say that they stopped.
