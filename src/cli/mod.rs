@@ -30,6 +30,7 @@ pub mod shell;
 pub mod snapshot;
 pub mod status;
 pub mod stop;
+pub mod store;
 pub mod upgrade;
 pub mod use_cmd;
 pub mod watch;
@@ -101,6 +102,9 @@ pub enum Command {
 
     /// Print a run's report
     Report(report::ReportArgs),
+
+    /// Maintain a box's event store
+    Store(store::StoreArgs),
 
     /// Stop a sandbox (preserves state)
     Stop(stop::StopArgs),
@@ -244,6 +248,7 @@ impl Command {
             Command::Run(args) => run::run(args, manager).await,
             Command::Runs(args) => runs::run(args, manager).await,
             Command::Report(args) => report::run(args, manager).await,
+            Command::Store(args) => store::run(args, manager).await,
             Command::Stop(args) => stop::run(args, manager).await,
             Command::Destroy(args) => destroy::run(args, manager).await,
             Command::List(args) => list::run(args, manager).await,

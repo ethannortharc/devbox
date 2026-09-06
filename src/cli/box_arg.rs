@@ -177,6 +177,7 @@ mod tests {
             // to be readable from in front of the `--`.
             case(&["run"], &["--", "true"], &["--name"]),
             case(&["runs"], &[], &["--name"]),
+            case(&["store", "redact"], &[], &["--name"]),
             case(&["export"], &["--format", "jsonl"], &["--name"]),
             case(&["broker", "reach"], &[], &["--name"]),
             case(&["sets", "list"], &[], &["--name"]),
@@ -240,7 +241,7 @@ mod tests {
     /// wrong slot, such as `snapshot save nightly devtest` binding `nightly`
     /// as the box.
     fn selected_box(argv: &[String]) -> Option<String> {
-        use crate::cli::{behavior, broker, nix_cmd, policy, sets, snapshot};
+        use crate::cli::{behavior, broker, nix_cmd, policy, sets, snapshot, store};
 
         let cli = Cli::try_parse_from(argv).expect("argv should parse");
         match cli.command.expect("a subcommand") {
@@ -273,6 +274,9 @@ mod tests {
                 | nix_cmd::NixAction::Remove { boxarg, .. } => boxarg.name().map(str::to_string),
             },
             Command::Layer(a) => a.action.boxarg().name().map(str::to_string),
+            Command::Store(a) => match a.command {
+                store::StoreCommand::Redact(a) => a.boxarg.name().map(str::to_string),
+            },
             Command::Sets(a) => match a.command {
                 sets::SetsCommand::List(a) => a.boxarg.name().map(str::to_string),
                 sets::SetsCommand::Apply(a) => a.boxarg.name().map(str::to_string),

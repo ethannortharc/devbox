@@ -161,6 +161,13 @@ before this landed still holds the original bytes in its `raw` column on the
 host's own disk, and is redacted when it is read. What is protected is
 everything devbox renders — which is what leaves the machine.
 
+To rewrite those older rows as well — for a database you want to hand over,
+archive, or simply not keep — `devbox store redact <box>` sweeps the stored
+argvs and reports how many changed; `--dry-run` reports the same count without
+writing. It is a command rather than a migration because it rewrites an
+append-only audit log, which is a decision to make once rather than a side
+effect of an upgrade.
+
 ## Run attribution
 
 A run is a command devbox started; attribution decides which events belong to
