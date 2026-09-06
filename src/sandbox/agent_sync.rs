@@ -370,6 +370,28 @@ impl Refresh {
     pub fn changed(&self) -> bool {
         self.pushed || self.unit_rewritten || self.ssh_env_rewritten || self.home_realigned
     }
+
+    /// One line naming what was put right, or `None` when nothing was.
+    ///
+    /// Each of these is a different thing to have been wrong, and a caller
+    /// that announces the agent swap for all of them tells the user something
+    /// untrue about three quarters of the time.
+    pub fn summary(&self) -> Option<String> {
+        let mut done: Vec<&str> = Vec::new();
+        if self.pushed {
+            done.push("its observability agent is now the one this devbox ships");
+        }
+        if self.unit_rewritten {
+            done.push("its agent service was regenerated");
+        }
+        if self.ssh_env_rewritten {
+            done.push("its sshd now carries the credential broker's environment");
+        }
+        if self.home_realigned {
+            done.push("its passwd entry now names the home its login shell uses");
+        }
+        (!done.is_empty()).then(|| done.join("; "))
+    }
 }
 
 /// Bring a box's agent up to the one this host binary carries.
