@@ -74,6 +74,7 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W4 | W4-6 `exec` and `shell` repair the box before they record a run | `v5/exec-repairs` (`a0a31c0`, `6381f1b`) | **DONE** |
 | W4 | W4-8 the stale-home archive lands on the host; `--keep` | `v5/stale-home-host` (`bf0caa7`) | **DONE** |
 | W4 | W4-7 README, docs, ADR-0072…0074, release notes, version 0.2.2 | `v5/docs-022` | **DONE** |
+| W4 | W4-9 the MCP wrapper writes its pgid file atomically (`.tmp` + `mv`); the reaper's contract on an empty file; 150/150 loops | `v5/pgid-atomic` (`c09f970`) | **DONE** |
 
 ## Environment notes
 
