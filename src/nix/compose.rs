@@ -616,10 +616,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &declared.into_iter().collect(),
-            None,
-            None,
-            None,
-            None,
+            &crate::nix::sets::GuestShape::default(),
         );
         assert!(
             toml.contains("\"terraform\" = \"nixpkgs#terraform\""),
@@ -737,10 +734,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &sel.declared_sources().into_iter().collect(),
-            None,
-            None,
-            None,
-            None,
+            &crate::nix::sets::GuestShape::default(),
         );
         assert_eq!(
             toml.matches("\"terraform\" =").count(),

@@ -646,15 +646,14 @@ pub async fn post_cache_setup(
     };
 
     // Update state file with current sandbox metadata
-    let state_toml = generate_state_toml(
-        sets,
-        languages,
-        &username,
-        Some(vm_home.as_str()),
-        runtime.name(),
-        mount_mode,
-        &package_names,
-    );
+    let shape = crate::nix::sets::GuestShape {
+        user: Some(username.clone()),
+        home: Some(vm_home.clone()),
+        runtime: Some(runtime.name().to_string()),
+        mount_mode: Some(mount_mode.to_string()),
+        workspace_nofail: workspace_nofail_for(runtime, name).await,
+    };
+    let state_toml = generate_state_toml(sets, languages, &shape, &package_names);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     if let Err(error) = install_obsd_binary(runtime, name).await {
@@ -793,15 +792,14 @@ async fn provision_nixos(
     .await?;
 
     // 5. Push devbox-state.toml (includes mount_mode for overlay setup)
-    let state_toml = generate_state_toml(
-        sets,
-        languages,
-        &username,
-        Some(home_dir.as_str()),
-        runtime.name(),
-        mount_mode,
-        packages,
-    );
+    let shape = crate::nix::sets::GuestShape {
+        user: Some(username.clone()),
+        home: Some(home_dir.clone()),
+        runtime: Some(runtime.name().to_string()),
+        mount_mode: Some(mount_mode.to_string()),
+        workspace_nofail: workspace_nofail_for(runtime, name).await,
+    };
+    let state_toml = generate_state_toml(sets, languages, &shape, packages);
     write_file_to_vm(runtime, name, "/etc/devbox/devbox-state.toml", &state_toml).await?;
 
     // 6. Push devbox-module.nix
@@ -1349,13 +1347,49 @@ fn strip_credential_sections(content: &str) -> String {
 // ── Shared Helpers ──────────────────────────────────────────
 
 /// Generate devbox-state.toml content from active sets and languages.
+/// Whether this box's `/workspace` may carry `nofail`.
+///
+/// Decided once, at the box's birth, and never revisited. `nofail` is what
+/// keeps an overlay that cannot be assembled from taking `local-fs.target`
+/// down and dropping the guest into emergency mode with no sshd — but adding
+/// it to a box that already has the mount is what W3-10 found leaves that box
+/// unable to complete any rebuild at all: `switch-to-configuration` reloads a
+/// mount unit whose options changed, a reload of an overlay is a remount, and
+/// overlayfs answers every one of those with
+/// `No changes allowed in reconfigure`. The switch then exits 4 and NixOS
+/// rolls the generation back, for good, because `/etc` has already moved.
+///
+/// So: a box with no state file has never been provisioned and gets it; a box
+/// that already says `true` keeps it; a box that has a state file and does not
+/// say so was built without it and must never be given it. Reprovisioning an
+/// existing box therefore preserves whatever that box was born with, which is
+/// the case a naive "new boxes get nofail" rule would get wrong.
+async fn workspace_nofail_for(runtime: &dyn Runtime, name: &str) -> bool {
+    let result = runtime
+        .exec_cmd(name, &["cat", "/etc/devbox/devbox-state.toml"], false)
+        .await;
+    let Ok(result) = result else {
+        // The box could not be asked. `false` leaves the mount exactly as it
+        // is, which is the answer that cannot break anything.
+        return false;
+    };
+    if result.exit_code != 0 {
+        // No state file: this box is being provisioned for the first time and
+        // its `/workspace` does not exist yet, so the options are still free.
+        return true;
+    }
+    result
+        .stdout
+        .parse::<toml::Value>()
+        .ok()
+        .map(|doc| crate::nix::sets::GuestShape::read(&doc).workspace_nofail)
+        .unwrap_or(false)
+}
+
 fn generate_state_toml(
     sets: &[String],
     languages: &[String],
-    username: &str,
-    home: Option<&str>,
-    runtime: &str,
-    mount_mode: &str,
+    shape: &crate::nix::sets::GuestShape,
     packages: &[String],
 ) -> String {
     let set_names = [
@@ -1371,6 +1405,7 @@ fn generate_state_toml(
     ];
     let lang_names = ["go", "rust", "python", "node", "java", "ruby"];
 
+    let username = shape.user.as_deref().unwrap_or("dev");
     let mut toml = String::from("[user]\n");
     toml.push_str(&format!("name = \"{username}\"\n"));
     // The home the box's login shell actually uses, so `devbox-module.nix` can
@@ -1380,7 +1415,7 @@ fn generate_state_toml(
     // Omitted rather than guessed when the box could not be asked: a wrong
     // value here is worse than the default, because it moves the entry away
     // from wherever the keys really are.
-    if let Some(home) = home {
+    if let Some(home) = &shape.home {
         toml.push_str(&format!("home = \"{home}\"\n"));
     }
     toml.push('\n');
@@ -1403,11 +1438,19 @@ fn generate_state_toml(
     }
 
     toml.push_str("\n[sandbox]\n");
+    let mount_mode = shape.mount_mode.as_deref().unwrap_or("overlay");
     toml.push_str(&format!("mount_mode = \"{mount_mode}\"\n"));
     // Which hypervisor the box runs under. The module gates the Incus guest
     // agent on it: on Lima there is no incus host to talk to, so the agent
     // fails and systemd restarts it every five seconds forever.
+    let runtime = shape.runtime.as_deref().unwrap_or("incus");
     toml.push_str(&format!("runtime = \"{runtime}\"\n"));
+    // Only when true, and only ever decided at the box's birth: writing the
+    // key onto a box that never had it is what changes a mounted overlay's
+    // options, which no rebuild can then apply.
+    if shape.workspace_nofail {
+        toml.push_str("workspace_nofail = true\n");
+    }
 
     // Ad-hoc packages. Quoted, because an attribute path like
     // `python312Packages.ipython` is otherwise read as a nested table and the
@@ -2671,6 +2714,22 @@ fn pick_vm_home(username: &str, shell_user: &str, shell_home: &str, passwd_home:
 mod tests {
     use super::*;
 
+    /// The box shape most of these tests do not care about.
+    fn shape(
+        user: &str,
+        home: Option<&str>,
+        runtime: &str,
+        mount_mode: &str,
+    ) -> crate::nix::sets::GuestShape {
+        crate::nix::sets::GuestShape {
+            user: Some(user.to_string()),
+            home: home.map(str::to_string),
+            runtime: Some(runtime.to_string()),
+            mount_mode: Some(mount_mode.to_string()),
+            workspace_nofail: false,
+        }
+    }
+
     use crate::runtime::SandboxStatus;
 
     /// A box that answers the username probe however the test says.
@@ -2938,10 +2997,7 @@ mod tests {
         let toml = generate_state_toml(
             &sets,
             &langs,
-            "testuser",
-            Some("/home/testuser.guest"),
-            "lima",
-            "overlay",
+            &shape("testuser", Some("/home/testuser.guest"), "lima", "overlay"),
             &[],
         );
 
@@ -2968,7 +3024,7 @@ mod tests {
             "lang-rust".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", None, "lima", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, &shape("dev", None, "lima", "overlay"), &[]);
 
         assert!(toml.contains("rust = true"));
         assert!(toml.contains("go = false"));
@@ -2984,7 +3040,7 @@ mod tests {
             "ai-code".to_string(),
         ];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "dev", None, "lima", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, &shape("dev", None, "lima", "overlay"), &[]);
 
         assert!(toml.contains("ai_code = true"));
         assert!(toml.contains("ai_infra = false"));
@@ -2998,10 +3054,7 @@ mod tests {
         let before = generate_state_toml(
             &["system".to_string(), "shell".to_string()],
             &["go".to_string()],
-            "ethan",
-            None,
-            "incus",
-            "writable",
+            &shape("ethan", None, "incus", "writable"),
             &["ripgrep".to_string()],
         );
         let after = with_user_home(&before, "/home/ethan.guest").expect("rewritten");
@@ -3023,7 +3076,7 @@ mod tests {
     /// that has already been repaired must not be rewritten forever.
     #[test]
     fn recording_the_home_twice_says_the_same_thing() {
-        let base = generate_state_toml(&[], &[], "ethan", None, "lima", "overlay", &[]);
+        let base = generate_state_toml(&[], &[], &shape("ethan", None, "lima", "overlay"), &[]);
         let once = with_user_home(&base, "/home/ethan.guest").unwrap();
         let twice = with_user_home(&once, "/home/ethan.guest").unwrap();
         assert_eq!(once, twice);
@@ -3040,7 +3093,7 @@ mod tests {
     #[test]
     fn the_state_file_records_which_hypervisor_the_box_runs_under() {
         for runtime in ["lima", "incus", "docker"] {
-            let toml = generate_state_toml(&[], &[], "dev", None, runtime, "overlay", &[]);
+            let toml = generate_state_toml(&[], &[], &shape("dev", None, runtime, "overlay"), &[]);
             let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
             assert_eq!(parsed["sandbox"]["runtime"].as_str(), Some(runtime));
             assert_eq!(parsed["sandbox"]["mount_mode"].as_str(), Some("overlay"));
@@ -3052,7 +3105,7 @@ mod tests {
     /// really are, which is strictly worse than the NixOS default.
     #[test]
     fn a_home_that_is_not_known_is_left_out_rather_than_guessed() {
-        let toml = generate_state_toml(&[], &[], "dev", None, "lima", "overlay", &[]);
+        let toml = generate_state_toml(&[], &[], &shape("dev", None, "lima", "overlay"), &[]);
         assert!(toml.contains("name = \"dev\""), "{toml}");
         assert!(!toml.contains("home ="), "{toml}");
         // The section still has to parse: `[user]` then a blank line then
@@ -3067,10 +3120,7 @@ mod tests {
         let toml = generate_state_toml(
             &[],
             &[],
-            "ethan",
-            Some("/home/ethan.guest"),
-            "lima",
-            "overlay",
+            &shape("ethan", Some("/home/ethan.guest"), "lima", "overlay"),
             &[],
         );
         let parsed: toml::Value = toml.parse().expect("the state file is valid TOML");
@@ -3082,7 +3132,7 @@ mod tests {
     fn generate_state_toml_bare() {
         let sets = vec![];
         let langs = vec![];
-        let toml = generate_state_toml(&sets, &langs, "user", None, "lima", "overlay", &[]);
+        let toml = generate_state_toml(&sets, &langs, &shape("user", None, "lima", "overlay"), &[]);
 
         assert!(toml.contains("system = false"));
         assert!(toml.contains("go = false"));
