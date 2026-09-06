@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -283,6 +284,25 @@ impl IncusRuntime {
 
 #[async_trait]
 impl Runtime for IncusRuntime {
+    async fn copy_from(&self, name: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        // `incus file pull [<remote>:]<instance>/<path> <target path>`. Note
+        // the separator: Incus joins the instance and the path with a **slash**
+        // where Lima, Docker and Multipass all use a colon — a colon here would
+        // be read as a remote name. Checked against the Incus manpage for
+        // `incus file pull` (linuxcontainers.org/incus/docs/main, `main`), whose
+        // own example is `incus file pull foo/etc/hosts .`.
+        //
+        // Not verified on a live Incus host: this machine has none.
+        let source = format!("{}{guest_path}", Self::vm_name(name));
+        run_ok(
+            "incus",
+            &["file", "pull", &source, &host_path.to_string_lossy()],
+        )
+        .await
+        .with_context(|| format!("copy {guest_path} out of box '{name}'"))?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "incus"
     }
