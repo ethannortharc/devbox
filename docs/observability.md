@@ -121,7 +121,33 @@ over rather than deferring to an equal version number.
 `devbox doctor` also reports the daemon's last published counters, then probes
 running guests for BTF, nftables, vsock/Unix-socket transport, the installed
 agent, the capture source and the file scope. The daemon log is
-`~/.devbox/logs/collector.log`.
+`~/.devbox/logs/collector.log`, and the broker's is `broker.log` beside it.
+Both default to `info` — only for the `__collector` and `__broker` processes,
+not for your terminal — because at `warn` the log was almost empty and a
+handover appeared in it as an exit followed by an unrelated start.
+
+### Handover
+
+When a newer build replaces a running daemon, neither side of that can
+describe it: the one being stopped only knows it was signalled, and the one
+starting only knows the lock was free. The process that *made* the decision is
+a third one — the command you typed — and its output goes to your terminal.
+
+So it leaves a note at `~/.devbox/locks/collector-daemon.handover` (and
+`broker-daemon.handover`) just before it signals. The daemon on its way out
+reads it, the daemon coming up reads it and deletes it, and both write a line
+naming the build that took over — version, commit and digest, never a pid,
+because the pid in that note would be the CLI's and not the daemon's. A daemon
+that is signalled with no note beside it says that too: silence is also how a
+crash looks.
+
+A handover **waits for work**. If any box on this host has a run in flight, the
+takeover is deferred rather than performed — the daemon owns each box's stdio
+agent as a child process, so replacing it mid-run cuts the only channel that
+run's events travel on. For the same reason, pushing a new agent into a box
+waits for that box's own runs, leaving
+`~/.devbox/boxes/<name>/agent-update-pending` behind until it can be done;
+`devbox doctor` prints it, and `devbox run` finishes the job on its way out.
 
 ## Secrets that reach an argv
 
@@ -305,6 +331,22 @@ The Coverage section is the part to read first. It carries the capture sources
 that were actually live, the agent version, the attributed event count broken
 down by rule, the events dropped during the run, and the count of events in the
 same window that belonged to something else.
+
+It also says whether capture was disturbed while the run was going, in three
+tiers — and only the first of them is a warning:
+
+| Line | Means | Terminal |
+|---|---|---|
+| **capture restarted** — *events before this were lost* | The agent's health record was re-published **after** this run's first attributed event **and** the agent process id changed. Something the run did was not recorded. | two warning lines |
+| capture re-attached — *same agent, nothing lost* | The record was re-published, but either nothing had been attributed yet or the same agent process kept sending. | nothing |
+| neither line | Nothing re-published during the run. | nothing |
+
+Both conditions have to hold for the warning, because either alone is
+routine: a collector handover at the very start of a run has nothing to lose,
+and a re-publish by the same agent lost nothing either. An agent too old to
+report its own pid is read as "cannot say", which lands in the middle tier —
+devbox would rather miss a warning than manufacture one out of an unanswerable
+question.
 
 `dropped during the run` is a difference between two daemon-wide snapshots, so
 concurrent activity in another box can inflate it. That is the current limit of

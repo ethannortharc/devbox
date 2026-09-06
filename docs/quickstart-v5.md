@@ -76,7 +76,7 @@ can attribute events to them — see [observability.md](observability.md#run-att
 | Network | One row per peer — connections, ports, TLS seen, bytes each way, duration. Plus TLS server names and DNS answers. |
 | Processes | The process tree, by pid. Devbox's own wrapper is folded into one `[devbox wrapper]` row, so the root of the tree is your command. Credentials that reached a command line read `***` — see below. |
 | Credentials | Each brokered credential the run reached for: provider, upstream, methods, uses, last use. `2 (1 denied)` means the scope refused one of them. |
-| Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. |
+| Coverage | Capture backends, agent version, events attributed and by which rule, events dropped, and events in the window that belonged to something else. Plus, if capture was disturbed mid-run, one of two lines: **capture restarted** (a warning — the agent changed after this run had already recorded something, so something was lost) or *capture re-attached* (no warning — same agent, nothing lost). |
 
 The outside-overlay table is the one worth reading twice. `devbox discard`
 undoes `/workspace`; it does not undo a package the run installed into `$HOME`,
@@ -117,11 +117,20 @@ devbox layer diff --from 01m1s3zz              # checkpoint vs the box now
 devbox layer diff --from 01m1s3zz --to 01m1s40 # checkpoint vs checkpoint
 devbox layer restore 01m1s3zz                  # put the overlay back
 devbox layer checkpoint-rm 01m1s3zz            # delete one
+devbox layer prune --dry-run                   # say what would go
+devbox layer prune --runs-older-than 7d        # let old runs' checkpoints go too
 ```
 
 An id can be shortened to any unique prefix. The newest 20 are kept; the ones a
 run's report cites are never pruned, and `checkpoint-rm` refuses them without
 `--force`.
+
+`layer prune` is how the pinned ones are eventually released. On its own it
+only touches unclaimed checkpoints (`--keep` sets how many survive).
+`--runs-older-than` also drops the pair a run took, but only once that run has
+ended, ended longer ago than the age you gave, **and** had its report written —
+a checkpoint is that report's evidence, and evidence is not something to drop
+because a timer expired.
 
 `restore` refuses while a run is still going — rewriting the upper layer out
 from under a run would invalidate the evidence the report is about to cite.

@@ -37,6 +37,30 @@ than no tool at all.
 
 ## Quick start
 
+> ### Upgrading from 0.2.0 or earlier? Read this before you stop a box.
+>
+> Every NixOS box devbox has ever created on Lima records Lima's `cidata`
+> mount by device UUID — and Lima regenerates that ISO, with a new UUID, on
+> every start. So the box waits for a device that never appears, drops into
+> emergency mode, and comes up with no sshd. It has been that way since v3;
+> it only bites on the *second* start, which is why it took this long to find.
+>
+> **A box that is still running repairs itself.** The first devbox command
+> that enters it (`devbox exec <box> -- true` will do) rewrites the mount by
+> label and runs one `nixos-rebuild` — about nine seconds. `devbox stop` now
+> does that repair for you first, and refuses to stop the box if the repair
+> fails, because stopping it is the step you cannot undo. `--force` overrides
+> that, with a warning.
+>
+> **A box that is already stopped and will not boot cannot be recovered.**
+> There is no sshd to get in through and the file to change is inside the
+> guest's filesystem. `devbox destroy` it and create it again; anything in its
+> overlay that was never committed is gone.
+>
+> Unrelated to the mount, every box built before 0.2.1 also does **one** extra
+> `nixos-rebuild` on the next command that enters it, so it picks up this
+> release's guest-side changes. It happens once per box.
+
 ### Install
 
 ```bash
@@ -345,6 +369,7 @@ its own, the box name comes second — `devbox snapshot save nightly devtest`,
 | `devbox layer diff --from <ID>` | Diff a checkpoint against the box now, or `--to` another |
 | `devbox layer restore <ID>` | Put the overlay back to a checkpoint |
 | `devbox layer checkpoint-rm <ID>` | Delete a checkpoint (`--force` for one a run's report cites) |
+| `devbox layer prune` | Delete old checkpoints (`--keep`, `--runs-older-than`, `--dry-run`) |
 | `devbox snapshot save` / `restore` / `list` | Whole-VM snapshots |
 | `devbox watch` | Query captured activity (`--type`, `--peer`, `--path`, `--tree`, `--json`) |
 | `devbox behavior summary` / `diff` / `pcap` | Summarize, compare, or capture a real flow pcap |
@@ -355,6 +380,7 @@ its own, the box name comes second — `devbox snapshot save nightly devtest`,
 | `devbox mcp report <name>` | The report for that server's most recent session |
 | `devbox mcp self` | Run devbox's own MCP server: runs and events, as tools |
 | `devbox export --format <fmt>` | Export events as OCSF, OTLP/JSON, or JSON Lines |
+| `devbox store redact` | Strip credentials from argvs recorded before redaction existed (`--dry-run`) |
 | `devbox web` | Start the local web console without touching a box |
 | `devbox code` | Open VS Code / Cursor into a box via Remote SSH |
 | `devbox use <name>` | Point an existing box at the current directory |
@@ -718,12 +744,20 @@ Devbox configures `~/.ssh/config` for the box, refreshes the overlay layer, and
 launches the editor with Remote SSH pointed at `/workspace`. Works with any
 editor that supports [Remote SSH](https://code.visualstudio.com/docs/remote/ssh).
 
-The editor's remote terminal gets the credential broker too. Devbox adds
-`SetEnv` lines to the box's `Host` block and configures the box's sshd to accept
-them, so a terminal in VS Code sees the same `DEVBOX_BROKER_*` and
+The editor's remote terminal gets the credential broker too. Devbox adds a
+`SetEnv` line to the box's `Host` block and configures the box's sshd to accept
+those names, so a terminal in VS Code sees the same `DEVBOX_BROKER_*` and
 `ANTHROPIC_BASE_URL` as `devbox shell` does. The token travels per connection
 and is never written inside the box; it is rotated whenever the box starts, and
 the `Host` block is refreshed with it.
+
+It is a probe, not an assumption. `ssh` does not carry environment over a
+shared connection, and Lima hands out a config that shares one — so `devbox
+code` first tries a direct connection that does not borrow Lima's master. If
+that works, the shared settings come out of devbox's block and the variables
+arrive. If it does not, devbox keeps the block exactly as the runtime gave it
+and says plainly that the editor's terminal will not have them, because a
+connection that fails is worse than a terminal without a token.
 
 > **NixOS compatibility:** devbox enables `nix-ld` in the VM so VS Code Server
 > and other dynamically linked binaries run without issues.
