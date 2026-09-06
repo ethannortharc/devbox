@@ -2285,3 +2285,41 @@ MSRV, Go, eBPF all green; locally 900 tests across 15 binaries, clippy
 **Open, for Ethan.** Publish the drafted release notes on the GitHub
 release; fast-forward `main` to `v5-main`; whether to rename the project.
 Everything else is in the checklist that becomes the next cycle's issues.
+
+## 2026-09-06T02:30Z — Next cycle, first batch: five closures and one new blocker
+
+**Landed on `v5-main`** (`85789ca`, CI run 34012651203 green, 957 tests):
+
+- `v5/takeover` — one judgement of daemon ownership in `src/daemon_identity.rs`,
+  shared by the collector and the broker; the broker is now taken over by
+  binary hash too. A daemon that holds its lock with an unreadable sidecar
+  is replaced after three consecutive commands agree it is a devbox daemon,
+  and never if it is not one.
+- `v5/run-hardening` — the host registers a run before the command starts
+  (the wrapper blocks on a FIFO until released; 20/20 runs now root at the
+  user's command with cgroup-attributed events), `runs.file_scope` and
+  `runs.start_gate` (schema v3), broker events carry no monotonic reading
+  and sort by wall time, and `devbox store redact` rewrites the argvs
+  recorded before redaction existed (a command, because it edits an audit
+  log).
+- `v5/guest-user` — the guest's user name is what the box says (`id -un`),
+  not a plausible passwd row; an MCP session that cannot be recorded still
+  runs; `mcp self` answers a batch with an explanation and names the
+  protocol revision it conforms to.
+- `v5/code-broker` — `devbox code` carries the broker variables as ssh
+  environment: one `SetEnv` line per Host (ssh honours only the first) and
+  `AcceptEnv` in the guest's sshd; the file is 0600 and a half-written
+  devbox block is refused rather than repaired by deleting what follows.
+- `v5/home-align` — why every Lima box had two homes: devbox created
+  `/home/<user>` while Lima's cloud-init had made `/home/<user>.guest`, and
+  sshd caches passwd per connection, so sessions on Lima's long-lived master
+  kept the old home while a direct connection could not authenticate at all.
+  The passwd home now follows the login shell; old boxes repair themselves
+  on the next lifecycle command.
+
+**Found, and now the first priority.** On Lima, a box that has been stopped
+does not start again: `limactl start` waits forever for port 22 and the
+serial log stays empty. Reproduced twice on clean throwaway boxes; the
+morning's `devtest` restart failure was very likely the same thing. Whether
+this is Lima, devbox's stop sequence, or a regression between v3 and v5 is
+W3-6's question, and no 0.2.1 goes out before it is answered.
