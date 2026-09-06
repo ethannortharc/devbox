@@ -200,6 +200,7 @@ pub async fn run(_args: DoctorArgs, manager: &SandboxManager) -> Result<()> {
                     Err(error) => println!("    \x1b[31mprobe failed\x1b[0m — {error}"),
                 }
                 print_agent_freshness(runtime.as_ref(), &state.name).await;
+                print_pending_agent_update(&manager.state_dir, &state.name);
                 print_capture_source(&manager.state_dir, &state.name);
                 print_host_reach(manager, runtime.as_ref(), &state.name).await;
             }
@@ -505,6 +506,28 @@ fn print_unaccounted(label: &str, orphans: Vec<String>) {
 /// the whole reason this line exists is that the version string every other
 /// check reads says `0.1.6` for two different agents. Its answer is the digest
 /// or nothing.
+/// An agent update this box is owed as soon as its run finishes.
+///
+/// Printed only when there is one. Without it, the line above says `stale` and
+/// gives no reason, and the reason — devbox is deliberately not touching the
+/// agent while a run depends on it — is the difference between a box that is
+/// being looked after and one that is being neglected.
+fn print_pending_agent_update(state_dir: &Path, name: &str) {
+    let Some(pending) = crate::sandbox::agent_sync::pending(state_dir, name) else {
+        return;
+    };
+    let running = crate::obs::run_in_flight(state_dir, name);
+    println!(
+        "    agent update: \x1b[33mdeferred since {}\x1b[0m — {}",
+        pending.since,
+        if running {
+            "a run is in flight; it is applied when the run ends"
+        } else {
+            "applied by the next command that enters this box"
+        }
+    );
+}
+
 async fn print_agent_freshness(runtime: &dyn crate::runtime::Runtime, name: &str) {
     use crate::sandbox::agent_sync::{Digest, doctor_line, host_digest, probe};
 

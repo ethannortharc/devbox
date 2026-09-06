@@ -24,6 +24,7 @@
 //!    its arguments regenerated per spawn ([`crate::obs::supervisor`]); this
 //!    closes the asymmetry for the service.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -336,6 +337,89 @@ pub fn lost_the_posture(error: &anyhow::Error) -> bool {
     error.downcast_ref::<PostureLost>().is_some()
 }
 
+/// An agent update that was due but held back because a run was in flight.
+///
+/// Replacing the agent means restarting it, and the stdio agent is a run's
+/// only route to the host — so doing it mid-run drops whatever that run had
+/// not yet delivered. The gap is longer than a collector handover's, because
+/// it also waits on `systemctl` and, on NixOS, on a rebuild.
+///
+/// Recorded rather than merely skipped, for two reasons: `devbox doctor` can
+/// say why a box's agent is stale without the reader having to guess, and
+/// `devbox run` can do the deferred work itself the moment its run ends,
+/// instead of leaving it for whenever a lifecycle command next happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// The digest this host wanted to install.
+    pub wanted: String,
+    /// When it was first deferred, RFC3339.
+    pub since: String,
+}
+
+fn pending_path(state_dir: &Path, name: &str) -> PathBuf {
+    state_dir
+        .join("boxes")
+        .join(name)
+        .join("agent-update-pending")
+}
+
+/// Note that this box's agent update is waiting for a run to finish.
+///
+/// Keeps the time of the *first* deferral: a box running one command a minute
+/// would otherwise keep resetting it, and "deferred since" is the number that
+/// says whether this is a moment's wait or a box that never gets updated.
+pub fn mark_pending(state_dir: &Path, name: &str, wanted: &str) {
+    if !crate::sandbox::state::is_safe_name(name) {
+        return;
+    }
+    let since = match pending(state_dir, name) {
+        Some(already) if already.wanted == wanted => already.since,
+        _ => chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    let path = pending_path(state_dir, name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(&path, format!("wanted={wanted} since={since}\n")) {
+        tracing::debug!(box_id = %name, %error, "could not record a deferred agent update");
+    }
+}
+
+/// Forget it, because the update has been done.
+pub fn clear_pending(state_dir: &Path, name: &str) {
+    if !crate::sandbox::state::is_safe_name(name) {
+        return;
+    }
+    let path = pending_path(state_dir, name);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The deferred update for this box, if there is one.
+pub fn pending(state_dir: &Path, name: &str) -> Option<Pending> {
+    if !crate::sandbox::state::is_safe_name(name) {
+        return None;
+    }
+    parse_pending(&std::fs::read_to_string(pending_path(state_dir, name)).ok()?)
+}
+
+fn parse_pending(text: &str) -> Option<Pending> {
+    let mut wanted = None;
+    let mut since = None;
+    for field in text.split_whitespace() {
+        if let Some(value) = field.strip_prefix("wanted=") {
+            wanted = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("since=") {
+            since = Some(value.to_string());
+        }
+    }
+    Some(Pending {
+        wanted: wanted?,
+        since: since.unwrap_or_default(),
+    })
+}
+
 /// How much of the box a refresh may change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -362,6 +446,10 @@ pub struct Refresh {
     /// The passwd entry was moved onto the home the login shell actually uses.
     pub home_realigned: bool,
     pub restarted: bool,
+    /// Held back because a run was in flight. Nothing else in this record is
+    /// set when it is: the whole refresh waits, rather than leaving a box with
+    /// new bytes on disk and an old process still serving a run.
+    pub deferred: bool,
     /// What was found but deliberately not acted on.
     pub notes: Vec<String>,
 }
@@ -440,6 +528,28 @@ pub async fn ensure_current(
 
     let mut refresh = Refresh::default();
     if !verdict.is_stale() && unit_current && ssh_env_current && home_drift.is_none() {
+        clear_pending(&manager.state_dir, name);
+        return Ok(refresh);
+    }
+
+    // Something is due — and every way of doing it ends with the agent being
+    // restarted. The stdio agent is a run's only route to the host, so a
+    // restart in the middle of one drops whatever that run had not yet
+    // delivered, and the gap is longer than a collector handover's because it
+    // waits on `systemctl` and, on NixOS, on a rebuild.
+    //
+    // The wait is bounded by the run itself: `devbox run` does this the moment
+    // its run ends, and any lifecycle command that arrives when no run is in
+    // flight does it too. Deferred whole rather than in part — pushing the
+    // bytes now and restarting later would leave the box reporting an agent it
+    // is not running.
+    if crate::obs::run_in_flight(&manager.state_dir, name) {
+        mark_pending(&manager.state_dir, name, host);
+        refresh.deferred = true;
+        tracing::info!(
+            box_id = %name,
+            "a run is in flight; the agent update waits for it to finish"
+        );
         return Ok(refresh);
     }
 
@@ -510,6 +620,8 @@ pub async fn ensure_current(
             }
         }
     }
+
+    clear_pending(&manager.state_dir, name);
 
     // A running agent keeps the bytes it started with. `install` replaced the
     // file, so nothing changes until the processes holding the old inode go.
@@ -933,6 +1045,71 @@ mod tests {
             .context("box 'w05c' was rebuilt to update its agent");
         assert!(lost_the_posture(&error));
         assert!(!lost_the_posture(&anyhow::anyhow!("the copy failed")));
+    }
+
+    // ── the update a run holds up ───────────────────────
+
+    #[test]
+    fn a_deferred_update_round_trips_and_is_forgotten_when_done() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pending(dir.path(), "alpha"), None);
+
+        mark_pending(dir.path(), "alpha", HOST);
+        let noted = pending(dir.path(), "alpha").expect("recorded");
+        assert_eq!(noted.wanted, HOST);
+        assert!(!noted.since.is_empty());
+
+        clear_pending(dir.path(), "alpha");
+        assert_eq!(pending(dir.path(), "alpha"), None);
+        // Clearing one that was never there is not an error.
+        clear_pending(dir.path(), "alpha");
+    }
+
+    /// The time is the *first* deferral, so "deferred since" answers "is this
+    /// a moment's wait or a box that never gets updated". A box running one
+    /// command a minute would otherwise keep resetting it to now.
+    #[test]
+    fn deferring_the_same_update_again_keeps_the_first_time() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_pending(dir.path(), "alpha", HOST);
+        let first = pending(dir.path(), "alpha").unwrap().since;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        mark_pending(dir.path(), "alpha", HOST);
+        assert_eq!(pending(dir.path(), "alpha").unwrap().since, first);
+
+        // A *different* update is a different wait, and starts its own clock.
+        mark_pending(dir.path(), "alpha", OTHER);
+        let second = pending(dir.path(), "alpha").unwrap();
+        assert_eq!(second.wanted, OTHER);
+        assert_ne!(second.since, first);
+    }
+
+    #[test]
+    fn each_box_defers_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_pending(dir.path(), "alpha", HOST);
+        assert!(pending(dir.path(), "beta").is_none());
+        clear_pending(dir.path(), "beta");
+        assert!(pending(dir.path(), "alpha").is_some());
+    }
+
+    /// A name that could escape its directory never reaches the filesystem.
+    #[test]
+    fn an_unsafe_name_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_pending(dir.path(), "../escape", HOST);
+        assert!(pending(dir.path(), "../escape").is_none());
+        assert!(!dir.path().join("boxes").join("..").exists());
+    }
+
+    #[test]
+    fn a_truncated_marker_reads_as_nothing_rather_than_as_an_update() {
+        assert_eq!(parse_pending(""), None);
+        assert_eq!(parse_pending("since=2026-09-06T00:00:00Z\n"), None);
+        // A marker with no time still names an update; the time is the extra.
+        let noted = parse_pending("wanted=abc\n").expect("still an update");
+        assert_eq!(noted.wanted, "abc");
+        assert_eq!(noted.since, "");
     }
 
     #[test]

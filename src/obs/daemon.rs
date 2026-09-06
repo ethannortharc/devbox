@@ -115,7 +115,7 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
                     // replacement between builds of the same release — a
                     // genuinely incompatible agent is refused by the version
                     // check regardless.
-                    if let Some(busy) = a_run_is_in_flight(&manager.state_dir) {
+                    if let Some(busy) = crate::obs::any_run_in_flight(&manager.state_dir) {
                         tracing::debug!(
                             box_id = %busy,
                             "deferring the collector handover until this run finishes"
@@ -276,36 +276,6 @@ fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
         }
     }
     reaped
-}
-
-/// Ask an older binary to release the stable daemon lock, then prove it did
-/// before launching the replacement. The pid comes from a 0600 record held
-/// under the same advisory lock, so another local user cannot redirect the
-/// Whether any box has a run the collector is still attributing to.
-///
-/// Names the box rather than answering yes, so the log line says which one.
-/// Best effort in the permissive direction: a store that cannot be read is not
-/// evidence of a live run, and refusing every handover because one box's
-/// database is unreadable would be a worse failure than the gap this avoids.
-fn a_run_is_in_flight(state_dir: &Path) -> Option<String> {
-    let boxes = std::fs::read_dir(state_dir.join("boxes")).ok()?;
-    for entry in boxes.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !crate::sandbox::state::is_safe_name(&name) {
-            continue;
-        }
-        let path = super::collector::store_path(state_dir, &name);
-        if !path.exists() {
-            continue;
-        }
-        let Ok(store) = super::store::Store::open(&path) else {
-            continue;
-        };
-        if store.active_runs().is_ok_and(|runs| !runs.is_empty()) {
-            return Some(name);
-        }
-    }
-    None
 }
 
 /// signal. A bounded wait is important: two collectors must never supervise
