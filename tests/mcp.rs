@@ -17,12 +17,10 @@
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::Result;
 use devbox::mcp::registry::{self, McpEntry};
 use devbox::mcp::shim::{self, ShimOptions};
-use devbox::runtime::{
-    CreateOpts, ExecResult, Mount, MountUpdate, Runtime, SandboxInfo, SandboxStatus, SnapshotInfo,
-};
+use devbox::runtime::stub::StubRuntime;
+use devbox::runtime::{ExecResult, Runtime, SandboxStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 // ── a runtime whose "box" is this host ──────────────────
@@ -32,79 +30,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 /// `argv` is the method the shim uses and the only one that has to be right:
 /// it prefixes the command exactly as `limactl shell … --` and `docker exec -i
 /// …` do, and the result is a host command line the caller owns the stdio of.
-/// `exec_cmd` is implemented too, because the reaper goes through it.
-struct LocalRuntime;
-
-#[async_trait::async_trait]
-impl Runtime for LocalRuntime {
-    fn name(&self) -> &str {
-        "local"
-    }
-    fn is_available(&self) -> bool {
-        true
-    }
-    fn priority(&self) -> u32 {
-        0
-    }
-    fn argv(&self, _name: &str, cmd: &[&str], _interactive: bool) -> Vec<String> {
-        // `env --` stands in for `limactl shell <vm> --`: a real prefix that
-        // execs the rest, so a bug in how the shim assembles argv shows up
-        // here rather than only inside a VM.
-        let mut argv = vec!["env".to_string(), "--".to_string()];
-        argv.extend(cmd.iter().map(|s| s.to_string()));
-        argv
-    }
-    async fn exec_cmd(&self, _: &str, cmd: &[&str], _: bool) -> Result<ExecResult> {
-        let output = Command::new(cmd[0]).args(&cmd[1..]).output()?;
-        Ok(ExecResult {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+/// `exec_cmd` is scripted too, because the reaper goes through it.
+fn local_runtime() -> StubRuntime {
+    StubRuntime::new()
+        .with_name("local")
+        .with_status(SandboxStatus::Running)
+        .with_argv(|_: &str, cmd: &[&str], _: bool| {
+            // `env --` stands in for `limactl shell <vm> --`: a real prefix
+            // that execs the rest, so a bug in how the shim assembles argv
+            // shows up here rather than only inside a VM.
+            let mut argv = vec!["env".to_string(), "--".to_string()];
+            argv.extend(cmd.iter().map(|s| s.to_string()));
+            argv
         })
-    }
-    async fn create(&self, _: &CreateOpts) -> Result<SandboxInfo> {
-        unimplemented!()
-    }
-    async fn start(&self, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn stop(&self, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn destroy(&self, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn status(&self, _: &str) -> Result<SandboxStatus> {
-        Ok(SandboxStatus::Running)
-    }
-    async fn list(&self) -> Result<Vec<SandboxInfo>> {
-        unimplemented!()
-    }
-    async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
-        unimplemented!()
-    }
-    async fn snapshot_list(&self, _: &str) -> Result<Vec<SnapshotInfo>> {
-        unimplemented!()
-    }
-    async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
-        unimplemented!()
-    }
-    async fn update_mounts(&self, _: &str, _: &[Mount]) -> Result<MountUpdate> {
-        unimplemented!()
-    }
-    async fn rollback_mounts(&self, _: &str, _: &MountUpdate) -> Result<()> {
-        unimplemented!()
-    }
+        .with_exec_cmd(|_: &str, cmd: &[&str], _: bool| {
+            let output = Command::new(cmd[0]).args(&cmd[1..]).output()?;
+            Ok(ExecResult {
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            })
+        })
 }
 
 /// The argv `mcp run` builds: registry entry → guest wrapper → runtime prefix.
 fn run_argv(pgid_file: &str, entry: &McpEntry) -> Vec<String> {
     let guest = shim::wrap_guest_command(pgid_file, entry.env.iter(), &entry.command);
     let refs: Vec<&str> = guest.iter().map(String::as_str).collect();
-    LocalRuntime.argv("devtest", &refs, false)
+    local_runtime().argv("devtest", &refs, false)
 }
 
 fn entry(command: &[&str]) -> McpEntry {
@@ -297,7 +250,7 @@ async fn a_deaf_server_and_the_children_it_spawned_are_both_stopped() {
     );
 
     // Before running the reaper *in this process*, check what it is about to
-    // be pointed at. `LocalRuntime` has no box to hide behind: the reaper runs
+    // be pointed at. `local_runtime()` has no box to hide behind: the reaper runs
     // in the harness's own process group, so a recorded id that is the
     // harness's group is a `kill` aimed at `cargo test`. That is not a
     // hypothetical — it is what this suite did on Linux CI, where the step
@@ -324,7 +277,7 @@ async fn a_deaf_server_and_the_children_it_spawned_are_both_stopped() {
     let refs: Vec<&str> = reaper.iter().map(String::as_str).collect();
     let reaped = tokio::time::timeout(
         Duration::from_secs(30),
-        LocalRuntime.exec_cmd("devtest", &refs, false),
+        local_runtime().exec_cmd("devtest", &refs, false),
     )
     .await
     .expect("the reaper must finish, or say which descendant is holding its pipes")
