@@ -165,6 +165,40 @@ pub(crate) fn resolve_project_mounts(
     mounts
 }
 
+/// What the box will be able to see, said out loud before it is created.
+///
+/// A box's mounts used to be invisible until someone looked inside it and
+/// found `/workspace` empty. They are the one part of a create that cannot be
+/// inspected afterwards without entering the box, and the one part a typo in
+/// `devbox.toml` silently removes — so they are printed.
+///
+/// `/mnt/host` is spelled as `/workspace (read-only lower layer)` because that
+/// is where the user will look for it: `/mnt/host` is an implementation detail
+/// of the overlay and naming it here would send them to the wrong path.
+pub(crate) fn describe_mounts(mounts: &[Mount]) -> String {
+    if mounts.is_empty() {
+        return concat!(
+            "  (nothing — this box will have no project files in it. ",
+            "An empty [mounts] table in devbox.toml is what asks for that.)"
+        )
+        .to_string();
+    }
+    let mut lines = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let target = if mount.container_path == "/mnt/host" {
+            "/workspace (read-only lower layer)"
+        } else {
+            &mount.container_path
+        };
+        let access = if mount.read_only { "ro" } else { "rw" };
+        lines.push(format!(
+            "  {} → {target} ({access})",
+            mount.host_path.display()
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Central manager for sandbox lifecycle.
 pub struct SandboxManager {
     /// Path to ~/.devbox/
@@ -424,6 +458,7 @@ impl SandboxManager {
         // project's configured disks.
         let is_overlay = config.sandbox.mount_mode == "overlay";
         let mut mounts = resolve_project_mounts(&cwd, config, is_overlay, extra_mounts);
+        println!("Mounts for '{name}':\n{}", describe_mounts(&mounts));
 
         // The host collector owns one endpoint per box. Mount its private
         // directory before the box is created so the in-guest agent has a
@@ -1606,6 +1641,43 @@ mod tests {
         assert_eq!(mounts[1].container_path, "/mnt/host");
         assert!(mounts[1].read_only);
         assert_eq!(mounts[2].host_path, PathBuf::from("/project/artifacts"));
+    }
+
+    /// The mount list is the one part of a create nobody can check afterwards
+    /// without entering the box, so it is printed — and the overlay's lower
+    /// layer is named for where the user will look for it.
+    #[test]
+    fn the_mount_summary_names_the_path_the_user_will_look_in() {
+        let summary = describe_mounts(&[
+            Mount {
+                host_path: PathBuf::from("/project"),
+                container_path: "/mnt/host".to_string(),
+                read_only: true,
+            },
+            Mount {
+                host_path: PathBuf::from("/project/var/cache"),
+                container_path: "/cache".to_string(),
+                read_only: false,
+            },
+        ]);
+        assert!(
+            summary.contains("/project → /workspace (read-only lower layer) (ro)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("/project/var/cache → /cache (rw)"),
+            "{summary}"
+        );
+        assert!(!summary.contains("→ /mnt/host"), "{summary}");
+    }
+
+    /// A box with nothing mounted is legal — an explicit empty `[mounts]`
+    /// asks for it — but it must not be reported as though it were normal.
+    #[test]
+    fn a_box_with_nothing_mounted_says_so_in_words() {
+        let summary = describe_mounts(&[]);
+        assert!(summary.contains("no project files"), "{summary}");
+        assert!(summary.contains("[mounts]"), "{summary}");
     }
 
     use crate::runtime::{ExecResult, SandboxInfo, SnapshotInfo};
