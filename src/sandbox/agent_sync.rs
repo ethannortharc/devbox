@@ -837,6 +837,24 @@ async fn reconfigure(
         if what.is_empty() {
             return Ok(());
         }
+        // Before anything is generated, and certainly before the rebuild: a
+        // box whose recorded workspace options are not the ones it is mounted
+        // with cannot be rebuilt at all, and finding that out from the exit
+        // code afterwards is finding it out too late.
+        let probe = super::provision::parse_birth_probe(
+            &runtime
+                .exec_cmd(name, &["sh", "-c", super::provision::BIRTH_PROBE], false)
+                .await
+                .map(|result| result.stdout)
+                .unwrap_or_default(),
+        );
+        if probe.answered {
+            super::provision::refuse_on_workspace_mismatch(
+                name,
+                probe.state_says_nofail,
+                super::provision::workspace_mount_has_nofail(runtime, name).await,
+            )?;
+        }
         println!("Regenerating {} for box '{name}'...", what.join(", "));
         // The module needs to know which hypervisor this is before it can
         // stop enabling the Incus guest agent on a Lima box. A box provisioned
