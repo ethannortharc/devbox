@@ -1031,10 +1031,18 @@ const HOME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// never leaves `~/.config` or `~/.cache` would otherwise look like a box
 /// doing nothing at all, and those are the reads worth seeing.
 ///
-/// The same `/etc/passwd` filter `detect_vm_username` uses, asked in one
-/// command rather than two. A box that cannot answer gets `/home`, which is
-/// broader than one user's directory and still excludes the /nix/store and
-/// /etc traffic this scope exists to keep out.
+/// Deliberately a *broader* probe than `detect_vm_username`, which now asks
+/// the box `id -un` and gets one account. This still scans `/etc/passwd`, and
+/// a box that answers nothing — every Lima box, whose guest user carries the
+/// host's uid — gets `/home` rather than one directory.
+///
+/// That is the safer answer here, not a leftover. Scoping to the single home
+/// `id -un` names would drop events under the *other* spelling: a box
+/// provisioned before W3-3 has its settings under `/home/<user>`, while its
+/// shells live in `/home/<user>.guest`, and capture that silently stopped
+/// covering the first would look like a box that had gone quiet. `/home`
+/// covers both and still excludes the /nix/store and /etc traffic this scope
+/// exists to keep out.
 pub(crate) async fn guest_file_scope(runtime: &dyn crate::runtime::Runtime, name: &str) -> String {
     const FALLBACK: &str = "/workspace,/home";
     let probe = runtime.exec_cmd(
