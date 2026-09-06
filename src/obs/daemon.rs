@@ -292,6 +292,13 @@ fn replace_outdated_owner(
     // stops the daemon and leaves a `limactl`/`ssh` pair attached to a guest.
     // The group is only signalled if it is still *led* by a live
     // `__collector`, which is what proves the recorded id was not recycled.
+    identity::note_handover(
+        state_dir,
+        KIND,
+        owner.pid,
+        mine,
+        &identity::reason(owner, mine),
+    );
     if owner.pgid != 0 {
         let stopped = crate::procgroup::stop_group(owner.pgid, "__collector", REPLACEMENT_TIMEOUT)
             .with_context(|| format!("stop the outdated collector group {}", owner.pgid))?;
@@ -412,6 +419,10 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
     me.pgid = crate::procgroup::lead_own_group()
         .context("give the collector daemon a process group of its own")?;
     publish_owner_identity(&manager.state_dir, &me)?;
+    // Whichever side of a handover this is, say so. A daemon log that shows an
+    // exit and a start with nothing between them is what made the capture gap
+    // in W3-7 take two rounds to explain.
+    identity::log_replacing(&manager.state_dir, KIND, &me);
 
     let stats = Arc::new(Stats::default());
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
@@ -456,6 +467,7 @@ pub async fn run(manager: Arc<SandboxManager>) -> Result<()> {
             }
         }
     }
+    identity::log_being_replaced(&manager.state_dir, KIND, me.pid);
     let _ = stop.send(true);
     let _ = supervised.await;
     publish_stats(&manager.state_dir, stats.snapshot())?;

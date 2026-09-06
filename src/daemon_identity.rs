@@ -359,6 +359,168 @@ pub fn publish(state_dir: &Path, kind: Kind, owner: &OwnerIdentity) -> Result<()
     published
 }
 
+// ── saying, in the log, that a handover happened ────────────
+
+/// Why one daemon replaced another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reason {
+    /// Different devbox versions.
+    Version { from: String, to: String },
+    /// Same version, different executables — the case a version comparison
+    /// cannot see, and the one that put a pre-eBPF collector in charge of an
+    /// eBPF box for a whole login session.
+    Build { from: String, to: String },
+    /// The record could not be read for this many consecutive commands.
+    Unreadable { strikes: u32 },
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reason::Version { from, to } => write!(formatter, "version {from} -> {to}"),
+            Reason::Build { from, to } => {
+                write!(
+                    formatter,
+                    "same version, build {} -> {}",
+                    short(from),
+                    short(to)
+                )
+            }
+            Reason::Unreadable { strikes } => {
+                write!(formatter, "identity unreadable for {strikes} commands")
+            }
+        }
+    }
+}
+
+/// Why `mine` is replacing `owner`, for the record.
+pub fn reason(owner: &OwnerIdentity, mine: &OwnerIdentity) -> Reason {
+    if owner.version != mine.version {
+        Reason::Version {
+            from: owner.version.clone(),
+            to: mine.version.clone(),
+        }
+    } else {
+        Reason::Build {
+            from: owner.build.clone(),
+            to: mine.build.clone(),
+        }
+    }
+}
+
+/// A handover in progress, left where both sides of it can find it.
+///
+/// Neither side can describe a handover alone. The daemon being stopped knows
+/// only that it was signalled; the daemon starting knows only that the lock is
+/// free. Whoever decided knows both, and is a third process that writes to the
+/// user's terminal rather than to the daemon log — so a handover left the log
+/// with an unexplained shutdown followed by an unexplained startup, which is
+/// what made W3-7 take two rounds to find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    /// The pid being replaced.
+    pub from: i32,
+    /// How the replacement describes itself.
+    pub to: String,
+    /// Rendered, because the log wants a sentence and this file is read by a
+    /// process that must not have to reconstruct the decision.
+    pub reason: String,
+}
+
+fn handover_path(kind: Kind, state_dir: &Path) -> PathBuf {
+    state_dir
+        .join("locks")
+        .join(format!("{}.handover", kind.stem()))
+}
+
+/// Leave the note, just before signalling.
+pub fn note_handover(state_dir: &Path, kind: Kind, from: i32, mine: &OwnerIdentity, why: &Reason) {
+    let path = handover_path(kind, state_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = format!(
+        "from={from}\nto={}\nreason={why}\n",
+        mine.describe().replace('\n', " ")
+    );
+    if let Err(error) = std::fs::write(&path, body) {
+        // The handover still happens; only its explanation is lost.
+        tracing::debug!(%error, "could not record a {} handover", kind.noun());
+        return;
+    }
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Read the note, if there is one for us.
+///
+/// `from` is checked against the reader's own pid where the reader is the
+/// daemon being stopped: a note left for somebody else is not ours to report.
+pub fn read_handover(state_dir: &Path, kind: Kind) -> Option<Handover> {
+    let text = std::fs::read_to_string(handover_path(kind, state_dir)).ok()?;
+    let mut from = None;
+    let mut to = None;
+    let mut why = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("from=") {
+            from = value.trim().parse::<i32>().ok();
+        } else if let Some(value) = line.strip_prefix("to=") {
+            to = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("reason=") {
+            why = Some(value.trim().to_string());
+        }
+    }
+    Some(Handover {
+        from: from?,
+        to: to?,
+        reason: why.unwrap_or_else(|| "unrecorded".to_string()),
+    })
+}
+
+pub fn clear_handover(state_dir: &Path, kind: Kind) {
+    let path = handover_path(kind, state_dir);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The line a daemon writes when it is stopped, so the gap in the log has a
+/// cause next to it.
+pub fn log_being_replaced(state_dir: &Path, kind: Kind, me: i32) {
+    match read_handover(state_dir, kind) {
+        Some(note) if note.from == me => tracing::info!(
+            pid = me,
+            successor = %note.to,
+            reason = %note.reason,
+            "stopping: this {} is being replaced",
+            kind.noun()
+        ),
+        // Signalled by something that left no note — a person, a reboot, a
+        // supervisor. Worth saying so, because the alternative reading of a
+        // silent exit is that the daemon crashed.
+        _ => tracing::info!(
+            pid = me,
+            "stopping: this {} was signalled, with no handover recorded",
+            kind.noun()
+        ),
+    }
+}
+
+/// The matching line from the other side, written once the successor is up.
+pub fn log_replacing(state_dir: &Path, kind: Kind, me: &OwnerIdentity) {
+    if let Some(note) = read_handover(state_dir, kind) {
+        tracing::info!(
+            pid = me.pid,
+            replaced = note.from,
+            reason = %note.reason,
+            "this {} took over",
+            kind.noun()
+        );
+        // One handover, one note. Leaving it would make the next unrelated
+        // start claim a takeover that did not happen.
+        clear_handover(state_dir, kind);
+    }
+}
+
 // ── the lock is held but the record cannot be read ──────────
 
 /// What a devbox process found when it asked who owns a daemon lock.
@@ -674,6 +836,13 @@ pub fn take_over_broken(
                  {UNREADABLE_STRIKES} commands",
                 kind.noun()
             );
+            note_handover(
+                state_dir,
+                kind,
+                pid,
+                &OwnerIdentity::mine(kind)?,
+                &Reason::Unreadable { strikes },
+            );
             let stopped = crate::procgroup::stop_group(pgid, kind.marker(), patience)
                 .with_context(|| {
                     format!(
@@ -875,6 +1044,108 @@ mod tests {
             assert_ne!(mine.build, UNKNOWN_BUILD);
             assert!(!should_replace(&mine, &mine));
         }
+    }
+
+    // ── saying that a handover happened ─────────────────
+
+    #[test]
+    fn a_handover_note_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let kind = Kind::Collector;
+        assert_eq!(read_handover(dir.path(), kind), None);
+
+        let mine = owner("0.2.0", "bbbb");
+        note_handover(
+            dir.path(),
+            kind,
+            500,
+            &mine,
+            &Reason::Build {
+                from: "aaaa".into(),
+                to: "bbbb".into(),
+            },
+        );
+        let note = read_handover(dir.path(), kind).expect("a note");
+        assert_eq!(note.from, 500);
+        assert!(note.to.contains("version 0.2.0"), "{note:?}");
+        assert_eq!(note.reason, "same version, build aaaa -> bbbb");
+
+        clear_handover(dir.path(), kind);
+        assert_eq!(read_handover(dir.path(), kind), None);
+        // The two daemons never read each other's.
+        note_handover(
+            dir.path(),
+            Kind::Broker,
+            7,
+            &mine,
+            &Reason::Unreadable { strikes: 3 },
+        );
+        assert_eq!(read_handover(dir.path(), Kind::Collector), None);
+        assert_eq!(
+            read_handover(dir.path(), Kind::Broker).unwrap().reason,
+            "identity unreadable for 3 commands"
+        );
+    }
+
+    /// The reason has to name the thing that decided. A version change and a
+    /// build change look identical in a log that only says "replaced".
+    #[test]
+    fn the_reason_names_what_actually_differed() {
+        let old_version = owner("0.1.6", "aaaa");
+        let new_version = owner("0.2.0", "aaaa");
+        assert_eq!(
+            reason(&old_version, &new_version).to_string(),
+            "version 0.1.6 -> 0.2.0"
+        );
+        let long = "c7d70a0857d42e7fbf0062fec377477658ff76cc8412b3210e60023a1736cca0";
+        let same_version = reason(&owner("0.2.0", "aaaa"), &owner("0.2.0", long));
+        assert_eq!(
+            same_version.to_string(),
+            "same version, build aaaa -> c7d70a0857d4"
+        );
+        assert_eq!(
+            Reason::Unreadable { strikes: 3 }.to_string(),
+            "identity unreadable for 3 commands"
+        );
+    }
+
+    /// A note left for another pid is not this daemon's to report: it would
+    /// otherwise claim, on the way out, a handover it was not part of.
+    #[test]
+    fn a_note_addressed_to_somebody_else_is_not_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let kind = Kind::Collector;
+        note_handover(
+            dir.path(),
+            kind,
+            500,
+            &owner("0.2.0", "bbbb"),
+            &Reason::Unreadable { strikes: 3 },
+        );
+        let note = read_handover(dir.path(), kind).unwrap();
+        assert_ne!(note.from, 999);
+        // `log_being_replaced` compares the two; both branches are reachable
+        // and neither panics.
+        log_being_replaced(dir.path(), kind, 500);
+        log_being_replaced(dir.path(), kind, 999);
+    }
+
+    #[test]
+    fn a_truncated_note_is_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let kind = Kind::Broker;
+        let path = handover_path(kind, dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "to=somebody\n").unwrap();
+        assert_eq!(read_handover(dir.path(), kind), None);
+        std::fs::write(&path, "from=5\n").unwrap();
+        assert_eq!(read_handover(dir.path(), kind), None);
+        // A note with no reason still names both sides; the reason is extra.
+        std::fs::write(&path, "from=5\nto=x\n").unwrap();
+        assert_eq!(
+            read_handover(dir.path(), kind).unwrap().reason,
+            "unrecorded"
+        );
     }
 
     // ── the unreadable-record rule ──────────────────────
