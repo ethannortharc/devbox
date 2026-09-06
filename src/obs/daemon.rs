@@ -99,6 +99,29 @@ fn try_ensure_running(manager: &SandboxManager) -> Result<()> {
                     if !should_replace(&owner, &mine) {
                         return Ok(());
                     }
+                    // Not while somebody's run is in flight.
+                    //
+                    // Taking over ends the old daemon, and the agent that
+                    // actually delivers events is its child — the unit agent
+                    // runs with `-no-transport`, so the stdio one is the whole
+                    // pipe. Replacing it costs about two seconds during which
+                    // nothing is captured, and a run released into that window
+                    // comes back with an empty report and a cgroup id that
+                    // matches nothing. Measured, not supposed: two in twenty
+                    // on a box while another build ran commands against it.
+                    //
+                    // The wait is bounded by the runs themselves: a run ends,
+                    // and the next command takes over then. This only defers a
+                    // replacement between builds of the same release — a
+                    // genuinely incompatible agent is refused by the version
+                    // check regardless.
+                    if let Some(busy) = a_run_is_in_flight(&manager.state_dir) {
+                        tracing::debug!(
+                            box_id = %busy,
+                            "deferring the collector handover until this run finishes"
+                        );
+                        return Ok(());
+                    }
                     if !replace_outdated_owner(&probe, &manager.state_dir, &owner, &mine)? {
                         return Ok(());
                     }
@@ -258,6 +281,33 @@ fn reap_orphans(state_dir: &Path, owner: Option<&OwnerIdentity>) -> usize {
 /// Ask an older binary to release the stable daemon lock, then prove it did
 /// before launching the replacement. The pid comes from a 0600 record held
 /// under the same advisory lock, so another local user cannot redirect the
+/// Whether any box has a run the collector is still attributing to.
+///
+/// Names the box rather than answering yes, so the log line says which one.
+/// Best effort in the permissive direction: a store that cannot be read is not
+/// evidence of a live run, and refusing every handover because one box's
+/// database is unreadable would be a worse failure than the gap this avoids.
+fn a_run_is_in_flight(state_dir: &Path) -> Option<String> {
+    let boxes = std::fs::read_dir(state_dir.join("boxes")).ok()?;
+    for entry in boxes.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !crate::sandbox::state::is_safe_name(&name) {
+            continue;
+        }
+        let path = super::collector::store_path(state_dir, &name);
+        if !path.exists() {
+            continue;
+        }
+        let Ok(store) = super::store::Store::open(&path) else {
+            continue;
+        };
+        if store.active_runs().is_ok_and(|runs| !runs.is_empty()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// signal. A bounded wait is important: two collectors must never supervise
 /// the same boxes just because shutdown got stuck.
 fn replace_outdated_owner(
