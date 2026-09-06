@@ -725,109 +725,36 @@ impl ChangeStatus {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-
+    use crate::runtime::stub::StubRuntime;
     use crate::runtime::{ExecResult, SandboxStatus};
 
-    /// A guest that records every privileged command and can be told to refuse
+    /// A guest that answers every privileged command and can be told to refuse
     /// the remount.
     ///
     /// `discard` is otherwise untestable without a hypervisor, and the thing
     /// that keeps being wrong is the *ordering* — whether the remount happens
-    /// at all, and whether it happens after the upper is cleared.
-    struct RecordingGuest {
-        commands: Mutex<Vec<String>>,
-        /// Both the `mount -o remount` and the umount/mount fallback fail, the
-        /// way a busy `/workspace` fails.
-        remount_fails: bool,
-    }
-
-    impl RecordingGuest {
-        fn new(remount_fails: bool) -> Self {
-            Self {
-                commands: Mutex::new(Vec::new()),
-                remount_fails,
-            }
-        }
-
-        fn commands(&self) -> Vec<String> {
-            self.commands.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Runtime for RecordingGuest {
-        fn name(&self) -> &str {
-            "recording"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn priority(&self) -> u32 {
-            0
-        }
-        // `run_as_root` funnels into this, so recording here catches the
-        // command the way the guest would receive it.
-        async fn exec_cmd(&self, _: &str, cmd: &[&str], _: bool) -> Result<ExecResult> {
-            let joined = cmd.join(" ");
-            self.commands.lock().unwrap().push(joined.clone());
-            let failed = self.remount_fails && joined.contains("mount");
-            Ok(ExecResult {
-                exit_code: i32::from(failed),
-                stdout: String::new(),
-                stderr: if failed {
-                    "target is busy".into()
-                } else {
-                    String::new()
-                },
+    /// at all, and whether it happens after the upper is cleared. The stub
+    /// records the commands; `run_as_root` funnels into `exec_cmd`, so what it
+    /// records is the command the way the guest would receive it.
+    ///
+    /// `remount_fails` makes both the `mount -o remount` and the umount/mount
+    /// fallback fail, the way a busy `/workspace` fails.
+    fn recording_guest(remount_fails: bool) -> StubRuntime {
+        StubRuntime::new()
+            .with_name("recording")
+            .with_status(SandboxStatus::Running)
+            .with_exec_cmd(move |_: &str, cmd: &[&str], _: bool| {
+                let failed = remount_fails && cmd.join(" ").contains("mount");
+                Ok(ExecResult {
+                    exit_code: i32::from(failed),
+                    stdout: String::new(),
+                    stderr: if failed {
+                        "target is busy".into()
+                    } else {
+                        String::new()
+                    },
+                })
             })
-        }
-        async fn create(
-            &self,
-            _: &crate::runtime::CreateOpts,
-        ) -> Result<crate::runtime::SandboxInfo> {
-            unimplemented!()
-        }
-        async fn start(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn stop(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn destroy(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn status(&self, _: &str) -> Result<SandboxStatus> {
-            Ok(SandboxStatus::Running)
-        }
-        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
-            unimplemented!()
-        }
-        async fn list(&self) -> Result<Vec<crate::runtime::SandboxInfo>> {
-            unimplemented!()
-        }
-        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_list(&self, _: &str) -> Result<Vec<crate::runtime::SnapshotInfo>> {
-            unimplemented!()
-        }
-        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
-            unimplemented!()
-        }
-        async fn update_mounts(
-            &self,
-            _: &str,
-            _: &[crate::runtime::Mount],
-        ) -> Result<crate::runtime::MountUpdate> {
-            unimplemented!()
-        }
-        async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
-            unimplemented!()
-        }
     }
 
     /// The stale-read fix: clearing the upper is only half of a discard,
@@ -835,11 +762,11 @@ mod tests {
     /// that were just thrown away until the mount is rebuilt.
     #[tokio::test]
     async fn discarding_everything_remounts_the_overlay_afterwards() {
-        let guest = RecordingGuest::new(false);
+        let guest = recording_guest(false);
         let count = discard(&guest, "devtest", None).await.expect("discard");
         assert_eq!(count, 1);
 
-        let commands = guest.commands();
+        let commands = guest.exec_commands();
         let cleared = commands
             .iter()
             .position(|c| c.contains("rm -rf") && c.contains(UPPER))
@@ -856,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn discarding_named_paths_remounts_too() {
-        let guest = RecordingGuest::new(false);
+        let guest = recording_guest(false);
         let paths = vec!["src/main.rs".to_string()];
         let count = discard(&guest, "devtest", Some(&paths))
             .await
@@ -864,7 +791,7 @@ mod tests {
         assert_eq!(count, 1);
         assert!(
             guest
-                .commands()
+                .exec_commands()
                 .iter()
                 .any(|c| c.contains("mount -o remount")),
             "a path-scoped discard leaves the same stale reads behind"
@@ -876,7 +803,7 @@ mod tests {
     /// reported as a failure.
     #[tokio::test]
     async fn a_refused_remount_is_a_warning_not_a_failure() {
-        let guest = RecordingGuest::new(true);
+        let guest = recording_guest(true);
         let count = discard(&guest, "devtest", None)
             .await
             .expect("a busy workspace does not fail the discard");
@@ -887,12 +814,16 @@ mod tests {
     /// remount would drop file handles for no reason.
     #[tokio::test]
     async fn a_discard_that_removed_nothing_leaves_the_mount_alone() {
-        let guest = RecordingGuest::new(false);
+        let guest = recording_guest(false);
         let count = discard(&guest, "devtest", Some(&[]))
             .await
             .expect("discard");
         assert_eq!(count, 0);
-        assert!(guest.commands().is_empty(), "{:?}", guest.commands());
+        assert!(
+            guest.exec_commands().is_empty(),
+            "{:?}",
+            guest.exec_commands()
+        );
     }
 
     fn change(path: &str, status: ChangeStatus, is_dir: bool) -> OverlayChange {

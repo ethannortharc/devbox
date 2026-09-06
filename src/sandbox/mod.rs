@@ -1800,8 +1800,8 @@ mod tests {
         assert!(summary.contains("[mounts]"), "{summary}");
     }
 
-    use crate::runtime::{ExecResult, SandboxInfo, SnapshotInfo};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::runtime::stub::StubRuntime;
+    use crate::runtime::{ExecResult, SandboxInfo};
 
     /// A runtime that makes nothing and remembers whether it was asked to.
     ///
@@ -1811,139 +1811,60 @@ mod tests {
     /// defect in the nft path, the bootstrap script, and here — so this is the
     /// smallest thing that makes the *ordering* observable, which is the part
     /// that keeps being wrong.
-    struct RecordingRuntime {
-        created: AtomicBool,
-        stopped: AtomicBool,
-        destroyed: AtomicBool,
-        fail_create: bool,
-        fail_destroy: bool,
-        fail_stop: bool,
-        fail_status: bool,
-        status: SandboxStatus,
-    }
-
-    #[async_trait::async_trait]
-    impl Runtime for RecordingRuntime {
-        fn name(&self) -> &str {
-            "recording"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn priority(&self) -> u32 {
-            0
-        }
-        async fn create(&self, opts: &CreateOpts) -> Result<SandboxInfo> {
-            self.created.store(true, Ordering::SeqCst);
-            if self.fail_create {
-                bail!("runtime failed after launch");
-            }
-            Ok(SandboxInfo {
-                name: opts.name.clone(),
-                status: SandboxStatus::Running,
-                runtime: "recording".into(),
-                created_at: Some("now".into()),
-                ip_address: None,
+    ///
+    /// Every step succeeds here. A test that needs one to fail re-scripts that
+    /// one step, and asks `called()` what the lifecycle reached.
+    fn recording_runtime() -> StubRuntime {
+        StubRuntime::new()
+            .with_name("recording")
+            .with_create(|opts: &CreateOpts| {
+                Ok(SandboxInfo {
+                    name: opts.name.clone(),
+                    status: SandboxStatus::Running,
+                    runtime: "recording".into(),
+                    created_at: Some("now".into()),
+                    ip_address: None,
+                })
             })
-        }
-        // Model the way a real runtime reports a guest-command failure: the
-        // subprocess launched successfully, but its exit status is non-zero.
-        // A transport-level `Err` would miss the failure channel that used to
-        // be downgraded to a warning by the provisioner.
-        async fn exec_cmd(&self, _: &str, _: &[&str], _: bool) -> Result<ExecResult> {
-            Ok(ExecResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: "guest command failed".into(),
+            .with_stop(|_: &str| Ok(()))
+            .with_destroy(|_: &str| Ok(()))
+            .with_status(SandboxStatus::Running)
+            // Model the way a real runtime reports a guest-command failure: the
+            // subprocess launched successfully, but its exit status is
+            // non-zero. A transport-level `Err` would miss the failure channel
+            // that used to be downgraded to a warning by the provisioner.
+            .with_exec_cmd(|_: &str, _: &[&str], _: bool| {
+                Ok(ExecResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "guest command failed".into(),
+                })
             })
-        }
-        // Nothing below is reachable in these tests.
-        async fn start(&self, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn stop(&self, _: &str) -> Result<()> {
-            self.stopped.store(true, Ordering::SeqCst);
-            if self.fail_stop {
-                bail!("runtime refused stop");
-            }
-            Ok(())
-        }
-        fn argv(&self, _: &str, _: &[&str], _: bool) -> Vec<String> {
-            unimplemented!()
-        }
-        async fn destroy(&self, _: &str) -> Result<()> {
-            self.destroyed.store(true, Ordering::SeqCst);
-            if self.fail_destroy {
-                bail!("runtime refused delete");
-            }
-            Ok(())
-        }
-        async fn status(&self, _: &str) -> Result<SandboxStatus> {
-            if self.fail_status {
-                bail!("runtime status unavailable");
-            }
-            Ok(self.status.clone())
-        }
-        async fn list(&self) -> Result<Vec<SandboxInfo>> {
-            unimplemented!()
-        }
-        async fn snapshot_create(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_restore(&self, _: &str, _: &str) -> Result<()> {
-            unimplemented!()
-        }
-        async fn snapshot_list(&self, _: &str) -> Result<Vec<SnapshotInfo>> {
-            unimplemented!()
-        }
-        async fn upgrade(&self, _: &str, _: &[String]) -> Result<()> {
-            unimplemented!()
-        }
-        async fn update_mounts(&self, _: &str, _: &[Mount]) -> Result<crate::runtime::MountUpdate> {
-            unimplemented!()
-        }
-        async fn rollback_mounts(&self, _: &str, _: &crate::runtime::MountUpdate) -> Result<()> {
-            unimplemented!()
-        }
     }
 
     #[tokio::test]
     async fn failed_runtime_destroy_is_not_success_while_the_guest_still_exists() {
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: true,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Stopped,
-        };
+        let runtime = recording_runtime()
+            .with_destroy(|_: &str| bail!("runtime refused delete"))
+            .with_status(SandboxStatus::Stopped);
 
         let error = destroy_runtime_or_confirm_absent(&runtime, "box")
             .await
             .expect_err("a failed delete of an extant guest must remain a failure");
-        assert!(runtime.destroyed.load(Ordering::SeqCst));
+        assert!(runtime.called("destroy"));
         assert!(error.to_string().contains("local state was preserved"));
     }
 
     #[tokio::test]
     async fn failed_runtime_destroy_is_success_when_the_guest_is_already_absent() {
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: true,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::NotFound,
-        };
+        let runtime = recording_runtime()
+            .with_destroy(|_: &str| bail!("runtime refused delete"))
+            .with_status(SandboxStatus::NotFound);
 
         destroy_runtime_or_confirm_absent(&runtime, "box")
             .await
             .expect("an already absent guest is safe to forget");
-        assert!(runtime.destroyed.load(Ordering::SeqCst));
+        assert!(runtime.called("destroy"));
     }
 
     #[tokio::test]
@@ -1952,16 +1873,8 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: true,
-            fail_destroy: false,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Running,
-        };
+        let runtime =
+            recording_runtime().with_create(|_: &CreateOpts| bail!("runtime failed after launch"));
 
         let error = manager
             .create_sandbox(
@@ -1976,8 +1889,8 @@ mod tests {
             .await
             .expect_err("a runtime error after launch is not a successful create");
 
-        assert!(runtime.created.load(Ordering::SeqCst));
-        assert!(runtime.stopped.load(Ordering::SeqCst));
+        assert!(runtime.called("create"));
+        assert!(runtime.called("stop"));
         assert!(manager.get_sandbox("partial").is_ok());
         assert!(error.to_string().contains("registered locally"));
     }
@@ -1988,16 +1901,10 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: true,
-            fail_destroy: false,
-            fail_stop: true,
-            fail_status: true,
-            status: SandboxStatus::Unknown("not observable".into()),
-        };
+        let runtime = recording_runtime()
+            .with_create(|_: &CreateOpts| bail!("runtime failed after launch"))
+            .with_stop(|_: &str| bail!("runtime refused stop"))
+            .with_status_fn(|_: &str| bail!("runtime status unavailable"));
 
         let error = manager
             .create_sandbox(
@@ -2012,8 +1919,8 @@ mod tests {
             .await
             .expect_err("an uncertain runtime side effect cannot be successful");
 
-        assert!(runtime.created.load(Ordering::SeqCst));
-        assert!(runtime.stopped.load(Ordering::SeqCst));
+        assert!(runtime.called("create"));
+        assert!(runtime.called("stop"));
         assert!(manager.get_sandbox("uncertain").is_ok());
         let message = error.to_string();
         assert!(message.contains("may still be running"));
@@ -2070,16 +1977,7 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: false,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Running,
-        };
+        let runtime = recording_runtime();
 
         let mut config = DevboxConfig::default();
         config.sandbox.image = "nixos".into();
@@ -2097,7 +1995,7 @@ mod tests {
             "the refusal should say why: {err}"
         );
         assert!(
-            !runtime.created.load(Ordering::SeqCst),
+            !runtime.called("create"),
             "the box was created before the package check ran, so the refusal \
              leaves an orphan runtime object behind"
         );
@@ -2120,16 +2018,7 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: false,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Running,
-        };
+        let runtime = recording_runtime();
 
         let too_long = "n".repeat(65);
         let err = manager
@@ -2149,7 +2038,7 @@ mod tests {
             "the refusal should say what the limit is: {err}"
         );
         assert!(
-            !runtime.created.load(Ordering::SeqCst),
+            !runtime.called("create"),
             "the runtime object was made under a name nothing can clean up"
         );
     }
@@ -2165,16 +2054,7 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: false,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Running,
-        };
+        let runtime = recording_runtime();
 
         let mut config = DevboxConfig::default();
         config.sandbox.image = "nixos".into();
@@ -2190,11 +2070,11 @@ mod tests {
             .await
             .expect_err("incomplete provisioning must not be reported as success");
         assert!(
-            runtime.created.load(Ordering::SeqCst),
+            runtime.called("create"),
             "a package that NixOS can install must not be refused"
         );
         assert!(error.to_string().contains("provisioning did not complete"));
-        assert!(runtime.stopped.load(Ordering::SeqCst));
+        assert!(runtime.called("stop"));
         assert!(manager.get_sandbox("t").is_ok());
     }
 
@@ -2204,16 +2084,7 @@ mod tests {
         let manager = SandboxManager {
             state_dir: tmp.path().to_path_buf(),
         };
-        let runtime = RecordingRuntime {
-            created: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
-            fail_create: false,
-            fail_destroy: false,
-            fail_stop: false,
-            fail_status: false,
-            status: SandboxStatus::Running,
-        };
+        let runtime = recording_runtime();
 
         // Defaults select several sets, and this source is unsupported by the
         // NixOS provisioner. Neither may matter when the user explicitly asks
@@ -2229,8 +2100,8 @@ mod tests {
             .await
             .expect("bare creation must not execute guest provisioning commands");
 
-        assert!(runtime.created.load(Ordering::SeqCst));
-        assert!(!runtime.stopped.load(Ordering::SeqCst));
+        assert!(runtime.called("create"));
+        assert!(!runtime.called("stop"));
         let state = manager.get_sandbox("bare").unwrap();
         assert!(state.sets.is_empty());
         assert!(state.languages.is_empty());

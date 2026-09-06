@@ -4,6 +4,7 @@ pub mod docker;
 pub mod incus;
 pub mod lima;
 pub mod multipass;
+pub mod stub;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
