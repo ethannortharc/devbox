@@ -113,6 +113,12 @@ struct Supervisor {
     stats: Arc<Stats>,
     active: HashMap<String, ActiveCollector>,
     retries: HashMap<String, RetryState>,
+    /// When each box's last collector was observed to have ended.
+    ///
+    /// Only so the line that starts the next one can say how long the box went
+    /// unwatched. Nobody can reconstruct that afterwards: the health record
+    /// keeps when capture *resumed* and nothing keeps when it stopped.
+    last_ended: HashMap<String, Instant>,
 }
 
 struct ActiveCollector {
@@ -217,6 +223,7 @@ impl Supervisor {
             stats,
             active: HashMap::new(),
             retries: HashMap::new(),
+            last_ended: HashMap::new(),
         }
     }
 
@@ -314,6 +321,7 @@ impl Supervisor {
             }
         }
         for (name, handshake_expired) in ended {
+            self.last_ended.insert(name.clone(), Instant::now());
             if let Some(active) = self.active.remove(&name) {
                 if handshake_expired {
                     active.task.abort();
@@ -337,6 +345,7 @@ impl Supervisor {
         }
 
         self.retries.retain(|name, _| wanted.contains_key(name));
+        self.last_ended.retain(|name, _| wanted.contains_key(name));
 
         // Started concurrently, because starting one means probing a runtime
         // CLI and those wedge. Serially, ten boxes on a stale Docker socket
@@ -365,6 +374,21 @@ impl Supervisor {
         for (name, outcome) in started {
             match outcome {
                 Ok(Some(active)) => {
+                    // Restarts are otherwise invisible. An agent killed by a
+                    // signal ends its stream cleanly, so nothing fails and
+                    // nothing gets logged; the only trace was the health
+                    // record's `since` moving, which nobody reading the log
+                    // has a reason to go and check. Read next to the
+                    // `observability agent stream ended` line above it, this
+                    // one says how long the box went unwatched.
+                    if let Some(ended) = self.last_ended.remove(&name) {
+                        tracing::info!(
+                            box_id = %name,
+                            attempt = self.retries.get(&name).map_or(0, |retry| retry.failures) + 1,
+                            after_ms = ended.elapsed().as_millis() as u64,
+                            "restarting observability agent"
+                        );
+                    }
                     if active.ready.is_none() {
                         self.retries.remove(&name);
                     }
@@ -1282,6 +1306,72 @@ mod tests {
         supervisor.reconcile().await.unwrap();
         assert_eq!(supervisor.active["alpha"].state_identity, new_identity);
         assert!(socket_path(dir.path(), "alpha").exists());
+        supervisor.stop_all().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_collector_says_so_and_says_how_long_the_box_went_unwatched() {
+        // The other half of the same silence. The collector now says when a
+        // stream ended, but the decision to start another one is the
+        // supervisor's, and it made that decision without a word: a box could
+        // lose its agent, wait out a backoff, and get a new one, with the log
+        // showing only two unremarkable "agent connected" lines and no hint
+        // that the seconds between them were unwatched.
+        let log = crate::obs::testlog::Captured::install();
+        let dir = tempfile::tempdir().unwrap();
+        save_box(dir.path(), "alpha");
+        let manager = Arc::new(SandboxManager {
+            state_dir: dir.path().to_path_buf(),
+        });
+        let mut supervisor = Supervisor::new(manager, Arc::new(Stats::default()));
+
+        supervisor.reconcile().await.unwrap();
+        // Ends the way a signalled agent's stream does: no error to report,
+        // the task is simply over.
+        supervisor.active["alpha"].task.abort();
+        for _ in 0..100 {
+            if supervisor.active["alpha"].task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        supervisor.reconcile().await.unwrap();
+        assert!(
+            supervisor.active.is_empty() && supervisor.last_ended.contains_key("alpha"),
+            "the end of a collector went unnoticed"
+        );
+        // The first backoff, waited out with the clock paused.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        supervisor.reconcile().await.unwrap();
+        assert!(supervisor.active.contains_key("alpha"));
+
+        let line = log.line("restarting observability agent");
+        assert!(
+            line.contains("box_id=alpha"),
+            "the restart does not name the box: {line}"
+        );
+        // The same count the health record carries, so the log and the console
+        // cannot disagree about which attempt this is.
+        assert!(
+            line.contains("attempt=2"),
+            "the restart does not say which attempt it is: {line}"
+        );
+        let after: u64 = line
+            .rsplit("after_ms=")
+            .next()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| {
+                panic!("the restart does not say how long the box went unwatched: {line}")
+            });
+        assert!(
+            after >= 2_000,
+            "the gap is reported as shorter than the backoff that caused it: {line}"
+        );
+        assert!(
+            supervisor.last_ended.is_empty(),
+            "a box that came back is still marked as ended"
+        );
         supervisor.stop_all().await;
     }
 
