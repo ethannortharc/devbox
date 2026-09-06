@@ -162,8 +162,27 @@ exec sh -c \"$s\" devbox-mcp \"$f\" \"$@\"";
 /// there is no group it may reap, and the host then confines itself to the one
 /// process it can name. Fewer processes cleaned up is a bug; the wrong
 /// processes killed is an outage.
+///
+/// **The write is a rename, not a redirect.** `> "$f"` opens the file with
+/// `O_CREAT|O_TRUNC` and only then lets `printf` fill it, so between those two
+/// steps the file *exists and is empty* — and everything downstream reads it
+/// by existence. A test polling `exists()` parsed the empty string and failed
+/// with `ParseIntError`, which is the harmless end of it; the reaper's own
+/// reading of an empty file is `rm -f` followed by `exit 0`, which deletes the
+/// only record of the group and abandons it silently. Writing beside the file
+/// and `mv`-ing it into place makes the name appear with its contents already
+/// there, because a same-directory rename is atomic.
+///
+/// A write that fails now says so on stderr instead of being swallowed by
+/// `2>/dev/null`. `devbox mcp run` puts the server's stderr in
+/// `~/.devbox/mcp/<name>.log`, so "this session has no reapable group" becomes
+/// something the log can be asked about rather than something inferred from an
+/// orphan hours later. It is still not fatal: refusing to start a server
+/// because bookkeeping failed would trade a cleanup gap for an outage.
 const GUEST_WRAPPER_STAGE2: &str = "f=$1; shift; PGID_READ; \
-if [ \"$g\" = \"$$\" ]; then printf '%s' \"$g\" > \"$f\" 2>/dev/null; fi; exec \"$@\"";
+if [ \"$g\" = \"$$\" ]; then \
+{ printf '%s' \"$g\" > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\"; } || \
+echo \"devbox-mcp: could not record process group $g in $f\" >&2; fi; exec \"$@\"";
 
 /// Kill the process group stage 2 recorded, then remove the file.
 ///
@@ -183,7 +202,7 @@ if [ \"$g\" = \"$$\" ]; then printf '%s' \"$g\" > \"$f\" 2>/dev/null; fi; exec \
 /// the moment some caller runs the reaper in a group of its own: the thing
 /// that must not be killed is whoever asked for the cleanup, and that is the
 /// parent whether or not we share a group with it.
-const GUEST_REAPER: &str = "p=$(cat \"$1\" 2>/dev/null); rm -f \"$1\" 2>/dev/null; \
+const GUEST_REAPER: &str = "p=$(cat \"$1\" 2>/dev/null); rm -f \"$1\" \"$1.tmp\" 2>/dev/null; \
 case \"$p\" in ''|*[!0-9]*) exit 0;; esac; PGID_READ; \
 pp=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' '); \
 pg=; [ -n \"$pp\" ] && pg=$(ps -o pgid= -p \"$pp\" 2>/dev/null | tr -d ' '); \
@@ -910,6 +929,25 @@ mod tests {
         assert_eq!(argv[8], "srv");
     }
 
+    /// Wait for the wrapper to finish recording, not merely to start.
+    ///
+    /// `exists()` is the wrong question and cost a red CI job: the old wrapper
+    /// wrote with `> "$f"`, so the name appeared before the digits did, and a
+    /// poller that stopped at existence read `""`. The write is a rename now,
+    /// which closes the window — but the test asks the question it actually
+    /// means either way, and says what it was waiting for when it gives up.
+    async fn recorded_group(pgid_file: &Path) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(pgid_file)
+                && !text.trim().is_empty()
+            {
+                return Some(text.trim().to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
     /// The wrapper and the reaper agree on where the process group id lives,
     /// and the pair works against a real process group.
     #[tokio::test]
@@ -931,17 +969,22 @@ mod tests {
             .spawn()
             .unwrap();
 
-        for _ in 0..100 {
-            if pgid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let recorded: i32 = std::fs::read_to_string(&pgid_file)
-            .unwrap()
-            .trim()
+        let recorded: i32 = recorded_group(&pgid_file)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "the wrapper never recorded a process group in {} within five \
+                     seconds; the file {} exist",
+                    pgid_file.display(),
+                    if pgid_file.exists() {
+                        "does"
+                    } else {
+                        "does not"
+                    }
+                )
+            })
             .parse()
-            .unwrap();
+            .expect("a process group id is a number");
         assert_eq!(
             recorded,
             child.id().unwrap() as i32,
@@ -1037,18 +1080,11 @@ mod tests {
             .spawn()
             .unwrap();
 
-        for _ in 0..60 {
-            if pgid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if pgid_file.exists() {
-            let recorded: i32 = std::fs::read_to_string(&pgid_file)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+        // `None` is a legitimate outcome here: with no `setsid` the wrapper
+        // has no group of its own to record, and recording nothing is the
+        // whole point of the test.
+        if let Some(recorded) = recorded_group(&pgid_file).await {
+            let recorded: i32 = recorded.parse().expect("a process group id is a number");
             // `setsid` was available, so the wrapper made itself a group.
             assert_ne!(
                 recorded,
@@ -1071,6 +1107,65 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = child.start_kill();
+    }
+
+    /// The reaper's contract for a pgid file it cannot read a group out of.
+    ///
+    /// Deterministic, because the race that produced such a file is not: a
+    /// half-written record used to be reachable in the microseconds between
+    /// `open` and `printf`, and the reaper's answer to it — delete the file,
+    /// exit 0 — abandoned a live process group with nothing left to point at
+    /// it. The atomic write means the shape should no longer occur; this pins
+    /// what happens if it ever does again, from a file this test writes itself.
+    #[tokio::test]
+    async fn a_pgid_file_with_no_group_in_it_is_cleaned_up_and_signals_nothing() {
+        for contents in ["", "   ", "\n", "not-a-pid"] {
+            let dir = tempfile::tempdir().unwrap();
+            let pgid_file = dir.path().join("run.pgid");
+            std::fs::write(&pgid_file, contents).unwrap();
+            // A leftover from an interrupted write, which the reaper also owns.
+            let temp = dir.path().join("run.pgid.tmp");
+            std::fs::write(&temp, "999999").unwrap();
+
+            let reaper = reaper_script(pgid_file.to_str().unwrap());
+            let out = Command::new(&reaper[0])
+                .args(&reaper[1..])
+                .output()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "reaper on {contents:?} exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !pgid_file.exists(),
+                "the reaper left {contents:?} behind at {}",
+                pgid_file.display()
+            );
+            assert!(
+                !temp.exists(),
+                "the reaper left the half-written temporary file behind"
+            );
+        }
+    }
+
+    /// The temporary file the wrapper writes through is still recognisable as
+    /// the shim's own plumbing.
+    ///
+    /// `is_wrapper_command` filters these out of a run's report by matching
+    /// [`PGID_PATH_PREFIX`], so a temporary name that fell outside the prefix
+    /// would put `mv -f /tmp/…` in the Processes section of every MCP report.
+    #[test]
+    fn the_temporary_pgid_file_keeps_the_prefix_the_report_filters_on() {
+        let path = pgid_file_path("fetch");
+        let temp = format!("{path}.tmp");
+        assert!(path.starts_with(PGID_PATH_PREFIX), "{path}");
+        assert!(temp.starts_with(PGID_PATH_PREFIX), "{temp}");
+        assert!(is_wrapper_command(&[temp]));
     }
 
     /// The guard that makes the CI failure impossible rather than unlikely.
