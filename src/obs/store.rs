@@ -11,14 +11,20 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::event::{Event, EventType};
-use super::run::{ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag};
+use super::run::{
+    ActiveRun, Attribution, Attributor, EndedBy, RunRecord, RunStatus, RunTag, StartGate,
+};
 
 /// The schema this build writes, recorded in `meta` under `schema`.
 ///
 /// 1. events + meta, as v4 shipped them. A store created before the key
 ///    existed reports 1 by its absence, not by its content.
 /// 2. `runs`, and `events.run_id` / `events.attribution` (§4.1).
-const SCHEMA_VERSION: u32 = 2;
+/// 3. `runs.file_scope` and `runs.start_gate`: what the agent was watching
+///    while the run happened, and whether the host got to register it before
+///    the command started. Both describe how much the report can claim, and
+///    neither can be reconstructed afterwards.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Opens and owns a box's event database.
 pub struct Store {
@@ -196,7 +202,9 @@ impl Store {
                 capture_sources  TEXT    NOT NULL DEFAULT '',
                 agent_version    TEXT    NOT NULL DEFAULT '',
                 dropped_events   INTEGER NOT NULL DEFAULT 0,
-                ended_by         TEXT
+                ended_by         TEXT,
+                file_scope       TEXT NOT NULL DEFAULT '',
+                start_gate       TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at DESC);
@@ -289,7 +297,7 @@ impl Store {
                 run_columns.push(row.context("failed to read a runs column")?);
             }
         }
-        for column in ["ended_by"] {
+        for column in ["ended_by", "file_scope", "start_gate"] {
             if run_columns.iter().any(|c| c == column) {
                 continue;
             }
@@ -434,8 +442,9 @@ impl Store {
                    (run_id, box_id, kind, argv, cwd, label, started_at, ended_at, exit_code,
                     status, posture_before, posture_during, cgroup_id, root_pid,
                     checkpoint_start, checkpoint_end, capture_sources, agent_version,
-                    dropped_events, ended_by)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    dropped_events, ended_by, file_scope, start_gate)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
+                         ?20,?21,?22)",
                 params![
                     run.run_id,
                     run.box_id,
@@ -457,9 +466,27 @@ impl Store {
                     run.agent_version,
                     run.dropped_events,
                     run.ended_by,
+                    run.file_scope,
+                    run.start_gate,
                 ],
             )
             .context("failed to record a run")?;
+        Ok(())
+    }
+
+    /// Record how the start gate went, once the host knows.
+    ///
+    /// Separate from [`Store::set_run_scope`] because the two answers arrive
+    /// at different moments and for different reasons: the scope is what the
+    /// wrapper reported, the gate is whether the host got to act on it in
+    /// time.
+    pub fn set_run_start_gate(&self, run_id: &str, gate: StartGate) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET start_gate = ?2 WHERE run_id = ?1",
+                params![run_id, gate.as_str()],
+            )
+            .context("failed to record a run's start gate")?;
         Ok(())
     }
 
@@ -1311,7 +1338,7 @@ fn event_params<'a>(
 const RUN_COLUMNS: &str = "run_id, box_id, kind, argv, cwd, label, started_at, ended_at, \
      exit_code, status, posture_before, posture_during, cgroup_id, root_pid, \
      checkpoint_start, checkpoint_end, capture_sources, agent_version, dropped_events, \
-     ended_by";
+     ended_by, file_scope, start_gate";
 
 /// Decode a stored event, with credentials removed from its argv.
 ///
@@ -1416,6 +1443,11 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         agent_version: row.get(17)?,
         dropped_events: row.get::<_, i64>(18)? as u64,
         ended_by: row.get(19)?,
+        // `ALTER TABLE … ADD COLUMN` gives a migrated row NULL where a fresh
+        // table has `DEFAULT ''`, so both spellings of "nothing recorded"
+        // have to read back the same.
+        file_scope: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
+        start_gate: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
     })
 }
 

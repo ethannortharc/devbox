@@ -80,22 +80,32 @@ pub async fn run(args: ExportArgs, manager: &SandboxManager) -> Result<()> {
     // `actor.session.uid`, and the `devbox.run.id` resource attribute all read
     // it from here. Selecting the run's rows without stamping them left every
     // record saying "correlated with nothing".
-    let ctx = export::Context {
-        run_id: run_id.map(str::to_string),
-        ..export::Context::new(&name)
-    };
-
     // Say so rather than exporting nothing. An empty OCSF document for a run
     // id that does not exist on this box is indistinguishable from a run that
     // did nothing, and only one of those is worth investigating.
-    if let Some(run_id) = run_id
-        && store.get_run(run_id)?.is_none()
-    {
-        bail!(
-            "box '{name}' has no run '{run_id}'. `devbox runs {name}` lists the \
-             runs it has recorded."
-        );
-    }
+    let record = match run_id {
+        Some(run_id) => {
+            let Some(record) = store.get_run(run_id)? else {
+                bail!(
+                    "box '{name}' has no run '{run_id}'. `devbox runs {name}` lists the \
+                     runs it has recorded."
+                );
+            };
+            Some(record)
+        }
+        None => None,
+    };
+
+    let ctx = export::Context {
+        run_id: run_id.map(str::to_string),
+        // From the run, not from the box's health now: the scope can have
+        // changed since, and an export is a record of what was true then.
+        file_scope: record
+            .as_ref()
+            .map(|r| r.file_scope.clone())
+            .filter(|scope| !scope.is_empty()),
+        ..export::Context::new(&name)
+    };
 
     let stats = match &args.out {
         None => {

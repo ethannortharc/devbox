@@ -68,6 +68,13 @@ pub struct Context {
     /// empty: an empty correlation id in an audit record reads as "correlated
     /// with nothing", which is a different claim from "not yet correlated".
     pub run_id: Option<String>,
+    /// The path prefixes the box's agent was reporting file events from while
+    /// the run happened.
+    ///
+    /// A consumer counting `file` records needs to know what was not being
+    /// looked at, or an empty result reads as a quiet box rather than as a
+    /// narrow scope. Absent, not empty, when the run predates the field.
+    pub file_scope: Option<String>,
 }
 
 impl Context {
@@ -76,6 +83,7 @@ impl Context {
             box_name: box_name.into(),
             product_version: env!("CARGO_PKG_VERSION").to_string(),
             run_id: None,
+            file_scope: None,
         }
     }
 }

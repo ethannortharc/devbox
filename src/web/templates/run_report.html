@@ -127,6 +127,9 @@
 
       <h2>Files</h2>
       <p class="note">scope: {{ report.files.scope }}</p>
+      {%- if !report.run.file_scope.is_empty() %}
+      <p class="note">file events observed under: <code>{{ report.run.file_scope }}</code></p>
+      {%- endif %}
       {% if report.files.is_empty() %}
       <p class="empty">No changes to the workspace overlay.</p>
       {% else %}

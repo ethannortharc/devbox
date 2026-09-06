@@ -213,6 +213,23 @@ pub struct RunRecord {
     /// Why the run stopped, when the host knows something the exit code does
     /// not say. See [`EndedBy`].
     pub ended_by: Option<String>,
+    /// The path prefixes the box's agent was reporting file events from while
+    /// this run happened.
+    ///
+    /// Recorded rather than read at render time: the scope can change between
+    /// the run and the report, and a Files section that names today's scope
+    /// while describing last week's run is worse than one that names none.
+    /// Empty when the host could not ask.
+    pub file_scope: String,
+    /// How the start gate went: `ok`, `timeout`, or empty for a run recorded
+    /// before the gate existed (and for `exec` / `shell`, which have no
+    /// wrapper to gate).
+    ///
+    /// `timeout` means the command started before the host had registered its
+    /// cgroup, so the run's first events were attributed by the back-fill
+    /// rather than as they arrived — which is the difference between a process
+    /// tree rooted at the user's command and one that opens partway down.
+    pub start_gate: String,
 }
 
 impl RunRecord {
@@ -278,6 +295,24 @@ impl fmt::Display for EndedBy {
     }
 }
 
+/// How the start gate went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartGate {
+    /// The host registered the run and released the wrapper.
+    Ok,
+    /// The wrapper gave up waiting, or the host could not reach it.
+    Timeout,
+}
+
+impl StartGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartGate::Ok => "ok",
+            StartGate::Timeout => "timeout",
+        }
+    }
+}
+
 /// How much isolation the guest could actually give a run.
 ///
 /// The wrapper reports this so the host knows whether the cgroup it was handed
@@ -339,6 +374,13 @@ pub struct GuestScope {
     pub root_pid: u32,
     #[serde(default)]
     pub scope: String,
+    /// The FIFO the wrapper is blocked on, waiting to be told to go.
+    ///
+    /// Reported rather than derived: the bootstrap chooses between
+    /// [`RUN_STATE_DIRS`] at run time, and the host guessing wrong would mean
+    /// writing a regular file next to the pipe nobody is reading.
+    #[serde(default)]
+    pub gate: String,
 }
 
 impl GuestScope {
@@ -660,6 +702,17 @@ pub const BOOTSTRAP_ARGV0: &str = "devbox-run";
 /// The run's identity in the command's environment.
 pub const RUN_ID_ENV: &str = "DEVBOX_RUN_ID";
 
+/// How long the guest waits at the start gate before running anyway.
+///
+/// The gate exists so the host has registered the run's cgroup *before* the
+/// command produces its first event; it must never be the reason a command
+/// does not run. Five seconds is a long time for one local SQLite write and a
+/// round trip, and a short time to notice that something is wrong.
+pub const GATE_SECONDS: u32 = 5;
+
+/// `$0` for the shell that waits at the gate, so `ps` says what it is.
+pub const GATE_ARGV0: &str = "devbox-run-gate";
+
 /// The wrapper, stage 2 and stage 1 in one script (§4.2).
 ///
 /// Stage 1 picks the most exclusive scope the guest can give, then re-execs
@@ -679,6 +732,8 @@ pub fn wrapper_script() -> &'static str {
             .replace("@SCOPED@", SCOPED_FLAG)
             .replace("@UNIT@", UNIT_PREFIX)
             .replace("@RUN_ID_ENV@", RUN_ID_ENV)
+            .replace("@GATE_SECONDS@", &GATE_SECONDS.to_string())
+            .replace("@GATE_ARGV0@", GATE_ARGV0)
     })
 }
 
@@ -697,9 +752,38 @@ if [ "${1-}" = "@SCOPED@" ]; then
     done < /proc/self/cgroup 2>/dev/null
     ino=0
     if [ -n "$cg" ]; then ino=$(stat -c %i "/sys/fs/cgroup$cg" 2>/dev/null || echo 0); fi
-    printf '{"run_id":"%s","cgroup_id":%s,"cgroup_path":"%s","root_pid":%s,"scope":"%s"}\n' \
-        "$rid" "${ino:-0}" "$cg" "$$" "$method" > "$state.tmp" 2>/dev/null &&
+
+    # The start gate.
+    #
+    # Made before the record is published, because the record's appearance is
+    # what tells the host the pipe is ready to be written to. A host that
+    # opened it first would create a regular file beside a pipe nobody reads.
+    gate=$state.go
+    mkfifo "$gate" 2>/dev/null
+
+    printf '{"run_id":"%s","cgroup_id":%s,"cgroup_path":"%s","root_pid":%s,"scope":"%s","gate":"%s"}\n' \
+        "$rid" "${ino:-0}" "$cg" "$$" "$method" "$gate" > "$state.tmp" 2>/dev/null &&
         mv "$state.tmp" "$state" 2>/dev/null
+
+    # Block until the host says it has registered this run.
+    #
+    # Without it the command is already running — and on a fast one, already
+    # finished — before the host knows which cgroup to attribute to, so the
+    # report's process tree opened partway down the wrapper's own children.
+    #
+    # A pipe rather than a polled file: `read` blocks with no spinning and no
+    # `sleep`, which would otherwise put one exec per poll into the report this
+    # gate exists to fix. `timeout` bounds it where coreutils has it; where it
+    # does not, the host's own deadline is the bound, and it always writes.
+    if [ -p "$gate" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout @GATE_SECONDS@ sh -c 'read _ < "$1"' @GATE_ARGV0@ "$gate" >/dev/null 2>&1
+        else
+            read _ < "$gate" >/dev/null 2>&1
+        fi
+        rm -f "$gate" 2>/dev/null
+    fi
+
     @RUN_ID_ENV@=$rid; export @RUN_ID_ENV@
     if [ -n "$home" ] && [ "${HOME-}" != "$home" ]; then HOME=$home; export HOME; fi
     if [ -n "$who" ] && [ "${USER-}" != "$who" ]; then USER=$who; LOGNAME=$who; export USER LOGNAME; fi
@@ -858,7 +942,12 @@ pub fn is_wrapper_command(argv: &[String]) -> bool {
     if argv.iter().any(|a| a == SCOPED_FLAG) {
         return true;
     }
-    if word(0) == BOOTSTRAP_ARGV0 {
+    if word(0) == BOOTSTRAP_ARGV0 || word(0) == GATE_ARGV0 {
+        return true;
+    }
+    // `timeout 5 sh -c … devbox-run-gate <fifo>`: the argv0 is the shell's,
+    // not `timeout`'s, so the marker sits further along.
+    if argv.iter().any(|a| a == GATE_ARGV0) {
         return true;
     }
 
@@ -875,6 +964,41 @@ pub fn is_wrapper_command(argv: &[String]) -> bool {
     })
 }
 
+/// Tell the wrapper it may run: open the gate and write one byte.
+///
+/// `>` on a FIFO blocks until a reader arrives, which is exactly the
+/// synchronisation wanted — but it also means a gate whose wrapper has already
+/// given up would hang this exec, so it carries its own timeout. Both are
+/// bounded; neither is allowed to be the reason a command does not run.
+pub fn gate_release_argv(gate: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "[ -p \"$1\" ] || exit 0; \
+             if command -v timeout >/dev/null 2>&1; then \
+             timeout {GATE_SECONDS} sh -c 'echo go > \"$1\"' {GATE_ARGV0} \"$1\"; \
+             else echo go > \"$1\"; fi"
+        ),
+        GATE_ARGV0.to_string(),
+        gate.to_string(),
+    ]
+}
+
+/// Whether a gate path is one this host could have handed out.
+///
+/// The path comes back from inside the box and becomes a shell word, so it is
+/// checked rather than trusted: it must be the scope record's own path with
+/// `.go` on the end, under one of the directories the bootstrap chooses from.
+pub fn is_gate_path(gate: &str, run_id: &str) -> bool {
+    if !is_run_id(run_id) {
+        return false;
+    }
+    RUN_STATE_DIRS
+        .iter()
+        .any(|dir| gate == format!("{dir}/{run_id}.json.go"))
+}
+
 /// Remove a finished run's wrapper and scope record from the guest.
 pub fn cleanup_argv(run_id: &str) -> Vec<String> {
     let primary = RUN_STATE_DIRS[0];
@@ -883,7 +1007,8 @@ pub fn cleanup_argv(run_id: &str) -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "rm -f {prefix}{run_id}.sh {primary}/{run_id}.json {fallback}/{run_id}.json 2>/dev/null; \
+            "rm -f {prefix}{run_id}.sh {primary}/{run_id}.json {fallback}/{run_id}.json \
+             {primary}/{run_id}.json.go {fallback}/{run_id}.json.go 2>/dev/null; \
              rmdir /sys/fs/cgroup/devbox/{unit}{run_id} 2>/dev/null; true",
             prefix = WRAPPER_PATH_PREFIX,
             unit = UNIT_PREFIX
@@ -1147,6 +1272,7 @@ mod tests {
             cgroup_path: "/user.slice".into(),
             root_pid: 10,
             scope: "none".into(),
+            gate: String::new(),
         };
         assert_eq!(shared.exclusive_cgroup_id(), 0);
         let exclusive = GuestScope {
@@ -1179,6 +1305,100 @@ mod tests {
         );
         assert!(argv.iter().any(|a| a == "DEVBOX_BROKER_URL=http://h:9"));
         assert_eq!(argv.last().unwrap(), "true", "the command comes last");
+    }
+
+    #[test]
+    fn the_wrapper_waits_at_a_gate_before_it_execs_the_command() {
+        let script = wrapper_script();
+        // The pipe is made *before* the record is published: the record's
+        // appearance is what tells the host the pipe is ready, and a host that
+        // opened it first would create a regular file beside it.
+        let mkfifo = script.find("mkfifo").expect("the wrapper makes a fifo");
+        let publish = script.find("$state.tmp").expect("the wrapper publishes");
+        let gate = script.find("read _ <").expect("the wrapper waits");
+        let exec = script.rfind("exec \"$@\"").expect("the wrapper execs");
+        assert!(
+            mkfifo < publish,
+            "the pipe must exist before the record does"
+        );
+        assert!(
+            publish < gate,
+            "the host cannot open a gate it has not heard of"
+        );
+        assert!(gate < exec, "the command started before the gate opened");
+
+        // The placeholders are substituted, so the deadline and the argv0 the
+        // fold matches on are the constants and not a second copy of them.
+        assert!(script.contains(&GATE_SECONDS.to_string()));
+        assert!(script.contains(GATE_ARGV0));
+        assert!(
+            !script.contains("@GATE"),
+            "a placeholder survived: {script}"
+        );
+    }
+
+    #[test]
+    fn the_gates_own_processes_fold_out_of_the_report() {
+        // The gate adds processes to the run's own cgroup, which is to say to
+        // the run's own report. Every one of them has to be recognised, or
+        // fixing the tree's first line would have cost it three more.
+        assert!(is_wrapper_command(&gate_release_argv(
+            "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json.go"
+        )));
+        for words in [
+            vec![
+                "timeout",
+                "5",
+                "sh",
+                "-c",
+                "read _ < \"$1\"",
+                GATE_ARGV0,
+                "/run/devbox/runs/01A.json.go",
+            ],
+            vec![
+                "sh",
+                "-c",
+                "read _ < \"$1\"",
+                GATE_ARGV0,
+                "/tmp/.devbox-runs/01A.json.go",
+            ],
+            vec![
+                "mkfifo",
+                "/run/devbox/runs/01ABCDEFGHJKMNPQRSTVWXYZ00.json.go",
+            ],
+        ] {
+            let argv: Vec<String> = words.iter().map(|s| s.to_string()).collect();
+            assert!(is_wrapper_command(&argv), "not folded: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_gate_path_is_checked_against_the_two_the_bootstrap_can_choose() {
+        // The path comes back from inside the box and becomes a shell word.
+        let run_id = "01ABCDEFGHJKMNPQRSTVWXYZ00";
+        assert!(is_gate_path(
+            &format!("/run/devbox/runs/{run_id}.json.go"),
+            run_id
+        ));
+        assert!(is_gate_path(
+            &format!("/tmp/.devbox-runs/{run_id}.json.go"),
+            run_id
+        ));
+        for bad in [
+            format!("/etc/{run_id}.json.go"),
+            format!("/run/devbox/runs/{run_id}.json.go; rm -rf /"),
+            format!("/run/devbox/runs/../../{run_id}.json.go"),
+            format!("/run/devbox/runs/{run_id}.json"),
+            String::new(),
+        ] {
+            assert!(!is_gate_path(&bad, run_id), "accepted: {bad:?}");
+        }
+        // And a gate for somebody else's run is not this run's gate.
+        assert!(!is_gate_path(
+            &format!("/run/devbox/runs/{run_id}.json.go"),
+            "01ABCDEFGHJKMNPQRSTVWXY99"
+        ));
+        assert!(!is_gate_path("/run/devbox/runs/x.json.go", "not-a-run-id"));
     }
 
     #[test]
