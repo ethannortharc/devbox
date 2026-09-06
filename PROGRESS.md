@@ -66,6 +66,14 @@ the full gate. The v5 build log starts at "devbox v5 — build log" below.
 | W3 | W3-10 `[mounts]` default, repair-before-stop, incus-agent per runtime | `v5/mounts-stop` | **DONE** |
 | W3 | W3-11 an attach at the start of a run is not an interruption | `v5/restart-threshold` | **DONE** |
 | W3 | W3-12 README, docs, ADR-0068…0071, release notes, version 0.2.1 | `v5/docs-021` | **DONE** |
+| W4 | W4-1 the capture verdict is one function, and the store setter takes its result | `v5/interrupted-judgement` (`3765569`) | **DONE** |
+| W4 | W4-2 `/workspace` gets `nofail` at birth; `devbox repair stale-home` | `v5/workspace-nofail` (`61f4171`) | **DONE** |
+| W4 | W4-3 one `StubRuntime` in place of five hand-written doubles | `v5/stub-runtime` (`61fbd36`) | **DONE** |
+| W4 | W4-4 an interrupted run names its window; three lines explain an agent restart | `v5/capture-gap-visibility` (`e09bb6e`) | **DONE** |
+| W4 | W4-5 the `nofail` grant needs two facts and a probe that finished | `v5/nofail-grant` (`bae8dd3`) | **DONE** |
+| W4 | W4-6 `exec` and `shell` repair the box before they record a run | `v5/exec-repairs` (`a0a31c0`, `6381f1b`) | **DONE** |
+| W4 | W4-8 the stale-home archive lands on the host; `--keep` | `v5/stale-home-host` (`bf0caa7`) | **DONE** |
+| W4 | W4-7 README, docs, ADR-0072…0074, release notes, version 0.2.2 | `v5/docs-022` | **DONE** |
 
 ## Environment notes
 
@@ -2406,3 +2414,54 @@ function, and `interrupted` produced on a real box), W4-2 (`/workspace`'s
 `/home/<user>` older boxes carry), W4-3 (one `StubRuntime` instead of five
 test doubles). Still needing a machine devbox does not have here: the Incus,
 Docker, and Ubuntu-image paths.
+
+## 2026-09-06 — 0.2.2: the advice in 0.2.1 becomes true
+
+**Landed on `v5-main`**, `v0.2.1..bf0caa7`, 22 non-merge commits across seven
+task branches.
+
+- **`devbox exec` and `devbox shell` apply a pending repair.** They had been
+  opening a run and then deferring to it — waiting for themselves — so 0.2.1's
+  own upgrade advice was false for the two commands most likely to be used, from
+  the day it was written. Two changes from the same day combined to do it
+  (`d8c7b83` recording exec/shell as runs, `9faf26a` deferring repairs behind a
+  run). The order is now a type: `SimpleRun::start` takes a `Prepared` it never
+  reads, so the old order does not compile (ADR-0073).
+- **An interrupted run says which stretch it is missing.** `capture_gap {from,
+  to}` in JSON, one sentence in Markdown and HTML — an outer bound, stated as
+  one: the measured example is a 21 s window around an agent that was down for
+  about 2 s. Three collector-log lines answer "did the pid change, and for how
+  long" without opening `capture.json`.
+- **`/workspace` gets `nofail` at birth or never** (ADR-0072), with the grant
+  gated on two independent facts and a probe that says it finished — the
+  reachability check that preceded it treated an ssh hiccup as "this box is
+  being born", which grants `nofail` to an existing box and makes it
+  permanently unrepairable. The consistency check had to be moved from the
+  kernel's mount options to `/etc/fstab`, because `nofail` never reaches the
+  kernel and the first version would have condemned every new box.
+- **`devbox repair stale-home`** cleans up the `/home/<user>` an older devbox
+  wrote into: settings merged, the rest archived to the host and verified before
+  anything is deleted, credentials deleted and named rather than archived
+  (ADR-0074).
+- Five hand-written `Runtime` doubles became one `StubRuntime`; 56
+  `unimplemented!()` left the tree.
+
+**Gate on `v5/docs-022`** — `cargo fmt --check`, `cargo +1.98.1 clippy -j 3
+--all-targets -- -D warnings`, `cargo test -j 3` (log at `/tmp/w47-test.log`).
+Test count 998 at 0.2.1 → 1040 here.
+
+**Not released.** Version is 0.2.2 and the release notes are final; no tag, no
+push. The two blockers from 0.2.1 are unchanged and still block: the release
+workflow has never run in its v5 shape on this host (no `act`; checked with
+`actionlint`, a YAML parse and `bash -n install.sh`), and `install.sh`, the
+README's install line and `Cargo.toml`'s `repository` name
+`github.com/ethannortharc/devbox` while `origin` is `git.giomni.com`.
+
+**What this cycle taught.** Three of the seven tasks found their own bug on a
+real box after the unit tests were green — the `findmnt` comparison, the
+`after_ms` that was a reconcile tick short, the exec ordering. In each case the
+test and the code shared an assumption, which is the failure mode a test cannot
+see. And the fix that sticks is the one that becomes a compile error: a type for
+the ordering, a store setter that takes a verdict. Two regressions this year
+were re-introduced by a `git checkout --`, and neither would have been possible
+against either of those.
