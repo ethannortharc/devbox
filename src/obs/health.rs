@@ -81,6 +81,14 @@ pub struct CaptureHealth {
     pub file_scope: Vec<String>,
     #[serde(default)]
     pub agent_version: String,
+    /// The pid of the agent process currently streaming, inside the box.
+    ///
+    /// A `since` that moved with this unchanged is a re-publish, not a new
+    /// agent — and a run that spans one of those has lost nothing. Zero when
+    /// the agent predates the field, which every reader has to treat as
+    /// "cannot tell" rather than as "unchanged".
+    #[serde(default)]
+    pub agent_pid: u32,
     /// Why the last attempt ended, empty while it has not.
     ///
     /// Carries the agent's own last words when it had any. A collector-side
@@ -107,6 +115,7 @@ impl CaptureHealth {
             source: String::new(),
             file_scope: Vec::new(),
             agent_version: String::new(),
+            agent_pid: 0,
             detail: String::new(),
             attempts: 0,
         }

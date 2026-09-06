@@ -146,10 +146,18 @@ fn coverage(out: &mut String, report: &RunReport) {
         "| dropped during the run | {} |\n",
         report.coverage.dropped_events
     ));
+    // Three tiers, and only one of them is a warning. A stream that was
+    // re-published without changing agent lost nothing, and saying so in the
+    // same voice as a real interruption is how a warning stops being read.
     if !report.run.capture_restarted_at.is_empty() {
         out.push_str(&format!(
             "| **capture restarted** | {} — events before this were lost |\n",
             report.run.capture_restarted_at
+        ));
+    } else if !report.run.capture_reattached_at.is_empty() {
+        out.push_str(&format!(
+            "| capture re-attached | {} — same agent, nothing lost |\n",
+            report.run.capture_reattached_at
         ));
     }
     out.push_str(&format!(

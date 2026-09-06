@@ -631,6 +631,7 @@ impl Supervisor {
                             source: hello.source.clone(),
                             file_scope: hello.file_scope.clone(),
                             agent_version: hello.version.clone(),
+                            agent_pid: hello.pid,
                             ..CaptureHealth::new(&health_box, CaptureState::Streaming)
                                 .with_transport(transport)
                         },

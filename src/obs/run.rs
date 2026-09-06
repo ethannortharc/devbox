@@ -230,6 +230,14 @@ pub struct RunRecord {
     /// "cannot happen", and a report that is quietly missing its own evidence
     /// is the one failure this whole component exists to prevent.
     pub capture_restarted_at: String,
+    /// When capture re-attached during this run without changing agent, RFC3339.
+    ///
+    /// A stream can be re-published — the collector attaches, the health
+    /// record's `since` moves — while the same agent process goes on
+    /// delivering. Nothing is lost, so nothing is warned about; the timestamp
+    /// is kept because "the report says nothing happened" and "the report was
+    /// not looking" are different claims and a reader is entitled to both.
+    pub capture_reattached_at: String,
     /// How the start gate went: `ok`, `timeout`, or empty for a run recorded
     /// before the gate existed (and for `exec` / `shell`, which have no
     /// wrapper to gate).

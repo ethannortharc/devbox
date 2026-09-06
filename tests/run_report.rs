@@ -737,7 +737,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
     }
 
     let mut store = Store::open(&path).expect("a v4 store must still open");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     // The identity survives: a migration that reset the generation would tell
     // every reader its cursor belonged to a different database.
     assert_eq!(store.generation().unwrap(), 4242);
@@ -786,7 +786,7 @@ fn a_v4_store_gains_the_run_columns_without_losing_a_row() {
 
     // Re-opening is not a second migration.
     let reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
     assert_eq!(reopened.count().unwrap(), 10);
 }
 
@@ -1038,7 +1038,7 @@ fn a_v2_runs_table_gains_the_new_columns_without_losing_a_row() {
     }
 
     let store = Store::open(&path).expect("a v2 store must still open");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
 
     let migrated = store.get_run(RUN).unwrap().expect("the pre-upgrade run");
     assert_eq!(migrated.run_id, RUN);
@@ -1061,7 +1061,109 @@ fn a_v2_runs_table_gains_the_new_columns_without_losing_a_row() {
     assert_eq!(read_back.start_gate, "timeout");
 
     // Re-opening is not a second migration.
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 4);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 5);
+}
+
+/// The three timings a moving `since` can have, and what each one means.
+///
+/// The rule is not "the stream moved". A collector attaching to a box
+/// re-publishes its health record, and that lands inside the first hundred
+/// milliseconds of a run often enough that "moved after the run started" put a
+/// warning about lost events on reports where the agent never changed and
+/// nothing went missing — which is how a warning stops being read.
+#[test]
+fn only_a_stream_that_moved_after_events_and_changed_agent_is_an_interruption() {
+    // Shared shape: a run with one attributed event at 10:00:00.100.
+    let prepared = |restart: Option<&str>, reattach: Option<&str>| {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut live = record();
+        live.status = RunStatus::Running.as_str().to_string();
+        live.ended_at = None;
+        store.insert_run(&live).unwrap();
+
+        let mut attributor = Attributor::new();
+        attributor.set_active(store.active_runs().unwrap());
+        let events = fixture();
+        let tags: Vec<_> = events.iter().map(|e| attributor.attribute(e)).collect();
+        store.insert_batch_tagged(&events, &tags).unwrap();
+
+        if let Some(at) = restart {
+            store.set_run_capture_restart(RUN, at).unwrap();
+        }
+        if let Some(at) = reattach {
+            store.set_run_capture_reattach(RUN, at).unwrap();
+        }
+        store
+    };
+
+    // The first attributed event is what the rule turns on, so pin it.
+    let store = prepared(None, None);
+    let first = store
+        .first_attributed_at(RUN)
+        .unwrap()
+        .expect("the run has events");
+    assert_eq!(first, "2026-09-05T10:00:00.000Z");
+
+    // 1. Attach at the run's start — before anything was produced. Nothing
+    //    could have been lost, so nothing is warned about.
+    let store = prepared(None, Some("2026-09-05T10:00:00.050Z"));
+    let text = markdown::render(&built_from(&store));
+    assert!(
+        !text.contains("capture restarted"),
+        "an attach at the run's start was called an interruption:\n{text}"
+    );
+    assert!(
+        text.contains("capture re-attached | 2026-09-05T10:00:00.050Z"),
+        "{text}"
+    );
+    assert!(text.contains("same agent, nothing lost"), "{text}");
+
+    // 2. The stream moved after events, but the same agent is serving — a
+    //    re-published view, not a new agent. Recorded, not warned about.
+    let store = prepared(None, Some("2026-09-05T10:00:00.900Z"));
+    let text = markdown::render(&built_from(&store));
+    assert!(!text.contains("capture restarted"), "{text}");
+    assert!(
+        text.contains("capture re-attached | 2026-09-05T10:00:00.900Z"),
+        "{text}"
+    );
+
+    // 3. After events, and a different agent process — the one case where
+    //    something is actually gone.
+    let store = prepared(Some("2026-09-05T10:00:00.900Z"), None);
+    let text = markdown::render(&built_from(&store));
+    assert!(
+        text.contains("**capture restarted** | 2026-09-05T10:00:00.900Z"),
+        "{text}"
+    );
+    assert!(text.contains("events before this were lost"), "{text}");
+    assert!(!text.contains("re-attached"), "both tiers at once: {text}");
+
+    // 4. Nothing at all: the ordinary run says nothing about its capture.
+    let store = prepared(None, None);
+    let text = markdown::render(&built_from(&store));
+    assert!(!text.contains("capture restarted"), "{text}");
+    assert!(!text.contains("re-attached"), "{text}");
+}
+
+/// Build a report from whatever the store now holds for [`RUN`].
+fn built_from(store: &Store) -> RunReport {
+    let run = store.get_run(RUN).unwrap().expect("the run");
+    let events = store
+        .query(&Query {
+            run_id: Some(RUN.to_string()),
+            limit: Some(Query::MAX_LIMIT),
+            ..Default::default()
+        })
+        .unwrap();
+    RunReport::build(
+        run,
+        &events,
+        Box::new(|| Ok(Vec::new())),
+        SCOPE_BOX,
+        Vec::new(),
+        0,
+    )
 }
 
 #[test]

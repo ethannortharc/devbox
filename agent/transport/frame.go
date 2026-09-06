@@ -71,6 +71,17 @@ type Hello struct {
 	// every path — the collector treats both as "not narrowed", which is what
 	// they are.
 	FileScope []string `json:"file_scope,omitempty"`
+	// PID is this agent process's pid inside the box.
+	//
+	// The host uses it to tell two things apart that look identical from
+	// outside: the collector re-publishing its view of a stream that never
+	// went away, and a stream that is now being served by a different agent
+	// process. Only the second can have lost events, and a run report that
+	// called the first one an interruption was warning people about nothing.
+	//
+	// Zero from an agent that predates the field, which reads as "cannot
+	// tell" rather than as "did not change".
+	PID int `json:"pid,omitempty"`
 }
 
 // HelloAck is the collector's reply.

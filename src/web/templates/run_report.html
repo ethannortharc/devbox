@@ -89,6 +89,8 @@
       }
       td.denied { color: var(--err); }
       .interrupted { color: var(--warn); }
+      /* Not a warning: nothing was lost, so it reads as a footnote. */
+      .reattached { color: var(--fg-faint); font-size: 12px; }
       .empty { color: var(--fg-faint); font-style: italic; }
       .note {
         color: var(--fg-muted); font-size: 13px; margin: 0 0 12px;
@@ -121,6 +123,9 @@
         {%- if !report.run.capture_restarted_at.is_empty() %}
         <dt>capture</dt>
         <dd class="interrupted">restarted at {{ report.run.capture_restarted_at }} — events before this were lost</dd>
+        {%- else if !report.run.capture_reattached_at.is_empty() %}
+        <dt>capture</dt>
+        <dd class="reattached">re-attached at {{ report.run.capture_reattached_at }} — same agent, nothing lost</dd>
         {%- endif %}
         <dt>events</dt>
         <dd>
