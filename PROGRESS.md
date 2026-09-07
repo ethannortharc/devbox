@@ -2466,3 +2466,32 @@ see. And the fix that sticks is the one that becomes a compile error: a type for
 the ordering, a store setter that takes a verdict. Two regressions this year
 were re-introduced by a `git checkout --`, and neither would have been possible
 against either of those.
+
+## 2026-09-07T05:41Z — 0.2.2 shipped; `main` is 0.2.2
+
+**Released.** `v0.2.2` at `b8bb6e3`:
+https://github.com/ethannortharc/devbox/releases/tag/v0.2.2 — the release
+workflow went green on its first run (both agents, both builds, the release),
+`devbox-darwin-arm64` (33.9 MB) and `devbox-linux-amd64` (37.4 MB)
+published, the macOS binary downloaded and verified on this host (`devbox
+0.2.2`, `repair stale-home --help` shows `--keep`), and the release notes
+posted as the release body. `main` was fast-forwarded from `1ffdeed` to
+`b8bb6e3` on GitHub and Gitea; CI on `main` is green (run 34087363557).
+
+**The two "blockers" carried since 0.2.1 are closed, not worked around.** The
+release workflow has now run in its v5 shape three times (0.2.0 after fixes,
+0.2.1 and 0.2.2 on the first try), which is the check `act` would have been
+a stand-in for. And the addresses are not inconsistent: `github.com/ethannortharc/devbox`
+is the public home — releases, `install.sh` and the changelog links all live
+there — while `origin` on this host is a private Gitea mirror. Nothing points
+where it should not.
+
+**What 0.2.2 is**, for the record: `exec` and `shell` repair the box before
+they record their run, so 0.2.1's upgrade advice is finally true (W4-6); an
+interrupted report names the window it cannot vouch for and the collector log
+narrates an agent restart on its own (W4-1, W4-4); `/workspace` gets
+`nofail` at birth or never, with a grant that must be proven and a state
+file checked against `/etc/fstab` (W4-2, W4-5); `devbox repair stale-home`
+with the archive on the host and `--keep` (W4-2, W4-5, W4-8); the MCP
+wrapper writes its pgid file atomically (W4-9); one `StubRuntime` for the
+tests (W4-3). 1000 → 1042 tests.
